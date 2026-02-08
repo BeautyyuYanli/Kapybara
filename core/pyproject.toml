@@ -1,5 +1,5 @@
 [project]
-name = "project-k"
+name = "kapybara"
 version = "0.1.0"
 description = "Default template for PDM package"
 authors = [
