@@ -1,0 +1,22 @@
+[project]
+name = "project-k"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "Yanli 盐粒", email = "yanli@dify.ai"},
+]
+dependencies = ["pydantic-ai>=1.56.0", "pydantic>=2.12.5", "pydantic-settings>=2.12.0", "python-dotenv>=1.2.1", "logfire>=4.22.0", "rich>=14.3.2"]
+requires-python = "==3.14.*"
+readme = "README.md"
+license = {text = "MIT"}
+
+
+[tool.pdm]
+distribution = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.0",
+    "ty>=0.0.15",
+]

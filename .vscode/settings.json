@@ -1,0 +1,16 @@
+{
+  "ty.importStrategy": "useBundled",
+  "ty.configuration": {
+    "environment": {
+      "python": "core/.venv"
+    }
+  },
+  
+  "python.defaultInterpreterPath": "core/.venv/bin/python",
+  "python.testing.pytestArgs": [
+    "core/tests"
+  ],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+
+}
