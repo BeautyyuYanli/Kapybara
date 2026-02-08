@@ -3,12 +3,12 @@ from __future__ import annotations
 import sys
 
 import anyio
-from k.io_helpers.bash_helper import BashSession
+from k.io_helpers.shell import ShellSession
 
 async def main() -> None:
-    async with BashSession("bash", timeout_seconds=3) as session:
+    async with ShellSession("bash", timeout_seconds=1) as session:
+        user_input = ""
         while True:
-            user_input = input("bash> ")
             user_input += "\n"
 
             stdout, stderr, code = await session.next(user_input.encode())
@@ -17,6 +17,8 @@ async def main() -> None:
             print(f"Exit Code: {code}")
             if code is not None:
                 break
+
+            user_input = input("bash> ")
 
 
 if __name__ == "__main__":

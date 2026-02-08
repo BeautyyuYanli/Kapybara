@@ -7,11 +7,10 @@ session with incremental stdin and non-blocking output drains.
 
 from __future__ import annotations
 
-import shlex
 import subprocess
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Final, Literal, Self, TypeAlias
+from typing import Literal, Self, TypeAlias
 
 import anyio
 from anyio.abc import (
@@ -36,7 +35,7 @@ OutputEvent: TypeAlias = tuple[StreamName, bytes] | _StreamDone
 
 
 @dataclass
-class BashSession:
+class ShellSession:
     """A minimal async session for incremental stdin and drained stdout/stderr.
 
     API:
@@ -50,7 +49,7 @@ class BashSession:
     command: str
 
     # Timeout/timing knobs (all in seconds).
-    timeout_seconds: float = 10.0
+    timeout_seconds: float = 5.0
     idle_output_wait_seconds: float = 0.1
     post_exit_flush_seconds: float = 0.5
     post_exit_drain_wait_seconds: float = 0.01
