@@ -152,7 +152,7 @@ class ShellSession:
             with suppress(BaseException):
                 await self._out_send.send(_StreamDone(stream=stream_name))
 
-    async def next(self, stdin: bytes | None) -> NextResult:
+    async def next(self, stdin: bytes | None = None) -> NextResult:
         """Send stdin and wait up to `timeout_seconds` for process exit.
 
         Returns:
