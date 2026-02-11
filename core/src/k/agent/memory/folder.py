@@ -5,7 +5,7 @@ index file.
 
 Layout (relative to `root`):
 - `order.jsonl`: one JSON object per non-empty line (append order), storing the
-  record id and its relative path.
+  record id, `created_at`, and relative path.
 - `records/YYYY/MM/DD/HH/<uuid>.json`: one JSON blob per record (pydantic dump),
   organized by `created_at`.
 
@@ -50,8 +50,8 @@ class _CacheKey:
 @dataclass(frozen=True, slots=True)
 class _OrderEntry:
     id_: UUID
-    created_at: datetime | None
-    relpath: str | None
+    created_at: datetime
+    relpath: str
 
 
 class FolderMemoryStore(MemoryStore):
@@ -381,11 +381,11 @@ class FolderMemoryStore(MemoryStore):
         ) as tf:
             tmp_path = Path(tf.name)
             for entry in entries:
-                payload: dict[str, object] = {"id": str(entry.id_)}
-                if entry.created_at is not None:
-                    payload["created_at"] = entry.created_at.isoformat()
-                if entry.relpath is not None:
-                    payload["relpath"] = entry.relpath
+                payload = {
+                    "id": str(entry.id_),
+                    "created_at": entry.created_at.isoformat(),
+                    "relpath": entry.relpath,
+                }
                 tf.write(json.dumps(payload) + "\n")
         tmp_path.replace(order_path)
 
@@ -409,23 +409,10 @@ class FolderMemoryStore(MemoryStore):
         return rec
 
     def _resolve_record_path(self, entry: _OrderEntry) -> Path:
-        if entry.relpath is not None:
-            return self.root / entry.relpath
-
-        if entry.created_at is not None:
-            return self._record_path_for_id_and_created_at(entry.id_, entry.created_at)
-
-        found = list(self._records_dir().rglob(f"{entry.id_}.json"))
-        if not found:
-            raise ValueError(
-                f"Missing record file for id {entry.id_} under {self._records_dir()}"
-            )
-        if len(found) > 1:
-            found_str = ", ".join(str(p) for p in sorted(found))
-            raise ValueError(
-                f"Multiple record files found for id {entry.id_} under {self._records_dir()}: {found_str}"
-            )
-        return found[0]
+        relpath = Path(entry.relpath)
+        if relpath.is_absolute() or ".." in relpath.parts:
+            raise ValueError(f"Invalid relpath in order.jsonl: {entry.relpath!r}")
+        return self.root / relpath
 
 
 def _read_order_file(path: Path, *, encoding: str) -> list[_OrderEntry]:
@@ -437,63 +424,45 @@ def _read_order_file(path: Path, *, encoding: str) -> list[_OrderEntry]:
                 continue
             try:
                 decoded = json.loads(line)
-            except ValueError:
-                decoded = line
+            except ValueError as e:
+                raise ValueError(f"Invalid JSON at {path}:{line_no}: {e}") from e
 
-            match decoded:
-                case str():
-                    # Backwards compatibility: JSON string UUID or raw UUID.
-                    try:
-                        record_id = UUID(decoded)
-                    except ValueError as e:
-                        raise ValueError(
-                            f"Invalid UUID at {path}:{line_no}: {decoded!r}"
-                        ) from e
-                    entries.append(
-                        _OrderEntry(id_=record_id, created_at=None, relpath=None)
-                    )
-                case dict():
-                    raw_id = decoded.get("id")
-                    if not isinstance(raw_id, str):
-                        raise ValueError(
-                            f"Invalid order entry at {path}:{line_no}: missing/invalid 'id'"
-                        )
-                    try:
-                        record_id = UUID(raw_id)
-                    except ValueError as e:
-                        raise ValueError(
-                            f"Invalid UUID at {path}:{line_no}: {raw_id!r}"
-                        ) from e
+            if not isinstance(decoded, dict):
+                raise ValueError(
+                    f"Invalid order entry at {path}:{line_no}: expected object, got {decoded!r}"
+                )
 
-                    created_at: datetime | None = None
-                    raw_created_at = decoded.get("created_at")
-                    if raw_created_at is not None:
-                        if not isinstance(raw_created_at, str):
-                            raise ValueError(
-                                f"Invalid order entry at {path}:{line_no}: invalid 'created_at'"
-                            )
-                        try:
-                            created_at = datetime.fromisoformat(raw_created_at)
-                        except ValueError as e:
-                            raise ValueError(
-                                f"Invalid created_at at {path}:{line_no}: {raw_created_at!r}"
-                            ) from e
+            raw_id = decoded.get("id")
+            if not isinstance(raw_id, str):
+                raise ValueError(
+                    f"Invalid order entry at {path}:{line_no}: missing/invalid 'id'"
+                )
+            try:
+                record_id = UUID(raw_id)
+            except ValueError as e:
+                raise ValueError(f"Invalid UUID at {path}:{line_no}: {raw_id!r}") from e
 
-                    relpath = decoded.get("relpath")
-                    if relpath is not None and not isinstance(relpath, str):
-                        raise ValueError(
-                            f"Invalid order entry at {path}:{line_no}: invalid 'relpath'"
-                        )
+            raw_created_at = decoded.get("created_at")
+            if not isinstance(raw_created_at, str):
+                raise ValueError(
+                    f"Invalid order entry at {path}:{line_no}: missing/invalid 'created_at'"
+                )
+            try:
+                created_at = datetime.fromisoformat(raw_created_at)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid created_at at {path}:{line_no}: {raw_created_at!r}"
+                ) from e
 
-                    entries.append(
-                        _OrderEntry(
-                            id_=record_id, created_at=created_at, relpath=relpath
-                        )
-                    )
-                case _:
-                    raise ValueError(
-                        f"Invalid order entry at {path}:{line_no}: {decoded!r}"
-                    )
+            relpath = decoded.get("relpath")
+            if not isinstance(relpath, str):
+                raise ValueError(
+                    f"Invalid order entry at {path}:{line_no}: missing/invalid 'relpath'"
+                )
+
+            entries.append(
+                _OrderEntry(id_=record_id, created_at=created_at, relpath=relpath)
+            )
     return entries
 
 
