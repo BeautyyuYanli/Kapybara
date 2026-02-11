@@ -48,7 +48,7 @@ def random_6digits() -> str:
 class ShellSessionOptions:
     """Timing/timeout knobs for `ShellSession` (all in seconds)."""
 
-    timeout_seconds: float = 5.0
+    timeout_seconds: float = 15.0
     idle_output_wait_seconds: float = 0.1
     post_exit_flush_seconds: float = 0.5
     post_exit_drain_wait_seconds: float = 0.01
@@ -474,6 +474,7 @@ class ShellSession:
 
         # Wait up to `timeout` for a single output event, then drain any burst.
         cancel_exc = anyio.get_cancelled_exc_class()
+        event = None
         with anyio.move_on_after(timeout):
             try:
                 event = await self._out_recv.receive()

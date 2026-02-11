@@ -5,30 +5,31 @@ from pathlib import Path
 
 def _skill_edit_script() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "data" / "fs" / "skills" / "edit" / "edit.py"
+    return repo_root / "data" / "fs" / "skills" / "meta" / "edit_file" / "edit.py"
 
 
 def _run_edit(
     *,
     filename: Path,
-    start_line: int,
+    start_line: int | None,
     old_content: str,
     new_content: str,
 ) -> subprocess.CompletedProcess[str]:
     script = _skill_edit_script()
+    cmd = [
+        sys.executable,
+        str(script),
+        "--filename",
+        str(filename),
+        "--old-content",
+        old_content,
+        "--new-content",
+        new_content,
+    ]
+    if start_line is not None:
+        cmd.extend(["--start-line", str(start_line)])
     return subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--filename",
-            str(filename),
-            "--start-line",
-            str(start_line),
-            "--old-content",
-            old_content,
-            "--new-content",
-            new_content,
-        ],
+        cmd,
         check=False,
         capture_output=True,
         text=True,
@@ -106,6 +107,49 @@ def test_edit_empty_file_treated_as_zero_lines(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0
     assert target.read_text(encoding="utf-8", newline="") == "hello\n"
+
+
+def test_edit_omitting_start_line_applies_unique_match(tmp_path: Path) -> None:
+    target = tmp_path / "u.txt"
+    target.write_text("a\nb\nc\n", encoding="utf-8", newline="\n")
+
+    proc = _run_edit(
+        filename=target,
+        start_line=None,
+        old_content="b\n",
+        new_content="B\n",
+    )
+    assert proc.returncode == 0
+    assert target.read_text(encoding="utf-8", newline="") == "a\nB\nc\n"
+
+
+def test_edit_omitting_start_line_fails_on_ambiguous_match(tmp_path: Path) -> None:
+    target = tmp_path / "amb.txt"
+    target.write_text("x\ny\nx\ny\n", encoding="utf-8", newline="\n")
+
+    proc = _run_edit(
+        filename=target,
+        start_line=None,
+        old_content="x\ny\n",
+        new_content="X\nY\n",
+    )
+    assert proc.returncode == 3
+    assert "multiple" in proc.stdout.lower()
+
+
+def test_edit_omitting_start_line_requires_non_empty_old_content(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "ins2.txt"
+    target.write_text("b\n", encoding="utf-8", newline="\n")
+
+    proc = _run_edit(
+        filename=target,
+        start_line=None,
+        old_content="",
+        new_content="a\n",
+    )
+    assert proc.returncode == 2
 
 
 def test_edit_script_exists() -> None:

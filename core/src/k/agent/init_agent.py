@@ -158,21 +158,21 @@ async def bash_interrupt(ctx: RunContext[MyDeps], session_id: str) -> str:
 async def edit_file(
     ctx: RunContext[MyDeps],
     filename: str,
-    start_line: int,
     old_content: str,
     new_content: str,
+    start_line: int | None = None,
 ) -> BashEvent:
     """Edit a file by replacing a known slice of lines.
 
     Args:
         filename: Target file path (relative or absolute).
-        start_line: 1-based line number where `old_content` is expected to start.
         old_content: The exact content expected at `start_line` (normalized for newlines).
         new_content: The replacement content.
+        start_line: 1-based line number where `old_content` is expected to start, or None to auto-detect.
     """
     return await bash(
         ctx,
-        f"python3 ~/.kapybara/edit.py --filename {single_quote(filename)} --start-line {single_quote(str(start_line))} --old-content {single_quote(old_content)} --new-content {single_quote(new_content)}",
+        f"python3 ~/skills/meta/edit_file/edit.py --filename {single_quote(filename)} --start-line {single_quote(str(start_line))} --old-content {single_quote(old_content)} --new-content {single_quote(new_content)}",
     )
 
 
