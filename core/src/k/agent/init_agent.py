@@ -165,7 +165,7 @@ async def edit_file(
     """Edit a file by replacing a known slice of lines.
 
     Args:
-        filename: Target file path (relative or absolute).
+        filename: Target file path (relative or absolute, cannot use `~`).
         old_content: The exact content expected at `start_line` (normalized for newlines).
         new_content: The replacement content.
         start_line: 1-based line number where `old_content` is expected to start, or None to auto-detect.
