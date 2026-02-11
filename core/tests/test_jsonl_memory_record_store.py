@@ -39,7 +39,7 @@ def test_store_get_latest_and_get_by_id(tmp_path) -> None:
     assert store.get_by_id(r1.id_) == r1
     assert store.get_by_id(str(r1.id_)) == r1
     assert store.get_by_ids({r2.id_, r1.id_}) == [r1, r2]
-    with pytest.raises(ValueError, match="Invalid UUID"):
+    with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
         store.get_by_id("not-a-uuid")
 
 
@@ -71,7 +71,7 @@ def test_store_get_parents_and_children(tmp_path) -> None:
     assert store.get_children(parent) == [child.id_]
     assert store.get_children(parent.id_) == [child.id_]
 
-    missing_child_id = uuid4()
+    missing_child_id = str(uuid4())
     missing = MemoryRecord(
         raw_pair=("i3", "o3"),
         compacted=["c3"],
