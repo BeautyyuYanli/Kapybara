@@ -6,13 +6,13 @@ index file.
 Layout (relative to `root`):
 - `order.jsonl`: one JSON object per non-empty line (append order), storing the
   record id, `created_at`, and relative path.
-- `records/YYYY/MM/DD/HH/<uuid>.json`: one JSON blob per record (pydantic dump),
+- `records/YYYY/MM/DD/HH/<id>.json`: one JSON blob per record (pydantic dump),
   organized by `created_at`.
 
 Design notes / invariants:
 - "Latest" means the last id in `order.jsonl` (append order), not necessarily the
   max `created_at`.
-- Parsing is strict: invalid UUIDs in `order.jsonl`, invalid JSON, or invalid
+- Parsing is strict: invalid ids in `order.jsonl`, invalid JSON, or invalid
   `MemoryRecord` data raises `ValueError` with path/line context.
 - `append()` updates each referenced parent's `children` list (persisting parent
   records) before persisting the new record.
@@ -28,7 +28,6 @@ from collections.abc import Set
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from uuid import UUID
 
 from pydantic import ValidationError
 
@@ -37,7 +36,7 @@ from k.agent.memory.store import (
     MemoryRecordId,
     MemoryRecordRef,
     MemoryStore,
-    coerce_uuid,
+    coerce_record_id,
 )
 
 
@@ -49,7 +48,7 @@ class _CacheKey:
 
 @dataclass(frozen=True, slots=True)
 class _OrderEntry:
-    id_: UUID
+    id_: str
     created_at: datetime
     relpath: str
 
@@ -62,8 +61,8 @@ class FolderMemoryStore(MemoryStore):
 
     _cache_key: _CacheKey | None
     _records: list[MemoryRecord]
-    _by_id: dict[UUID, MemoryRecord]
-    _record_paths: dict[UUID, Path]
+    _by_id: dict[str, MemoryRecord]
+    _record_paths: dict[str, Path]
 
     def __init__(self, root: str | Path, *, encoding: str = "utf-8") -> None:
         self.root = Path(root)
@@ -79,13 +78,13 @@ class FolderMemoryStore(MemoryStore):
         self._cache_key = None
         self._load_if_needed()
 
-    def get_latest(self) -> UUID | None:
+    def get_latest(self) -> str | None:
         self._load_if_needed()
         return self._records[-1].id_ if self._records else None
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
         self._load_if_needed()
-        record_id = coerce_uuid(id_)
+        record_id = coerce_record_id(id_)
         return self._by_id.get(record_id)
 
     def get_by_ids(
@@ -93,7 +92,7 @@ class FolderMemoryStore(MemoryStore):
     ) -> list[MemoryRecord]:
         self._load_if_needed()
 
-        record_ids = {coerce_uuid(id_) for id_ in ids}
+        record_ids = {coerce_record_id(id_) for id_ in ids}
         missing = [id_ for id_ in record_ids if id_ not in self._by_id]
         if strict and missing:
             missing_str = ", ".join(str(i) for i in sorted(missing))
@@ -106,7 +105,7 @@ class FolderMemoryStore(MemoryStore):
 
     def get_parents(
         self, record: MemoryRecordRef, *, strict: bool = False
-    ) -> list[UUID]:
+    ) -> list[str]:
         self._load_if_needed()
         rec = self._coerce_record(record)
         if strict:
@@ -118,7 +117,7 @@ class FolderMemoryStore(MemoryStore):
 
     def get_children(
         self, record: MemoryRecordRef, *, strict: bool = False
-    ) -> list[UUID]:
+    ) -> list[str]:
         self._load_if_needed()
         rec = self._coerce_record(record)
         if strict:
@@ -134,7 +133,7 @@ class FolderMemoryStore(MemoryStore):
         *,
         level: int | None = None,
         strict: bool = False,
-    ) -> list[UUID]:
+    ) -> list[str]:
         if level is not None and level < 0:
             raise ValueError(f"level must be >= 0 or None; got {level}")
 
@@ -144,14 +143,14 @@ class FolderMemoryStore(MemoryStore):
         if level == 0:
             return []
 
-        ancestors: list[UUID] = []
-        seen: set[UUID] = set()
+        ancestors: list[str] = []
+        seen: set[str] = set()
 
         frontier = self.get_parents(current, strict=strict)
         depth = 0
         while frontier and (level is None or depth < level):
             depth += 1
-            next_frontier: list[UUID] = []
+            next_frontier: list[str] = []
             for parent_id in frontier:
                 if parent_id in seen:
                     continue
@@ -175,13 +174,13 @@ class FolderMemoryStore(MemoryStore):
         *,
         include_start: bool = True,
         include_end: bool = True,
-    ) -> list[UUID]:
+    ) -> list[str]:
         if start > end:
             raise ValueError(f"start must be <= end; got start={start!r}, end={end!r}")
 
         self._load_if_needed()
 
-        indexed: list[tuple[int, UUID, datetime]] = []
+        indexed: list[tuple[int, str, datetime]] = []
         for idx, record in enumerate(self._records):
             if _in_datetime_range(
                 record.created_at,
@@ -248,8 +247,8 @@ class FolderMemoryStore(MemoryStore):
         order_entries = _read_order_file(self._order_path(), encoding=self.encoding)
 
         records: list[MemoryRecord] = []
-        by_id: dict[UUID, MemoryRecord] = {}
-        record_paths: dict[UUID, Path] = {}
+        by_id: dict[str, MemoryRecord] = {}
+        record_paths: dict[str, Path] = {}
         for entry in order_entries:
             record_path = self._resolve_record_path(entry)
             try:
@@ -336,7 +335,7 @@ class FolderMemoryStore(MemoryStore):
         return self._record_path_for_id_and_created_at(record.id_, record.created_at)
 
     def _record_path_for_id_and_created_at(
-        self, id_: UUID, created_at: datetime
+        self, id_: str, created_at: datetime
     ) -> Path:
         return (
             self._records_dir()
@@ -402,7 +401,7 @@ class FolderMemoryStore(MemoryStore):
     def _coerce_record(self, record: MemoryRecordRef) -> MemoryRecord:
         if isinstance(record, MemoryRecord):
             return record
-        record_id = coerce_uuid(record)
+        record_id = coerce_record_id(record)
         rec = self._by_id.get(record_id)
         if rec is None:
             raise KeyError(f"Unknown MemoryRecord id: {record_id}")
@@ -438,9 +437,11 @@ def _read_order_file(path: Path, *, encoding: str) -> list[_OrderEntry]:
                     f"Invalid order entry at {path}:{line_no}: missing/invalid 'id'"
                 )
             try:
-                record_id = UUID(raw_id)
+                record_id = coerce_record_id(raw_id)
             except ValueError as e:
-                raise ValueError(f"Invalid UUID at {path}:{line_no}: {raw_id!r}") from e
+                raise ValueError(
+                    f"Invalid record id at {path}:{line_no}: {raw_id!r}"
+                ) from e
 
             raw_created_at = decoded.get("created_at")
             if not isinstance(raw_created_at, str):

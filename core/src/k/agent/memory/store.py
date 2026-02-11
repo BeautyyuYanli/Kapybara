@@ -21,25 +21,24 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
-from k.agent.memory.entities import MemoryRecord
+from k.agent.memory.entities import MemoryRecord, is_memory_record_id
 
-type MemoryRecordId = UUID | str
-type MemoryRecordRef = MemoryRecord | UUID | str
+type MemoryRecordId = str | UUID
+type MemoryRecordRef = MemoryRecord | str | UUID
 
 
-def coerce_uuid(value: MemoryRecordId) -> UUID:
-    """Coerce a UUID or UUID string into a :class:`uuid.UUID`.
+def coerce_record_id(value: MemoryRecordId) -> str:
+    """Coerce a record id into its canonical string form.
 
     Raises:
-        ValueError: If `value` is not a valid UUID string.
+        ValueError: If `value` is not a valid MemoryRecord id.
     """
 
     if isinstance(value, UUID):
-        return value
-    try:
-        return UUID(value)
-    except ValueError as e:
-        raise ValueError(f"Invalid UUID: {value!r}") from e
+        return str(value)
+    if not is_memory_record_id(value):
+        raise ValueError(f"Invalid MemoryRecord id: {value!r}")
+    return value
 
 
 @runtime_checkable
@@ -49,7 +48,7 @@ class MemoryStore(Protocol):
     def refresh(self) -> None:
         """Force a reload from disk (even if the underlying storage did not change)."""
 
-    def get_latest(self) -> UUID | None:
+    def get_latest(self) -> str | None:
         """Return the latest record id (store append order), or `None` if empty."""
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
@@ -62,12 +61,12 @@ class MemoryStore(Protocol):
 
     def get_parents(
         self, record: MemoryRecordRef, *, strict: bool = False
-    ) -> list[UUID]:
+    ) -> list[str]:
         """Return parent ids for `record` (in the same order as `record.parents`)."""
 
     def get_children(
         self, record: MemoryRecordRef, *, strict: bool = False
-    ) -> list[UUID]:
+    ) -> list[str]:
         """Return child ids for `record` (in the same order as `record.children`)."""
 
     def get_ancestors(
@@ -76,7 +75,7 @@ class MemoryStore(Protocol):
         *,
         level: int | None = None,
         strict: bool = False,
-    ) -> list[UUID]:
+    ) -> list[str]:
         """Return ancestor ids for `record` by repeatedly following parents."""
 
     def get_between(
@@ -86,7 +85,7 @@ class MemoryStore(Protocol):
         *,
         include_start: bool = True,
         include_end: bool = True,
-    ) -> list[UUID]:
+    ) -> list[str]:
         """Return record ids whose `created_at` falls within the given range."""
 
     def append(self, record: MemoryRecord) -> None:

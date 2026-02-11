@@ -24,12 +24,16 @@ from collections.abc import Set
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from uuid import UUID
 
 from pydantic import ValidationError
 
 from k.agent.memory.entities import MemoryRecord
-from k.agent.memory.store import MemoryStore, coerce_uuid
+from k.agent.memory.store import (
+    MemoryRecordId,
+    MemoryRecordRef,
+    MemoryStore,
+    coerce_record_id,
+)
 
 
 @dataclass(slots=True)
@@ -55,7 +59,7 @@ class JsonlMemoryRecordStore(MemoryStore):
 
     _cache_key: _CacheKey | None
     _records: list[MemoryRecord]
-    _by_id: dict[UUID, MemoryRecord]
+    _by_id: dict[str, MemoryRecord]
 
     def __init__(self, path: str | Path, *, encoding: str = "utf-8") -> None:
         self.path = Path(path)
@@ -70,21 +74,21 @@ class JsonlMemoryRecordStore(MemoryStore):
         self._cache_key = None
         self._load_if_needed()
 
-    def get_latest(self) -> UUID | None:
+    def get_latest(self) -> str | None:
         """Return the latest record id (last line in file order), or `None` if empty."""
 
         self._load_if_needed()
         return self._records[-1].id_ if self._records else None
 
-    def get_by_id(self, id_: UUID | str) -> MemoryRecord | None:
+    def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
         """Return a record by id, or `None` if missing."""
 
         self._load_if_needed()
-        record_id = coerce_uuid(id_)
+        record_id = coerce_record_id(id_)
         return self._by_id.get(record_id)
 
     def get_by_ids(
-        self, ids: Set[UUID | str], *, strict: bool = False
+        self, ids: Set[MemoryRecordId], *, strict: bool = False
     ) -> list[MemoryRecord]:
         """Return records for ids, sorted by `created_at` (then file order).
 
@@ -95,7 +99,7 @@ class JsonlMemoryRecordStore(MemoryStore):
 
         self._load_if_needed()
 
-        record_ids = {coerce_uuid(id_) for id_ in ids}
+        record_ids = {coerce_record_id(id_) for id_ in ids}
         missing = [id_ for id_ in record_ids if id_ not in self._by_id]
         if strict and missing:
             missing_str = ", ".join(str(i) for i in sorted(missing))
@@ -107,8 +111,8 @@ class JsonlMemoryRecordStore(MemoryStore):
         return records
 
     def get_parents(
-        self, record: MemoryRecord | UUID | str, *, strict: bool = False
-    ) -> list[UUID]:
+        self, record: MemoryRecordRef, *, strict: bool = False
+    ) -> list[str]:
         """Return parent ids for `record` (in the same order as `record.parents`).
 
         Args:
@@ -126,8 +130,8 @@ class JsonlMemoryRecordStore(MemoryStore):
         return list(rec.parents)
 
     def get_children(
-        self, record: MemoryRecord | UUID | str, *, strict: bool = False
-    ) -> list[UUID]:
+        self, record: MemoryRecordRef, *, strict: bool = False
+    ) -> list[str]:
         """Return child ids for `record` (in the same order as `record.children`).
 
         Args:
@@ -146,11 +150,11 @@ class JsonlMemoryRecordStore(MemoryStore):
 
     def get_ancestors(
         self,
-        record: MemoryRecord | UUID | str,
+        record: MemoryRecordRef,
         *,
         level: int | None = None,
         strict: bool = False,
-    ) -> list[UUID]:
+    ) -> list[str]:
         """Return ancestor ids for `record` by repeatedly following `get_parents`.
 
         Args:
@@ -178,14 +182,14 @@ class JsonlMemoryRecordStore(MemoryStore):
         if level == 0:
             return []
 
-        ancestors: list[UUID] = []
-        seen: set[UUID] = set()
+        ancestors: list[str] = []
+        seen: set[str] = set()
 
         frontier = self.get_parents(current, strict=strict)
         depth = 0
         while frontier and (level is None or depth < level):
             depth += 1
-            next_frontier: list[UUID] = []
+            next_frontier: list[str] = []
             for parent_id in frontier:
                 if parent_id in seen:
                     continue
@@ -209,7 +213,7 @@ class JsonlMemoryRecordStore(MemoryStore):
         *,
         include_start: bool = True,
         include_end: bool = True,
-    ) -> list[UUID]:
+    ) -> list[str]:
         """Return record ids whose `created_at` falls within `[start, end]` by default.
 
         Args:
@@ -227,7 +231,7 @@ class JsonlMemoryRecordStore(MemoryStore):
 
         self._load_if_needed()
 
-        indexed: list[tuple[int, UUID, datetime]] = []
+        indexed: list[tuple[int, str, datetime]] = []
         for idx, record in enumerate(self._records):
             if _in_datetime_range(
                 record.created_at,
@@ -310,20 +314,20 @@ class JsonlMemoryRecordStore(MemoryStore):
 
         tmp_path.replace(self.path)
 
-    def _coerce_record(self, record: MemoryRecord | UUID | str) -> MemoryRecord:
+    def _coerce_record(self, record: MemoryRecordRef) -> MemoryRecord:
         if isinstance(record, MemoryRecord):
             return record
-        record_id = coerce_uuid(record)
+        record_id = coerce_record_id(record)
         rec = self._by_id.get(record_id)
         if rec is None:
             raise KeyError(f"Unknown MemoryRecord id: {record_id}")
         return rec
 
     def _resolve_links(
-        self, ids: list[UUID], *, link_name: str, strict: bool
+        self, ids: list[str], *, link_name: str, strict: bool
     ) -> list[MemoryRecord]:
         res: list[MemoryRecord] = []
-        missing: list[UUID] = []
+        missing: list[str] = []
         for id_ in ids:
             rec = self._by_id.get(id_)
             if rec is None:
@@ -340,9 +344,9 @@ class JsonlMemoryRecordStore(MemoryStore):
 
 def _read_jsonl_memory_records(
     path: Path, *, encoding: str
-) -> tuple[list[MemoryRecord], dict[UUID, MemoryRecord]]:
+) -> tuple[list[MemoryRecord], dict[str, MemoryRecord]]:
     records: list[MemoryRecord] = []
-    by_id: dict[UUID, MemoryRecord] = {}
+    by_id: dict[str, MemoryRecord] = {}
 
     with path.open("r", encoding=encoding) as f:
         for line_no, raw_line in enumerate(f, start=1):
