@@ -14,6 +14,9 @@ RUN apt-get update \
         git \
         openssh-server \
         supervisor \
+        ripgrep \
+        wget \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
