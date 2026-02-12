@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = []
 lock_version = "4.5.0"
-content_hash = "sha256:c660ee4649e3abbfc8ff2c132020d377032cabe0fb2fa48753317bd071bbd69f"
+content_hash = "sha256:b2f3af5f0de7b1d774489e9aff8eedef14d58d3a4f655d1011b48a331462bdd5"
 
 [[metadata.targets]]
 requires_python = "==3.14.*"
@@ -482,12 +482,11 @@ files = [
 [[package]]
 name = "pydantic-ai-slim"
 version = "1.58.0"
-extras = ["openai"]
+extras = ["openrouter"]
 summary = ""
 dependencies = [
     "openai",
     "pydantic-ai-slim==1.58.0",
-    "tiktoken",
 ]
 files = [
     {file = "pydantic_ai_slim-1.58.0-py3-none-any.whl", hash = "sha256:077e2d3ac95f8121a8988808674400be0c3e5f88e7e3cd30b317fe50096b2935"},
