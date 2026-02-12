@@ -3,11 +3,11 @@ from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext, ToolOutput
+from pydantic_ai import Agent, ModelMessage, RunContext, ToolOutput
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart
 from pydantic_ai.models import KnownModelName, Model
 from rich import print
@@ -18,6 +18,7 @@ from k.config import Config
 from k.io_helpers.shell import NextResult, ShellSessionInfo, ShellSessionManager
 from k.runner_helpers.basic_os import BasicOSHelper, single_quote
 
+from k.agent.memory.folder import FolderMemoryStore
 
 @dataclass()
 class MyDeps:
@@ -30,6 +31,7 @@ class MyDeps:
     """
 
     config: Config
+    memory_storage: FolderMemoryStore
     start_event: Event | None = None
     bash_cmd_history: list[str] = field(default_factory=list)
     stuck_warning: int = 0
@@ -78,8 +80,8 @@ class BashEvent:
         stdout, stderr, exit_code = tpl
         return BashEvent(
             session_id=session_id,
-            stdout=stdout.decode(),
-            stderr=stderr.decode(),
+            stdout=stdout.decode(errors="replace"),
+            stderr=stderr.decode(errors="replace"),
             exit_code=exit_code,
             active_sessions=all_active_sessions,
             system_msg=system_msg,
@@ -215,6 +217,7 @@ async def handoff(
     return HandoffEvent(kind=kind, id_=id_, text=text)
 
 
+
 bash_tool_prompt = """
 <BashInstruction>
 You have access to a Linux machine via a bash shell, exposed through these tools:
@@ -235,8 +238,44 @@ Operating rules:
 </BashInstruction>
 """
 
+agent: Agent[MyDeps, HandoffEvent] = Agent(
+    system_prompt=[
+        bash_tool_prompt,
+        "<General>\n"
+        "Role: You can use the provided tools and skills in `~/skills/`.\n"
+        "\n"
+        "How to operate:\n"
+        "- Determine the user's intent first (often clarified by the most recent memories). Memories are ordered oldest → newest.\n"
+        "- If the intent is ambiguous, do not start work; finish quickly and ask for clarification.\n"
+        "- Usually use the `retrieve_memory` skill as the first action to gather more context (e.g. the user references prior work, you need to reuse earlier outputs, or current intent depends on older memories).\n"
+        "- Usually use `file_search` skill under `~/skills/` as the second action to see whether a relevant skill already exists.\n"
+        "\n"
+        "Skills:\n"
+        "- Actively gather missing information using available `*_search` skills (e.g. `web_search`, `file_search`) instead of guessing.\n"
+        "- Prefer `web_fetch` to fetch readable page text instead of downloading raw HTML (only fall back to raw HTML when necessary).\n"
+        "- Assume required environment variables for existing skills are already set; do not double-check them.\n"
+        "- If a required environment variable is missing, ask the user to add it to `~/.env`.\n"
+        "- Use the `create_skill` tool to create new skills when needed.\n"
+        "\n"
+        "Scripting:\n"
+        "- For one-off Python scripts, prefer inline deps in-file (PEP 723, `# /// script`) to keep scripts reproducible/self-contained; use `execute_code` when appropriate.\n"
+        "\n"
+        "Software & storage:\n"
+        "- You may install software into `/App` or via a user-space package manager, then create skills to use it.\n"
+        "- Use `/tmp` for temporary storage.\n"
+        "\n"
+        "Completion:\n"
+        "- When done, call the `finish` tool to end the loop.\n"
+        "- If you cannot proceed, call `finish` with kind: `stuck` (even if the work is unfinished).\n",
+        "\n</General>",
+    ],
+    tools=[bash, bash_input, bash_wait, bash_interrupt, edit_file],
+    deps_type=MyDeps,
+    output_type=ToolOutput(handoff, name="finish"),
+)  # type: ignore
 
-def concat_skills_md(base_path: str | Path) -> str:
+
+def _concat_skills_md(base_path: str | Path) -> str:
     """Scan <base_path>/skills/{core,meta}/*/SKILLS.md and concatenate contents.
 
     Returns a single string which is the concatenation of all found SKILLS.md files,
@@ -269,42 +308,12 @@ def concat_skills_md(base_path: str | Path) -> str:
     return "\n".join(chunks).rstrip() + "\n"
 
 
+@agent.system_prompt
 def concat_skills_prompt(ctx: RunContext[MyDeps]) -> str:
     base_path = ctx.deps.config.fs_base
-    skills_md = concat_skills_md(base_path)
+    skills_md = _concat_skills_md(base_path)
     return f"<BasicSkills>{skills_md}</BasicSkills>"
 
-
-agent: Agent[MyDeps, HandoffEvent] = Agent(
-    system_prompt=[
-        bash_tool_prompt,
-        "<General>\n"
-        "Role: You are a helpful AI agent that can use the provided tools and skills in `~/skills/`.\n"
-        "\n"
-        "How to operate:\n"
-        "- Determine the user's intent first (often clarified by the most recent memories). Memories are ordered oldest → newest.\n"
-        "- If the intent is ambiguous, do not start work; finish quickly and ask for clarification.\n"
-        "\n"
-        "Skills:\n"
-        "- First, use `file_search` under `~/skills/` to see whether a relevant skill already exists.\n"
-        "- Actively gather missing information using available `*_search` skills (e.g. `web_search`, `file_search`) instead of guessing.\n"
-        "- Assume required environment variables for existing skills are already set; do not double-check them.\n"
-        "- If a required environment variable is missing, ask the user to add it to `~/.env`.\n"
-        "- Use the `create_skill` tool to create new skills when needed.\n"
-        "\n"
-        "Software & storage:\n"
-        "- You may install software into `/App` or via a user-space package manager, then create skills to use it.\n"
-        "- Use `/tmp` for temporary storage.\n"
-        "\n"
-        "Completion:\n"
-        "- When done, call the `finish` tool to end the loop.\n"
-        "- If you cannot proceed, call `finish` with kind: `stuck` (even if the work is unfinished).\n",
-        "\n</General>",
-    ],
-    tools=[bash, bash_input, bash_wait, bash_interrupt, edit_file],
-    deps_type=MyDeps,
-    output_type=ToolOutput(handoff, name="finish"),
-)  # type: ignore
 
 
 def claim_read_and_empty(path: str) -> str:
@@ -328,25 +337,7 @@ def claim_read_and_empty(path: str) -> str:
 
     return data
 
-
-async def agent_run(
-    model: Model | KnownModelName,
-    config: Config,
-    instruct: str,
-    memory_string: str | None = None,
-) -> tuple[HandoffEvent, list[ModelRequest | ModelResponse]]:
-    async with MyDeps(config=config) as my_deps:
-        agent.system_prompt(concat_skills_prompt)
-        res = await agent.run(
-            model=model,
-            deps=my_deps,
-            user_prompt=(
-                f"<Memory>{memory_string}</Memory>" if memory_string else "",
-                f"<System>Datetime Now: {datetime.now()}</System>"
-                f"<Instruct>{instruct}</Instruct>",
-            ),
-        )
-    msgs: list[ModelRequest | ModelResponse] = res.new_messages()
+def _strip_history(msgs: list[ModelRequest | ModelResponse], instruct: str):
     first_msg = msgs[0]
     if isinstance(first_msg, ModelRequest):
         last_part = first_msg.parts[-1]
@@ -359,14 +350,88 @@ async def agent_run(
         first_msg,
         *msgs[1:-1],
     ]  # remove initial message and final finish message
-    return res.output, msgs
+    return msgs
+
+    
+async def _memory_select(
+    memory_store: FolderMemoryStore,
+    parent_memories: list[str],
+):
+    recent_mem = set(parent_memories)
+    all_mem = set(parent_memories)
+    for mem in parent_memories:
+        recent_mem.union(
+            memory_store.get_ancestors(mem, level=3)
+        )
+        all_mem.union(
+            memory_store.get_ancestors(mem, level=10)
+        )
+
+    all_mem_rec = memory_store.get_by_ids(all_mem)
+    return all_mem_rec, recent_mem
+    
+
+async def agent_run(
+    model: Model | KnownModelName,
+    config: Config,
+    memory_store: FolderMemoryStore,
+    instruct: str,
+    message_history: Sequence[ModelMessage] | None = None,
+    parent_memories: list[str] | None = None,
+) -> tuple[HandoffEvent, MemoryRecord]:
+    parent_memories = parent_memories or []
+    
+    all_mem_rec, recent_mem = await _memory_select(
+        memory_store,
+        parent_memories,
+    )
+    memory_string = "\n".join(
+        x.dump_compated() if x.id_ in recent_mem else x.dump_raw_pair()
+        for x in all_mem_rec
+    )
+
+    if message_history:
+        message_history = copy(list(message_history))
+        user_prompt_part = UserPromptPart(
+            f"<Memory>{memory_string}</Memory>\n" if parent_memories else ""
+            f"{instruct}",
+        )
+        if not isinstance(message_history[-1], ModelRequest):
+            message_history.append(ModelRequest(parts=[user_prompt_part]))
+        else:
+            message_history[-1].parts = copy(list(message_history[-1].parts))
+            message_history[-1].parts.append(user_prompt_part)
+    
+    async with MyDeps(config=config, memory_storage=memory_store) as my_deps:
+        res = await agent.run(
+            model=model,
+            deps=my_deps,
+            user_prompt=(
+                f"<Memory>{memory_string}</Memory>\n" if parent_memories else "",
+                f"<System>Now: {datetime.now()}</System>\n",
+                f"{instruct}",
+            ),
+            message_history=message_history,
+        )
+    msgs: list[ModelRequest | ModelResponse] = res.new_messages()
+    msgs = _strip_history(msgs, instruct)
+    compacted = await run_compaction(
+            model=model,
+            detailed=msgs,
+    )
+    mem = MemoryRecord(
+            raw_pair=(instruct, res.output.text),
+            compacted=compacted,
+            parents=parent_memories,
+            detailed=msgs,
+    )
+    return res.output, mem
 
 
 async def main():
     from rich import print
 
     # from k.agent.memory.simple import JsonlMemoryRecordStore
-    from k.agent.memory.folder import FolderMemoryStore
 
     config = Config()  # type: ignore
     model = "openai:gpt-5.2"
@@ -379,38 +444,16 @@ async def main():
             print("Exiting the agent loop.")
             break
         latest_mem = mem_store.get_latest()
-        recent_ancestors_mem = set(
-            [*mem_store.get_ancestors(latest_mem, level=5), latest_mem]
-            if latest_mem
-            else []
-        )
-        more_ancestors_mem = set(
-            [*mem_store.get_ancestors(latest_mem, level=20), latest_mem]
-            if latest_mem
-            else []
-        )
-        all_mem = mem_store.get_by_ids(more_ancestors_mem)
-        mem_string = "\n".join(
-            x.dump_compated() if x.id_ in recent_ancestors_mem else x.dump_raw_pair()
-            for x in all_mem
-        )
-        output, detailed = await agent_run(
-            model, config, instruct, memory_string=mem_string
+        output, mem = await agent_run(
+            model,
+            config,
+            mem_store,
+            instruct,
+            parent_memories=[latest_mem] if latest_mem else [],
         )
         print(output.text)
-        raw_pair = (instruct, output.text)
-        compacted = await run_compaction(
-            model=model,
-            detailed=detailed,
-        )
-        mem = MemoryRecord(
-            raw_pair=raw_pair,
-            compacted=compacted,
-            parents=[latest_mem] if latest_mem is not None else [],
-            detailed=detailed,
-        )
         mem_store.append(mem)
-        print(compacted)
+        print(mem.compacted)
 
 
 async def main_1():
