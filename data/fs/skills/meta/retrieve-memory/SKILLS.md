@@ -31,9 +31,8 @@ Combined with `core/file-search` skill for searching.
 ```bash
 # search by keywords in records
 # sort in reverse path order to get newest first
- rg -n --sortr path -g "*.json" 'weather|天气|forecast' memories/records | head -n 20
+ rg -n --sortr path -g "*.json" 'weather|天气|forecast' ~/memories/records | head -n 20
 
-# open a record
-# detailed content is usually too verbose
-cat ~/memories/records/YYYY/MM/DD/HH/<id>.json | jq -M 'del(.detailed)'
+# open a record or consume using jq
+cat ~/memories/records/YYYY/MM/DD/HH/<id>.json | jq -M
 ```
