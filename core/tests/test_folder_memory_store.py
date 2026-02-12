@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from uuid import uuid4
 
 import pytest
 
@@ -14,16 +13,18 @@ def test_folder_store_get_latest_and_get_by_id(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     r1 = MemoryRecord(
-        raw_pair=("i1", "o1"),
+        input="i1",
         compacted=["c1"],
+        output="o1",
         detailed=[],
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
     store.append(r1)
 
     r2 = MemoryRecord(
-        raw_pair=("i2", "o2"),
+        input="i2",
         compacted=["c2"],
+        output="o2",
         detailed=[],
         created_at=datetime(2026, 1, 2, 0, 0, 0),
         parents=[r1.id_],
@@ -43,8 +44,9 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     parent = MemoryRecord(
-        raw_pair=("i1", "o1"),
+        input="i1",
         compacted=["c1"],
+        output="o1",
         detailed=[],
         created_at=datetime(2026, 1, 1, 0, 0, 0),
         children=[],
@@ -52,8 +54,9 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     store.append(parent)
 
     child = MemoryRecord(
-        raw_pair=("i2", "o2"),
+        input="i2",
         compacted=["c2"],
+        output="o2",
         detailed=[],
         created_at=datetime(2026, 1, 1, 1, 0, 0),
         parents=[parent.id_],
@@ -66,10 +69,11 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     assert store.get_children(parent) == [child.id_]
     assert store.get_children(parent.id_) == [child.id_]
 
-    missing_child_id = str(uuid4())
+    missing_child_id = "zzzzzzzz"
     missing = MemoryRecord(
-        raw_pair=("i3", "o3"),
+        input="i3",
         compacted=["c3"],
+        output="o3",
         detailed=[],
         created_at=datetime(2026, 1, 1, 2, 0, 0),
         parents=[child.id_],
@@ -96,20 +100,23 @@ def test_folder_store_get_between(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     r1 = MemoryRecord(
-        raw_pair=("i1", "o1"),
+        input="i1",
         compacted=["c1"],
+        output="o1",
         detailed=[],
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
     r2 = MemoryRecord(
-        raw_pair=("i2", "o2"),
+        input="i2",
         compacted=["c2"],
+        output="o2",
         detailed=[],
         created_at=datetime(2026, 1, 1, 12, 0, 0),
     )
     r3 = MemoryRecord(
-        raw_pair=("i3", "o3"),
+        input="i3",
         compacted=["c3"],
+        output="o3",
         detailed=[],
         created_at=datetime(2026, 1, 2, 0, 0, 0),
     )
@@ -134,8 +141,9 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     r1 = MemoryRecord(
-        raw_pair=("i1", "o1"),
+        input="i1",
         compacted=["c1"],
+        output="o1",
         detailed=[],
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
@@ -144,8 +152,9 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
 
     external = FolderMemoryStore(root)
     r2 = MemoryRecord(
-        raw_pair=("i2", "o2"),
+        input="i2",
         compacted=["c2"],
+        output="o2",
         detailed=[],
         created_at=datetime(2026, 1, 2, 0, 0, 0),
     )

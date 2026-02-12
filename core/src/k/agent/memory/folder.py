@@ -361,7 +361,9 @@ class FolderMemoryStore(MemoryStore):
             delete=False,
         ) as tf:
             tmp_path = Path(tf.name)
-            tf.write(record.model_dump_json(exclude={"detailed"})) # omit detailed  which is hard to read in the plain text file
+            tf.write(
+                record.model_dump_json(exclude={"detailed"})
+            )  # omit detailed  which is hard to read in the plain text file
         tmp_path.replace(path)
         self._record_paths[record.id_] = path
         return path

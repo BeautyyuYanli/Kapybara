@@ -1,43 +1,65 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from k.agent.memory.entities import MemoryRecord, memory_record_id_from_created_at
 
 
-def test_memory_record_id_is_base64url_millis() -> None:
+def test_memory_record_id_is_ordered_base64_millis() -> None:
     created_at = datetime(1970, 1, 1, 0, 0, 0, tzinfo=UTC)
-    assert memory_record_id_from_created_at(created_at) == "AAAAAAAA"
+    assert memory_record_id_from_created_at(created_at) == "--------"
 
     r = MemoryRecord(
-        raw_pair=("i", "o"),
+        input="i",
         compacted=["c"],
+        output="o",
         detailed=[],
         created_at=created_at,
     )
-    assert r.id_ == "AAAAAAAA"
+    assert r.id_ == "--------"
 
 
-def test_memory_record_id_accepts_legacy_uuid() -> None:
-    legacy = "00000000-0000-0000-0000-000000000000"
-    r = MemoryRecord(
-        id_=legacy,
-        raw_pair=("i", "o"),
-        compacted=["c"],
-        detailed=[],
-        created_at=datetime(2026, 1, 1, 0, 0, 0),
-    )
-    assert r.id_ == legacy
+def test_memory_record_id_lexicographic_order_matches_created_at() -> None:
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    ids = [
+        memory_record_id_from_created_at(base + timedelta(milliseconds=offset))
+        for offset in (0, 1, 2, 10, 11)
+    ]
+    assert ids == sorted(ids)
+    assert {len(i) for i in ids} == {8}
+
+
+def test_memory_record_id_rejects_legacy_ids() -> None:
+    with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
+        MemoryRecord(
+            id_="019c52f782ec",
+            input="i",
+            compacted=["c"],
+            output="o",
+            detailed=[],
+            created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+        )
+
+    with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
+        MemoryRecord(
+            id_="00000000-0000-0000-0000-000000000000",
+            input="i",
+            compacted=["c"],
+            output="o",
+            detailed=[],
+            created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+        )
 
 
 def test_memory_record_id_rejects_invalid_ids() -> None:
     with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
         MemoryRecord(
             id_="not-a-uuid",
-            raw_pair=("i", "o"),
+            input="i",
             compacted=["c"],
+            output="o",
             detailed=[],
             created_at=datetime(2026, 1, 1, 0, 0, 0),
         )

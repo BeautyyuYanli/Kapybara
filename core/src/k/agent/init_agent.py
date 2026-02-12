@@ -530,11 +530,9 @@ async def agent_run(
         detailed=msgs,
     )
     mem = MemoryRecord(
-        raw_pair=(
-            "\n".join((x if isinstance(x, str) else str(x)) for x in instruct),
-            res.output.text,
-        ),
+        input="\n".join((x if isinstance(x, str) else str(x)) for x in instruct),
         compacted=compacted,
+        output=res.output.text,
         parents=parent_memories,
         detailed=msgs,
     )
@@ -542,9 +540,10 @@ async def agent_run(
 
 
 async def main():
+    from pydantic_ai.models.openrouter import OpenRouterModel
 
     config = Config()  # type: ignore
-    model = "openai:gpt-5.2"
+    model = OpenRouterModel("openai/gpt-5.2")
     mem_store = FolderMemoryStore(
         root=config.fs_base / "memories",
     )

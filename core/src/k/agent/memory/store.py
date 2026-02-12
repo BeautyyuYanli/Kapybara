@@ -19,12 +19,11 @@ from __future__ import annotations
 from collections.abc import Set
 from datetime import datetime
 from typing import Protocol, runtime_checkable
-from uuid import UUID
 
 from k.agent.memory.entities import MemoryRecord, is_memory_record_id
 
-type MemoryRecordId = str | UUID
-type MemoryRecordRef = MemoryRecord | str | UUID
+type MemoryRecordId = str
+type MemoryRecordRef = MemoryRecord | str
 
 
 def coerce_record_id(value: MemoryRecordId) -> str:
@@ -34,8 +33,6 @@ def coerce_record_id(value: MemoryRecordId) -> str:
         ValueError: If `value` is not a valid MemoryRecord id.
     """
 
-    if isinstance(value, UUID):
-        return str(value)
     if not is_memory_record_id(value):
         raise ValueError(f"Invalid MemoryRecord id: {value!r}")
     return value
