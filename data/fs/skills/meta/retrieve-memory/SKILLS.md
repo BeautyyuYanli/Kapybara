@@ -1,6 +1,6 @@
 ---
 name: retrieve-memory
-description: Works with the local ~/memories store (index + JSON records).
+description: Works with the local ~/memories store.
 ---
 
 # retrieve-memory
