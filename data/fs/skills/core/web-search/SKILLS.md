@@ -10,7 +10,7 @@ description: Web search via Jina Search Foundation (JSON output).
 
 # web-search
 
-Env: `JINA_AI_KEY`.
+Env: `JINA_AI_KEY` (required).
 
 ```bash
 q='your query'

@@ -34,3 +34,5 @@ uv run --with rich --with 'requests<3' script.py   # per-run deps (no inline blo
 Project dir (`pyproject.toml` present):
 - plain script: `uv run --no-project script.py` (flag before script)
 - PEP 723 script: uv ignores project deps (usually no `--no-project` needed)
+
+Tip: prefer `uv run --no-project` for truly one-off scripts to avoid surprising imports from the current repo.

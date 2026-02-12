@@ -8,7 +8,9 @@ description: Defines how to create a new skill in ~/skills.
 Ref: https://agentskills.io/specification.md
 
 ## What a skill is
-A skill is a folder `~/skills/<skill-name>/` with an entry doc: `SKILL.md` or `SKILLS.md`.
+A skill is a folder `~/skills/<group>/<skill-name>/` with an entry doc: `SKILL.md` or `SKILLS.md`.
+
+Groups are an organizing convention (e.g. `core/`, `meta/`, `misc/`) and are not part of the skill name.
 
 ## Writing rules
 - Be **concise**, **fluent**, and **structured**.
@@ -30,8 +32,8 @@ description: <one-line, third-person>
 
 ## Minimal scaffold (optional)
 ```bash
-mkdir -p ~/skills/<skill-name>
-cat > ~/skills/<skill-name>/SKILL.md <<'MD'
+mkdir -p ~/skills/<group>/<skill-name>
+cat > ~/skills/<group>/<skill-name>/SKILL.md <<'MD'
 ---
 name: <lowercase-hyphen-name>
 description: <one-line, third-person>

@@ -1,9 +1,9 @@
 ---
-name: file_search
+name: file-search
 description: CLI file/content search cheatsheet.
 ---
 
-# file_search
+# file-search
 
 ## Find files (by name)
 ```bash

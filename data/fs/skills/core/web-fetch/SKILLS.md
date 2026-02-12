@@ -15,7 +15,7 @@ Env: `JINA_AI_KEY`.
 ```bash
 target='https://example.com/page'
 url="https://r.jina.ai/${target}"
-out=/tmp/web_fetch_${RANDOM}.txt
+out=/tmp/web-fetch_${RANDOM}.txt
 curl -sS "$url" -H "Authorization: Bearer $JINA_AI_KEY" -H 'Accept: text/plain' -o "$out"
 sed -n '1,120p' "$out"
 ```

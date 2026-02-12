@@ -6,8 +6,7 @@ description: Works with the local ~/memories store (index + JSON records).
 # retrieve-memory
 
 ## What it is
-`~/memories` is a local memory store:
-- an **append-only index** (`~/memories/order.jsonl`) that points to
+- `~/memories` is a local memory store
 - **record files** (`~/memories/records/YYYY/MM/DD/HH/<id>.json`) that store one conversation memory each.
 
 A record is defined as:
@@ -27,15 +26,14 @@ class MemoryRecord(BaseModel):
  base64url of **48-bit** big-endian `created_at` **POSIX millis** (usually ~8 chars)
 
 ## Common tasks
-Combined with `core/file_search` skill for searching.
+Combined with `core/file-search` skill for searching.
 
 ```bash
-# newest entries
- tail -n 20 ~/memories/order.jsonl
+# search by keywords in records
+# sort in reverse path order to get newest first
+ rg -n --sortr path -g "*.json" 'weather|天气|forecast' memories/records | head -n 20
 
 # open a record
- jq . ~/memories/records/YYYY/MM/DD/HH/<id>.json
-
-# search
- rg -n 'weather|天气|forecast' ~/memories/records -g '*.json'
+# detailed content is usually too verbose
+cat ~/memories/records/YYYY/MM/DD/HH/<id>.json | jq -M 'del(.detailed)'
 ```

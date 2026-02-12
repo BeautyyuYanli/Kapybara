@@ -7,8 +7,20 @@ from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, ModelMessage, RunContext, ToolOutput
-from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart
+from pydantic_ai import (
+    Agent,
+    ModelMessage,
+    ModelRetry,
+    RunContext,
+    ToolOutput,
+    ToolReturnPart,
+)
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    UserContent,
+    UserPromptPart,
+)
 from pydantic_ai.models import KnownModelName, Model
 from rich import print
 
@@ -32,6 +44,7 @@ class MyDeps:
 
     config: Config
     memory_storage: FolderMemoryStore
+    memory_parents: list[str]
     start_event: Event | None = None
     bash_cmd_history: list[str] = field(default_factory=list)
     stuck_warning: int = 0
@@ -175,13 +188,80 @@ async def edit_file(
     """
     return await bash(
         ctx,
-        f"python3 ~/skills/meta/edit_file/edit.py --filename {single_quote(filename)} --old-content {single_quote(old_content)} --new-content {single_quote(new_content)} "
+        f"python3 ~/skills/meta/edit-file/edit.py --filename {single_quote(filename)} --old-content {single_quote(old_content)} --new-content {single_quote(new_content)} "
         + (
             f"--start-line {single_quote(str(start_line))}"
             if start_line is not None
             else ""
         ),
     )
+
+
+async def fork(
+    ctx: RunContext[MyDeps],
+    instruct: str,
+    # inject_memories: list[str] | None = None,
+) -> str:
+    """Run `instruct` in a forked agent run. The fork reuses the current conversation and memory context.
+
+    Returns a short status string; on success it includes the forked run's
+    compacted memory record.
+
+    `fork` can not be used as the first tool call.
+    """
+
+    parent_mems = []
+    # parent_mems = (
+    #     inject_memories if inject_memories else []
+    # )
+    if len(ctx.messages) == 1:
+        raise ModelRetry("Cannot fork as the first message.")
+    message_history = copy(ctx.messages)
+    if isinstance(message_history[-1], ModelResponse):
+        if not ctx.tool_name or not ctx.tool_call_id:
+            raise RuntimeError(
+                "Tool name and call id must be set when forking from a ModelResponse"
+            )
+        message_history.append(
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name=ctx.tool_name,
+                        content="Success. You are continuing as the forked agent.",
+                        tool_call_id=ctx.tool_call_id,
+                    )
+                ]
+            )
+        )
+    else:
+        raise RuntimeError("Last message when forking must be a ModelResponse")
+
+    try:
+        _res, mem = await agent_run(
+            model=ctx.model,
+            config=ctx.deps.config,
+            memory_store=ctx.deps.memory_storage,
+            instruct=[
+                "You are the forked agent to complete only the following instruct, ignoring the previous ones.\nInstruction: ",
+                instruct,
+            ],
+            message_history=message_history,
+            parent_memories=parent_mems,
+        )
+    except Exception as e:
+        return f"Fork failed: {type(e).__name__}: {e}"
+    else:
+        mem.parents = list(set(mem.parents + ctx.deps.memory_parents))
+        ctx.deps.memory_storage.append(mem)
+        ctx.deps.memory_parents.append(mem.id_)
+        return "\n".join(
+            [
+                "Fork succeeded.",
+                f"- memory_id: {mem.id_}",
+                "- record:",
+                mem.dump_compated(),
+            ]
+        )
 
 
 class Event(BaseModel):
@@ -241,23 +321,23 @@ agent: Agent[MyDeps, HandoffEvent] = Agent(
     system_prompt=[
         bash_tool_prompt,
         "<General>\n"
-        "Role: You can use the provided tools and skills in `~/skills/`.\n"
+        "Role: You are an agent who can use the provided tools and skills in `~/skills/`.\n"
         "\n"
         "How to operate:\n"
         "- Determine the user's intent first (often clarified by the most recent memories). Memories are ordered oldest → newest.\n"
         "- If the intent is ambiguous, do not start work; finish quickly and ask for clarification.\n"
-        "- Usually use the `retrieve_memory` skill as the first action to gather more context (e.g. the user references prior work, you need to reuse earlier outputs, or current intent depends on older memories).\n"
-        "- Usually use `file_search` skill under `~/skills/` as the second action to see whether a relevant skill already exists.\n"
+        "- Usually use the `retrieve-memory` skill as the first action to gather more context (e.g. the user references prior work, you need to reuse earlier outputs, or current intent depends on older memories).\n"
+        "- Usually use `file-search` skill under `~/skills/` as the second action to see whether a relevant skill already exists.\n"
         "\n"
         "Skills:\n"
-        "- Actively gather missing information using available `*_search` skills (e.g. `web_search`, `file_search`) instead of guessing.\n"
-        "- Prefer `web_fetch` to fetch readable page text instead of downloading raw HTML (only fall back to raw HTML when necessary).\n"
+        "- Actively gather missing information using available `*-search` skills (e.g. `web-search`, `file-search`) instead of guessing.\n"
+        "- Prefer `web-fetch` to fetch readable page text instead of downloading raw HTML (only fall back to raw HTML when necessary).\n"
         "- Assume required environment variables for existing skills are already set; do not double-check them.\n"
         "- If a required environment variable is missing, ask the user to add it to `~/.env`.\n"
-        "- Use the `create_skill` tool to create new skills when needed.\n"
+        "- Use the `create-skill` tool to create new skills when needed.\n"
         "\n"
         "Scripting:\n"
-        "- For one-off Python scripts, prefer inline deps in-file (PEP 723, `# /// script`) to keep scripts reproducible/self-contained; use `execute_code` when appropriate.\n"
+        "- For one-off Python scripts, prefer inline deps in-file (PEP 723, `# /// script`) to keep scripts reproducible/self-contained; use `execute-code` when appropriate.\n"
         "\n"
         "Software & storage:\n"
         "- You may install software into `/App` or via a user-space package manager, then create skills to use it.\n"
@@ -268,7 +348,7 @@ agent: Agent[MyDeps, HandoffEvent] = Agent(
         "- If you cannot proceed, call `finish` with kind: `stuck` (even if the work is unfinished).\n",
         "\n</General>",
     ],
-    tools=[bash, bash_input, bash_wait, bash_interrupt, edit_file],
+    tools=[bash, bash_input, bash_wait, bash_interrupt, edit_file, fork],
     deps_type=MyDeps,
     output_type=ToolOutput(handoff, name="finish"),
 )  # type: ignore
@@ -336,7 +416,9 @@ def claim_read_and_empty(path: str) -> str:
     return data
 
 
-def _strip_history(msgs: list[ModelRequest | ModelResponse], instruct: str):
+def _strip_history(
+    msgs: list[ModelRequest | ModelResponse], instruct: Sequence[UserContent]
+):
     first_msg = msgs[0]
     if isinstance(first_msg, ModelRequest):
         last_part = first_msg.parts[-1]
@@ -355,12 +437,14 @@ def _strip_history(msgs: list[ModelRequest | ModelResponse], instruct: str):
 async def _memory_select(
     memory_store: FolderMemoryStore,
     parent_memories: list[str],
+    compacted_level_num: int = 5,
+    raw_pair_level_num: int = 20,
 ):
     recent_mem = set(parent_memories)
     all_mem = set(parent_memories)
     for mem in parent_memories:
-        recent_mem.union(memory_store.get_ancestors(mem, level=3))
-        all_mem.union(memory_store.get_ancestors(mem, level=10))
+        recent_mem.union(memory_store.get_ancestors(mem, level=compacted_level_num))
+        all_mem.union(memory_store.get_ancestors(mem, level=raw_pair_level_num))
 
     all_mem_rec = memory_store.get_by_ids(all_mem)
     return all_mem_rec, recent_mem
@@ -370,7 +454,7 @@ async def agent_run(
     model: Model | KnownModelName,
     config: Config,
     memory_store: FolderMemoryStore,
-    instruct: str,
+    instruct: list[UserContent],
     message_history: Sequence[ModelMessage] | None = None,
     parent_memories: list[str] | None = None,
 ) -> tuple[HandoffEvent, MemoryRecord]:
@@ -385,25 +469,18 @@ async def agent_run(
         for x in all_mem_rec
     )
 
-    if message_history:
-        message_history = copy(list(message_history))
-        user_prompt_part = UserPromptPart(
-            f"<Memory>{memory_string}</Memory>\n" if parent_memories else f"{instruct}",
-        )
-        if not isinstance(message_history[-1], ModelRequest):
-            message_history.append(ModelRequest(parts=[user_prompt_part]))
-        else:
-            message_history[-1].parts = copy(list(message_history[-1].parts))
-            message_history[-1].parts.append(user_prompt_part)
-
-    async with MyDeps(config=config, memory_storage=memory_store) as my_deps:
+    async with MyDeps(
+        config=config,
+        memory_storage=memory_store,
+        memory_parents=parent_memories,
+    ) as my_deps:
         res = await agent.run(
             model=model,
             deps=my_deps,
             user_prompt=(
                 f"<Memory>{memory_string}</Memory>\n" if parent_memories else "",
                 f"<System>Now: {datetime.now()}</System>\n",
-                f"{instruct}",
+                *instruct,
             ),
             message_history=message_history,
         )
@@ -414,7 +491,10 @@ async def agent_run(
         detailed=msgs,
     )
     mem = MemoryRecord(
-        raw_pair=(instruct, res.output.text),
+        raw_pair=(
+            "\n".join((x if isinstance(x, str) else str(x)) for x in instruct),
+            res.output.text,
+        ),
         compacted=compacted,
         parents=parent_memories,
         detailed=msgs,
@@ -423,7 +503,6 @@ async def agent_run(
 
 
 async def main():
-    from rich import print
 
     config = Config()  # type: ignore
     model = "openai:gpt-5.2"
@@ -440,7 +519,7 @@ async def main():
             model,
             config,
             mem_store,
-            instruct,
+            [instruct],
             parent_memories=[latest_mem] if latest_mem else [],
         )
         print(output.text)
