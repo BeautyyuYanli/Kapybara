@@ -1,6 +1,5 @@
-data/*
-!data/fs/
 data/fs/*
+!data/fs/.bashrc
 !data/fs/skills/
 data/fs/skills/*
 !data/fs/skills/core/

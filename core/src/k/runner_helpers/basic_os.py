@@ -23,7 +23,7 @@ class BasicOSHelper:
             env = {}
         return (
             self.command_base()
-            + "'export TERM=dumb; stty -echo; set -a; . ~/.env; set +a; "
+            + "'. ~/.bashrc; "
             + single_quote_escape(
                 "".join(
                     f"{key}='{single_quote_escape(value)}'; "
