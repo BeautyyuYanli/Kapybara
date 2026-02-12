@@ -1,4 +1,3 @@
-import asyncio
 from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, field
@@ -426,8 +425,6 @@ async def agent_run(
 async def main():
     from rich import print
 
-    # from k.agent.memory.simple import JsonlMemoryRecordStore
-
     config = Config()  # type: ignore
     model = "openai:gpt-5.2"
     mem_store = FolderMemoryStore(
@@ -449,48 +446,6 @@ async def main():
         print(output.text)
         mem_store.append(mem)
         print(mem.compacted)
-
-
-async def main_1():
-    config = Config()  # type: ignore
-    tasks: set[asyncio.Task[None]] = set()
-    while True:
-        res = claim_read_and_empty("bus.jsonl")
-        lines = [line for line in res.strip().split("\n") if line.strip()]
-        events = [Event.model_validate_json(line) for line in lines]
-        for event in events:
-            match event.kind:
-                case "instruct":
-
-                    async def tmp(e: Event) -> None:
-                        async with MyDeps(config=config, start_event=e) as my_deps:
-                            resp = await agent.run(
-                                deps=my_deps,
-                                user_prompt=e.text,
-                            )
-                            output_event = resp.output
-                            with open("bus.jsonl", "a", encoding="utf-8") as f:
-                                f.write(output_event.model_dump_json() + "\n")
-
-                    task = asyncio.create_task(tmp(event))
-                    tasks.add(task)
-                    task.add_done_callback(tasks.discard)
-                case "response":
-                    print(f"Received response event:\n{event.text}")
-                case "stuck":
-                    print(f"Received stuck event:\n{event.text}")
-                case _:
-                    print(f"Unknown event kind: {event.kind}")
-                    print(event.text)
-        await asyncio.sleep(1)
-    # async with MyDeps(config=config) as my_deps:
-    #     res = await agent.run(
-    #         deps=my_deps,
-    #         # user_prompt="explore the environment. Use the tools concurrently if needed.",
-    #         # user_prompt="Demo your ability to write JSON to a file, and the JSON should contain a long text field with markdown formatting to greeting the user with emojis and other complex style.",
-    #         user_prompt="You should edit `sample.py` to make all things async.",
-    #     )
-    #     print(res.output)
 
 
 if __name__ == "__main__":
