@@ -3,7 +3,7 @@ from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -30,6 +30,29 @@ from k.agent.memory.folder import FolderMemoryStore
 from k.config import Config
 from k.io_helpers.shell import NextResult, ShellSessionInfo, ShellSessionManager
 from k.runner_helpers.basic_os import BasicOSHelper, single_quote
+
+_BASH_STDIO_TOKEN_LIMIT = 8000
+_CL100K_BASE_ENCODING: Any | None = None
+
+
+def _cl100k_base_token_len(text: str) -> int:
+    """Count tokens using `tiktoken`'s `cl100k_base`.
+
+    Used to keep bash tool responses within a predictable token budget so the
+    agent doesn't accidentally ingest huge stdout/stderr payloads.
+    """
+
+    if not text:
+        return 0
+
+    global _CL100K_BASE_ENCODING
+    if _CL100K_BASE_ENCODING is None:
+        import tiktoken
+
+        _CL100K_BASE_ENCODING = tiktoken.get_encoding("cl100k_base")
+
+    # `tiktoken` returns a list of token ids; its length is the token count.
+    return len(_CL100K_BASE_ENCODING.encode(text))
 
 
 @dataclass()
@@ -91,10 +114,25 @@ class BashEvent:
         system_msg: str | None = None,
     ) -> BashEvent:
         stdout, stderr, exit_code = tpl
+        stdout_text = stdout.decode(errors="replace")
+        stderr_text = stderr.decode(errors="replace")
+
+        combined_stdio = stdout_text + stderr_text
+        if (
+            len(combined_stdio) > _BASH_STDIO_TOKEN_LIMIT
+            and _cl100k_base_token_len(combined_stdio) > _BASH_STDIO_TOKEN_LIMIT
+        ):
+            stdout_text = ""
+            stderr_text = ""
+            too_long_msg = "The stdout/stderr is too long, please dump to a /tmp file before consume."
+            system_msg = (
+                too_long_msg if system_msg is None else f"{system_msg}\n{too_long_msg}"
+            )
+
         return BashEvent(
             session_id=session_id,
-            stdout=stdout.decode(errors="replace"),
-            stderr=stderr.decode(errors="replace"),
+            stdout=stdout_text,
+            stderr=stderr_text,
             exit_code=exit_code,
             active_sessions=all_active_sessions,
             system_msg=system_msg,
@@ -313,6 +351,7 @@ Session model:
 Operating rules:
 - Do not run meaningless commands (e.g. `true`, `echo ...`) unless they are part of a real workflow.
 - If a command needs time, do not skip it—keep calling `bash_wait` until `exit_code` becomes non-null (or interrupt if necessary).
+- If a command outputs a lot, redirect it to a file (e.g. under `/tmp`) and then read only the relevant parts.
 - You do not have root access. If a command would require root, return the command(s) instead of trying to run them.
 </BashInstruction>
 """

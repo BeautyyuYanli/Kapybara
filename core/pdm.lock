@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = []
 lock_version = "4.5.0"
-content_hash = "sha256:361e8698d95751320f6a901f0449228fa3645ff487a609944844ad2717c421c3"
+content_hash = "sha256:c660ee4649e3abbfc8ff2c132020d377032cabe0fb2fa48753317bd071bbd69f"
 
 [[metadata.targets]]
 requires_python = "==3.14.*"
@@ -94,15 +94,15 @@ files = [
 
 [[package]]
 name = "genai-prices"
-version = "0.0.52"
+version = "0.0.53"
 summary = ""
 dependencies = [
     "httpx",
     "pydantic",
 ]
 files = [
-    {file = "genai_prices-0.0.52-py3-none-any.whl", hash = "sha256:639e7a2ae7eddf5710febb9779b9c9e31ff5acf464b4eb1f6018798ea642e6d3"},
-    {file = "genai_prices-0.0.52.tar.gz", hash = "sha256:0df7420b555fa3a48d09e5c7802ba35b5dfa9fd49b0c3bb2c150c59060d83f52"},
+    {file = "genai_prices-0.0.53-py3-none-any.whl", hash = "sha256:5a5dfd92089e9e8a174f7097a1521e36f4e75c74cfbdfb1ec56283bae3c0c96e"},
+    {file = "genai_prices-0.0.53.tar.gz", hash = "sha256:0afe7595d77dbcd80473ad168385c7500c7fbc6c2b370840ffdbfea9e0902544"},
 ]
 
 [[package]]
@@ -119,14 +119,34 @@ files = [
 
 [[package]]
 name = "griffe"
-version = "1.15.0"
+version = "2.0.0"
+summary = ""
+dependencies = [
+    "griffecli",
+    "griffelib",
+]
+files = [
+    {file = "griffe-2.0.0-py3-none-any.whl", hash = "sha256:5418081135a391c3e6e757a7f3f156f1a1a746cc7b4023868ff7d5e2f9a980aa"},
+]
+
+[[package]]
+name = "griffecli"
+version = "2.0.0"
 summary = ""
 dependencies = [
     "colorama",
+    "griffelib",
 ]
 files = [
-    {file = "griffe-1.15.0-py3-none-any.whl", hash = "sha256:6f6762661949411031f5fcda9593f586e6ce8340f0ba88921a0f2ef7a81eb9a3"},
-    {file = "griffe-1.15.0.tar.gz", hash = "sha256:7726e3afd6f298fbc3696e67958803e7ac843c1cfe59734b6251a40cdbfb5eea"},
+    {file = "griffecli-2.0.0-py3-none-any.whl", hash = "sha256:9f7cd9ee9b21d55e91689358978d2385ae65c22f307a63fb3269acf3f21e643d"},
+]
+
+[[package]]
+name = "griffelib"
+version = "2.0.0"
+summary = ""
+files = [
+    {file = "griffelib-2.0.0-py3-none-any.whl", hash = "sha256:01284878c966508b6d6f1dbff9b6fa607bc062d8261c5c7253cb285b06422a7f"},
 ]
 
 [[package]]
@@ -231,7 +251,7 @@ files = [
 
 [[package]]
 name = "logfire"
-version = "4.22.0"
+version = "4.23.0"
 summary = ""
 dependencies = [
     "executing",
@@ -243,17 +263,17 @@ dependencies = [
     "typing-extensions",
 ]
 files = [
-    {file = "logfire-4.22.0-py3-none-any.whl", hash = "sha256:9a0d20885613efe4bc9efcfa19a7943a6c642bc21339d926c51fcc74c0d083d6"},
-    {file = "logfire-4.22.0.tar.gz", hash = "sha256:284b3b955c7515d4428dbc1e04784c3e652e62acf7597bd64a0aa9ecb6a7dedd"},
+    {file = "logfire-4.23.0-py3-none-any.whl", hash = "sha256:916de6a0cfdf8629474e82da0759c1ea153e3aeef37a0b84f444b639be9227c8"},
+    {file = "logfire-4.23.0.tar.gz", hash = "sha256:4a86dbd568473e137a963fdb9edeea779e4f07b57fadc804b4bd043c399db932"},
 ]
 
 [[package]]
 name = "logfire-api"
-version = "4.22.0"
+version = "4.23.0"
 summary = ""
 files = [
-    {file = "logfire_api-4.22.0-py3-none-any.whl", hash = "sha256:9fd2a2dac9cc3adf71ad4dac7bc9d26af326a5aa87445be90026048d22b92a8e"},
-    {file = "logfire_api-4.22.0.tar.gz", hash = "sha256:b22a038e76c58cba1ab2ce7ce1a26aa5f3df8c63e84d6ad01fb22f75273ca830"},
+    {file = "logfire_api-4.23.0-py3-none-any.whl", hash = "sha256:9fe6d0b04f85f2ff1c263450007c58c9ee0bed9d9b1a825ef72115a72d3693bb"},
+    {file = "logfire_api-4.23.0.tar.gz", hash = "sha256:898dbfc13f9304a7e5edfe6718864d43a484138f139dfefedb3fdd9244c6935e"},
 ]
 
 [[package]]
@@ -279,7 +299,7 @@ files = [
 
 [[package]]
 name = "openai"
-version = "2.17.0"
+version = "2.20.0"
 summary = ""
 dependencies = [
     "anyio",
@@ -292,8 +312,8 @@ dependencies = [
     "typing-extensions",
 ]
 files = [
-    {file = "openai-2.17.0-py3-none-any.whl", hash = "sha256:4f393fd886ca35e113aac7ff239bcd578b81d8f104f5aedc7d3693eb2af1d338"},
-    {file = "openai-2.17.0.tar.gz", hash = "sha256:47224b74bd20f30c6b0a6a329505243cb2f26d5cf84d9f8d0825ff8b35e9c999"},
+    {file = "openai-2.20.0-py3-none-any.whl", hash = "sha256:38d989c4b1075cd1f76abc68364059d822327cf1a932531d429795f4fc18be99"},
+    {file = "openai-2.20.0.tar.gz", hash = "sha256:2654a689208cd0bf1098bb9462e8d722af5cbe961e6bba54e6f19fb843d88db1"},
 ]
 
 [[package]]
@@ -395,11 +415,11 @@ files = [
 
 [[package]]
 name = "packaging"
-version = "25.0"
+version = "26.0"
 summary = ""
 files = [
-    {file = "packaging-25.0-py3-none-any.whl", hash = "sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484"},
-    {file = "packaging-25.0.tar.gz", hash = "sha256:d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f"},
+    {file = "packaging-26.0-py3-none-any.whl", hash = "sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529"},
+    {file = "packaging-26.0.tar.gz", hash = "sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4"},
 ]
 
 [[package]]
@@ -443,7 +463,7 @@ files = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "1.56.0"
+version = "1.58.0"
 summary = ""
 dependencies = [
     "genai-prices",
@@ -455,23 +475,23 @@ dependencies = [
     "typing-inspection",
 ]
 files = [
-    {file = "pydantic_ai_slim-1.56.0-py3-none-any.whl", hash = "sha256:d657e4113485020500b23b7390b0066e2a0277edc7577eaad2290735ca5dd7d5"},
-    {file = "pydantic_ai_slim-1.56.0.tar.gz", hash = "sha256:9f9f9c56b1c735837880a515ae5661b465b40207b25f3a3434178098b2137f05"},
+    {file = "pydantic_ai_slim-1.58.0-py3-none-any.whl", hash = "sha256:077e2d3ac95f8121a8988808674400be0c3e5f88e7e3cd30b317fe50096b2935"},
+    {file = "pydantic_ai_slim-1.58.0.tar.gz", hash = "sha256:8f13086aaa046c759ddc36c14593f95c15fb09df1c3998e690df3c79732931dc"},
 ]
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "1.56.0"
+version = "1.58.0"
 extras = ["openai"]
 summary = ""
 dependencies = [
     "openai",
-    "pydantic-ai-slim==1.56.0",
+    "pydantic-ai-slim==1.58.0",
     "tiktoken",
 ]
 files = [
-    {file = "pydantic_ai_slim-1.56.0-py3-none-any.whl", hash = "sha256:d657e4113485020500b23b7390b0066e2a0277edc7577eaad2290735ca5dd7d5"},
-    {file = "pydantic_ai_slim-1.56.0.tar.gz", hash = "sha256:9f9f9c56b1c735837880a515ae5661b465b40207b25f3a3434178098b2137f05"},
+    {file = "pydantic_ai_slim-1.58.0-py3-none-any.whl", hash = "sha256:077e2d3ac95f8121a8988808674400be0c3e5f88e7e3cd30b317fe50096b2935"},
+    {file = "pydantic_ai_slim-1.58.0.tar.gz", hash = "sha256:8f13086aaa046c759ddc36c14593f95c15fb09df1c3998e690df3c79732931dc"},
 ]
 
 [[package]]
@@ -515,7 +535,7 @@ files = [
 
 [[package]]
 name = "pydantic-graph"
-version = "1.56.0"
+version = "1.58.0"
 summary = ""
 dependencies = [
     "httpx",
@@ -524,8 +544,8 @@ dependencies = [
     "typing-inspection",
 ]
 files = [
-    {file = "pydantic_graph-1.56.0-py3-none-any.whl", hash = "sha256:ec3f0a1d6fcedd4eb9c59fef45079c2ee4d4185878d70dae26440a9c974c6bb3"},
-    {file = "pydantic_graph-1.56.0.tar.gz", hash = "sha256:5e22972dbb43dbc379ab9944252ff864019abf3c7d465dcdf572fc8aec9a44a1"},
+    {file = "pydantic_graph-1.58.0-py3-none-any.whl", hash = "sha256:706441a4122e1b893f442d74e7e5d4f44f3d0eb69ff4d26882afc323e570f54e"},
+    {file = "pydantic_graph-1.58.0.tar.gz", hash = "sha256:5a697ac5e27aa0ed2936175e4e6fca473c309e65856a45840468dbca4641ea5b"},
 ]
 
 [[package]]
@@ -718,26 +738,26 @@ files = [
 
 [[package]]
 name = "ty"
-version = "0.0.15"
+version = "0.0.16"
 summary = ""
 files = [
-    {file = "ty-0.0.15-py3-none-linux_armv6l.whl", hash = "sha256:68e092458516c61512dac541cde0a5e4e5842df00b4e81881ead8f745ddec794"},
-    {file = "ty-0.0.15-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:79f2e75289eae3cece94c51118b730211af4ba5762906f52a878041b67e54959"},
-    {file = "ty-0.0.15-py3-none-macosx_11_0_arm64.whl", hash = "sha256:112a7b26e63e48cc72c8c5b03227d1db280cfa57a45f2df0e264c3a016aa8c3c"},
-    {file = "ty-0.0.15-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:71f62a2644972975a657d9dc867bf901235cde51e8d24c20311067e7afd44a56"},
-    {file = "ty-0.0.15-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:9e48b42be2d257317c85b78559233273b655dd636fc61e7e1d69abd90fd3cba4"},
-    {file = "ty-0.0.15-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:27dd5b52a421e6871c5bfe9841160331b60866ed2040250cb161886478ab3e4f"},
-    {file = "ty-0.0.15-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:76b85c9ec2219e11c358a7db8e21b7e5c6674a1fb9b6f633836949de98d12286"},
-    {file = "ty-0.0.15-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:a9e8204c61d8ede4f21f2975dce74efdb80fafb2fae1915c666cceb33ea3c90b"},
-    {file = "ty-0.0.15-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:af87c3be7c944bb4d6609d6c63e4594944b0028c7bd490a525a82b88fe010d6d"},
-    {file = "ty-0.0.15-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:50dccf7398505e5966847d366c9e4c650b8c225411c2a68c32040a63b9521eea"},
-    {file = "ty-0.0.15-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:bd797b8f231a4f4715110259ad1ad5340a87b802307f3e06d92bfb37b858a8f3"},
-    {file = "ty-0.0.15-py3-none-musllinux_1_2_i686.whl", hash = "sha256:9deb7f20e18b25440a9aa4884f934ba5628ef456dbde91819d5af1a73da48af3"},
-    {file = "ty-0.0.15-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:7b31b3de031255b90a5f4d9cb3d050feae246067c87130e5a6861a8061c71754"},
-    {file = "ty-0.0.15-py3-none-win32.whl", hash = "sha256:9362c528ceb62c89d65c216336d28d500bc9f4c10418413f63ebc16886e16cc1"},
-    {file = "ty-0.0.15-py3-none-win_amd64.whl", hash = "sha256:4db040695ae67c5524f59cb8179a8fa277112e69042d7dfdac862caa7e3b0d9c"},
-    {file = "ty-0.0.15-py3-none-win_arm64.whl", hash = "sha256:e5a98d4119e77d6136461e16ae505f8f8069002874ab073de03fbcb1a5e8bf25"},
-    {file = "ty-0.0.15.tar.gz", hash = "sha256:4f9a5b8df208c62dba56e91b93bed8b5bb714839691b8cff16d12c983bfa1174"},
+    {file = "ty-0.0.16-py3-none-linux_armv6l.whl", hash = "sha256:6d8833b86396ed742f2b34028f51c0e98dbf010b13ae4b79d1126749dc9dab15"},
+    {file = "ty-0.0.16-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:934c0055d3b7f1cf3c8eab78c6c127ef7f347ff00443cef69614bda6f1502377"},
+    {file = "ty-0.0.16-py3-none-macosx_11_0_arm64.whl", hash = "sha256:b55e8e8733b416d914003cd22e831e139f034681b05afed7e951cc1a5ea1b8d4"},
+    {file = "ty-0.0.16-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:feccae8f4abd6657de111353bd604f36e164844466346eb81ffee2c2b06ea0f0"},
+    {file = "ty-0.0.16-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:1cad5e29d8765b92db5fa284940ac57149561f3f89470b363b9aab8a6ce553b0"},
+    {file = "ty-0.0.16-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:86f28797c7dc06f081238270b533bf4fc8e93852f34df49fb660e0b58a5cda9a"},
+    {file = "ty-0.0.16-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:be971a3b42bcae44d0e5787f88156ed2102ad07558c05a5ae4bfd32a99118e66"},
+    {file = "ty-0.0.16-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:3c9f982b7c4250eb91af66933f436b3a2363c24b6353e94992eab6551166c8b7"},
+    {file = "ty-0.0.16-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d122edf85ce7bdf6f85d19158c991d858fc835677bd31ca46319c4913043dc84"},
+    {file = "ty-0.0.16-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:497ebdddbb0e35c7758ded5aa4c6245e8696a69d531d5c9b0c1a28a075374241"},
+    {file = "ty-0.0.16-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:e1e0ac0837bde634b030243aeba8499383c0487e08f22e80f5abdacb5b0bd8ce"},
+    {file = "ty-0.0.16-py3-none-musllinux_1_2_i686.whl", hash = "sha256:1216c9bcca551d9f89f47a817ebc80e88ac37683d71504e5509a6445f24fd024"},
+    {file = "ty-0.0.16-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:221bbdd2c6ee558452c96916ab67fcc465b86967cf0482e19571d18f9c831828"},
+    {file = "ty-0.0.16-py3-none-win32.whl", hash = "sha256:d52c4eb786be878e7514cab637200af607216fcc5539a06d26573ea496b26512"},
+    {file = "ty-0.0.16-py3-none-win_amd64.whl", hash = "sha256:f572c216aa8ecf79e86589c6e6d4bebc01f1f3cb3be765c0febd942013e1e73a"},
+    {file = "ty-0.0.16-py3-none-win_arm64.whl", hash = "sha256:430eadeb1c0de0c31ef7bef9d002bdbb5f25a31e3aad546f1714d76cd8da0a87"},
+    {file = "ty-0.0.16.tar.gz", hash = "sha256:a999b0db6aed7d6294d036ebe43301105681e0c821a19989be7c145805d7351c"},
 ]
 
 [[package]]
