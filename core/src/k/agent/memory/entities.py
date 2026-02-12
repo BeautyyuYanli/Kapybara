@@ -64,7 +64,7 @@ class MemoryRecord(BaseModel):
 
     raw_pair: tuple[str, str]
     compacted: list[str]
-    detailed: list[ModelRequest | ModelResponse]
+    detailed: list[ModelRequest | ModelResponse] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _finalize_and_validate_ids(self) -> MemoryRecord:
@@ -84,7 +84,9 @@ class MemoryRecord(BaseModel):
         return self.id_[:8]
 
     def dump_raw_pair(self) -> str:
-        return self.model_dump_json(exclude={"detailed", "compacted"})
+        # return self.model_dump_json(exclude={"detailed", "compacted"})
+        return f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta><Instruct>{self.raw_pair[0]}</Instruct><Response>{self.raw_pair[1]}</Response>"""
 
     def dump_compated(self) -> str:
-        return self.model_dump_json(exclude={"detailed"})
+        # return self.model_dump_json(exclude={"detailed"})
+        return f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta><Instruct>{self.raw_pair[0]}</Instruct><Process>{self.compacted}</Process><Response>{self.raw_pair[1]}</Response>"""

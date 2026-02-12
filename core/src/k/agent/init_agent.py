@@ -2,6 +2,7 @@ import asyncio
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
@@ -173,9 +174,11 @@ async def edit_file(
     return await bash(
         ctx,
         f"python3 ~/skills/meta/edit_file/edit.py --filename {single_quote(filename)} --old-content {single_quote(old_content)} --new-content {single_quote(new_content)} "
-        + (f"--start-line {single_quote(str(start_line))}"
-        if start_line is not None
-        else ""),
+        + (
+            f"--start-line {single_quote(str(start_line))}"
+            if start_line is not None
+            else ""
+        ),
     )
 
 
@@ -214,34 +217,89 @@ async def handoff(
 
 bash_tool_prompt = """
 <BashInstruction>
-You have access to a Linux machine via bash shell.
-You can run commands on the machine using `bash` tools.
+You have access to a Linux machine via a bash shell, exposed through these tools:
+- `bash`: start a new session and run initial commands
+- `bash_input`: send more input to an existing session
+- `bash_wait`: wait for an existing session to produce more output / finish
+- `bash_interrupt`: interrupt an existing session
 
-`bash` always starts a new session and returns a `session_id`.
-Use that `session_id` with `bash_input`/`bash_wait`/`bash_interrupt`.
+Session model:
+- `bash` always returns a `session_id`. Use that `session_id` for follow-up calls.
+- If `exit_code` is `null`, the session is still running.
+- If `exit_code` is an `int`, the session has finished and is closed.
 
-You shouldn't use meaningless commands like `true` or `echo something` without further actions.
-
-If `exit_code` is null, the session is still running.
-If `exit_code` is an int, the session is finished and closed.
+Operating rules:
+- Do not run meaningless commands (e.g. `true`, `echo ...`) unless they are part of a real workflow.
+- If a command needs time, do not skip it—keep calling `bash_wait` until `exit_code` becomes non-null (or interrupt if necessary).
+- You do not have root access. If a command would require root, return the command(s) instead of trying to run them.
 </BashInstruction>
 """
+
+
+def concat_skills_md(base_path: str | Path) -> str:
+    """Scan <base_path>/skills/{core,meta}/*/SKILLS.md and concatenate contents.
+
+    Returns a single string which is the concatenation of all found SKILLS.md files,
+    separated by clear delimiters.
+    """
+    base_path = Path(base_path).expanduser().resolve()
+    skills_root = base_path / "skills"
+
+    chunks: list[str] = []
+
+    for group in ("core", "meta"):
+        group_root = skills_root / group
+        if not group_root.exists():
+            continue
+
+        for md in sorted(
+            group_root.glob("*/SKILLS.md"), key=lambda p: (p.parent.name, str(p))
+        ):
+            content = md.read_text()
+            chunks.append(
+                "\n".join(
+                    [
+                        f"# ===== ~/skills/{group}/{md.parent.name}/SKILLS.md =====",
+                        content.rstrip(),
+                        "",
+                    ]
+                )
+            )
+
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def concat_skills_prompt(ctx: RunContext[MyDeps]) -> str:
+    base_path = ctx.deps.config.fs_base
+    skills_md = concat_skills_md(base_path)
+    return f"<BasicSkills>{skills_md}</BasicSkills>"
+
 
 agent: Agent[MyDeps, HandoffEvent] = Agent(
     system_prompt=[
         bash_tool_prompt,
-        "You are a helpful AI agent that can use the provided tools and skills in ~/skills/ directory. "
-        "You should firstly understand the intention of the instruction, that may in the context of the recent memories' raw_pair. "
-        "If the intention is ambiguous, you should finish soon instead of starting the work. "
-
-        "Most env vars required by the skills are already set up for you. "
-        "If not, ask to provide them to set in the ~/.env file. "
-        "There is a `create_skill` tool available for you to create new skills. "
-        "You can install new softwares to /App and create new skills to use them. "
-        "/tmp is for you to use as temporary storage. ",
-
-        "After finishing your work, use the `finish` tool to end the loop. "
-        "You can finish with kind: `stuck` if you get stuck, even when the work is not finished. ",
+        "<General>\n"
+        "Role: You are a helpful AI agent that can use the provided tools and skills in `~/skills/`.\n"
+        "\n"
+        "How to operate:\n"
+        "- Determine the user's intent first (often clarified by the most recent memories). Memories are ordered oldest → newest.\n"
+        "- If the intent is ambiguous, do not start work; finish quickly and ask for clarification.\n"
+        "\n"
+        "Skills:\n"
+        "- First, use `file_search` under `~/skills/` to see whether a relevant skill already exists.\n"
+        "- Actively gather missing information using available `*_search` skills (e.g. `web_search`, `file_search`) instead of guessing.\n"
+        "- Assume required environment variables for existing skills are already set; do not double-check them.\n"
+        "- If a required environment variable is missing, ask the user to add it to `~/.env`.\n"
+        "- Use the `create_skill` tool to create new skills when needed.\n"
+        "\n"
+        "Software & storage:\n"
+        "- You may install software into `/App` or via a user-space package manager, then create skills to use it.\n"
+        "- Use `/tmp` for temporary storage.\n"
+        "\n"
+        "Completion:\n"
+        "- When done, call the `finish` tool to end the loop.\n"
+        "- If you cannot proceed, call `finish` with kind: `stuck` (even if the work is unfinished).\n",
+        "\n</General>",
     ],
     tools=[bash, bash_input, bash_wait, bash_interrupt, edit_file],
     deps_type=MyDeps,
@@ -278,13 +336,14 @@ async def agent_run(
     memory_string: str | None = None,
 ) -> tuple[HandoffEvent, list[ModelRequest | ModelResponse]]:
     async with MyDeps(config=config) as my_deps:
+        agent.system_prompt(concat_skills_prompt)
         res = await agent.run(
             model=model,
             deps=my_deps,
             user_prompt=(
+                f"<Memory>{memory_string}</Memory>" if memory_string else "",
                 f"<System>Datetime Now: {datetime.now()}</System>"
                 f"<Instruct>{instruct}</Instruct>",
-                f"<Memory>{memory_string}</Memory>" if memory_string else "",
             ),
         )
     msgs: list[ModelRequest | ModelResponse] = res.new_messages()
@@ -306,12 +365,13 @@ async def agent_run(
 async def main():
     from rich import print
 
-    from k.agent.memory.simple import JsonlMemoryRecordStore
+    # from k.agent.memory.simple import JsonlMemoryRecordStore
+    from k.agent.memory.folder import FolderMemoryStore
 
     config = Config()  # type: ignore
     model = "openai:gpt-5.2"
-    mem_store = JsonlMemoryRecordStore(
-        path="./mem.jsonl",
+    mem_store = FolderMemoryStore(
+        root=config.fs_base / "memories",
     )
     while True:
         instruct = input("\nEnter your instruction (or 'exit' to quit): ")
@@ -337,6 +397,7 @@ async def main():
         output, detailed = await agent_run(
             model, config, instruct, memory_string=mem_string
         )
+        print(output.text)
         raw_pair = (instruct, output.text)
         compacted = await run_compaction(
             model=model,
@@ -345,8 +406,8 @@ async def main():
         mem = MemoryRecord(
             raw_pair=raw_pair,
             compacted=compacted,
-            detailed=detailed,
             parents=[latest_mem] if latest_mem is not None else [],
+            detailed=detailed,
         )
         mem_store.append(mem)
         print(compacted)
