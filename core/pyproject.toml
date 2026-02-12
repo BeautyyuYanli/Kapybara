@@ -5,7 +5,7 @@ description = "Default template for PDM package"
 authors = [
     {name = "Yanli 盐粒", email = "yanli@dify.ai"},
 ]
-dependencies = ["pydantic>=2.12.5", "pydantic-settings>=2.12.0", "python-dotenv>=1.2.1", "logfire>=4.22.0", "rich>=14.3.2", "anyio>=4.12.1", "pydantic-ai-slim[openai]>=1.56.0", "uuid6>=2025.0.1"]
+dependencies = ["pydantic>=2.12.5", "pydantic-settings>=2.12.0", "python-dotenv>=1.2.1", "logfire>=4.22.0", "rich>=14.3.2", "anyio>=4.12.1", "pydantic-ai-slim[openai]>=1.56.0", "uuid6>=2025.0.1", "tiktoken>=0.12.0"]
 requires-python = "==3.14.*"
 readme = "README.md"
 license = {text = "MIT"}
