@@ -83,7 +83,7 @@ class MyDeps:
     input_event_kind: str
     start_event: Event | None = None
     bash_cmd_history: list[str] = field(default_factory=list)
-    count_down: int = 10
+    count_down: int = 6
     stuck_warning: int = 0
     stuck_warning_limit: int = 3
     basic_os_helper: BasicOSHelper = field(init=False)
