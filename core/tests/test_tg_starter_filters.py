@@ -2,6 +2,7 @@ import pytest
 
 from k.config import Config
 from k.starters.telegram import (
+    _expand_chat_id_watchlist,
     _poll_and_run_forever,
     chat_group_is_triggered,
     dispatch_groups_for_batch,
@@ -112,6 +113,51 @@ def test_dispatch_groups_for_batch_dispatches_all_groups_when_any_triggers() -> 
     assert sorted(grouped.keys()) == [1, 2]
 
 
+def test_dispatch_groups_for_batch_trigger_watchlist_includes_other_chats_on_dispatch() -> (
+    None
+):
+    updates = [
+        {
+            "update_id": 1,
+            "message": {"chat": {"id": 1, "type": "group"}, "text": "kapy hi"},
+        },
+        {
+            "update_id": 2,
+            "message": {"chat": {"id": 2, "type": "group"}, "text": "untriggered"},
+        },
+    ]
+    grouped = dispatch_groups_for_batch(
+        updates,
+        keyword="kapy",
+        chat_ids={1},
+        bot_user_id=None,
+        bot_username=None,
+    )
+    assert grouped is not None
+    assert sorted(grouped.keys()) == [1, 2]
+
+
+def test_dispatch_groups_for_batch_trigger_watchlist_requires_trigger_in_watchlist() -> (
+    None
+):
+    updates = [
+        {
+            "update_id": 1,
+            "message": {"chat": {"id": 2, "type": "group"}, "text": "kapy hi"},
+        },
+    ]
+    assert (
+        dispatch_groups_for_batch(
+            updates,
+            keyword="kapy",
+            chat_ids={1},
+            bot_user_id=None,
+            bot_username=None,
+        )
+        is None
+    )
+
+
 def test_dispatch_groups_for_batch_returns_none_when_no_trigger() -> None:
     updates = [
         {"update_id": 1, "message": {"chat": {"id": 1, "type": "group"}, "text": "hi"}},
@@ -127,6 +173,11 @@ def test_dispatch_groups_for_batch_returns_none_when_no_trigger() -> None:
         )
         is None
     )
+
+
+def test_expand_chat_id_watchlist_adds_supergroup_variants() -> None:
+    assert _expand_chat_id_watchlist({-1886218691}) == {-1886218691, -1001886218691}
+    assert _expand_chat_id_watchlist({-1001886218691}) == {-1886218691, -1001886218691}
 
 
 def test_group_updates_by_chat_id_groups_and_keeps_unknown_when_no_allowlist() -> None:

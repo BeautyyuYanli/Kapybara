@@ -16,15 +16,16 @@ Design notes / boundaries:
   and creates agent memories.
 - The starter tracks the latest consumed `update_id` in-memory only.
   - Restarts may reprocess updates that are still pending server-side.
-- The batch is filtered by a time window (`--time-window-seconds`) when a
-  Telegram `date` field is available. When at least one update in the time
-  window matches `--keyword`, the whole time-window batch is forwarded.
-- The forwarded batch is grouped by `chat.id` and a separate `agent_run` is
-  started for each chat group concurrently.
+- Updates are accumulated in-memory until a trigger condition is met. Once
+  triggered, the starter forwards *all pending* updates, grouped by `chat.id`,
+  and starts one background :func:`k.agent.core.agent_run` per chat group.
+  - When `--chat_id` is provided, it is treated as a *trigger watchlist*:
+    only updates from those chats can cause a trigger, but when a trigger
+    occurs, *all pending* updates (from any chat) are dispatched.
 
 Trigger rules:
-- If **any** update in the time-window batch triggers, the starter dispatches
-  **all** time-window updates (grouped by `chat.id`) concurrently.
+- If **any** pending update triggers, the starter dispatches **all** pending
+  updates (grouped by `chat.id`) concurrently.
 - Trigger conditions: keyword match, private chat, reply-to-bot, or @mention.
 """
 
@@ -33,7 +34,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +53,7 @@ from k.config import Config
 
 _TELEGRAM_API_BASE: Final[str] = "https://api.telegram.org"
 _ID_SPLIT_RE: Final[re.Pattern[str]] = re.compile(r"[,\s]+")
+_SUPERGROUP_ID_PREFIX: Final[str] = "100"
 _UPDATE_DATE_PATHS: Final[tuple[tuple[str, ...], ...]] = (
     ("message", "date"),
     ("edited_message", "date"),
@@ -113,6 +114,31 @@ _REPLY_TO_FROM_USERNAME_PATHS: Final[tuple[tuple[str, ...], ...]] = (
 
 class TelegramBotApiError(RuntimeError):
     """Raised when Telegram Bot API returns a non-ok response or invalid JSON."""
+
+def _expand_chat_id_watchlist(chat_ids: set[int]) -> set[int]:
+    """Expand a chat-id watchlist to be resilient to Telegram supergroup IDs.
+
+    Telegram supergroup/channel chat ids are often presented with a `-100...`
+    prefix (e.g. `-1001886218691`). It's easy to copy/paste the shorter
+    `-1886218691` form from other places. To reduce footguns, expand the
+    watchlist to include both forms when the number appears to be a supergroup
+    variant.
+    """
+
+    expanded: set[int] = set(chat_ids)
+    for chat_id in list(chat_ids):
+        if chat_id >= 0:
+            continue
+
+        abs_str = str(abs(chat_id))
+        if abs_str.startswith(_SUPERGROUP_ID_PREFIX) and len(abs_str) > 3:
+            expanded.add(-int(abs_str[3:]))
+            continue
+
+        expanded.add(-int(_SUPERGROUP_ID_PREFIX + abs_str))
+
+    return expanded
+
 
 
 def telegram_update_to_event(update: dict[str, Any]) -> Event:
@@ -314,6 +340,30 @@ def chat_group_is_triggered(
     return False
 
 
+def trigger_flags_for_updates(
+    updates: list[dict[str, Any]],
+    *,
+    keyword: str,
+    bot_user_id: int | None,
+    bot_username: str | None,
+) -> dict[str, bool]:
+    """Return which trigger conditions are present in an update list."""
+
+    return {
+        "keyword": any(update_matches_keyword(u, keyword=keyword) for u in updates),
+        "private": any(update_is_private_chat(u) for u in updates),
+        "mention": any(
+            update_mentions_bot(u, bot_username=bot_username) for u in updates
+        ),
+        "reply": any(
+            update_is_reply_to_bot(
+                u, bot_user_id=bot_user_id, bot_username=bot_username
+            )
+            for u in updates
+        ),
+    }
+
+
 def dispatch_groups_for_batch(
     updates: list[dict[str, Any]],
     *,
@@ -322,17 +372,36 @@ def dispatch_groups_for_batch(
     bot_user_id: int | None,
     bot_username: str | None,
 ) -> dict[int | None, list[dict[str, Any]]] | None:
-    """Return chat groups to dispatch, or None if no trigger occurred."""
+    """Return chat groups to dispatch, or None if no trigger occurred.
+
+    When `chat_ids` is provided, it acts as a trigger watchlist: only updates
+    from those chats are considered for trigger evaluation. If a trigger
+    occurs, the returned groups include *all* provided updates (regardless of
+    chat id).
+    """
+
+    trigger_updates = (
+        updates
+        if chat_ids is None
+        else [
+            u
+            for u in updates
+            if (cid := extract_chat_id(u)) is not None and cid in chat_ids
+        ]
+    )
+
+    if not trigger_updates:
+        return None
 
     if not chat_group_is_triggered(
-        updates,
+        trigger_updates,
         keyword=keyword,
         bot_user_id=bot_user_id,
         bot_username=bot_username,
     ):
         return None
 
-    grouped = group_updates_by_chat_id(updates, chat_ids=chat_ids)
+    grouped = group_updates_by_chat_id(updates, chat_ids=None)
     return grouped or None
 
 
@@ -622,12 +691,37 @@ async def _poll_and_run_forever(
                     updates,
                     last_processed_update_id=last_consumed_update_id,
                 )
+
+                seen_chat_ids = sorted(
+                    {
+                        cid
+                        for update in updates
+                        if (cid := extract_chat_id(update)) is not None
+                    }
+                )
+                chat_ids_preview = seen_chat_ids[:5] + (
+                    ["..."] if len(seen_chat_ids) > 5 else []
+                )
+                print(
+                    "[cyan]telegram recv[/cyan] "
+                    + f"updates={len(updates)} unseen={len(unseen_updates)} "
+                    + f"next_offset={next_offset} chats={chat_ids_preview or None}"
+                )
+
                 latest_observed_update_id = last_consumed_update_id
+                accepted = 0
+                watched = 0
                 for update in unseen_updates:
                     update_id = extract_update_id(update)
                     if update_id is None:
                         continue
+
                     pending_updates_by_id.setdefault(update_id, update)
+                    accepted += 1
+                    if chat_ids is not None:
+                        update_chat_id = extract_chat_id(update)
+                        if update_chat_id is not None and update_chat_id in chat_ids:
+                            watched += 1
                     if (
                         latest_observed_update_id is None
                         or update_id > latest_observed_update_id
@@ -636,16 +730,12 @@ async def _poll_and_run_forever(
                 if latest_observed_update_id is not None:
                     last_consumed_update_id = latest_observed_update_id
                     next_offset = last_consumed_update_id + 1
+                if accepted:
+                    print(
+                        "[cyan]telegram pending[/cyan] "
+                        + f"accepted={accepted} watched={watched if chat_ids is not None else None} pending={len(pending_updates_by_id)}"
+                    )
 
-            if not pending_updates_by_id:
-                continue
-
-            now_unix_seconds = int(time.time())
-            _prune_pending_updates_by_time_window(
-                pending_updates_by_id,
-                now_unix_seconds=now_unix_seconds,
-                window_seconds=time_window_seconds,
-            )
             if not pending_updates_by_id:
                 continue
 
@@ -653,16 +743,9 @@ async def _poll_and_run_forever(
                 pending_updates_by_id[update_id]
                 for update_id in sorted(pending_updates_by_id)
             ]
-            batch_updates = filter_updates_in_time_window(
-                pending_updates_in_order,
-                now_unix_seconds=now_unix_seconds,
-                window_seconds=time_window_seconds,
-            )
-            if not batch_updates:
-                continue
 
             grouped = dispatch_groups_for_batch(
-                batch_updates,
+                pending_updates_in_order,
                 keyword=keyword,
                 chat_ids=chat_ids,
                 bot_user_id=bot_user_id,
@@ -671,7 +754,31 @@ async def _poll_and_run_forever(
             if not grouped:
                 continue
 
-            # Clear pending only when dispatching a triggered time-window batch.
+            flags = trigger_flags_for_updates(
+                pending_updates_in_order,
+                keyword=keyword,
+                bot_user_id=bot_user_id,
+                bot_username=bot_username,
+            )
+            reasons = ",".join([k for k, v in flags.items() if v]) or "unknown"
+            print(
+                "[green]telegram trigger[/green] "
+                + f"pending={len(pending_updates_in_order)} groups={len(grouped)} reasons={reasons}"
+            )
+            for cid, updates_for_chat in grouped.items():
+                ids = [
+                    uid
+                    for update in updates_for_chat
+                    if (uid := extract_update_id(update)) is not None
+                ]
+                id_span = f"{min(ids)}..{max(ids)}" if ids else "?"
+                prefix = f"[chat_id={cid}]" if cid is not None else "[chat_id=?]"
+                print(
+                    "[green]telegram dispatch[/green] "
+                    + f"{prefix} updates={len(updates_for_chat)} update_id={id_span}"
+                )
+
+            # Clear pending only when dispatching a triggered batch.
             pending_updates_by_id.clear()
 
             for cid, updates_for_chat in grouped.items():
@@ -745,7 +852,7 @@ async def main() -> None:
             chat_ids = {int(p) for p in parts}
         except ValueError as e:
             raise ValueError(f"Invalid --chat_id entry in: {raw_chat_ids!r}") from e
-
+        chat_ids = _expand_chat_id_watchlist(chat_ids)
     await _poll_and_run_forever(
         config=config,
         model_name=args.model_name,
