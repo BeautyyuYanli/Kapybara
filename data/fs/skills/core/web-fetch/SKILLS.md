@@ -1,6 +1,6 @@
 ---
 name: web-fetch
-description: Fetch a single URL via Jina AI Reader (r.jina.ai) and return clean text.
+description: Fetch one or more URLs via Jina AI Reader.
 ---
 
 ## Upstream dependency
@@ -13,11 +13,12 @@ description: Fetch a single URL via Jina AI Reader (r.jina.ai) and return clean 
 Env: `JINA_AI_KEY`.
 
 ```bash
+# Single URL
 target='https://example.com/page'
-url="https://r.jina.ai/${target}"
-out=/tmp/web-fetch_${RANDOM}.txt
-curl -sS "$url" -H "Authorization: Bearer $JINA_AI_KEY" -H 'Accept: text/plain' -o "$out"
-sed -n '1,120p' "$out"
+./fetch.py "$target" --out-dir /tmp/my-fetch
+
+# Multiple URLs (parallel)
+./fetch.py https://url1.com https://url2.com --out-dir /tmp/my-fetches
 ```
 
 You may need to wait longer for this command to complete.
