@@ -337,6 +337,11 @@ def chat_group_is_triggered(
             update, bot_user_id=bot_user_id, bot_username=bot_username
         ):
             return True
+        # Check if it is a reply to ANY bot in the group (useful if there are multiple agent bots)
+        reply_to = update.get("message", {}).get("reply_to_message")
+        if reply_to and reply_to.get("from", {}).get("is_bot"):
+             return True
+
     return False
 
 
@@ -356,9 +361,9 @@ def trigger_flags_for_updates(
             update_mentions_bot(u, bot_username=bot_username) for u in updates
         ),
         "reply": any(
-            update_is_reply_to_bot(
-                u, bot_user_id=bot_user_id, bot_username=bot_username
-            )
+            # Also count "reply to any bot" as a reply trigger for flags
+            update_is_reply_to_bot(u, bot_user_id=bot_user_id, bot_username=bot_username)
+            or (u.get("message", {}).get("reply_to_message", {}).get("from", {}).get("is_bot") is True)
             for u in updates
         ),
     }
@@ -499,7 +504,7 @@ class TelegramBotApi:
             "timeout": timeout_seconds,
             # Telegram `getUpdates` `limit` is capped (commonly 100). Use the
             # maximum to drain pending updates without needing a CLI knob.
-            "limit": 100,
+            "limit": 10,
         }
         if offset is not None:
             params["offset"] = offset
