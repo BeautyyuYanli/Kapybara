@@ -59,8 +59,6 @@ RG_MATCH_FLAGS=(--no-line-number --with-filename)
 mkdir -p "$OUT"
 
 # Route A1: by chat.id (and kind=telegram)
-# Note: In the memory store, Telegram updates often appear *nested inside an escaped string*.
-# The regexes below intentionally allow any number of backslashes before quotes.
 KIND_RE='"kind"[[:space:]]*:[[:space:]]*"telegram"'
 CHAT_RE='\\*"chat\\*"[[:space:]]*:[[:space:]]*\{[[:space:]]*\\*"id\\*"[[:space:]]*:[[:space:]]*'"${CHAT_ID}"
 FROM_RE='\\*"from\\*"[[:space:]]*:[[:space:]]*\{[[:space:]]*\\*"id\\*"[[:space:]]*:[[:space:]]*'"${FROM_ID}"
@@ -81,6 +79,11 @@ if [[ -n "$KW" ]]; then
   } || true &
 else
   : > "$OUT/by_kw.txt"
+fi
+# Route A4: Preferences
+PREF_FILE="$HOME/preferences/telegram/by_chat/${CHAT_ID}.md"
+if [[ -f "$PREF_FILE" ]]; then
+  { echo "Preference content in ~/preferences/telegram/by_chat/${CHAT_ID}.md"; cat "$PREF_FILE"; echo "---"; } > "$OUT/preference.txt"
 fi
 
 wait
