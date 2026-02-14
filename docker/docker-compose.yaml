@@ -13,3 +13,5 @@ services:
     volumes:
       - ../data/fs:/home/k
       - ../core:/core
+    ports:
+      - "${SSH_HOST_PORT:-2222}:22"
