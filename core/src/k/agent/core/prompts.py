@@ -146,7 +146,9 @@ SOP_prompt = """
 3) Decide whether to respond / jump in (see `<IntentInstruct>`). If you decide not to respond, it is OK to ignore and finish without replying.
 4) Check whether the required skills exist for the decided intent(s) (use `meta/search-skills`).
 5) Fulfill the intent(s) using the appropriate tools/skills.
-   - Send progress status if the process takes a long while, using the channel identified in step (1) (see `<ResponseInstruct>`).
+   - If the work is expected to take a long while, send a short ack **before** doing heavy work, using the channel identified in step (1) (see `<ResponseInstruct>`).
+   - If the system explicitly asks you to report progress, send a timely progress update using the same channel (see `<ResponseInstruct>`).
+   - For long-running work, send progress status updates when appropriate using the same channel (see `<ResponseInstruct>`).
 6) Send any required responses using the channel identified in step (1) (see `<ResponseInstruct>`).
 7) If the work involves a newly installed app or can be packaged as a reusable workflow, create a new skill in an appropriate group (create the group if needed).
 8) Generate the final structured summary by calling `FinishAction`.
