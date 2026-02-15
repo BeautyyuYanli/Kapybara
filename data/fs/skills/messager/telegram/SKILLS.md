@@ -1,5 +1,5 @@
 ---
-name: telegram
+name: messager/telegram
 description: Uses curl to call the Telegram Bot API for the handful of methods we actually use.
 ---
 
@@ -42,6 +42,34 @@ curl -sS -X POST "$BASE/sendMessage" \
   --data-urlencode text="$MSG" \
   -d parse_mode=HTML \
   -d disable_web_page_preview=true
+```
+
+## sendViaTelegraph
+
+Use this to publish long/structured content to Telegra.ph and send the link to Telegram.
+
+Env:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAPH_ACCESS_TOKEN`
+
+```bash
+CHAT_ID=123456789
+
+# This script creates a page AND sends the link to the specified chat automatically.
+# You do NOT need to call sendMessage afterwards; the script handles the delivery.
+./send_via_telegraph "<h3>HTML content here</h3>" \
+  --chat-id "$CHAT_ID" \
+  --title "Page Title"
+```
+
+## sendDocument
+
+```bash
+CHAT_ID=123
+FILE_PATH="/path/to/file.txt"
+CAPTION="Here is the file"
+
+~/skills/messager/telegram/send_document.py "$FILE_PATH" --chat-id "$CHAT_ID" --caption "$CAPTION"
 ```
 
 ## sendPhoto
@@ -114,3 +142,10 @@ curl -sS -X POST "$BASE/deleteMessage" \
 - Prefer `--data-urlencode text=...` so newlines / special chars are encoded correctly.
 - For formatting, `parse_mode=HTML` is usually easier than `MarkdownV2` (less escaping).
 - In shell scripts, using `cat <<'HTML'` (heredoc) allows direct use of newlines; typing `\n` literally will result in literal backslashes rather than a line break.
+
+
+## Important Note on HTML Sanitization
+When using `sendMessage` with `parse_mode=HTML`:
+- Always HTML-escape the content variables (like filenames or user-provided strings) before including them in the message.
+- Unescaped characters like `<` or `>` will cause the Telegram API to reject the message, often resulting in "blank" displays or delivery failures in certain clients if the tag is interpreted incorrectly.
+- Example: If you are mentioning a file path, ensure `/path/to/<file>` becomes `/path/to/&lt;file&gt;`.

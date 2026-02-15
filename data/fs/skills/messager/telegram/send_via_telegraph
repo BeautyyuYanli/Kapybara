@@ -1,0 +1,126 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["requests", "beautifulsoup4", "lxml"]
+# ///
+
+import os
+import sys
+import json
+import requests
+import argparse
+from bs4 import BeautifulSoup, NavigableString
+
+def html_to_node(element):
+    """
+    Converts a BeautifulSoup element (or NavigableString) to a Telegra.ph Node.
+    """
+    if isinstance(element, NavigableString):
+        return str(element)
+    
+    node = {"tag": element.name}
+    
+    # Allowed tags in Telegra.ph
+    allowed_tags = ['a', 'aside', 'b', 'blockquote', 'br', 'code', 'em', 'figcaption', 'figure', 'h3', 'h4', 'hr', 'i', 'iframe', 'img', 'li', 'ol', 'p', 'pre', 's', 'strong', 'u', 'ul', 'video']
+    if element.name not in allowed_tags:
+        node["tag"] = "p" # fallback to paragraph if tag not supported
+
+    # Allowed attributes in Telegra.ph: href, src
+    attrs = {}
+    if element.name == "a" and element.has_attr("href"):
+        attrs["href"] = element["href"]
+    if element.name in ["img", "video"] and element.has_attr("src"):
+        attrs["src"] = element["src"]
+    
+    if attrs:
+        node["attrs"] = attrs
+        
+    children = []
+    for child in element.children:
+        child_node = html_to_node(child)
+        if child_node:
+            children.append(child_node)
+            
+    if children:
+        node["children"] = children
+        
+    return node
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("content", help="The HTML content to publish")
+    parser.add_argument("--chat-id", required=True, help="Telegram Chat ID to send the link to")
+    parser.add_argument("--title", default="Note", help="Telegra.ph page title")
+    args = parser.parse_args()
+
+    telegraph_token = os.environ.get("TELEGRAPH_ACCESS_TOKEN")
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+    if not telegraph_token:
+        print("Error: TELEGRAPH_ACCESS_TOKEN not set", file=sys.stderr)
+        sys.exit(1)
+    if not tg_token:
+        print("Error: TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
+        sys.exit(1)
+
+    # 1. Create Telegra.ph page
+    soup = BeautifulSoup(args.content, "lxml")
+    body = soup.body
+    if not body:
+        nodes = [args.content]
+    else:
+        nodes = []
+        for child in body.children:
+            node = html_to_node(child)
+            if node and node != '\n':
+                nodes.append(node)
+
+    api_url = "https://api.telegra.ph/createPage"
+    data = {
+        "access_token": telegraph_token,
+        "title": args.title,
+        "content": json.dumps(nodes),
+        "return_content": False
+    }
+
+    try:
+        r = requests.post(api_url, data=data)
+        r.raise_for_status()
+        res = r.json()
+        if not res.get("ok"):
+            print(f"Telegraph Error: {res.get('error')}", file=sys.stderr)
+            sys.exit(1)
+        
+        page_url = res["result"]["url"]
+        
+        # 2. Send link to Telegram
+        tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+        
+        message_text = page_url
+        
+        tg_data = {
+            "chat_id": args.chat_id,
+            "text": message_text.strip(),
+            "parse_mode": "HTML",
+            "link_preview_options": json.dumps({
+                "url": page_url,
+                "prefer_large_media": True
+            })
+        }
+        
+        tg_r = requests.post(tg_url, data=tg_data)
+        tg_r.raise_for_status()
+        tg_res = tg_r.json()
+        
+        if tg_res.get("ok"):
+            print(page_url)
+        else:
+            print(f"Telegram Error: {tg_res.get('description')}", file=sys.stderr)
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"Exception: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
