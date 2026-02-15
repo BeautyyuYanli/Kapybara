@@ -1,9 +1,9 @@
 ---
-name: telegram-context
+name: context/telegram
 description: Optimizes Telegram context/memory retrieval for speed and accuracy without building indexes.
 ---
 
-# telegram-context
+# context/telegram
 
 This skill is a lightweight, **no-index** workflow for retrieving relevant context from the local `~/memories/records` store when replying on Telegram.
 
@@ -28,7 +28,7 @@ The recommended entrypoint is the bundled **Stage A** script, which does a paral
 
 Notes:
 - The script forces ripgrep output to **not** include line numbers.
-- `--n` controls how many lines are kept per route (chat / user / kw). Default: `10`.
+- `--n` controls how many lines are kept per route (chat / user / kw). Default: `7`.
 
 ### Example
 

@@ -202,12 +202,15 @@ async def read_media(
     results = []
     for s in media_contents:
         if s.url_or_path.startswith("http://") or s.url_or_path.startswith("https://"):
-            content = MultiModalContentAdapter.validate_python(
-                {
-                    "kind": s.kind + "-url",
-                    "url": s.url_or_path,
-                }
-            )
+            try:
+                content = MultiModalContentAdapter.validate_python(
+                    {
+                        "kind": s.kind + "-url",
+                        "url": s.url_or_path,
+                    }
+                )
+            except Exception as e:
+                raise ModelRetry(f"Failed to load URL {s.url_or_path}: {e}")
         else:
             try:
                 content = BinaryContent.from_path(Path(s.url_or_path))
@@ -215,7 +218,10 @@ async def read_media(
                 raise ModelRetry(f"Failed to read file {s.url_or_path}: {e}") from e
 
         results.append(content)
-    return results
+    try:
+        return results
+    except Exception as e:
+        raise ModelRetry(f"Failed to process media contents: {e}")
 
 
 def _read_persona_override(fs_base: Path) -> str:
