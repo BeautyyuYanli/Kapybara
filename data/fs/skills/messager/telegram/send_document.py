@@ -4,29 +4,50 @@
 # dependencies = ["requests"]
 # ///
 
+"""Send a document via the Telegram Bot API.
+
+This script is intentionally minimal and is used by the `messager/telegram`
+skill docs. It prints the Telegram API JSON response to stdout as compact
+UTF-8 JSON (no ASCII `\\uXXXX` escaping) so it can be pasted into LLM prompts
+without extra whitespace or ANSI control codes.
+"""
+
+import json
 import os
 import sys
-import requests
 import argparse
 
-def send_document(chat_id, file_path, caption=None):
+import requests
+
+
+def _json_dumps(obj: object) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def send_document(chat_id: str, file_path: str, caption: str | None = None) -> dict:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        print("Error: TELEGRAM_BOT_TOKEN not set.")
-        sys.exit(1)
-    
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+
     url = f"https://api.telegram.org/bot{token}/sendDocument"
-    
-    with open(file_path, 'rb') as f:
-        data = {'chat_id': chat_id}
+
+    with open(file_path, "rb") as f:
+        data: dict[str, str] = {"chat_id": chat_id}
         if caption:
-            data['caption'] = caption
-            data['parse_mode'] = 'HTML'
-        
-        files = {'document': f}
-        response = requests.post(url, data=data, files=files)
+            data["caption"] = caption
+            data["parse_mode"] = "HTML"
+
+        files = {"document": f}
+        response = requests.post(url, data=data, files=files, timeout=30)
+
+    # Telegram sometimes returns a 200 with {"ok": false, ...}; treat that as a failure.
+    payload = response.json()
+    if response.status_code >= 400:
         response.raise_for_status()
-        return response.json()
+    if not payload.get("ok", False):
+        desc = payload.get("description") or payload.get("error") or "unknown error"
+        raise RuntimeError(f"Telegram API error: {desc}")
+    return payload
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Send a document via Telegram Bot API")
@@ -38,7 +59,10 @@ if __name__ == "__main__":
     
     try:
         result = send_document(args.chat_id, args.file_path, args.caption)
-        print("Success!")
+        print(_json_dumps(result))
+    except requests.RequestException as e:
+        print(f"Request error: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
