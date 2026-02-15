@@ -36,18 +36,27 @@ Notes:
 ~/skills/context/telegram/stage_a.sh \
   --chat-id 567113516 \
   --from-id 567113516 \
-  --kw 'retrieve-memory|neighborhood.py|telegram-context' \
+  --kw 'retrieve-memory|telegram-context' \
 ```
 
 ### Output
 
 - Writes intermediate files into `--out` (default `/tmp/tg_ctx/`):
   - `by_chat.txt`, `by_user.txt`, `by_kw.txt`
-- Prints a de-duped, path-sorted candidate list on stdout.
+- Prints a de-duped, id-sorted candidate list on stdout (1 line per memory id).
+
+Columns (TSV):
+`id`, `routes`, `matched_detailed_line`
+
+Notes:
+- `routes` is a comma-separated list of which routes matched (`chat`, `user`, `kw`).
+- `matched_detailed_line` is only present when `--kw` is provided (the `kw` route).
 
 ## Follow-ups (manual)
 
 Once you have candidate record paths/IDs:
-- Open a candidate `.core.json` to read the actual content.
-- If you need higher-signal traces, search matching `.compacted.json`.
-- If you need more surrounding context, expand via `~/skills/meta/retrieve-memory/neighborhood.py`.
+- Open a candidate `.core.json` to read metadata + `compacted` (one line).
+- Open the sibling `.detailed.jsonl` to see the raw `input` (line 1), record
+  `output` (line 2), and simplified tool calls (line 3, a JSON array on one line).
+  This file can be verbose; prefer reading just the first few lines
+  instead of loading the whole file.

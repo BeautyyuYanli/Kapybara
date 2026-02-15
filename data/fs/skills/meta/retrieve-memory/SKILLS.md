@@ -7,9 +7,14 @@ description: Works with the local ~/memories store.
 
 ## What it is
 - `~/memories` is a local memory store
-- **record files** (`~/memories/records/YYYY/MM/DD/HH/<id>.core.json`) that store one conversation memory each.
-- **compacted sidecars** (`~/memories/records/YYYY/MM/DD/HH/<id>.compacted.json`) that store only the `compacted` field (JSON array of strings). This keeps the primary record file small and easy to scan.
-- `compacted` is the **working logs** for the corresponding conversation: a chronological list of concise steps extracted from the agent’s tool traces (what was done, why, and the outcome). It is typically **more verbose** than the core record file.
+- **core record files** (`~/memories/records/YYYY/MM/DD/HH/<id>.core.json`) that store one conversation memory each (one JSON object per line), including metadata and `compacted`.
+- **detailed record files** (`~/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl`) that store high-signal raw context as JSONL:
+  - line 1: the raw `input` (JSON string)
+  - line 2: the record `output` (JSON string)
+  - line 3: simplified tool calls (JSON array, one line)
+- `*.detailed.jsonl` can still be verbose (raw `input` and `output` may be large).
+  Prefer **partial reads** instead of loading whole files.
+- `compacted` is the **working log** for the conversation: a chronological list of concise steps extracted from the agent’s tool traces (what was done, why, and the outcome).
 
 A record is defined as:
 ```
@@ -33,34 +38,17 @@ Combined with `core/file-search` skill for searching.
 
 ### Search by keywords
 ```bash
-# sort in path order to get newest first
-rg -n --sort path -g "*.core.json" 'weather|天气|forecast' ~/memories/records | head -n 10
+# Search the detailed files (raw input + output + tool calls).
+rg -n --sort path -g "*.detailed.jsonl" 'weather|天气|forecast' ~/memories/records | head -n 10
 ```
 
-### Search compacted steps (the sidecar files)
+### Read only the beginning of a detailed file
 ```bash
-rg -n --sort path -g "*.compacted.json" 'ffmpeg|telegram|fish' ~/memories/records | head -n 10
+# Just the first 3 lines: input, output, tool_calls
+head -n 3 ~/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl
 ```
 
-### Get memory neighborhood (related records via parents/children) up to N levels
-The `parents` / `children` fields form a graph that links related memory records.
-
-Here, a record’s “neighborhood” means: **all records reachable from a starting record by following `parents` and/or `children` links up to N steps** (inclusive), plus the starting record itself.
-
-- `parents`: IDs of the record(s) this memory was derived from / depends on (e.g., the earlier memory you continued from, summarized, or referenced).
-- `children`: IDs of records that were created later and explicitly link back to this record (e.g., follow-ups, refinements, or downstream summaries).
-
-This helper traverses **both directions** (ancestors + descendants) via BFS, up to depth `N`.
-
-Sidecar script:
-- `~/skills/meta/retrieve-memory/neighborhood.py` (PEP 723; runnable directly)
-
+### Search compacted steps (the core files)
 ```bash
-id='<memory_id>'
-N=3
-~/skills/meta/retrieve-memory/neighborhood.py --id "$id" --levels "$N"
+rg -n --sort path -g "*.core.json" 'ffmpeg|telegram|fish' ~/memories/records | head -n 10
 ```
-
-Notes:
-- Output format is NDJSON (one JSON record per line).
-- Results are sorted by chronological order (older → newer).

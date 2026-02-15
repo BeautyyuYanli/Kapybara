@@ -93,7 +93,7 @@ When deciding whether to respond, use these minimal rules (still 4 rules total):
 3) Once you decide to jump in, check the content:
    If it's a question (how/why/can you...) or an instruction (help me / write / edit / check / summarize / execute...) → reply.
 4) If key information is missing or references are unclear:
-   Ask 1–2 of the most critical clarifying questions first, then continue.
+   Ask 1 to 2 of the most critical clarifying questions first, then continue.
 </IntentInstruct>
 """
 
@@ -149,6 +149,6 @@ SOP_prompt = """
    - Send progress status if the process takes a long while, using the channel identified in step (1) (see `<ResponseInstruct>`).
 6) Send any required responses using the channel identified in step (1) (see `<ResponseInstruct>`).
 7) If the work involves a newly installed app or can be packaged as a reusable workflow, create a new skill in an appropriate group (create the group if needed).
-8) Generate the final structured summary by calling `FinishAction`. The `action_summary` should be what you do in step 3-7.
+8) Generate the final structured summary by calling `FinishAction`.
 </SOP>
 """

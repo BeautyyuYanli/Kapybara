@@ -26,12 +26,24 @@ def test_folder_store_get_latest_and_get_by_id(tmp_path) -> None:
     r1_path = root / "records" / "2026" / "01" / "01" / "00" / f"{r1.id_}.core.json"
     assert r1_path.exists()
     assert (root / "order.jsonl").exists()
-    assert '"compacted"' not in r1_path.read_text(encoding="utf-8")
-    r1_compacted_path = (
-        root / "records" / "2026" / "01" / "01" / "00" / f"{r1.id_}.compacted.json"
+    core_payload = json.loads(r1_path.read_text(encoding="utf-8"))
+    assert core_payload["compacted"] == ["c1"]
+    assert "input" not in core_payload
+    assert "output" not in core_payload
+    assert "detailed" not in core_payload
+
+    r1_detailed_path = (
+        root / "records" / "2026" / "01" / "01" / "00" / f"{r1.id_}.detailed.jsonl"
     )
-    assert r1_compacted_path.exists()
-    assert json.loads(r1_compacted_path.read_text(encoding="utf-8")) == ["c1"]
+    assert r1_detailed_path.exists()
+    detailed_lines = r1_detailed_path.read_text(encoding="utf-8").splitlines()
+    assert json.loads(detailed_lines[0]) == "i1"
+    assert json.loads(detailed_lines[1]) == "o1"
+    assert json.loads(detailed_lines[2]) == []
+
+    assert not (
+        root / "records" / "2026" / "01" / "01" / "00" / f"{r1.id_}.compacted.json"
+    ).exists()
 
     r2 = MemoryRecord(
         kind="test",
@@ -187,7 +199,7 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
     assert store.get_latest() == r2.id_
 
 
-def test_folder_store_rebuild_order_ignores_compacted_sidecars(tmp_path) -> None:
+def test_folder_store_rebuild_order_ignores_detailed_files(tmp_path) -> None:
     root = tmp_path / "mem"
     store = FolderMemoryStore(root)
 
@@ -202,7 +214,7 @@ def test_folder_store_rebuild_order_ignores_compacted_sidecars(tmp_path) -> None
     store.append(r1)
 
     # Simulate a missing index file; the store should rebuild the order from
-    # record files without treating *.compacted.json sidecars as records.
+    # record files without treating `*.detailed.jsonl` as a record file.
     (root / "order.jsonl").unlink()
 
     rebuilt = FolderMemoryStore(root)

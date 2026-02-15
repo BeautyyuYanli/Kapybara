@@ -18,10 +18,18 @@ from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import cast, Literal
+from typing import Literal, cast
 
 from pydantic import BaseModel, TypeAdapter
-from pydantic_ai import Agent, ModelMessage, MultiModalContent, RunContext, ToolOutput, ModelRetry, BinaryContent
+from pydantic_ai import (
+    Agent,
+    BinaryContent,
+    ModelMessage,
+    ModelRetry,
+    MultiModalContent,
+    RunContext,
+    ToolOutput,
+)
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -31,6 +39,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import KnownModelName, Model
 
+from k.agent.core.entities import Event, MemoryHint, finish_action
 from k.agent.core.prompts import (
     SOP_prompt,
     bash_tool_prompt,
@@ -48,7 +57,6 @@ from k.agent.core.shell_tools import (
     edit_file,
 )
 from k.agent.core.skills_md import concat_skills_md, maybe_load_kind_skill_md
-from k.agent.core.entities import Event, MemoryHint, finish_action
 from k.agent.memory.compactor import run_compaction
 from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
@@ -173,17 +181,21 @@ async def fork(
         )
 
 
-MultiModalContentAdapter= TypeAdapter(MultiModalContent)
+MultiModalContentAdapter = TypeAdapter(MultiModalContent)
+
+
 class MediaContent(BaseModel):
     kind: Literal["image", "video", "audio", "document"]
     url_or_path: str
+
+
 async def read_media(
     ctx: RunContext[MyDeps],
     media_contents: list[MediaContent],
 ) -> list[MultiModalContent]:
     """
     Read media files from urls or local file paths
-    
+
     Args:
     - `media_contents`: a list of MediaContent, each containing a `kind` (e.g. "image", "video", "audio", "document") and a `url_or_path` (either a URL or a local file path)
     """
@@ -198,9 +210,9 @@ async def read_media(
             )
         else:
             try:
-                content = BinaryContent.from_path(s.url_or_path)
+                content = BinaryContent.from_path(Path(s.url_or_path))
             except Exception as e:
-                raise ModelRetry(f"Failed to read file {s.url_or_path}: {e}")
+                raise ModelRetry(f"Failed to read file {s.url_or_path}: {e}") from e
 
         results.append(content)
     return results
@@ -210,7 +222,8 @@ def _read_persona_override(fs_base: Path) -> str:
     """Load an optional persona override from `fs_base/PERSONA.md`.
 
     Returns:
-        The file contents (trimmed) when present and non-empty; otherwise `None`.
+        The override file contents (trimmed) when present and non-empty;
+        otherwise the default `persona_prompt`.
 
     Notes:
         This helper is intentionally forgiving: missing/unreadable files are
@@ -222,11 +235,12 @@ def _read_persona_override(fs_base: Path) -> str:
     except FileNotFoundError:
         try:
             text = (fs_base / "PERSONA.default.md").read_text(encoding="utf-8").strip()
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError, OSError:
             return ""
     except OSError:
         return ""
     return text or "" 
+
 
 agent = Agent(
     system_prompt=[
@@ -258,6 +272,7 @@ def general_system_prompt() -> str:
 @agent.system_prompt
 def sop_system_prompt() -> str:
     return SOP_prompt
+
 
 @agent.system_prompt
 def concat_skills_prompt(ctx: RunContext[MyDeps]) -> str:
@@ -360,16 +375,17 @@ async def agent_run(
     mem = MemoryRecord(
         input=instruct.content,
         compacted=compacted,
-        output=output_hint.model_dump_json(),
+        output=output_hint.model_dump_json(exclude={"referenced_memory_ids"}),
         parents=list(set(parent_memories + ref_mem)),
         detailed=msgs,
         kind=instruct.kind,
     )
-    return output_hint.model_dump_json(), mem
+    return output_hint.model_dump_json(exclude={"referenced_memory_ids"}), mem
 
 
 if __name__ == "__main__":
     import asyncio
+
     import logfire
     from pydantic_ai.models.openrouter import OpenRouterModel
 
@@ -377,9 +393,14 @@ if __name__ == "__main__":
     logfire.instrument_pydantic_ai()
 
     async def main():
-        config = Config(fs_base=Path("./data/fs"), basic_os_port=2222, basic_os_addr="localhost")
+        config = Config(
+            fs_base=Path("./data/fs"), basic_os_port=2222, basic_os_addr="localhost"
+        )
         memory_store = FolderMemoryStore(config.fs_base / "memories")
-        instruct = Event(kind="test", content="use `read_media` tool to read image and describe them to ~/image.txt : 1. https://fastly.picsum.photos/id/59/536/354.jpg?hmac=HQ1B2iVRsA2r75Mxt18dSuJa241-Wggf0VF9BxKQhPc \n 2. ./data/fs/961-536x354.jpg")
+        instruct = Event(
+            kind="test",
+            content="use `read_media` tool to read image and describe them to ~/image.txt : 1. https://fastly.picsum.photos/id/59/536/354.jpg?hmac=HQ1B2iVRsA2r75Mxt18dSuJa241-Wggf0VF9BxKQhPc \n 2. ./data/fs/961-536x354.jpg",
+        )
         output, mem = await agent_run(
             model=OpenRouterModel("google/gemini-3-flash-preview"),
             config=config,

@@ -6,11 +6,14 @@ index file.
 Layout (relative to `root`):
 - `order.jsonl`: one JSON object per non-empty line (append order), storing the
   record id, `created_at`, and relative path.
-- `records/YYYY/MM/DD/HH/<id>.core.json`: one JSON blob per record (pydantic dump,
-  excluding `detailed` and `compacted`), organized by `created_at`.
-- `records/YYYY/MM/DD/HH/<id>.compacted.json`: a sidecar JSON file containing
-  only the record's `compacted` field (a JSON array of strings). Missing sidecars
-  are treated as `compacted=[]` for backward compatibility.
+- `records/YYYY/MM/DD/HH/<id>.core.json`: one JSON blob per record (one line),
+  storing record metadata and `compacted`.
+- `records/YYYY/MM/DD/HH/<id>.detailed.jsonl`: a JSONL file (one JSON value per
+  non-empty line). Line 1 is the raw `input` (a JSON string). Line 2 is the
+  record `output` (a JSON string). Line 3 is a JSON array of simplified tool
+  call parts extracted from the run's `ModelResponse` messages. Each element is
+  an object with only `tool_name` and `args`. `ModelRequest` messages and full
+  `ModelResponse` objects are not persisted in this detailed file.
 
 Design notes / invariants:
 - "Latest" means the last id in `order.jsonl` (append order), not necessarily the
@@ -32,7 +35,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
+from pydantic_ai.messages import BaseToolCallPart, ModelResponse
 
 from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.store import (
@@ -54,6 +58,287 @@ class _OrderEntry:
     id_: str
     created_at: datetime
     relpath: str
+
+
+_CORE_FIELDS: set[str] = {
+    "created_at",
+    "kind",
+    "id_",
+    "parents",
+    "children",
+    "compacted",
+}
+
+
+class _CoreRecordOnDisk(BaseModel):
+    """On-disk schema for `<id>.core.json` in the split core/detailed format."""
+
+    created_at: datetime
+    kind: str
+    id_: str
+    parents: list[str] = Field(default_factory=list)
+    children: list[str] = Field(default_factory=list)
+    compacted: list[str] = Field(default_factory=list)
+
+
+def _compacted_sidecar_path_for_record_path(record_path: Path) -> Path:
+    """Return the legacy `*.compacted.json` sidecar path for `record_path`."""
+
+    name = record_path.name
+    if name.endswith(".core.json"):
+        record_id = name[: -len(".core.json")]
+    elif name.endswith(".json") and not name.endswith(".detailed.json"):
+        record_id = name[: -len(".json")]
+    else:
+        raise ValueError(f"Unexpected record filename: {record_path}")
+    return record_path.with_name(f"{record_id}.compacted.json")
+
+
+def _read_detailed_file(
+    path: Path, *, encoding: str
+) -> tuple[str, str, list[dict[str, object]]]:
+    """Read `<id>.detailed.jsonl` JSONL as `(input, output, tool_calls)`."""
+
+    try:
+        lines = path.read_text(encoding=encoding).splitlines()
+    except OSError as e:
+        raise ValueError(f"Failed to read detailed file: {path}: {e}") from e
+
+    input_line_no: int | None = None
+    input_value: str | None = None
+    output_line_no: int | None = None
+    output_value: str | None = None
+    tool_calls_line_no: int | None = None
+    tool_calls_value: list[dict[str, object]] | None = None
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if input_value is None:
+            input_line_no = line_no
+            try:
+                decoded = json.loads(line)
+            except ValueError as e:
+                raise ValueError(f"Invalid JSON at {path}:{line_no}: {e}") from e
+            if not isinstance(decoded, str):
+                raise ValueError(
+                    f"Invalid detailed file at {path}:{line_no}: first JSON value must be a string"
+                )
+            input_value = decoded
+            continue
+
+        if output_value is None:
+            output_line_no = line_no
+            try:
+                decoded = json.loads(line)
+            except ValueError as e:
+                raise ValueError(f"Invalid JSON at {path}:{line_no}: {e}") from e
+            if not isinstance(decoded, str):
+                raise ValueError(
+                    f"Invalid detailed file at {path}:{line_no}: second JSON value must be a string"
+                )
+            output_value = decoded
+            continue
+
+        if tool_calls_value is None:
+            tool_calls_line_no = line_no
+            try:
+                decoded = json.loads(line)
+            except ValueError as e:
+                raise ValueError(f"Invalid JSON at {path}:{line_no}: {e}") from e
+            if not isinstance(decoded, list):
+                raise ValueError(
+                    f"Invalid detailed file at {path}:{line_no}: third JSON value must be an array"
+                )
+            tool_calls: list[dict[str, object]] = []
+            for idx, item in enumerate(decoded):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"Invalid detailed file at {path}:{line_no}: tool_calls[{idx}] must be an object"
+                    )
+                tool_name = item.get("tool_name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    raise ValueError(
+                        f"Invalid detailed file at {path}:{line_no}: tool_calls[{idx}].tool_name must be a non-empty string"
+                    )
+                args = item.get("args")
+                if args is not None and not isinstance(args, (str, dict)):
+                    raise ValueError(
+                        f"Invalid detailed file at {path}:{line_no}: tool_calls[{idx}].args must be a string, object, or null"
+                    )
+                tool_calls.append({"tool_name": tool_name, "args": args})
+            tool_calls_value = tool_calls
+            continue
+
+        raise ValueError(
+            f"Invalid detailed file at {path}:{line_no}: unexpected extra non-empty line"
+        )
+
+    if input_value is None:
+        suffix = "" if input_line_no is None else f":{input_line_no}"
+        raise ValueError(
+            f"Invalid detailed file at {path}{suffix}: missing raw input line"
+        )
+
+    if output_value is None:
+        suffix = "" if output_line_no is None else f":{output_line_no}"
+        raise ValueError(
+            f"Invalid detailed file at {path}{suffix}: missing output line"
+        )
+
+    if tool_calls_value is None:
+        suffix = "" if tool_calls_line_no is None else f":{tool_calls_line_no}"
+        raise ValueError(
+            f"Invalid detailed file at {path}{suffix}: missing tool_calls line"
+        )
+
+    return input_value, output_value, tool_calls_value
+
+
+def _encode_detailed_jsonl(record: MemoryRecord) -> str:
+    """Encode a record's detailed data as JSONL (input + output + tool_calls list)."""
+
+    tool_calls: list[dict[str, object]] = []
+    lines: list[str] = [
+        json.dumps(record.input, ensure_ascii=False),
+        json.dumps(record.output, ensure_ascii=False),
+        "",
+    ]
+    for msg in record.detailed:
+        if not isinstance(msg, ModelResponse):
+            continue
+        for part in msg.parts:
+            if isinstance(part, BaseToolCallPart):
+                tool_calls.append({"tool_name": part.tool_name, "args": part.args})
+
+    lines[2] = json.dumps(tool_calls, ensure_ascii=False, separators=(",", ":"))
+    return "\n".join(lines) + "\n"
+
+
+def _load_memory_record_from_disk(
+    record_path: Path,
+    raw_core: str,
+    *,
+    encoding: str,
+    detailed_path: Path,
+) -> MemoryRecord:
+    """Load a `MemoryRecord` from disk, supporting legacy and split formats.
+
+    Legacy formats:
+    - `<id>.core.json` or `<id>.json` storing most fields (including `input`).
+    - Optional sibling `<id>.compacted.json` sidecar storing `compacted`.
+
+    Split format:
+    - `<id>.core.json` stores metadata + `compacted`.
+    - `<id>.detailed.jsonl` stores raw `input` + `output` + a simplified `tool_calls` list.
+    """
+
+    try:
+        decoded = json.loads(raw_core)
+    except ValueError as e:
+        raise ValueError(f"Invalid JSON at {record_path}: {e}") from e
+
+    if not isinstance(decoded, dict):
+        raise ValueError(f"Invalid MemoryRecord JSON at {record_path}: expected object")
+
+    # Legacy core files include `input`.
+    if "input" in decoded:
+        try:
+            record = MemoryRecord.model_validate(decoded)
+        except ValidationError as e:
+            raise e
+
+        if "compacted" not in decoded:
+            compacted_path = _compacted_sidecar_path_for_record_path(record_path)
+            if compacted_path.exists():
+                record = record.model_copy(
+                    update={
+                        "compacted": _read_legacy_compacted_sidecar(
+                            compacted_path, encoding=encoding
+                        )
+                    }
+                )
+
+        return record
+
+    core = _CoreRecordOnDisk.model_validate(decoded)
+
+    # Backward compatibility: some stores used a `*.compacted.json` sidecar.
+    if "compacted" not in decoded:
+        compacted_path = _compacted_sidecar_path_for_record_path(record_path)
+        if compacted_path.exists():
+            core.compacted = _read_legacy_compacted_sidecar(
+                compacted_path, encoding=encoding
+            )
+
+    if not detailed_path.exists():
+        raise ValueError(f"Missing detailed file for id {core.id_}: {detailed_path}")
+
+    input_value, output_value, _tool_calls = _read_detailed_file(
+        detailed_path, encoding=encoding
+    )
+    return MemoryRecord(
+        created_at=core.created_at,
+        kind=core.kind,
+        id_=core.id_,
+        parents=list(core.parents),
+        children=list(core.children),
+        input=input_value,
+        compacted=list(core.compacted),
+        output=output_value,
+        detailed=[],
+    )
+
+
+def _read_legacy_compacted_sidecar(path: Path, *, encoding: str) -> list[str]:
+    try:
+        raw = path.read_text(encoding=encoding)
+    except OSError as e:
+        raise ValueError(f"Failed to read compacted sidecar: {path}: {e}") from e
+    try:
+        decoded = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"Invalid JSON at {path}: {e}") from e
+    if not isinstance(decoded, list) or any(
+        not isinstance(item, str) for item in decoded
+    ):
+        raise ValueError(
+            f"Invalid compacted sidecar at {path}: expected JSON array of strings"
+        )
+    return decoded
+
+
+def _read_record_id_and_created_at(raw: str, *, path: Path) -> tuple[str, datetime]:
+    """Return `(id_, created_at)` for a record file (legacy or split core)."""
+
+    try:
+        decoded = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"Invalid JSON at {path}: {e}") from e
+
+    if not isinstance(decoded, dict):
+        raise ValueError(f"Invalid MemoryRecord JSON at {path}: expected object")
+
+    raw_id = decoded.get("id_") or decoded.get("id")
+    if not isinstance(raw_id, str):
+        raise ValueError(f"Invalid MemoryRecord JSON at {path}: missing/invalid 'id_'")
+    record_id = coerce_record_id(raw_id)
+
+    raw_created_at = decoded.get("created_at")
+    if not isinstance(raw_created_at, str):
+        raise ValueError(
+            f"Invalid MemoryRecord JSON at {path}: missing/invalid 'created_at'"
+        )
+    try:
+        created_at = datetime.fromisoformat(raw_created_at)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid MemoryRecord JSON at {path}: invalid 'created_at': {e}"
+        ) from e
+
+    return record_id, created_at
 
 
 class FolderMemoryStore(MemoryStore):
@@ -224,15 +509,23 @@ class FolderMemoryStore(MemoryStore):
         self._by_id[record.id_] = record
         self._cache_key = self._stat_key()
 
-    def _compacted_path_for_record_path(self, record_path: Path) -> Path:
+    def _detailed_path_for_record_path(self, record_path: Path) -> Path:
+        """Return the sibling detailed path for a record path.
+
+        The record path may be the canonical `<id>.core.json` file or a legacy
+        `<id>.json` file referenced by old `order.jsonl` entries.
+        """
+
         name = record_path.name
         if name.endswith(".core.json"):
             record_id = name[: -len(".core.json")]
-        elif name.endswith(".json") and not name.endswith(".compacted.json"):
+        elif name.endswith(".json") and not name.endswith(
+            (".detailed.json", ".detailed.jsonl")
+        ):
             record_id = name[: -len(".json")]
         else:
             raise ValueError(f"Unexpected record filename: {record_path}")
-        return record_path.with_name(f"{record_id}.compacted.json")
+        return record_path.with_name(f"{record_id}.detailed.jsonl")
 
     def _load_if_needed(self) -> None:
         if not self.root.exists():
@@ -275,7 +568,9 @@ class FolderMemoryStore(MemoryStore):
                         record_path = legacy
                 elif record_path.name.endswith(
                     ".json"
-                ) and not record_path.name.endswith(".compacted.json"):
+                ) and not record_path.name.endswith(
+                    (".detailed.json", ".detailed.jsonl")
+                ):
                     core = record_path.with_name(
                         record_path.name[: -len(".json")] + ".core.json"
                     )
@@ -288,13 +583,18 @@ class FolderMemoryStore(MemoryStore):
                     f"Missing record file for id {entry.id_}: {record_path}"
                 ) from e
             try:
-                record = MemoryRecord.model_validate_json(raw)
+                record = _load_memory_record_from_disk(
+                    record_path,
+                    raw,
+                    encoding=self.encoding,
+                    detailed_path=self._detailed_path_for_record_path(record_path),
+                )
             except ValidationError as e:
                 raise ValueError(
                     f"Invalid MemoryRecord JSON at {record_path}: {e}"
                 ) from e
             except ValueError as e:
-                raise ValueError(f"Invalid JSON at {record_path}: {e}") from e
+                raise ValueError(f"{e}") from e
 
             if record.id_ != entry.id_:
                 raise ValueError(
@@ -304,26 +604,6 @@ class FolderMemoryStore(MemoryStore):
                 raise ValueError(
                     f"Duplicate MemoryRecord id in order file: {record.id_}"
                 )
-
-            compacted_path = self._compacted_path_for_record_path(record_path)
-            if compacted_path.exists():
-                try:
-                    compacted_raw = compacted_path.read_text(encoding=self.encoding)
-                except OSError as e:
-                    raise ValueError(
-                        f"Failed to read compacted sidecar for id {entry.id_}: {compacted_path}: {e}"
-                    ) from e
-                try:
-                    decoded = json.loads(compacted_raw)
-                except ValueError as e:
-                    raise ValueError(f"Invalid JSON at {compacted_path}: {e}") from e
-                if not isinstance(decoded, list) or any(
-                    not isinstance(item, str) for item in decoded
-                ):
-                    raise ValueError(
-                        f"Invalid compacted sidecar at {compacted_path}: expected JSON array of strings"
-                    )
-                record = record.model_copy(update={"compacted": decoded})
 
             records.append(record)
             by_id[record.id_] = record
@@ -341,8 +621,12 @@ class FolderMemoryStore(MemoryStore):
             self._persist_order([])
             return
 
-        indexed: list[tuple[MemoryRecord, str]] = []
+        indexed: list[tuple[str, datetime, str]] = []
         for path in records_dir.rglob("*.json"):
+            if path.name.endswith(".detailed.json"):
+                continue
+            if path.name.endswith(".detailed.jsonl"):
+                continue
             if path.name.endswith(".compacted.json"):
                 continue
             if (
@@ -358,23 +642,21 @@ class FolderMemoryStore(MemoryStore):
             except OSError as e:
                 raise ValueError(f"Failed to read MemoryRecord at {path}: {e}") from e
             try:
-                record = MemoryRecord.model_validate_json(raw)
-            except ValidationError as e:
-                raise ValueError(f"Invalid MemoryRecord JSON at {path}: {e}") from e
+                record_id, created_at = _read_record_id_and_created_at(raw, path=path)
             except ValueError as e:
-                raise ValueError(f"Invalid JSON at {path}: {e}") from e
-            indexed.append((record, str(path.relative_to(self.root))))
+                raise ValueError(f"{e}") from e
+            indexed.append((record_id, created_at, str(path.relative_to(self.root))))
 
         # Stable order for rebuilds: by created_at then id.
-        indexed.sort(key=lambda t: (t[0].created_at, str(t[0].id_)))
+        indexed.sort(key=lambda t: (t[1], str(t[0])))
         self._persist_order(
             [
                 _OrderEntry(
-                    id_=record.id_,
-                    created_at=record.created_at,
+                    id_=record_id,
+                    created_at=created_at,
                     relpath=relpath,
                 )
-                for record, relpath in indexed
+                for record_id, created_at, relpath in indexed
             ]
         )
 
@@ -423,20 +705,21 @@ class FolderMemoryStore(MemoryStore):
 
     def _persist_record(self, record: MemoryRecord) -> Path:
         path = self._record_paths.get(record.id_)
-        if path is None:
+        if path is None or not path.name.endswith(".core.json"):
             path = self._record_path_for(record)
 
-        # Omit "detailed" (verbose tool traces) and "compacted" (stored as a sidecar)
-        # to keep the primary record file readable and small.
+        # Split persistence:
+        # - core: metadata + compacted + output (one JSON blob, one line)
+        # - detailed: raw input + output + tool_calls list (JSONL)
         self._atomic_write_text(
             path,
-            record.model_dump_json(exclude={"detailed", "compacted"}),
+            record.model_dump_json(include=_CORE_FIELDS),
         )
 
-        compacted_path = self._compacted_path_for_record_path(path)
+        detailed_path = self._detailed_path_for_record_path(path)
         self._atomic_write_text(
-            compacted_path,
-            json.dumps(record.compacted, ensure_ascii=False),
+            detailed_path,
+            _encode_detailed_jsonl(record),
         )
 
         self._record_paths[record.id_] = path
