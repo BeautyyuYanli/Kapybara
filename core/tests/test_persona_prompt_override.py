@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from k.agent.core.agent import persona_prompt_from_fs
-from k.agent.core.prompts import persona_prompt
 from k.config import Config
 
 
@@ -23,7 +22,7 @@ def test_persona_prompt_from_fs_falls_back_when_missing(tmp_path: Path) -> None:
     ctx = SimpleNamespace(deps=SimpleNamespace(config=config))
 
     prompt = persona_prompt_from_fs(ctx)  # type: ignore[arg-type]
-    assert prompt == persona_prompt
+    assert prompt == ""
 
 
 def test_persona_prompt_from_fs_falls_back_when_empty(tmp_path: Path) -> None:
@@ -33,4 +32,4 @@ def test_persona_prompt_from_fs_falls_back_when_empty(tmp_path: Path) -> None:
     ctx = SimpleNamespace(deps=SimpleNamespace(config=config))
 
     prompt = persona_prompt_from_fs(ctx)  # type: ignore[arg-type]
-    assert prompt == persona_prompt
+    assert prompt == ""

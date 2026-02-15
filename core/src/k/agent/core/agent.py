@@ -7,8 +7,10 @@ This module owns:
 
 Persona override:
     If `Config.fs_base / "PERSONA.md"` exists and is non-empty, its contents are
-    used as the persona system prompt. Otherwise we fall back to the default
-    `persona_prompt` defined in `k.agent.core.prompts`.
+    used as the persona system prompt. Otherwise, if
+    `Config.fs_base / "PERSONA.default.md"` exists and is non-empty, its
+    contents are used. If neither file is present (or both are empty), no
+    persona system prompt is added.
 """
 
 from __future__ import annotations
@@ -18,15 +20,11 @@ from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
-from pydantic import BaseModel, TypeAdapter
 from pydantic_ai import (
     Agent,
-    BinaryContent,
     ModelMessage,
-    ModelRetry,
-    MultiModalContent,
     RunContext,
     ToolOutput,
 )
@@ -40,6 +38,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import KnownModelName, Model
 
 from k.agent.core.entities import Event, MemoryHint, finish_action
+from k.agent.core.media_tools import read_media
 from k.agent.core.prompts import (
     SOP_prompt,
     bash_tool_prompt,
@@ -181,52 +180,12 @@ async def fork(
         )
 
 
-MultiModalContentAdapter = TypeAdapter(MultiModalContent)
-
-
-class MediaContent(BaseModel):
-    kind: Literal["image", "video", "audio", "document"]
-    url_or_path: str
-
-
-async def read_media(
-    ctx: RunContext[MyDeps],
-    media_contents: list[MediaContent],
-) -> list[MultiModalContent]:
-    """
-    Read media files from urls or local file paths
-
-    Args:
-    - `media_contents`: a list of MediaContent, each containing a `kind` (e.g. "image", "video", "audio", "document") and a `url_or_path` (either a URL or a local file path)
-    """
-    results = []
-    for s in media_contents:
-        if s.url_or_path.startswith("http://") or s.url_or_path.startswith("https://"):
-            try:
-                content = MultiModalContentAdapter.validate_python(
-                    {
-                        "kind": s.kind + "-url",
-                        "url": s.url_or_path,
-                    }
-                )
-            except Exception as e:
-                raise ModelRetry(f"Failed to load URL {s.url_or_path}: {e}") from e
-        else:
-            try:
-                content = BinaryContent.from_path(Path(s.url_or_path))
-            except Exception as e:
-                raise ModelRetry(f"Failed to read file {s.url_or_path}: {e}") from e
-
-        results.append(content)
-    return results
-
-
 def _read_persona_override(fs_base: Path) -> str:
     """Load an optional persona override from `fs_base/PERSONA.md`.
 
     Returns:
         The override file contents (trimmed) when present and non-empty;
-        otherwise the default `persona_prompt`.
+        otherwise an empty string (meaning "no persona override").
 
     Notes:
         This helper is intentionally forgiving: missing/unreadable files are
@@ -242,7 +201,7 @@ def _read_persona_override(fs_base: Path) -> str:
             return ""
     except OSError:
         return ""
-    return text or "" 
+    return text or ""
 
 
 agent = Agent(
