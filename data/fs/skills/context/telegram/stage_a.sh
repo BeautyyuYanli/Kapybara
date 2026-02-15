@@ -29,7 +29,7 @@ CHAT_ID=""
 FROM_ID=""
 KW=""
 ROOT="$HOME/memories/records"
-N=10
+N=7
 OUT=/tmp/tg_ctx
 
 while [[ $# -gt 0 ]]; do
