@@ -1,3 +1,5 @@
+from datetime import UTC
+
 import pytest
 
 from k.config import Config
@@ -216,4 +218,5 @@ async def test_poll_and_run_forever_requires_keyword(tmp_path) -> None:
             keyword=" ",
             time_window_seconds=60,
             chat_ids=None,
+            tz=UTC,
         )

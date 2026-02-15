@@ -1,4 +1,5 @@
 import json
+from datetime import UTC
 
 from k.starters.telegram import telegram_update_to_event_json
 
@@ -29,6 +30,46 @@ def test_telegram_update_to_event_json_roundtrip() -> None:
     # Compacting merges/drops verbose profile fields.
     assert "first_name" not in body["message"]["from"]
     assert "last_name" not in body["message"]["from"]
+
+
+def test_telegram_event_renders_message_date_in_default_timezone() -> None:
+    update = {
+        "update_id": 123,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 42, "first_name": "Alice"},
+            "chat": {"id": 99, "type": "private"},
+            "date": 1_700_000_000,
+            "text": "hello",
+        },
+    }
+
+    event_json = telegram_update_to_event_json(update)
+    event = json.loads(event_json)
+    body = json.loads(event["content"])
+
+    assert body["message"]["date"] == "2023-11-15T06:13:20+08:00"
+    assert body["message"]["date_unix"] == 1_700_000_000
+
+
+def test_telegram_event_renders_message_date_in_configured_timezone() -> None:
+    update = {
+        "update_id": 123,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 42, "first_name": "Alice"},
+            "chat": {"id": 99, "type": "private"},
+            "date": 1_700_000_000,
+            "text": "hello",
+        },
+    }
+
+    event_json = telegram_update_to_event_json(update, tz=UTC)
+    event = json.loads(event_json)
+    body = json.loads(event["content"])
+
+    assert body["message"]["date"] == "2023-11-14T22:13:20+00:00"
+    assert body["message"]["date_unix"] == 1_700_000_000
 
 
 def test_telegram_event_content_keeps_stage_a_chat_and_from_layout() -> None:
