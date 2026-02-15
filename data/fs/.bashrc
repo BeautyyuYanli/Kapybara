@@ -14,3 +14,15 @@ stty -echo;
 set -a; 
 . ~/.env; 
 set +a; 
+
+# Token-efficient JSON for LLM prompts:
+# - `-c`: compact (no pretty whitespace)
+# - `-M`: monochrome (no ANSI color codes)
+# - default filter is `.` so pipelines can use `| jq` instead of `| jq .`
+jq() {
+  if [ "$#" -eq 0 ]; then
+    command jq -cM .
+  else
+    command jq -cM "$@"
+  fi
+}

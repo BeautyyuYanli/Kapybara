@@ -41,7 +41,7 @@ curl -sS -X POST "$BASE/sendMessage" \
   -d chat_id="$CHAT_ID" \
   --data-urlencode text="$MSG" \
   -d parse_mode=HTML \
-  -d disable_web_page_preview=true
+  -d disable_web_page_preview=true | jq
 ```
 
 ## sendViaTelegraph
@@ -83,7 +83,7 @@ curl -sS -X POST "$BASE/sendPhoto" \
   -d chat_id="$CHAT_ID" \
   -d photo="$PHOTO_URL" \
   --data-urlencode caption="$CAPTION" \
-  -d parse_mode=HTML
+  -d parse_mode=HTML | jq
 ```
 
 Reply to a message:
@@ -92,7 +92,7 @@ Reply to a message:
 curl -sS -X POST "$BASE/sendMessage" \
   -d chat_id="$CHAT_ID" \
   -d reply_to_message_id=120 \
-  --data-urlencode text="Got it"
+  --data-urlencode text="Got it" | jq
 ```
 
 ## editMessageText
@@ -106,7 +106,7 @@ curl -sS -X POST "$BASE/editMessageText" \
   -d chat_id="$CHAT_ID" \
   -d message_id="$MSG_ID" \
   --data-urlencode text="$NEW_TEXT" \
-  -d parse_mode=HTML
+  -d parse_mode=HTML | jq
 ```
 
 ## setMessageReaction
@@ -123,7 +123,7 @@ MESSAGE_ID=898
 curl -sS -X POST "$BASE/setMessageReaction" \
   -d chat_id="$CHAT_ID" \
   -d message_id="$MESSAGE_ID" \
-  --data-urlencode 'reaction=[{"type":"emoji","emoji":"👍"}]'
+  --data-urlencode 'reaction=[{"type":"emoji","emoji":"👍"}]' | jq
 ```
 
 ## deleteMessage
@@ -134,7 +134,7 @@ MSG_ID=456
 
 curl -sS -X POST "$BASE/deleteMessage" \
   -d chat_id="$CHAT_ID" \
-  -d message_id="$MSG_ID"
+  -d message_id="$MSG_ID" | jq
 ```
 
 ## Gotchas
@@ -142,6 +142,12 @@ curl -sS -X POST "$BASE/deleteMessage" \
 - Prefer `--data-urlencode text=...` so newlines / special chars are encoded correctly.
 - For formatting, `parse_mode=HTML` is usually easier than `MarkdownV2` (less escaping).
 - In shell scripts, using `cat <<'HTML'` (heredoc) allows direct use of newlines; typing `\n` literally will result in literal backslashes rather than a line break.
+- If you want to inspect the API response, parse the JSON and print it as UTF-8 (some formatters default to ASCII-escaped `\uXXXX` output):
+
+```bash
+# jq prints UTF-8 by default; avoid `jq -a/--ascii-output`.
+curl -sS -X POST "$BASE/getMe" | jq
+```
 
 
 ## Important Note on HTML Sanitization
