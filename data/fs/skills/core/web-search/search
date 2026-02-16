@@ -4,16 +4,28 @@
 # dependencies = ["httpx"]
 # ///
 
-"""Run Jina web search and mirror stdout to a required output file.
+"""Run Jina web search and emit compact JSON to stdout and a required file.
 
-`--out` must be a unique path. The script refuses to overwrite existing files to
-avoid races across concurrent tool invocations.
+Per Jina Search Foundation docs, `s.jina.ai` JSON responses include top-level
+`code`/`status` and a `data` field containing search result objects. Each
+result object may include `title`, `description`, `url`, and `content`.
+
+This skill maps that documented shape to compact output and writes untruncated
+`content` into per-result files.
+
+`--out` must be a unique path. The script refuses to overwrite existing paths
+to avoid races across concurrent tool invocations.
 """
 
+import argparse
+import json
 import os
 import sys
-import argparse
-import httpx
+from pathlib import Path
+
+
+MAX_SNIPPET_CHARS = 280
+UPSTREAM_META_KEYS = ("code", "status", "name", "message", "readableMessage")
 
 
 def _write_stdout_and_file(output: str, out_path: str) -> None:
@@ -22,7 +34,132 @@ def _write_stdout_and_file(output: str, out_path: str) -> None:
         f.write(output)
     sys.stdout.write(output)
 
-def main():
+
+def _normalize_whitespace(value: str) -> str:
+    """Collapse all whitespace into single spaces."""
+    return " ".join(value.split())
+
+
+def _as_clean_string(value: object) -> str:
+    """Return a stripped string when value is a string; otherwise empty."""
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    """Trim text to max_chars while preserving readability."""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _full_text_dir_from_output(out_path: str) -> Path:
+    """Return the per-run directory used for full-text result files."""
+    resolved_out_path = Path(out_path).resolve()
+    return resolved_out_path.parent / f"{resolved_out_path.name}.full_text"
+
+
+def _dump_full_text(full_text: str, full_text_dir: Path, result_index: int) -> Path:
+    """Persist one result's full text and return the file path."""
+    full_text_dir.mkdir(parents=True, exist_ok=True)
+    result_path = full_text_dir / f"result_{result_index:03d}.txt"
+    with result_path.open("w", encoding="utf-8") as f:
+        f.write(full_text)
+        if not full_text.endswith("\n"):
+            f.write("\n")
+    return result_path
+
+
+def _extract_search_items(payload: dict[str, object]) -> list[dict[str, object]]:
+    """Extract result objects from the documented `data` field."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def _extract_upstream_meta(payload: dict[str, object]) -> dict[str, object]:
+    """Keep stable top-level metadata from the upstream response."""
+    return {key: payload[key] for key in UPSTREAM_META_KEYS if key in payload}
+
+
+def _compact_result(item: dict[str, object], full_text_dir: Path, result_index: int) -> dict[str, str] | None:
+    """Reduce one documented search result and persist its full text."""
+    title = _as_clean_string(item.get("title"))
+    url = _as_clean_string(item.get("url"))
+    description = _as_clean_string(item.get("description"))
+    full_text = _as_clean_string(item.get("content"))
+    snippet = _truncate(_normalize_whitespace(full_text), MAX_SNIPPET_CHARS) if full_text else ""
+
+    if not description and snippet:
+        description = snippet
+        snippet = ""
+
+    if not any((title, url, description, full_text)):
+        return None
+
+    compact = {"title": title, "url": url, "description": description}
+    if snippet:
+        compact["snippet"] = snippet
+    if full_text:
+        full_text_path = _dump_full_text(full_text, full_text_dir, result_index)
+        compact["full_text_path"] = str(full_text_path)
+    return compact
+
+
+def _format_search_output(raw_output: str, query: str, out_path: str) -> str:
+    """Convert documented upstream payload into compact JSON records."""
+    resolved_out_path = str(Path(out_path).resolve())
+    full_text_dir = _full_text_dir_from_output(out_path)
+
+    try:
+        payload = json.loads(raw_output)
+    except json.JSONDecodeError:
+        fallback = {
+            "query": query,
+            "output_path": resolved_out_path,
+            "full_text_dir": str(full_text_dir),
+            "results": [],
+            "error": "Search response was not valid JSON.",
+            "raw_preview": _truncate(_normalize_whitespace(raw_output), MAX_SNIPPET_CHARS),
+        }
+        return json.dumps(fallback, ensure_ascii=False, indent=2) + "\n"
+
+    if not isinstance(payload, dict):
+        fallback = {
+            "query": query,
+            "output_path": resolved_out_path,
+            "full_text_dir": str(full_text_dir),
+            "results": [],
+            "error": "Search response JSON root was not an object.",
+            "raw_preview": _truncate(_normalize_whitespace(raw_output), MAX_SNIPPET_CHARS),
+        }
+        return json.dumps(fallback, ensure_ascii=False, indent=2) + "\n"
+
+    compact_results: list[dict[str, str]] = []
+    for result_index, item in enumerate(_extract_search_items(payload)):
+        compact = _compact_result(item, full_text_dir, result_index)
+        if compact:
+            compact_results.append(compact)
+
+    output = {
+        "query": query,
+        "output_path": resolved_out_path,
+        "full_text_dir": str(full_text_dir),
+        "results": compact_results,
+    }
+    upstream_meta = _extract_upstream_meta(payload)
+    if upstream_meta:
+        output["upstream"] = upstream_meta
+    if not compact_results and "message" in payload:
+        output["error"] = _as_clean_string(payload.get("message")) or "Search API returned no result data."
+    return json.dumps(output, ensure_ascii=False, indent=2) + "\n"
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Web search via Jina AI Search")
     parser.add_argument("query", help="Search query")
     parser.add_argument(
@@ -42,22 +179,36 @@ def main():
         print("Use a unique output file name to avoid race conditions.", file=sys.stderr)
         sys.exit(1)
 
+    full_text_dir = _full_text_dir_from_output(args.out)
+    if full_text_dir.exists():
+        print(f"Error: full-text output directory already exists: {full_text_dir}", file=sys.stderr)
+        print("Use a unique output file name to avoid race conditions.", file=sys.stderr)
+        sys.exit(1)
+
+    import httpx
+
     headers = {
         "Authorization": f"Bearer {jina_key}",
-        "Accept": "application/json"
+        "Accept": "application/json",
     }
-    params = {"q": args.query}
-    
+    request_body = {"q": args.query}
+
     try:
-        response = httpx.get("https://s.jina.ai/", params=params, headers=headers, timeout=30.0)
+        response = httpx.post(
+            "https://s.jina.ai/",
+            json=request_body,
+            headers=headers,
+            timeout=30.0,
+        )
         response.raise_for_status()
-        output = response.text
+        output = _format_search_output(response.text, args.query, args.out)
 
         _write_stdout_and_file(output, args.out)
-            
+
     except Exception as e:
         print(f"Error during search: {e}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
