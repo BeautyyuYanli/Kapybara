@@ -298,7 +298,6 @@ def sop_system_prompt() -> str:
     return SOP_prompt
 
 
-
 def _strip_history(
     msgs: list[ModelRequest | ModelResponse], instruct: Sequence[UserContent]
 ):

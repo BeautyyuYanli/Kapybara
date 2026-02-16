@@ -212,7 +212,7 @@ async def test_poll_and_run_forever_requires_keyword(tmp_path) -> None:
     with pytest.raises(ValueError, match="--keyword"):
         await _poll_and_run_forever(
             config=cfg,
-            model_name="openai/gpt-5.2",
+            model="openai/gpt-5.2",
             token="test-token",
             timeout_seconds=1,
             keyword=" ",

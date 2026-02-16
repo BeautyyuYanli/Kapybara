@@ -7,8 +7,8 @@ from typing import Any
 
 import anyio
 import anyio.to_thread as to_thread
-from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.models import Model
+from pydantic_ai.models.openrouter import OpenRouterModel
 from rich import print
 
 from k.agent.core import agent_run
@@ -101,8 +101,7 @@ async def _poll_and_run_forever(
 
     mem_store = FolderMemoryStore(root=config.fs_base / "memories")
     if isinstance(model, str):
-        model_name = model
-        model = OpenRouterModel(model_name)
+        model = OpenRouterModel(model)
     api = TelegramBotApi(token=token)
     try:
         me = await api.get_me()
