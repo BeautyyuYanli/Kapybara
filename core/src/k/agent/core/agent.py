@@ -257,7 +257,7 @@ agent = Agent(
 )
 
 
-@agent.system_prompt(dynamic=True)
+@agent.system_prompt
 def persona_prompt_from_fs(ctx: RunContext[MyDeps]) -> str:
     """Return the persona system prompt, preferring `fs_base/PERSONA.md`."""
 
@@ -265,11 +265,7 @@ def persona_prompt_from_fs(ctx: RunContext[MyDeps]) -> str:
     return _read_persona_override(fs_base)
 
 
-@agent.system_prompt
-def general_system_prompt() -> str:
-    return general_prompt
-
-
+agent.system_prompt(lambda: general_prompt)
 agent.system_prompt(lambda: bash_tool_prompt)
 agent.system_prompt(lambda: input_event_prompt)
 agent.system_prompt(lambda: response_instruct_prompt)
