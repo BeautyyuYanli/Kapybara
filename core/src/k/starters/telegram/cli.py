@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import re
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import logfire
+
+if TYPE_CHECKING:
+    from pydantic_ai.models import Model
 
 from k.config import Config
 
@@ -24,8 +27,8 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-name",
-        default="openai/gpt-5.2",
-        help="PydanticAI model name passed to OpenRouterModel.",
+        required=True,
+        help="PydanticAI model name passed to OpenRouterModel (required).",
     )
     parser.add_argument(
         "--token",
@@ -63,22 +66,33 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def main() -> None:
-    """CLI entrypoint."""
+async def run(
+    *,
+    token: str,
+    keyword: str,
+    model: Model | str,
+    chat_id: str = "",
+    timezone: str = _DEFAULT_TIMEZONE,
+    timeout_seconds: int = 60,
+    time_window_seconds: int = 60,
+) -> None:
+    """Function entrypoint.
+
+    `model` is required so callers must make an explicit model choice.
+    """
 
     logfire.configure()
     logfire.instrument_pydantic_ai()
 
-    args = _parse_cli_args()
     config = Config()  # type: ignore[call-arg]
 
     try:
-        tz = _parse_timezone(str(args.timezone))
+        tz = _parse_timezone(str(timezone))
     except ValueError as e:
-        raise ValueError(f"Invalid --timezone: {e}") from e
+        raise ValueError(f"Invalid timezone: {e}") from e
 
     chat_ids: set[int] | None
-    raw_chat_ids = str(args.chat_id).strip()
+    raw_chat_ids = str(chat_id).strip()
     if not raw_chat_ids:
         chat_ids = None
     else:
@@ -86,15 +100,30 @@ async def main() -> None:
         try:
             chat_ids = {int(p) for p in parts}
         except ValueError as e:
-            raise ValueError(f"Invalid --chat_id entry in: {raw_chat_ids!r}") from e
+            raise ValueError(f"Invalid chat_id entry in: {raw_chat_ids!r}") from e
         chat_ids = _expand_chat_id_watchlist(chat_ids)
+
     await _poll_and_run_forever(
         config=config,
-        model_name=args.model_name,
-        token=args.token,
-        timeout_seconds=args.timeout_seconds,
-        keyword=args.keyword,
-        time_window_seconds=args.time_window_seconds,
+        model=model,
+        token=token,
+        timeout_seconds=timeout_seconds,
+        keyword=keyword,
+        time_window_seconds=time_window_seconds,
         chat_ids=chat_ids,
         tz=tz,
+    )
+
+
+async def main() -> None:
+    """CLI entrypoint."""
+    args = _parse_cli_args()
+    await run(
+        token=args.token,
+        keyword=args.keyword,
+        model=args.model_name,
+        chat_id=args.chat_id,
+        timezone=args.timezone,
+        timeout_seconds=args.timeout_seconds,
+        time_window_seconds=args.time_window_seconds,
     )
