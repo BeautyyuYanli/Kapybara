@@ -1,0 +1,153 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "typer",
+# ]
+# ///
+
+import os
+import subprocess
+import json
+from pathlib import Path
+from typing import Optional, Annotated
+import typer
+from collections import defaultdict
+
+app = typer.Typer(add_completion=False)
+
+def get_detailed_files(root: Path) -> list[Path]:
+    """Find all detailed.jsonl files that correspond to telegram memories."""
+    try:
+        res = subprocess.run(
+            ["rg", "-l", "--sort", "path", "-g", "*.core.json", r'"kind"\s*:\s*"telegram"', str(root)],
+            capture_output=True, text=True, check=True
+        )
+        core_files = res.stdout.strip().split('\n')
+    except subprocess.CalledProcessError:
+        return []
+
+    detailed_files = []
+    for cf in core_files:
+        if not cf: continue
+        # cf is like /path/to/id.core.json
+        df = Path(cf).parent / (Path(cf).name.removesuffix(".core.json") + ".detailed.jsonl")
+        if df.exists():
+            detailed_files.append(df)
+    return detailed_files
+
+def search_files(files: list[Path], pattern: str, n: int) -> list[tuple[Path, str]]:
+    """Search for pattern in files and return last N matches."""
+    if not files:
+        return []
+    
+    file_args = [str(f) for f in files]
+    try:
+        # Using xargs style logic if too many files, but for now just pass them
+        res = subprocess.run(
+            ["rg", "--max-count", "1", "--with-filename", "--no-line-number", pattern] + file_args,
+            capture_output=True, text=True
+        )
+        lines = res.stdout.strip().split('\n')
+        matches = []
+        for line in lines:
+            if not line: continue
+            # rg output is path:match
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                matches.append((Path(parts[0]), parts[1]))
+            else:
+                matches.append((Path(parts[0]), ""))
+        
+        matches.sort(key=lambda x: x[0])
+        return matches[-n:]
+    except subprocess.CalledProcessError:
+        return []
+
+@app.command()
+def main(
+    chat_id: Annotated[str, typer.Option(help="Telegram chat.id")],
+    from_id: Annotated[Optional[str], typer.Option(help="Sender id (defaults to chat-id)")] = None,
+    kw: Annotated[Optional[str], typer.Option(help="Regex for extra narrowing")] = None,
+    root: Annotated[Path, typer.Option(help="Memories root")] = Path.home() / "memories/records",
+    n: Annotated[int, typer.Option(help="Lines kept per route")] = 7,
+    out_dir: Annotated[Path, typer.Option(help="Output dir")] = Path("/tmp/tg_ctx"),
+):
+    if from_id is None:
+        from_id = chat_id
+    
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    detailed_files = get_detailed_files(root)
+    
+    # Regexes (matching escaped quotes in detailed.jsonl)
+    chat_re = rf'\\"chat\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{chat_id}'
+    from_re = rf'\\"from\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{from_id}'
+    
+    matches_chat = search_files(detailed_files, chat_re, n)
+    matches_user = search_files(detailed_files, from_re, n)
+    
+    matches_kw = []
+    if kw:
+        # Find all files matching chat_re first
+        try:
+            res = subprocess.run(
+                ["rg", "-l", "--sort", "path", chat_re] + [str(f) for f in detailed_files],
+                capture_output=True, text=True
+            )
+            all_chat_files = [Path(p) for p in res.stdout.strip().split('\n') if p]
+            if all_chat_files:
+                matches_kw = search_files(all_chat_files, kw, n)
+        except Exception:
+            pass
+
+    # Preferences
+    kind = "telegram"
+    prefs = []
+    pref_paths = [
+        (Path.home() / f"preferences/{kind}/preferences.md", f"Global Preference ({kind}):"),
+        (Path.home() / f"preferences/{kind}/by_chat/{chat_id}.md", f"Chat-specific Preference (chat_id: {chat_id}):"),
+        (Path.home() / f"preferences/{kind}/by_user/{from_id}.md", f"User-specific Preference (from_id: {from_id}):"),
+    ]
+    
+    for path, title in pref_paths:
+        if path.exists():
+            prefs.append(f"{title}\n{path.read_text()}\n---")
+    
+    if prefs:
+        print("\n".join(prefs))
+
+    # Collect results
+    results = {} # id -> {routes: set, core_json: str, matched_line: str}
+    
+    def add_match(match_list, route_name):
+        for path, line in match_list:
+            # Map detailed.jsonl back to core.json
+            core_path = path.parent / (path.name.removesuffix(".detailed.jsonl") + ".core.json")
+            if not core_path.exists(): continue
+            
+            mem_id = core_path.name.removesuffix(".core.json")
+            if mem_id not in results:
+                results[mem_id] = {
+                    "routes": {route_name},
+                    "core_json": core_path.read_text().strip(),
+                    "matched_line": line
+                }
+            else:
+                results[mem_id]["routes"].add(route_name)
+                if line:
+                    results[mem_id]["matched_line"] = line
+
+    add_match(matches_chat, "chat")
+    add_match(matches_user, "user")
+    add_match(matches_kw, "kw")
+    
+    # Output TSV
+    print("# id\troutes\tcore_json\tmatched_detailed_line")
+    for mem_id in sorted(results.keys()):
+        data = results[mem_id]
+        routes_str = ",".join(sorted(data["routes"]))
+        print(f"{mem_id}\t{routes_str}\t{data['core_json']}\t{data['matched_line']}")
+
+if __name__ == "__main__":
+    app()
