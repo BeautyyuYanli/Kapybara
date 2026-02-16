@@ -23,11 +23,11 @@ The recommended entrypoint is the bundled **Stage A** script, which does a paral
   [--kw <regex>] \
   [--root <dir>] \
   [--n <N>] \
-  [--out-dir <dir>]
+  --out <file>
 ```
 
 Notes:
-- The script forces ripgrep output to **not** include line numbers.
+- The script records ripgrep match line numbers so you can jump to the exact `.detailed.jsonl` line.
 - `--n` controls how many lines are kept per route (chat / user / kw). Default: `6`.
 
 ### Example
@@ -37,17 +37,14 @@ Notes:
   --chat-id 567113516 \
   --from-id 567113516 \
   --kw 'retrieve-memory|telegram-context' \
+  --out /tmp/tg_ctx_<unique>.tsv \
 ```
 
 ### Output
 
-- Writes intermediate files into `--out-dir` (default `/tmp/tg_ctx/`):
-  - `by_chat.txt`, `by_user.txt`
-  - `by_kw.txt` (only when `--kw` is provided)
-- Prints a de-duped, id-sorted candidate list on stdout (1 line per memory id).
-
-Intermediate file columns (TSV):
-`detailed_path`, `line_number`, `matched_line`
+- Writes the full output to `--out` (required) and also prints it to stdout.
+  - Use a unique `/tmp/tg_ctx_<unique>.tsv` to avoid races/clobbering.
+  - If `--out` is missing or already exists, the script errors and tells you to pick a unique path.
 
 Columns (TSV):
 `id`, `routes`, `core_json`, `matched_detailed_lines`

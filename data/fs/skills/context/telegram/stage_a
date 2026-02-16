@@ -8,6 +8,7 @@
 
 import subprocess
 import json
+import tempfile
 from pathlib import Path
 from typing import Optional, Annotated
 import typer
@@ -113,14 +114,28 @@ def search_files_all_matches_grouped(files: list[Path], pattern: str, n: int) ->
         selected.append((path, grouped[path][-n:]))
     return selected
 
-def write_route_file(out_path: Path, matches: FileMatches) -> None:
-    """Write a TSV of detailed-path -> match line numbers and lines."""
-    lines = ["# detailed_path\tline_number\tmatched_line"]
-    for path, line_matches in matches:
-        for line_no, line in line_matches:
-            safe_line = line.replace("\t", "\\t")
-            lines.append(f"{path}\t{line_no}\t{safe_line}")
-    out_path.write_text("\n".join(lines) + "\n")
+
+class _OutputWriter:
+    def __init__(self, *, out_path: Path) -> None:
+        self._out_path = out_path
+        self._fh = None
+
+    def __enter__(self) -> "_OutputWriter":
+        self._out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Use exclusive create to avoid clobbering when multiple runs race.
+        self._fh = self._out_path.open("x", encoding="utf-8")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def line(self, s: str) -> None:
+        self._fh.write(s)
+        self._fh.write("\n")
+        print(s)
+
 
 @app.command()
 def main(
@@ -129,102 +144,117 @@ def main(
     kw: Annotated[Optional[str], typer.Option(help="Regex for extra narrowing")] = None,
     root: Annotated[Path, typer.Option(help="Memories root")] = Path.home() / "memories/records",
     n: Annotated[int, typer.Option(help="Lines kept per route")] = 6,
-    out_dir: Annotated[Path, typer.Option(help="Output dir")] = Path("/tmp/tg_ctx"),
+    out: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="Output TSV file path. Required. Use a unique (random) path under /tmp to avoid races.",
+            show_default=False,
+        ),
+    ] = None,
 ):
     if from_id is None:
         from_id = chat_id
-    
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    detailed_files = get_detailed_files(root)
-    
-    # Regexes (matching escaped quotes in detailed.jsonl)
-    chat_re = rf'\\"chat\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{chat_id}'
-    from_re = rf'\\"from\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{from_id}'
-    
-    matches_chat = search_files_first_match_per_file(detailed_files, chat_re, n)
-    matches_user = search_files_first_match_per_file(detailed_files, from_re, n)
-    
-    matches_kw = []
-    if kw:
-        # Find all files matching chat_re first
-        try:
-            res = subprocess.run(
-                ["rg", "-l", "--sort", "path", chat_re] + [str(f) for f in detailed_files],
-                capture_output=True, text=True
-            )
-            if res.returncode not in (0, 1):  # 1 = no matches, 2 = rg error
-                raise RuntimeError(f"rg failed for chat filter: rc={res.returncode}")
-            all_chat_files = [Path(p) for p in res.stdout.strip().split('\n') if p]
-            if all_chat_files:
-                matches_kw = search_files_all_matches_grouped(all_chat_files, kw, n)
-        except Exception:
-            pass
 
-    # Intermediate route outputs: useful for debugging which route(s) produced
-    # which candidates, and for quickly opening the matching detailed.jsonl line.
-    write_route_file(out_dir / "by_chat.txt", matches_chat)
-    write_route_file(out_dir / "by_user.txt", matches_user)
-    if kw:
-        write_route_file(out_dir / "by_kw.txt", matches_kw)
-    print(f"# wrote {out_dir / 'by_chat.txt'}")
-    print(f"# wrote {out_dir / 'by_user.txt'}")
-    if kw:
-        print(f"# wrote {out_dir / 'by_kw.txt'}")
+    if out is None:
+        typer.echo("Error: missing required option '--out'.", err=True)
+        typer.echo(
+            "Tip: use a unique file to avoid races, e.g. --out /tmp/tg_ctx_<unique>.tsv",
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
-    # Preferences
-    kind = "telegram"
-    prefs = []
-    pref_paths = [
-        (Path.home() / f"preferences/{kind}/preferences.md", f"Global Preference ({kind}):"),
-        (Path.home() / f"preferences/{kind}/by_chat/{chat_id}.md", f"Chat-specific Preference (chat_id: {chat_id}):"),
-        (Path.home() / f"preferences/{kind}/by_user/{from_id}.md", f"User-specific Preference (from_id: {from_id}):"),
-    ]
-    
-    for path, title in pref_paths:
-        if path.exists():
-            prefs.append(f"{title}\n{path.read_text()}\n---")
-    
-    if prefs:
-        print("\n".join(prefs))
+    out_path = out.expanduser()
 
-    # Collect results
-    results = {} # id -> {routes: set, core_json: str, matched_detailed_lines: list[dict]}
-    
-    def add_match(match_list: FileMatches, route_name: str) -> None:
-        for path, line_matches in match_list:
-            # Map detailed.jsonl back to core.json
-            core_path = path.parent / (path.name.removesuffix(".detailed.jsonl") + ".core.json")
-            if not core_path.exists(): continue
+    try:
+        with _OutputWriter(out_path=out_path) as w:
+            detailed_files = get_detailed_files(root)
             
-            mem_id = core_path.name.removesuffix(".core.json")
-            if mem_id not in results:
-                results[mem_id] = {
-                    "routes": {route_name},
-                    "core_json": core_path.read_text().strip(),
-                    "matched_detailed_lines": []
-                }
-            else:
-                results[mem_id]["routes"].add(route_name)
+            # Regexes (matching escaped quotes in detailed.jsonl)
+            chat_re = rf'\\"chat\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{chat_id}'
+            from_re = rf'\\"from\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{from_id}'
+            
+            matches_chat = search_files_first_match_per_file(detailed_files, chat_re, n)
+            matches_user = search_files_first_match_per_file(detailed_files, from_re, n)
+            
+            matches_kw = []
+            if kw:
+                # Find all files matching chat_re first
+                try:
+                    res = subprocess.run(
+                        ["rg", "-l", "--sort", "path", chat_re] + [str(f) for f in detailed_files],
+                        capture_output=True, text=True
+                    )
+                    if res.returncode not in (0, 1):  # 1 = no matches, 2 = rg error
+                        raise RuntimeError(f"rg failed for chat filter: rc={res.returncode}")
+                    all_chat_files = [Path(p) for p in res.stdout.strip().split('\n') if p]
+                    if all_chat_files:
+                        matches_kw = search_files_all_matches_grouped(all_chat_files, kw, n)
+                except Exception:
+                    pass
 
-            # Only the kw route is treated as a "content match" worth surfacing
-            # in the main TSV output; chat/user routes are just for candidate finding.
-            if route_name == "kw" and line_matches:
-                results[mem_id]["matched_detailed_lines"] = [
-                    {"line": line_no, "text": text} for line_no, text in line_matches
-                ]
+            # Collect results
+            results = {} # id -> {routes: set, core_json: str, matched_detailed_lines: list[dict]}
+            
+            def add_match(match_list: FileMatches, route_name: str) -> None:
+                for path, line_matches in match_list:
+                    # Map detailed.jsonl back to core.json
+                    core_path = path.parent / (path.name.removesuffix(".detailed.jsonl") + ".core.json")
+                    if not core_path.exists(): continue
+                    
+                    mem_id = core_path.name.removesuffix(".core.json")
+                    if mem_id not in results:
+                        results[mem_id] = {
+                            "routes": {route_name},
+                            "core_json": core_path.read_text().strip(),
+                            "matched_detailed_lines": []
+                        }
+                    else:
+                        results[mem_id]["routes"].add(route_name)
 
-    add_match(matches_chat, "chat")
-    add_match(matches_user, "user")
-    add_match(matches_kw, "kw")
-    
-    # Output TSV
-    print("# id\troutes\tcore_json\tmatched_detailed_lines")
-    for mem_id in sorted(results.keys()):
-        data = results[mem_id]
-        routes_str = ",".join(sorted(data["routes"]))
-        matched = json.dumps(data["matched_detailed_lines"], ensure_ascii=False)
-        print(f"{mem_id}\t{routes_str}\t{data['core_json']}\t{matched}")
+                    # Only the kw route is treated as a "content match" worth surfacing
+                    # in the main TSV output; chat/user routes are just for candidate finding.
+                    if route_name == "kw" and line_matches:
+                        results[mem_id]["matched_detailed_lines"] = [
+                            {"line": line_no, "text": text} for line_no, text in line_matches
+                        ]
+
+            add_match(matches_chat, "chat")
+            add_match(matches_user, "user")
+            add_match(matches_kw, "kw")
+
+            # Preferences
+            kind = "telegram"
+            prefs = []
+            pref_paths = [
+                (Path.home() / f"preferences/{kind}/preferences.md", f"Global Preference ({kind}):"),
+                (Path.home() / f"preferences/{kind}/by_chat/{chat_id}.md", f"Chat-specific Preference (chat_id: {chat_id}):"),
+                (Path.home() / f"preferences/{kind}/by_user/{from_id}.md", f"User-specific Preference (from_id: {from_id}):"),
+            ]
+            
+            for path, title in pref_paths:
+                if path.exists():
+                    prefs.append(f"{title}\n{path.read_text()}\n---")
+            
+            if prefs:
+                for block in "\n".join(prefs).splitlines():
+                    w.line(block)
+
+            # Output TSV
+            w.line("# id\troutes\tcore_json\tmatched_detailed_lines")
+            for mem_id in sorted(results.keys()):
+                data = results[mem_id]
+                routes_str = ",".join(sorted(data["routes"]))
+                matched = json.dumps(data["matched_detailed_lines"], ensure_ascii=False)
+                w.line(f"{mem_id}\t{routes_str}\t{data['core_json']}\t{matched}")
+    except FileExistsError:
+        typer.echo(f"Error: output file already exists: {out_path}", err=True)
+        typer.echo(
+            "Tip: use a unique file to avoid races, e.g. --out /tmp/tg_ctx_<unique>.tsv",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Output saved to: {out_path} (candidates: {len(results)})", err=True)
 
 if __name__ == "__main__":
     app()
