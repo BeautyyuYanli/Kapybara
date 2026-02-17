@@ -50,6 +50,20 @@ async def test_shell_session_manager_interrupt_unregisters() -> None:
 
 
 @pytest.mark.anyio
+async def test_shell_session_manager_next_allows_timeout_override() -> None:
+    manager = ShellSessionManager()
+    session_id = await manager.new_shell(
+        "python -c 'import time; print(\"READY\"); time.sleep(0.05)'",
+        options=ShellSessionOptions(timeout_seconds=0.01),
+    )
+
+    stdout, _stderr, code = await manager.next(session_id, timeout_seconds=0.2)
+    assert b"READY\n" in stdout
+    assert code == 0
+    assert await manager.list_sessions() == []
+
+
+@pytest.mark.anyio
 async def test_shell_session_manager_close_guards_operations() -> None:
     manager = ShellSessionManager()
     await manager.close()

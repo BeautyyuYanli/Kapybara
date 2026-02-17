@@ -148,8 +148,21 @@ class ShellSessionManager:
             self._sessions[session.session_id] = session
             return session.session_id
 
-    async def next(self, session_id: str, stdin: bytes | None = None) -> NextResult:
-        """Run the next step for a registered session."""
+    async def next(
+        self,
+        session_id: str,
+        stdin: bytes | None = None,
+        timeout_seconds: float | None = None,
+    ) -> NextResult:
+        """Run the next step for a registered session.
+
+        Args:
+            session_id: Registered shell session id.
+            stdin: Optional stdin bytes to write before waiting.
+            timeout_seconds:
+                Optional per-call timeout override (seconds) for this `next()`
+                call only. If omitted, the session default is used.
+        """
 
         async with self._lock:
             self._require_open()
@@ -157,7 +170,7 @@ class ShellSessionManager:
             if session is None:
                 raise KeyError(f"Unknown session id: {session_id}")
 
-            result = await session.next(stdin=stdin)
+            result = await session.next(stdin=stdin, timeout_seconds=timeout_seconds)
             if session.is_closed():
                 self._sessions.pop(session_id, None)
             return result
@@ -374,8 +387,16 @@ class ShellSession:
             with suppress(BaseException):
                 await self._out_send.send(_StreamDone(stream=stream_name))
 
-    async def next(self, stdin: bytes | None = None) -> NextResult:
-        """Send stdin and wait up to `timeout_seconds` for process exit.
+    async def next(
+        self, stdin: bytes | None = None, timeout_seconds: float | None = None
+    ) -> NextResult:
+        """Send stdin and wait for output or exit.
+
+        Args:
+            stdin: Optional stdin bytes to send first.
+            timeout_seconds:
+                Optional per-call timeout override in seconds. If omitted, uses
+                `self.options.timeout_seconds`.
 
         Returns:
             (stdout, stderr, returncode). `returncode=None` means the process did
@@ -404,7 +425,15 @@ class ShellSession:
         stderr = bytearray()
         returncode: int | None = None
 
-        deadline = anyio.current_time() + self.options.timeout_seconds
+        effective_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self.options.timeout_seconds
+        )
+        if effective_timeout <= 0:
+            raise ValueError(f"timeout_seconds must be > 0; got {effective_timeout}")
+
+        deadline = anyio.current_time() + effective_timeout
         while True:
             if process.returncode is not None:
                 returncode = process.returncode

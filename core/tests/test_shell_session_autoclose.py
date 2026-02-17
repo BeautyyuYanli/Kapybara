@@ -44,6 +44,25 @@ async def test_shell_session_next_does_not_autoclose_on_timeout() -> None:
 
 
 @pytest.mark.anyio
+async def test_shell_session_next_allows_per_call_timeout_override() -> None:
+    session = ShellSession(
+        "python -c 'import time; print(\"START\"); time.sleep(0.05)'",
+        options=ShellSessionOptions(
+            timeout_seconds=0.01,
+            terminate_wait_seconds=0.1,
+            kill_wait_seconds=0.1,
+            process_close_wait_seconds=0.1,
+        ),
+    )
+
+    stdout, _stderr, code = await session.next(timeout_seconds=0.2)
+
+    assert b"START\n" in stdout
+    assert code == 0
+    assert session.is_closed() is True
+
+
+@pytest.mark.anyio
 async def test_shell_session_interrupt_from_different_task_does_not_crash(
     anyio_backend,
 ) -> None:
