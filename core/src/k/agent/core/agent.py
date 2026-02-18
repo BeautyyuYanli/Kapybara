@@ -16,19 +16,16 @@ Persona override:
 from __future__ import annotations
 
 import asyncio
-import functools
-import inspect
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Concatenate, cast
+from typing import cast
 
 from pydantic_ai import (
     Agent,
     ModelMessage,
-    ModelRetry,
     RunContext,
     ToolOutput,
 )
@@ -41,7 +38,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import KnownModelName, Model
 
-from k.agent.core.entities import Event, MemoryHint, finish_action
+from k.agent.core.entities import Event, MemoryHint, finish_action, tool_exception_guard
 from k.agent.core.media_tools import read_media
 from k.agent.core.prompts import (
     SOP_prompt,
@@ -68,40 +65,7 @@ from k.io_helpers.shell import ShellSessionManager
 from k.runner_helpers.basic_os import BasicOSHelper
 
 
-def _tool_model_retry_guard[DepsT, **P, R](
-    fn: Callable[Concatenate[RunContext[DepsT], P], Awaitable[R] | R],
-) -> Callable[Concatenate[RunContext[DepsT], P], Awaitable[R]]:
-    """Wrap a tool so unexpected exceptions become `ModelRetry`.
-
-    `pydantic_ai` treats `ModelRetry` as a recoverable tool failure (the model
-    gets a chance to correct its tool call). Unhandled exceptions would abort
-    the run; this guard converts them to `ModelRetry` while preserving
-    cancellation and already-retriable errors.
-    """
-
-    @functools.wraps(fn)
-    async def wrapper(ctx: RunContext[DepsT], *args: P.args, **kwargs: P.kwargs) -> R:
-        try:
-            res = fn(ctx, *args, **kwargs)
-            if inspect.isawaitable(res):
-                return await cast(Awaitable[R], res)
-            return cast(R, res)
-        except ModelRetry:
-            raise
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            tool_name = getattr(ctx, "tool_name", None) or getattr(fn, "__name__", "")
-            tool_label = f"`{tool_name}`" if tool_name else "tool"
-            raise ModelRetry(
-                f"{tool_label} raised an unexpected error ({type(e).__name__}): {e}"
-            ) from e
-
-    wrapper.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
-    return wrapper
-
-
-@dataclass()
+@dataclass(slots=True)
 class MyDeps:
     """Dependencies for the agent run.
 
@@ -154,6 +118,7 @@ class MyDeps:
         await self.shell_manager.close()
 
 
+@tool_exception_guard
 async def fork(
     ctx: RunContext[MyDeps],
     instruct: str,
@@ -234,7 +199,7 @@ def _read_persona_override(fs_base: Path) -> str:
     except FileNotFoundError:
         try:
             text = (fs_base / "PERSONA.default.md").read_text(encoding="utf-8").strip()
-        except FileNotFoundError, OSError:
+        except (FileNotFoundError, OSError):
             return ""
     except OSError:
         return ""
@@ -244,13 +209,13 @@ def _read_persona_override(fs_base: Path) -> str:
 agent = Agent(
     system_prompt=[],
     tools=[
-        _tool_model_retry_guard(bash),
-        _tool_model_retry_guard(bash_input),
-        _tool_model_retry_guard(bash_wait),
-        _tool_model_retry_guard(bash_interrupt),
-        _tool_model_retry_guard(edit_file),
-        _tool_model_retry_guard(read_media),
-        _tool_model_retry_guard(fork),
+        bash,
+        bash_input,
+        bash_wait,
+        bash_interrupt,
+        edit_file,
+        read_media,
+        fork,
     ],
     deps_type=MyDeps,
     output_type=ToolOutput(finish_action, name="finish_action"),
@@ -322,8 +287,8 @@ async def _memory_select(
     recent_mem = set(parent_memories)
     all_mem = set(parent_memories)
     for mem in parent_memories:
-        recent_mem.union(memory_store.get_ancestors(mem, level=compacted_level_num))
-        all_mem.union(memory_store.get_ancestors(mem, level=raw_pair_level_num))
+        recent_mem.update(memory_store.get_ancestors(mem, level=compacted_level_num))
+        all_mem.update(memory_store.get_ancestors(mem, level=raw_pair_level_num))
 
     all_mem_rec = memory_store.get_by_ids(all_mem)
     return all_mem_rec, recent_mem

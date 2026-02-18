@@ -6,6 +6,12 @@ tools, deps, and runners without creating import cycles.
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import cast
+
 from pydantic import BaseModel
 
 
@@ -18,6 +24,31 @@ class MemoryHint(BaseModel):
     referenced_memory_ids: list[str]
     from_where_and_response_to_where: str
     user_intents: str
+
+
+def tool_exception_guard[**P, R](
+    fn: Callable[P, Awaitable[R] | R],
+) -> Callable[P, Awaitable[R | str]]:
+    """Decorator for tool functions that converts unexpected failures to strings.
+
+    - Lets `asyncio.CancelledError` propagate (cancellation should abort).
+    - Catches all other `Exception` instances and returns `str(e)`.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R | str:
+        try:
+            res = fn(*args, **kwargs)
+            if inspect.isawaitable(res):
+                return await cast(Awaitable[R], res)
+            return cast(R, res)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return str(exc)
+
+    wrapper.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
+    return wrapper
 
 
 def finish_action(
