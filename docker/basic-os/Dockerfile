@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.14-slim-bookworm
+FROM python:3.14-slim-trixie
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -20,6 +20,8 @@ RUN apt-get update \
         jq \
         fd-find \
         plocate \
+        xz-utils \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv ast-grep-cli
