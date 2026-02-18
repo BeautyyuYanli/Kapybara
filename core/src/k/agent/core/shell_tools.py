@@ -194,7 +194,6 @@ async def _bash_impl(
     )
 
 
-@tool_exception_guard
 @bash_countdown_tool
 async def bash(
     ctx: RunContext[ShellToolDeps], text: str, timeout_seconds: float | None = None
@@ -209,7 +208,6 @@ async def bash(
     return await _bash_impl(ctx, text, timeout_seconds=timeout_seconds)
 
 
-@tool_exception_guard
 @bash_countdown_tool
 async def bash_input(
     ctx: RunContext[ShellToolDeps],
@@ -237,7 +235,6 @@ async def bash_input(
     return BashEvent.new(session_id, res, all_active_sessions=active_sessions)
 
 
-@tool_exception_guard
 @bash_countdown_tool
 async def bash_wait(
     ctx: RunContext[ShellToolDeps],
@@ -263,7 +260,6 @@ async def bash_wait(
     return BashEvent.new(session_id, res, all_active_sessions=active_sessions)
 
 
-@tool_exception_guard
 async def bash_interrupt(ctx: RunContext[ShellToolDeps], session_id: str) -> str:
     """
     Interrupt a bash session. If the session is already ended, do nothing.
@@ -276,7 +272,6 @@ async def bash_interrupt(ctx: RunContext[ShellToolDeps], session_id: str) -> str
     return "Session ended."
 
 
-@tool_exception_guard
 @bash_countdown_tool
 async def edit_file(
     ctx: RunContext[ShellToolDeps],

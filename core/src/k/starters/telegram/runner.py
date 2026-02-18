@@ -349,9 +349,7 @@ async def _poll_and_run_forever(
             # to avoid duplicate processing in multi-instance setups.
             if chat_ids is not None:
                 dispatch_groups = {
-                    cid: updates
-                    for cid, updates in grouped.items()
-                    if cid in chat_ids
+                    cid: updates for cid, updates in grouped.items() if cid in chat_ids
                 }
             else:
                 dispatch_groups = grouped

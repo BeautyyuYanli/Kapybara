@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -97,6 +98,7 @@ async def run(
 
     logfire.configure()
     logfire.instrument_pydantic_ai()
+    logging.basicConfig(level=logging.INFO, handlers=[logfire.LogfireLoggingHandler()])
 
     config = Config()  # type: ignore[call-arg]
 

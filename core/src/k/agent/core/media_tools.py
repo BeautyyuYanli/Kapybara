@@ -20,8 +20,10 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
-from pydantic_ai import BinaryContent, ModelRetry, MultiModalContent, RunContext
+from pydantic_ai import BinaryContent, MultiModalContent
 from pydantic_ai.messages import AudioUrl, DocumentUrl, ImageUrl, VideoUrl
+
+from k.agent.core.entities import tool_exception_guard
 
 
 def _is_http_url(value: str) -> bool:
@@ -41,6 +43,18 @@ def _url_kind_from_media_type(media_type: str) -> UrlMediaKind | None:
     if mt.startswith("video/"):
         return "video-url"
     if mt == "application/pdf" or mt.startswith("text/"):
+        return "document-url"
+    if mt in {
+        "application/json",
+        "application/rtf",
+        "application/xml",
+        "application/msword",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }:
         return "document-url"
     return None
 
@@ -76,72 +90,77 @@ async def _sniff_url_media_type(url: str) -> str | None:
     return None
 
 
-async def _infer_url_kind(url: str) -> UrlMediaKind:
+def _is_generic_binary_media_type(media_type: str) -> bool:
+    mt = media_type.lower()
+    return mt in {"application/octet-stream", "binary/octet-stream"}
+
+
+async def _infer_url_kind(url: str) -> UrlMediaKind | None:
     path = urlparse(url).path
     guessed_type, _ = mimetypes.guess_type(path)
     if guessed_type:
+        if _is_generic_binary_media_type(guessed_type):
+            return None
         kind = _url_kind_from_media_type(guessed_type)
         if kind:
             return kind
 
     sniffed_type = await _sniff_url_media_type(url)
     if sniffed_type:
+        if _is_generic_binary_media_type(sniffed_type):
+            return None
         kind = _url_kind_from_media_type(sniffed_type)
         if kind:
             return kind
 
-    return "document-url"
+    return None
 
 
+@tool_exception_guard
 async def read_media[DepsT](
-    ctx: RunContext[DepsT],
     media: list[str],
-) -> list[MultiModalContent]:
+) -> list[MultiModalContent] | str:
     """
     Read media files from URLs or local file paths.
 
     Args:
-    - `media`: A list of URLs and/or local file paths.
+        media: A list of URLs and/or local file paths.
     """
 
-    del ctx
     results: list[MultiModalContent] = []
     for raw in media:
-        raw = raw.strip()
-        if not raw:
-            raise ModelRetry("Invalid media spec: empty string")
+        spec = raw.strip()
+        if not spec:
+            raise ValueError("Invalid media spec: empty string")
 
-        raw_lower = raw.lower()
-        if raw_lower.startswith(("image:", "audio:", "video:", "document:")):
-            raise ModelRetry(
+        if spec.lower().startswith(("image:", "audio:", "video:", "document:")):
+            raise ValueError(
                 "Invalid media spec: kind prefixes like 'image:https://...' are not supported; "
                 "pass the URL/path directly."
             )
 
-        spec = raw.strip()
-        if not spec:
-            raise ModelRetry(f"Invalid media spec: {raw!r}")
-
         if _is_http_url(spec):
-            try:
-                url_kind = await _infer_url_kind(spec)
-                if url_kind == "image-url":
-                    content = ImageUrl(url=spec)
-                elif url_kind == "audio-url":
-                    content = AudioUrl(url=spec)
-                elif url_kind == "video-url":
-                    content = VideoUrl(url=spec)
-                else:
-                    content = DocumentUrl(url=spec)
-            except Exception as e:
-                raise ModelRetry(f"Failed to load URL {spec}: {e}") from e
+            url_kind = await _infer_url_kind(spec)
+            if url_kind is None:
+                raise ValueError("Invalid URL/path or not a supported media file.")
+            if url_kind == "image-url":
+                content = ImageUrl(url=spec)
+            elif url_kind == "audio-url":
+                content = AudioUrl(url=spec)
+            elif url_kind == "video-url":
+                content = VideoUrl(url=spec)
+            else:
+                content = DocumentUrl(url=spec)
+            # Fail fast
+            content._infer_media_type()
         else:
-            try:
-                expanded = os.path.expandvars(spec)
-                path = Path(expanded).expanduser()
-                content = BinaryContent.from_path(path)
-            except Exception as e:
-                raise ModelRetry(f"Failed to read file {spec}: {e}") from e
+            expanded = os.path.expandvars(spec)
+            path = Path(expanded).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {path}")
+
+            content = BinaryContent.from_path(path)
+
 
         results.append(content)
     return results
