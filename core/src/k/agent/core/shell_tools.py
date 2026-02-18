@@ -15,6 +15,7 @@ from typing import Any, Concatenate, Protocol
 
 from pydantic_ai import RunContext
 
+from k.agent.core.entities import tool_exception_guard
 from k.io_helpers.shell import (
     NextResult,
     ShellSessionInfo,
@@ -193,10 +194,11 @@ async def _bash_impl(
     )
 
 
+@tool_exception_guard
 @bash_countdown_tool
 async def bash(
     ctx: RunContext[ShellToolDeps], text: str, timeout_seconds: float | None = None
-) -> BashEvent:
+) -> BashEvent | str:
     """
     Start a new bash session and run initial commands.
 
@@ -207,6 +209,7 @@ async def bash(
     return await _bash_impl(ctx, text, timeout_seconds=timeout_seconds)
 
 
+@tool_exception_guard
 @bash_countdown_tool
 async def bash_input(
     ctx: RunContext[ShellToolDeps],
@@ -234,6 +237,7 @@ async def bash_input(
     return BashEvent.new(session_id, res, all_active_sessions=active_sessions)
 
 
+@tool_exception_guard
 @bash_countdown_tool
 async def bash_wait(
     ctx: RunContext[ShellToolDeps],
@@ -259,6 +263,7 @@ async def bash_wait(
     return BashEvent.new(session_id, res, all_active_sessions=active_sessions)
 
 
+@tool_exception_guard
 async def bash_interrupt(ctx: RunContext[ShellToolDeps], session_id: str) -> str:
     """
     Interrupt a bash session. If the session is already ended, do nothing.
@@ -271,6 +276,7 @@ async def bash_interrupt(ctx: RunContext[ShellToolDeps], session_id: str) -> str
     return "Session ended."
 
 
+@tool_exception_guard
 @bash_countdown_tool
 async def edit_file(
     ctx: RunContext[ShellToolDeps],
@@ -278,7 +284,7 @@ async def edit_file(
     old_content: str,
     new_content: str,
     start_line: int | None = None,
-) -> BashEvent:
+) -> BashEvent | str:
     """Edit a file by replacing a known slice of lines.
 
     Args:

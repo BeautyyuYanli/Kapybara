@@ -494,7 +494,7 @@ class ShellSession:
         while True:
             try:
                 event = self._out_recv.receive_nowait()
-            except anyio.WouldBlock, anyio.EndOfStream:
+            except (anyio.WouldBlock, anyio.EndOfStream):
                 break
             self._apply_event(event, stdout, stderr)
 
@@ -517,7 +517,7 @@ class ShellSession:
         while True:
             try:
                 event = self._out_recv.receive_nowait()
-            except anyio.WouldBlock, anyio.EndOfStream:
+            except (anyio.WouldBlock, anyio.EndOfStream):
                 break
             self._apply_event(event, stdout, stderr)
 
