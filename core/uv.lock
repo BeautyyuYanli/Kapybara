@@ -385,7 +385,7 @@ dependencies = [
     { name = "filetype" },
     { name = "logfire" },
     { name = "pydantic" },
-    { name = "pydantic-ai-slim", extra = ["google", "openrouter"] },
+    { name = "pydantic-ai-slim", extra = ["google", "openai", "openrouter"] },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "rich" },
@@ -406,7 +406,7 @@ requires-dist = [
     { name = "filetype", specifier = ">=1.2.0" },
     { name = "logfire", specifier = ">=4.22.0" },
     { name = "pydantic", specifier = ">=2.12.5" },
-    { name = "pydantic-ai-slim", extras = ["openrouter", "google"], specifier = ">=1.58.0" },
+    { name = "pydantic-ai-slim", extras = ["google", "openai", "openrouter"] },
     { name = "pydantic-settings", specifier = ">=2.12.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "rich", specifier = ">=14.3.2" },
@@ -684,6 +684,10 @@ wheels = [
 [package.optional-dependencies]
 google = [
     { name = "google-genai" },
+]
+openai = [
+    { name = "openai" },
+    { name = "tiktoken" },
 ]
 openrouter = [
     { name = "openai" },
