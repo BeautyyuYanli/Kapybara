@@ -82,7 +82,9 @@ class TelegramBotApi:
 
         result = payload.get("result")
         if not isinstance(result, dict):
-            raise TelegramBotApiError("Telegram sendMessage failed: missing result dict")
+            raise TelegramBotApiError(
+                "Telegram sendMessage failed: missing result dict"
+            )
 
         return result
 
@@ -99,7 +101,7 @@ class TelegramBotApi:
         """
 
         # Keep a minimal guard to avoid Telegram rejecting NUL-containing strings.
-        safe_text = text.replace("\x00", "\uFFFD")
+        safe_text = text.replace("\x00", "\ufffd")
         return await to_thread.run_sync(
             lambda: self._send_message_sync(
                 chat_id=chat_id,

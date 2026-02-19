@@ -10,12 +10,14 @@ import asyncio
 import functools
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import cast
 from logging import getLogger
+from typing import cast
 
 from pydantic import BaseModel
 
 logger = getLogger(__name__)
+
+
 class Event(BaseModel):
     kind: str
     content: str

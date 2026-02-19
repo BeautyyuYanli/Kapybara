@@ -161,6 +161,5 @@ async def read_media[DepsT](
 
             content = BinaryContent.from_path(path)
 
-
         results.append(content)
     return results

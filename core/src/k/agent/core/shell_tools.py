@@ -15,7 +15,6 @@ from typing import Any, Concatenate, Protocol
 
 from pydantic_ai import RunContext
 
-from k.agent.core.entities import tool_exception_guard
 from k.io_helpers.shell import (
     NextResult,
     ShellSessionInfo,
