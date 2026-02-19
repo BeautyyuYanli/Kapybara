@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import html
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ from .history import (
 
 
 async def run_agent_for_chat_batch(
+    api: TelegramBotApi,
     chat_id: int | None,
     batch_updates: list[dict[str, Any]],
     model: OpenRouterModel,
@@ -54,6 +56,41 @@ async def run_agent_for_chat_batch(
     except Exception as e:  # pragma: no cover (model/runtime dependent)
         prefix = f"[chat_id={chat_id}] " if chat_id is not None else "[chat_id=?] "
         print(f"[red]agent_run failed[/red]: {prefix}{type(e).__name__}: {e}")
+        reply_to_message_id: int | None = None
+        reply_chat_id: int | None = chat_id
+        for update in reversed(batch_updates):
+            message = update.get("message")
+            if not isinstance(message, dict):
+                continue
+            message_id = message.get("message_id")
+            if not isinstance(message_id, int):
+                continue
+            reply_to_message_id = message_id
+            if reply_chat_id is None:
+                chat = message.get("chat")
+                if isinstance(chat, dict) and isinstance(chat.get("id"), int):
+                    reply_chat_id = chat["id"]
+            break
+
+        if reply_chat_id is not None and reply_to_message_id is not None:
+            exc_type = html.escape(type(e).__name__)
+            exc_msg = html.escape(str(e)) if str(e) else "Unknown error"
+            text = (
+                "<b>Agent error</b>\n"
+                + f"<code>{exc_type}</code>: {exc_msg}\n"
+                + "Check the server logs for a traceback."
+            )
+            try:
+                await api.send_message(
+                    chat_id=reply_chat_id,
+                    text=text,
+                    reply_to_message_id=reply_to_message_id,
+                )
+            except Exception as send_err:  # pragma: no cover (network dependent)
+                print(
+                    "[yellow]Telegram sendMessage failed[/yellow]: "
+                    + f"{type(send_err).__name__}: {send_err}"
+                )
         return
 
     # `FolderMemoryStore.append()` mutates on-disk files; serialize appends
@@ -458,6 +495,7 @@ async def _poll_and_run_forever(
             for cid, updates_for_chat in dispatch_groups.items():
                 tg.start_soon(
                     run_agent_for_chat_batch,
+                    api,
                     cid,
                     list(updates_for_chat),
                     model,

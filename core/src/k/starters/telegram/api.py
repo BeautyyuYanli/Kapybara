@@ -28,6 +28,87 @@ class TelegramBotApi:
         # Never log/print this URL; it embeds the bot token.
         return f"{_TELEGRAM_API_BASE}/bot{self.token}/{method}"
 
+    def _send_message_sync(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None = None,
+        parse_mode: str = "HTML",
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+        }
+        if reply_to_message_id is not None:
+            params["reply_to_message_id"] = reply_to_message_id
+
+        data = urllib.parse.urlencode(params).encode("utf-8")
+        request = urllib.request.Request(
+            self._method_url("sendMessage"),
+            data=data,
+            method="POST",
+        )
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                raw = resp.read()
+        except (
+            urllib.error.HTTPError
+        ) as e:  # pragma: no cover (hard to simulate reliably)
+            raise TelegramBotApiError(
+                f"Telegram sendMessage failed: HTTP {e.code}"
+            ) from e
+        except urllib.error.URLError as e:  # pragma: no cover (network dependent)
+            raise TelegramBotApiError(
+                "Telegram sendMessage failed: network error"
+            ) from e
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise TelegramBotApiError(
+                "Telegram sendMessage failed: invalid JSON"
+            ) from e
+
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            desc = payload.get("description") if isinstance(payload, dict) else None
+            raise TelegramBotApiError(
+                "Telegram sendMessage failed"
+                + (f": {desc}" if isinstance(desc, str) and desc else "")
+            )
+
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise TelegramBotApiError("Telegram sendMessage failed: missing result dict")
+
+        return result
+
+    async def send_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Send a message via `sendMessage` (async wrapper).
+
+        Uses `parse_mode="HTML"` by default.
+        """
+
+        # Keep a minimal guard to avoid Telegram rejecting NUL-containing strings.
+        safe_text = text.replace("\x00", "\uFFFD")
+        return await to_thread.run_sync(
+            lambda: self._send_message_sync(
+                chat_id=chat_id,
+                text=safe_text,
+                reply_to_message_id=reply_to_message_id,
+                parse_mode="HTML",
+            )
+        )
+
     def _get_me_sync(self) -> dict[str, Any]:
         request = urllib.request.Request(self._method_url("getMe"), method="GET")
         try:

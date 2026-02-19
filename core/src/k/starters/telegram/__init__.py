@@ -14,11 +14,11 @@ Design notes / boundaries:
   the agent can infer routing metadata (e.g. `chat.id`) later, while avoiding
   high-token, low-signal fields (e.g. file sizes, repeated user/chat profile
   fields).
-  - Invariant: `chat.id` and `from.id` remain present in the familiar nested
-    form (`"chat": {"id": ...}`, `"from": {"id": ...}`) so downstream regex
-    matchers can continue to route by chat/user id.
-- No outbound Telegram send is performed here; this package only consumes
-  updates and creates agent memories.
+- Invariant: `chat.id` and `from.id` remain present in the familiar nested
+  form (`"chat": {"id": ...}`, `"from": {"id": ...}`) so downstream regex
+  matchers can continue to route by chat/user id.
+- No outbound Telegram send is performed (except replying with agent run errors);
+  this package primarily consumes updates and creates agent memories.
 - The starter tracks the latest consumed `update_id` in-memory only.
   - Restarts may reprocess updates that are still pending server-side.
 - When `--updates-store-path` is configured, each accepted update is appended
