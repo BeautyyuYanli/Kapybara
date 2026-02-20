@@ -5,7 +5,16 @@ from pathlib import Path
 
 def _skill_edit_script() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "data" / "fs" / "skills" / "meta" / "edit-file" / "edit.py"
+    return (
+        repo_root
+        / "data"
+        / "fs"
+        / ".kapybara"
+        / "skills"
+        / "meta"
+        / "edit-file"
+        / "edit.py"
+    )
 
 
 def _run_edit(

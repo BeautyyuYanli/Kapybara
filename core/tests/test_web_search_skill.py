@@ -6,7 +6,16 @@ from pathlib import Path
 
 def _web_search_script_path() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "data" / "fs" / "skills" / "core" / "web-search" / "search"
+    return (
+        repo_root
+        / "data"
+        / "fs"
+        / ".kapybara"
+        / "skills"
+        / "core"
+        / "web-search"
+        / "search"
+    )
 
 
 def _load_web_search_module():

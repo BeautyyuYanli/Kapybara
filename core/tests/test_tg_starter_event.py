@@ -86,7 +86,7 @@ def test_telegram_event_content_keeps_stage_a_chat_and_from_layout() -> None:
 
     event_json = telegram_update_to_event_json(update)
 
-    # `stage_a.sh` matches on the JSON-escaped payload inside the event JSON.
+    # `stage_a` matches on the JSON-escaped payload inside the event JSON.
     # Keep it simple here: ensure the `chat`/`from` objects still use the
     # familiar nested shape, with `id` as the first key.
     assert '\\"chat\\":{\\"id\\":-100123' in event_json
