@@ -10,6 +10,9 @@ This script is intentionally minimal and is used by the `messager/telegram`
 skill docs. It prints the Telegram API JSON response to stdout as compact
 UTF-8 JSON (no ASCII `\\uXXXX` escaping) so it can be pasted into LLM prompts
 without extra whitespace or ANSI control codes.
+
+When `message_thread_id` is provided, the document is sent to that thread.
+Use the same thread id from the input message when replies must stay in-thread.
 """
 
 import json
@@ -24,7 +27,12 @@ def _json_dumps(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-def send_document(chat_id: str, file_path: str, caption: str | None = None) -> dict:
+def send_document(
+    chat_id: str,
+    file_path: str,
+    caption: str | None = None,
+    message_thread_id: str | None = None,
+) -> dict:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -36,6 +44,8 @@ def send_document(chat_id: str, file_path: str, caption: str | None = None) -> d
         if caption:
             data["caption"] = caption
             data["parse_mode"] = "HTML"
+        if message_thread_id:
+            data["message_thread_id"] = message_thread_id
 
         files = {"document": f}
         response = requests.post(url, data=data, files=files, timeout=30)
@@ -54,11 +64,22 @@ if __name__ == "__main__":
     parser.add_argument("file_path", help="Path to the file to send")
     parser.add_argument("--chat-id", required=True, help="Telegram Chat ID")
     parser.add_argument("--caption", help="Caption for the document (HTML supported)")
+    parser.add_argument(
+        "--message-thread-id",
+        "--message_thread_id",
+        dest="message_thread_id",
+        help="Optional Telegram message_thread_id for thread-scoped delivery",
+    )
     
     args = parser.parse_args()
     
     try:
-        result = send_document(args.chat_id, args.file_path, args.caption)
+        result = send_document(
+            args.chat_id,
+            args.file_path,
+            args.caption,
+            args.message_thread_id,
+        )
         print(_json_dumps(result))
     except requests.RequestException as e:
         print(f"Request error: {e}", file=sys.stderr)

@@ -4,12 +4,20 @@
 # dependencies = ["requests", "beautifulsoup4", "lxml"]
 # ///
 
+"""Publish HTML to Telegra.ph and send the page URL to Telegram.
+
+When `--message-thread-id` is provided, delivery is pinned to that Telegram
+thread (`message_thread_id`). This is required when the input message came
+from a private-chat/forum topic thread and replies must stay in-thread.
+"""
+
 import os
 import sys
 import json
 import requests
 import argparse
 from bs4 import BeautifulSoup, NavigableString
+
 
 def html_to_node(element):
     """
@@ -49,7 +57,17 @@ def html_to_node(element):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("content", help="The HTML content to publish")
-    parser.add_argument("--chat-id", required=True, help="Telegram Chat ID to send the link to")
+    parser.add_argument(
+        "--chat-id",
+        required=True,
+        help="Telegram Chat ID to send the link to",
+    )
+    parser.add_argument(
+        "--message-thread-id",
+        "--message_thread_id",
+        dest="message_thread_id",
+        help="Optional Telegram message_thread_id for thread-scoped delivery",
+    )
     parser.add_argument("--title", default="Note", help="Telegra.ph page title")
     args = parser.parse_args()
 
@@ -107,6 +125,8 @@ def main():
                 "prefer_large_media": True
             })
         }
+        if args.message_thread_id:
+            tg_data["message_thread_id"] = args.message_thread_id
         
         tg_r = requests.post(tg_url, data=tg_data)
         tg_r.raise_for_status()

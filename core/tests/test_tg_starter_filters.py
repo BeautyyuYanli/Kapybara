@@ -10,7 +10,9 @@ from k.starters.telegram import (
     dispatch_groups_for_batch,
     extract_chat_id,
     extract_chat_type,
+    filter_non_forum_topic_created_updates,
     group_updates_by_chat_id,
+    update_is_forum_topic_created,
     update_is_private_chat,
     update_is_reply_to_bot,
     update_matches_keyword,
@@ -52,6 +54,46 @@ def test_update_mentions_bot() -> None:
     update = {"message": {"chat": {"id": 1, "type": "group"}, "text": "hi @MyBot"}}
     assert update_mentions_bot(update, bot_username="MyBot") is True
     assert update_mentions_bot(update, bot_username="OtherBot") is False
+
+
+def test_update_is_forum_topic_created() -> None:
+    service_update = {
+        "message": {
+            "chat": {"id": 1, "type": "supergroup"},
+            "forum_topic_created": {"name": "topic"},
+        }
+    }
+    normal_update = {
+        "message": {
+            "chat": {"id": 1, "type": "supergroup"},
+            "text": "normal",
+        }
+    }
+    assert update_is_forum_topic_created(service_update) is True
+    assert update_is_forum_topic_created(normal_update) is False
+
+
+def test_filter_non_forum_topic_created_updates_drops_service_updates() -> None:
+    updates = [
+        {
+            "update_id": 1,
+            "message": {
+                "chat": {"id": 1, "type": "supergroup"},
+                "forum_topic_created": {"name": "topic"},
+            },
+        },
+        {
+            "update_id": 2,
+            "message": {
+                "chat": {"id": 1, "type": "group"},
+                "text": "normal",
+            },
+        },
+    ]
+
+    kept, dropped = filter_non_forum_topic_created_updates(updates)
+    assert dropped == 1
+    assert [u["update_id"] for u in kept] == [2]
 
 
 def test_update_is_reply_to_bot_by_id_or_username() -> None:

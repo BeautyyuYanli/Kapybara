@@ -1,4 +1,12 @@
-"""Polling loop and dispatch for the Telegram starter."""
+"""Polling loop and dispatch for the Telegram starter.
+
+Event payload policy:
+- Only *definite* plain-text message updates are compacted before forwarding
+  to the agent.
+- Non-text updates are forwarded in their original shape so media/callback
+  payloads keep as much detail as possible.
+- `forum_topic_created` service updates are ignored.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +22,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.models.openrouter import OpenRouterModel
 from rich import print
 
-from k.agent.core import agent_run
+from k.agent.core import Event, agent_run
 from k.agent.memory.folder import FolderMemoryStore
 from k.config import Config
 
@@ -23,10 +31,11 @@ from .compact import (
     dispatch_groups_for_batch,
     extract_chat_id,
     extract_update_id,
+    filter_non_forum_topic_created_updates,
     filter_unseen_updates,
     trigger_flags_for_updates,
 )
-from .events import telegram_updates_to_event
+from .events import telegram_update_to_event, telegram_updates_to_event
 from .history import (
     append_updates_jsonl,
     load_last_trigger_update_id_by_chat,
@@ -34,6 +43,168 @@ from .history import (
     save_last_trigger_update_id_by_chat,
     trigger_cursor_state_path_for_updates_store,
 )
+
+_TEXT_MESSAGE_UPDATE_KEYS: frozenset[str] = frozenset(
+    {
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "business_message",
+        "edited_business_message",
+    }
+)
+_TEXT_MESSAGE_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "message_id",
+        "date",
+        "edit_date",
+        "chat",
+        "from",
+        "text",
+        "entities",
+        "link_preview_options",
+        "message_thread_id",
+        "is_topic_message",
+        "reply_to_message",
+    }
+)
+
+
+def _extract_single_text_message_object(
+    update: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the update's message object when it is text-compaction-eligible."""
+
+    message_obj: dict[str, Any] | None = None
+    for key, value in update.items():
+        if key == "update_id":
+            continue
+        if key not in _TEXT_MESSAGE_UPDATE_KEYS or not isinstance(value, dict):
+            return None
+        if message_obj is not None:
+            return None
+        message_obj = value
+    return message_obj
+
+
+def _is_plain_text_message(message: dict[str, Any]) -> bool:
+    """Whether a Telegram message object is definitively plain text.
+
+    This predicate is intentionally conservative: if we see any field outside
+    the strict plain-text allowlist we do not compact, so richer payloads keep
+    their original detail. Text-format metadata (for example `entities`) is
+    allowed and compacted away.
+    """
+
+    text = message.get("text")
+    if not isinstance(text, str) or not text:
+        return False
+
+    for key, value in message.items():
+        if key not in _TEXT_MESSAGE_ALLOWED_KEYS:
+            return False
+
+        if key == "reply_to_message":
+            if not isinstance(value, dict):
+                return False
+            # `forum_topic_created` reply stubs are service payloads: keep the
+            # parent text message compactable and drop this reply in compaction.
+            if _is_forum_topic_created_message(value):
+                continue
+            if not _is_plain_text_reply_message(value):
+                return False
+    return True
+
+
+def _is_forum_topic_created_message(message: dict[str, Any]) -> bool:
+    """Whether a message dict is a forum-topic-created service payload."""
+
+    return "forum_topic_created" in message
+
+
+def _is_plain_text_reply_message(message: dict[str, Any]) -> bool:
+    """Whether a nested reply message is still text-only for compaction.
+
+    Reply snippets may include text-format metadata (`entities`) and may point
+    to forum-topic service messages, which are dropped during compaction.
+    """
+
+    if _is_forum_topic_created_message(message):
+        return True
+
+    text = message.get("text")
+    if not isinstance(text, str) or not text:
+        return False
+
+    for key, value in message.items():
+        if key not in _TEXT_MESSAGE_ALLOWED_KEYS:
+            return False
+
+        if key == "reply_to_message":
+            if not isinstance(value, dict):
+                return False
+            if _is_forum_topic_created_message(value):
+                continue
+            if not _is_plain_text_reply_message(value):
+                return False
+    return True
+
+
+def _should_compact_update_for_agent(update: dict[str, Any]) -> bool:
+    """Only compact updates that are simple text message variants."""
+
+    message = _extract_single_text_message_object(update)
+    if message is None:
+        return False
+    return _is_plain_text_message(message)
+
+
+def _telegram_updates_to_event_text_only_compaction(
+    updates: list[dict[str, Any]],
+    *,
+    tz: datetime.tzinfo,
+) -> Event:
+    """Build the agent instruct event with text-only update compaction.
+
+    We derive channels from the original batch so routing stays unchanged
+    (including topic-thread channel derivation), then compact only those update
+    lines that are plain text messages.
+    """
+
+    in_channel = telegram_updates_to_event(updates, compact=False, tz=tz).in_channel
+    bodies = [
+        telegram_update_to_event(
+            update,
+            compact=_should_compact_update_for_agent(update),
+            tz=tz,
+        ).content
+        for update in updates
+    ]
+    return Event(in_channel=in_channel, content="\n".join(bodies))
+
+
+def filter_dispatch_groups_without_forum_topic_created_updates(
+    dispatch_groups: dict[int | None, list[dict[str, Any]]],
+) -> tuple[dict[int | None, list[dict[str, Any]]], int, int]:
+    """Drop `forum_topic_created` service updates from dispatch groups.
+
+    Returns:
+        `(filtered_groups, dropped_updates, dropped_groups)`, where
+        `dropped_groups` counts chat groups emptied by this filter.
+    """
+
+    filtered: dict[int | None, list[dict[str, Any]]] = {}
+    dropped_updates = 0
+    dropped_groups = 0
+    for chat_id, updates in dispatch_groups.items():
+        kept_updates, dropped = filter_non_forum_topic_created_updates(updates)
+        dropped_updates += dropped
+        if kept_updates:
+            filtered[chat_id] = kept_updates
+        else:
+            dropped_groups += 1
+    return filtered, dropped_updates, dropped_groups
 
 
 async def run_agent_for_chat_batch(
@@ -51,7 +222,10 @@ async def run_agent_for_chat_batch(
             model=model,
             config=config,
             memory_store=memory_store,
-            instruct=telegram_updates_to_event(batch_updates, tz=tz),
+            instruct=_telegram_updates_to_event_text_only_compaction(
+                batch_updates,
+                tz=tz,
+            ),
         )
     except Exception as e:  # pragma: no cover (model/runtime dependent)
         prefix = f"[chat_id={chat_id}] " if chat_id is not None else "[chat_id=?] "
@@ -303,6 +477,10 @@ async def _poll_and_run_forever(
                     updates,
                     last_processed_update_id=last_consumed_update_id,
                 )
+                (
+                    unseen_updates,
+                    ignored_forum_topic_created_updates,
+                ) = filter_non_forum_topic_created_updates(unseen_updates)
 
                 seen_chat_ids = sorted(
                     {
@@ -317,6 +495,7 @@ async def _poll_and_run_forever(
                 print(
                     "[cyan]telegram recv[/cyan] "
                     + f"updates={len(updates)} unseen={len(unseen_updates)} "
+                    + f"forum_topic_created_ignored={ignored_forum_topic_created_updates} "
                     + f"next_offset={next_offset} chats={chat_ids_preview or None}"
                 )
 
@@ -425,6 +604,18 @@ async def _poll_and_run_forever(
 
             cursor_dropped_updates = 0
             cursor_dropped_groups = 0
+            forum_topic_created_dropped_updates = 0
+            forum_topic_created_dropped_groups = 0
+            (
+                dispatch_groups,
+                forum_topic_created_dropped_updates,
+                forum_topic_created_dropped_groups,
+            ) = filter_dispatch_groups_without_forum_topic_created_updates(
+                dispatch_groups
+            )
+            if forum_topic_created_dropped_updates:
+                dispatch_source += "+forum_topic_created"
+
             dispatch_groups, cursor_dropped_updates, cursor_dropped_groups = (
                 filter_dispatch_groups_after_last_trigger(
                     dispatch_groups,
@@ -445,6 +636,10 @@ async def _poll_and_run_forever(
                 "[green]telegram trigger[/green] "
                 + f"pending={len(pending_updates_in_order)} groups={len(dispatch_groups)} "
                 + f"source={dispatch_source} replaced_groups={replaced_groups} "
+                + "forum_topic_created_dropped_updates="
+                + f"{forum_topic_created_dropped_updates} "
+                + "forum_topic_created_dropped_groups="
+                + f"{forum_topic_created_dropped_groups} "
                 + f"cursor_dropped_updates={cursor_dropped_updates} cursor_dropped_groups={cursor_dropped_groups} "
                 + f"reasons={reasons}"
             )

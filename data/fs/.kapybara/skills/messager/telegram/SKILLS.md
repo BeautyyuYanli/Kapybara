@@ -21,10 +21,18 @@ Base URL:
 BASE="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
 ```
 
+## Thread routing (`message_thread_id`)
+
+- Telegram API field name is `message_thread_id` (optional; not every message has it).
+- If the input message has no `message_thread_id`, do not send this field.
+- If the input message is in a thread (`message_thread_id` present), all outgoing messages must stay in that same thread:
+  include the same `message_thread_id` on every send call.
+
 ## sendMessage
 
 ```bash
 CHAT_ID=123456789
+THREAD_ID=987654321  # use the input message's message_thread_id when replying in-thread
 
 MSG=$(cat <<'HTML'
 <b>Hi I'm here!</b> <i>Welcome</i> to the bot message. <u>Have a great day</u>
@@ -39,6 +47,7 @@ HTML
 
 curl -sS -X POST "$BASE/sendMessage" \
   -d chat_id="$CHAT_ID" \
+  -d message_thread_id="$THREAD_ID" \
   --data-urlencode text="$MSG" \
   -d parse_mode=HTML \
   -d disable_web_page_preview=true | jq
@@ -47,6 +56,7 @@ curl -sS -X POST "$BASE/sendMessage" \
 ## sendViaTelegraph
 
 Use this to publish long/structured content to Telegra.ph and send the link to Telegram.
+If you need to reply inside a thread, pass the same `message_thread_id`.
 
 Env:
 - `TELEGRAM_BOT_TOKEN`
@@ -54,11 +64,14 @@ Env:
 
 ```bash
 CHAT_ID=123456789
+THREAD_ID=987654321  # optional unless you need in-thread delivery
 
 # This script creates a page AND sends the link to the specified chat automatically.
 # You do NOT need to call sendMessage afterwards; the script handles the delivery.
+# It posts the Telegra.ph URL directly into the conversation/thread.
 ./send_via_telegraph "<h3>HTML content here</h3>" \
   --chat-id "$CHAT_ID" \
+  --message-thread-id "$THREAD_ID" \
   --title "Page Title"
 ```
 
@@ -82,11 +95,13 @@ Response includes `message_thread_id`.
 ### Send Sticker (via API)
 ```bash
 CHAT_ID=...
+THREAD_ID=...
 FILE_ID=...
 BASE="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
 
 curl -sS -X POST "$BASE/sendSticker" \
   -d chat_id="$CHAT_ID" \
+  -d message_thread_id="$THREAD_ID" \
   -d sticker="$FILE_ID" | jq
 ```
 
@@ -94,21 +109,28 @@ curl -sS -X POST "$BASE/sendSticker" \
 
 ```bash
 CHAT_ID=123
+THREAD_ID=987654321
 FILE_PATH="/path/to/file.txt"
 CAPTION="Here is the file"
 
-~/.kapybara/skills/messager/telegram/send_document "$FILE_PATH" --chat-id "$CHAT_ID" --caption "$CAPTION"
+~/.kapybara/skills/messager/telegram/send_document \
+  "$FILE_PATH" \
+  --chat-id "$CHAT_ID" \
+  --message-thread-id "$THREAD_ID" \
+  --caption "$CAPTION"
 ```
 
 ## sendPhoto
 
 ```bash
 CHAT_ID=123
+THREAD_ID=987654321
 PHOTO_URL="https://example.com/image.jpg"
 CAPTION="Look at this!"
 
 curl -sS -X POST "$BASE/sendPhoto" \
   -d chat_id="$CHAT_ID" \
+  -d message_thread_id="$THREAD_ID" \
   -d photo="$PHOTO_URL" \
   --data-urlencode caption="$CAPTION" \
   -d parse_mode=HTML | jq
@@ -119,6 +141,7 @@ Reply to a message:
 ```bash
 curl -sS -X POST "$BASE/sendMessage" \
   -d chat_id="$CHAT_ID" \
+  -d message_thread_id="$THREAD_ID" \
   -d reply_to_message_id=120 \
   --data-urlencode text="Got it" | jq
 ```

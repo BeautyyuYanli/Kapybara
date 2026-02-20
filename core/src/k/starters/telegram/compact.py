@@ -73,6 +73,15 @@ _REPLY_TO_FROM_USERNAME_PATHS: Final[tuple[tuple[str, ...], ...]] = (
     ("message", "reply_to_message", "from", "username"),
     ("edited_message", "reply_to_message", "from", "username"),
 )
+_FORUM_TOPIC_CREATED_PATHS: Final[tuple[tuple[str, ...], ...]] = (
+    ("message", "forum_topic_created"),
+    ("edited_message", "forum_topic_created"),
+    ("channel_post", "forum_topic_created"),
+    ("edited_channel_post", "forum_topic_created"),
+    ("callback_query", "message", "forum_topic_created"),
+    ("business_message", "forum_topic_created"),
+    ("edited_business_message", "forum_topic_created"),
+)
 
 
 def _expand_chat_id_watchlist(chat_ids: set[int]) -> set[int]:
@@ -239,6 +248,12 @@ def _compact_document_like(doc: Any) -> dict[str, Any] | None:
     return out or None
 
 
+def _message_is_forum_topic_created(message: Any) -> bool:
+    """Whether a message-like payload is a forum-topic-created service event."""
+
+    return isinstance(message, dict) and "forum_topic_created" in message
+
+
 def _compact_message(msg: Any, *, tz: datetime.tzinfo) -> dict[str, Any] | None:
     if not isinstance(msg, dict):
         return None
@@ -272,7 +287,7 @@ def _compact_message(msg: Any, *, tz: datetime.tzinfo) -> dict[str, Any] | None:
     # Entities are verbose and primarily describe formatting; drop them to reduce tokens.
 
     reply_to = msg.get("reply_to_message")
-    if isinstance(reply_to, dict):
+    if isinstance(reply_to, dict) and not _message_is_forum_topic_created(reply_to):
         compact_reply = _compact_message(reply_to, tz=tz)
         if compact_reply:
             out["reply_to_message"] = compact_reply
@@ -512,6 +527,50 @@ def _extract_first_str(
         if val is not None:
             return val
     return None
+
+
+def _extract_nested_dict(
+    update: dict[str, Any], path: tuple[str, ...]
+) -> dict[str, Any] | None:
+    cur: Any = update
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur if isinstance(cur, dict) else None
+
+
+def update_is_forum_topic_created(update: dict[str, Any]) -> bool:
+    """Return whether an update is a forum-topic-created service message.
+
+    Telegram carries this as `forum_topic_created` inside message-like payloads.
+    Callers can use this to filter out topic-creation service noise before
+    triggering/dispatching.
+    """
+
+    for path in _FORUM_TOPIC_CREATED_PATHS:
+        if _extract_nested_dict(update, path) is not None:
+            return True
+    return False
+
+
+def filter_non_forum_topic_created_updates(
+    updates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop updates that contain `forum_topic_created` service payloads.
+
+    Returns:
+        A tuple `(kept_updates, dropped_count)`.
+    """
+
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for update in updates:
+        if update_is_forum_topic_created(update):
+            dropped += 1
+            continue
+        kept.append(update)
+    return kept, dropped
 
 
 def filter_updates_in_time_window(

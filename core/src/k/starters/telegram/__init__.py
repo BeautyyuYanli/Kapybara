@@ -11,10 +11,11 @@ keyword-triggered batches of updates to :func:`k.agent.core.agent_run` as an
 Design notes / boundaries:
 - This is a polling (no webhook) starter intended for local/dev usage.
 - The forwarded `content` is a newline-delimited stream where each line is a
-  compacted Telegram update JSON object. This keeps the payload structured so
-  the agent can infer routing metadata (e.g. `chat.id`) later, while avoiding
-  high-token, low-signal fields (e.g. file sizes, repeated user/chat profile
-  fields).
+  Telegram update JSON object.
+  - Only definite plain-text message updates are compacted to reduce token usage.
+  - Non-text updates are forwarded close to raw form so media/callback payload
+    detail is preserved.
+- Service updates with `forum_topic_created` are ignored.
 - Invariant: `chat.id` and `from.id` remain present in the familiar nested
   form (`"chat": {"id": ...}`, `"from": {"id": ...}`) so downstream regex
   matchers can continue to route by chat/user id.
@@ -63,10 +64,12 @@ from .compact import (
     extract_chat_type,
     extract_update_date_unix_seconds,
     extract_update_id,
+    filter_non_forum_topic_created_updates,
     filter_unseen_updates,
     filter_updates_in_time_window,
     group_updates_by_chat_id,
     trigger_flags_for_updates,
+    update_is_forum_topic_created,
     update_is_private_chat,
     update_is_reply_to_bot,
     update_matches_keyword,
@@ -108,6 +111,7 @@ __all__ = [
     "extract_chat_type",
     "extract_update_date_unix_seconds",
     "extract_update_id",
+    "filter_non_forum_topic_created_updates",
     "filter_unseen_updates",
     "filter_updates_in_time_window",
     "group_updates_by_chat_id",
@@ -121,6 +125,7 @@ __all__ = [
     "telegram_updates_to_event",
     "trigger_cursor_state_path_for_updates_store",
     "trigger_flags_for_updates",
+    "update_is_forum_topic_created",
     "update_is_private_chat",
     "update_is_reply_to_bot",
     "update_matches_keyword",
