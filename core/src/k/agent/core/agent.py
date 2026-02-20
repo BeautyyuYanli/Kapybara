@@ -206,19 +206,22 @@ def _read_persona_override(fs_base: Path) -> str:
     return text or ""
 
 
-agent = Agent(
-    system_prompt=[],
-    tools=[
-        bash,
-        bash_input,
-        bash_wait,
-        bash_interrupt,
-        edit_file,
-        read_media,
-        fork,
-    ],
-    deps_type=MyDeps,
-    output_type=ToolOutput(finish_action, name="finish_action"),
+agent = cast(
+    Agent[MyDeps, MemoryHint],
+    Agent(
+        system_prompt=[],
+        tools=[
+            bash,
+            bash_input,
+            bash_wait,
+            bash_interrupt,
+            edit_file,
+            read_media,
+            fork,
+        ],
+        deps_type=MyDeps,
+        output_type=ToolOutput(finish_action, name="finish_action"),
+    ),
 )
 
 
@@ -331,15 +334,13 @@ async def agent_run(
         )
     msgs: list[ModelRequest | ModelResponse] = res.new_messages()
     msgs = _strip_history(msgs, (instruct.content,))
+    output_hint = res.output
+    ref_mem = output_hint.referenced_memory_ids
+
     compacted = await run_compaction(
         model=model,
         detailed=msgs,
     )
-    output_hint = cast(MemoryHint, res.output)
-    ref_mem = output_hint.referenced_memory_ids
-    ref_mem = [
-        mem_id for mem_id in ref_mem if memory_store.get_by_id(mem_id) is not None
-    ]
 
     mem = MemoryRecord(
         input=instruct.content,
