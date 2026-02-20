@@ -12,6 +12,12 @@ It is intentionally scoped to FolderMemoryStore on-disk files:
 
 It skips sidecar/detail files (`*.detailed.jsonl`, `*.detailed.json`,
 `*.compacted.json`).
+
+Telegram legacy-note:
+- For records with `kind="telegram"`, the migration tries to infer
+  `in_channel=telegram/chat/<chat_id>` from the stored input payload.
+  Legacy split records store that payload in the first JSON value of
+  `<id>.detailed.jsonl`.
 """
 
 from __future__ import annotations
@@ -21,8 +27,10 @@ import json
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 from k.agent.channels import validate_channel_path
+from k.starters.telegram.compact import extract_chat_id
 
 
 @dataclass(slots=True)
@@ -66,7 +74,11 @@ def migrate_folder_memory_kind_to_channel(
         try:
             raw = path.read_text(encoding=encoding)
             decoded = json.loads(raw)
-            changed, migrated = _migrate_record_payload(decoded, path=path)
+            changed, migrated = _migrate_record_payload(
+                decoded,
+                path=path,
+                encoding=encoding,
+            )
             if changed:
                 report.changed_files += 1
                 if not dry_run:
@@ -96,10 +108,137 @@ def _iter_record_json_files(records_root: Path) -> list[Path]:
     return sorted(files)
 
 
+def _detailed_path_for_record(path: Path) -> Path | None:
+    name = path.name
+    if name.endswith(".core.json"):
+        record_id = name.removesuffix(".core.json")
+    elif name.endswith(".json") and not name.endswith(".detailed.json"):
+        record_id = name.removesuffix(".json")
+    else:
+        return None
+    return path.with_name(f"{record_id}.detailed.jsonl")
+
+
+def _read_legacy_input_text_from_detailed(path: Path, *, encoding: str) -> str | None:
+    """Read the first JSON value (raw input) from a detailed JSONL sidecar.
+
+    The split store format writes the first detailed line as a JSON string.
+    For robustness we also accept a JSON object/array line and treat the raw line
+    itself as input text.
+    """
+
+    try:
+        lines = path.read_text(encoding=encoding).splitlines()
+    except OSError:
+        return None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            decoded = json.loads(line)
+        except ValueError:
+            return None
+        if isinstance(decoded, str):
+            return decoded
+        if isinstance(decoded, (dict, list)):
+            return line
+        return None
+    return None
+
+
+def _extract_legacy_input_text(
+    *,
+    data: dict[str, object],
+    path: Path,
+    encoding: str,
+) -> str | None:
+    raw_input = data.get("input")
+    if isinstance(raw_input, str):
+        return raw_input
+
+    detailed_path = _detailed_path_for_record(path)
+    if detailed_path is None or not detailed_path.exists():
+        return None
+    return _read_legacy_input_text_from_detailed(detailed_path, encoding=encoding)
+
+
+def _parse_telegram_updates(input_text: str) -> list[dict[str, Any]]:
+    """Parse one or many Telegram update JSON objects from stored input text."""
+
+    updates: list[dict[str, Any]] = []
+    for raw_line in input_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            decoded = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(decoded, dict):
+            updates.append(cast(dict[str, Any], decoded))
+    if updates:
+        return updates
+
+    stripped = input_text.strip()
+    if not stripped:
+        return []
+    try:
+        decoded = json.loads(stripped)
+    except ValueError:
+        return []
+
+    if isinstance(decoded, dict):
+        return [cast(dict[str, Any], decoded)]
+    if isinstance(decoded, list):
+        return [
+            cast(dict[str, Any], item) for item in decoded if isinstance(item, dict)
+        ]
+    return []
+
+
+def _infer_in_channel_from_legacy_kind(
+    *,
+    data: dict[str, object],
+    path: Path,
+    encoding: str,
+) -> str | None:
+    """Best-effort channel inference for legacy `kind` payloads.
+
+    Today this is only specialized for Telegram because historic records often
+    used `kind="telegram"` while keeping the concrete `chat.id` in input JSON.
+    """
+
+    legacy_kind = data.get("kind")
+    if legacy_kind != "telegram":
+        return None
+
+    input_text = _extract_legacy_input_text(data=data, path=path, encoding=encoding)
+    if not input_text:
+        return None
+
+    updates = _parse_telegram_updates(input_text)
+    if not updates:
+        return None
+
+    chat_ids = {
+        chat_id
+        for update in updates
+        if (chat_id := extract_chat_id(update)) is not None
+    }
+    if len(chat_ids) != 1:
+        # Keep chat-level unknown when history contains mixed/no chat ids.
+        return "telegram"
+
+    return f"telegram/chat/{next(iter(chat_ids))}"
+
+
 def _migrate_record_payload(
     payload: object,
     *,
     path: Path,
+    encoding: str,
 ) -> tuple[bool, dict[str, object]]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object, got: {type(payload).__name__}")
@@ -114,6 +253,13 @@ def _migrate_record_payload(
         legacy_kind = data.get("kind")
         if not isinstance(legacy_kind, str):
             raise ValueError("Missing both 'in_channel' and legacy 'kind'")
+        inferred = _infer_in_channel_from_legacy_kind(
+            data=data,
+            path=path,
+            encoding=encoding,
+        )
+        if inferred is not None:
+            legacy_kind = inferred
         in_channel = validate_channel_path(
             legacy_kind,
             field_name=f"{path.name}.kind",

@@ -18,6 +18,7 @@ def _write_record_files_with_legacy_kind(
     root: Path,
     created_at: datetime,
     kind: str = "telegram",
+    detailed_input: str = "input",
 ) -> tuple[str, Path]:
     record_id = memory_record_id_from_created_at(created_at)
     relpath = (
@@ -46,7 +47,7 @@ def _write_record_files_with_legacy_kind(
 
     detailed_path = record_path.with_name(f"{record_id}.detailed.jsonl")
     detailed_path.write_text(
-        "\n".join([json.dumps("input"), json.dumps("output")]) + "\n",
+        "\n".join([json.dumps(detailed_input), json.dumps("output")]) + "\n",
         encoding="utf-8",
     )
 
@@ -110,3 +111,26 @@ def test_folder_store_requires_migration_then_loads_after_apply(tmp_path: Path) 
     rerun = migrate_folder_memory_kind_to_channel(root, dry_run=False)
     assert rerun.changed_files == 0
     assert rerun.unchanged_files == 1
+
+
+def test_migration_infers_telegram_chat_id_from_detailed_input(tmp_path: Path) -> None:
+    root = tmp_path / "memories"
+    created_at = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    sample_update = (
+        '{"update_id":846262453,"message":{"message_id":2254,'
+        '"chat":{"id":567113516,"type":"private","username":"yanli_one"},'
+        '"from":{"id":567113516,"username":"yanli_one"},"text":"ping"}}'
+    )
+    _record_id, record_path = _write_record_files_with_legacy_kind(
+        root=root,
+        created_at=created_at,
+        kind="telegram",
+        detailed_input=sample_update,
+    )
+
+    report = migrate_folder_memory_kind_to_channel(root, dry_run=False)
+    assert report.errors == []
+
+    migrated = json.loads(record_path.read_text(encoding="utf-8"))
+    assert migrated["in_channel"] == "telegram/chat/567113516"
+    assert migrated["out_channel"] is None
