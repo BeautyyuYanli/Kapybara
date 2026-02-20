@@ -18,7 +18,7 @@ Extracts frames from a video at a rate of 1 frame per second, overlays timestamp
 ### Interface
 
 ```bash
-~/skills/core/read-video/read <video_path>
+~/.kapybara/skills/core/read-video/read <video_path>
 ```
 
 ### Behavior

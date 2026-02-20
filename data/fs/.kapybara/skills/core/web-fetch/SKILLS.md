@@ -16,10 +16,10 @@ The script refuses to overwrite an existing path so concurrent runs do not race.
 
 ```bash
 # Single URL
-~/skills/core/web-fetch/fetch "https://example.com" --out /tmp/web_fetch_example_01.txt
+~/.kapybara/skills/core/web-fetch/fetch "https://example.com" --out /tmp/web_fetch_example_01.txt
 
 # Multiple URLs
-~/skills/core/web-fetch/fetch https://url1.com https://url2.com --out /tmp/web_fetch_batch_01.txt
+~/.kapybara/skills/core/web-fetch/fetch https://url1.com https://url2.com --out /tmp/web_fetch_batch_01.txt
 ```
 
 The output file content is exactly the same as stdout. Always read the output file when stdout may be truncated by tooling.

@@ -59,7 +59,7 @@ The JSON output also includes:
 
 ```bash
 # Search
-~/skills/core/web-search/search "your query" --out /tmp/jina_search_01.json
+~/.kapybara/skills/core/web-search/search "your query" --out /tmp/jina_search_01.json
 ```
 
 The output file content is exactly the same as stdout. Always read the output file when stdout may be truncated by tooling.

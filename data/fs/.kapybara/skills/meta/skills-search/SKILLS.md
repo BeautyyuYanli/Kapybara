@@ -1,35 +1,37 @@
 ---
 name: search-skills
-description: Document skill on how to discover and search for existing skills in ~/skills/.
+description: Document skill on how to discover and search for existing skills in ~/.kapybara/skills/.
 ---
 
 # Search Skills
 
 When you need to find if a skill already exists or discover how to use one, follow these steps.
 
+Note: Skill docs may link to other skills using `skills:<path>`. The base directory for `skills:` is `~/.kapybara/skills`.
+
 ## 1. List all skill groups
-Each subdirectory in `~/skills/` represents a group.
+Each subdirectory in `~/.kapybara/skills/` represents a group.
 ```bash
-ls -F ~/skills/
+ls -F ~/.kapybara/skills/
 ```
 
 ## 2. Search for a skill by name
 Use `find` to locate the `SKILLS.md` file for a specific skill.
 ```bash
-find ~/skills/ -type f -name 'SKILLS.md' | grep "skill-name"
+find ~/.kapybara/skills/ -type f -name 'SKILLS.md' | grep "skill-name"
 ```
 
 ## 3. Search skill descriptions or content
 Use `ripgrep` (`rg`) to search for keywords across all `SKILLS.md` files. This is the most effective way to find a skill for a specific task.
 ```bash
-rg -i "ffmpeg" ~/skills/
-rg -i "telegram" ~/skills/
+rg -i "ffmpeg" ~/.kapybara/skills/
+rg -i "telegram" ~/.kapybara/skills/
 ```
 
 ## 4. Read skill documentation
 Once you find a `SKILLS.md` file, read it to understand the usage, dependencies, and examples.
 ```bash
-cat ~/skills/group/name/SKILLS.md
+cat ~/.kapybara/skills/group/name/SKILLS.md
 ```
 
 ## 5. Typical structure

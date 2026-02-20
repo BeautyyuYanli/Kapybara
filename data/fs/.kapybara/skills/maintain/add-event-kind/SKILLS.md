@@ -8,7 +8,7 @@ description: Guide and tools for adding a new event kind (communication channel)
 To add a new communication channel (e.g., Discord, Slack, etc.) to Kapybara, you need to implement three components: **Context Retrieval**, **Message Delivery**, and an **Event Starter**.
 
 ## 1. Context Retrieval Skill
-Create a skill at `~/skills/context/<kind>/SKILLS.md` to define how to fetch history and preferences for that platform.
+Create a skill at `skills:context/<kind>/SKILLS.md` to define how to fetch history and preferences for that platform.
 
 ### Preference Management
 The `context/<kind>` skill is responsible for retrieving preference files from `~/preferences/<kind>/`.
@@ -23,10 +23,10 @@ The `context/<kind>` skill is responsible for retrieving preference files from `
     - Output a list of candidate memory record paths sorted by time.
     - Prepend loaded preference contents to the output.
 
-Example: `~/skills/context/telegram/stage_a.sh` searches local memories and always loads `~/preferences/telegram/preferences.md`, plus chat-specific files if they exist.
+Example: `skills:context/telegram/stage_a` searches local memories and always loads `~/preferences/telegram/preferences.md`, plus chat-specific files if they exist.
 
 ## 2. Message Delivery Skill
-Create a skill at `~/skills/messager/<kind>/SKILLS.md` to define how to reply via the platform's API (e.g., using `curl`).
+Create a skill at `skills:messager/<kind>/SKILLS.md` to define how to reply via the platform's API (e.g., using `curl`).
 
 Common methods to implement:
 - `sendMessage`

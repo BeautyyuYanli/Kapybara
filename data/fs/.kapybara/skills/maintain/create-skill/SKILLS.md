@@ -1,6 +1,6 @@
 ---
 name: create-skill
-description: Defines how to create a new skill in ~/skills.
+description: Defines how to create a new skill in ~/.kapybara/skills.
 ---
 
 # create-skill
@@ -8,7 +8,7 @@ description: Defines how to create a new skill in ~/skills.
 Ref: https://agentskills.io/specification.md
 
 ## What a skill is
-A skill is a folder `~/skills/<group>/<skill-name>/` with an entry doc: `SKILL.md` or `SKILLS.md`.
+A skill is a folder `~/.kapybara/skills/<group>/<skill-name>/` with an entry doc: `SKILL.md` or `SKILLS.md`.
 
 Groups are an organizing convention (e.g. `core/`, `meta/`, `misc/`) and are not part of the skill name.
 
@@ -33,8 +33,8 @@ description: <one-line, third-person>
 
 ## Minimal scaffold (optional)
 ```bash
-mkdir -p ~/skills/<group>/<skill-name>
-cat > ~/skills/<group>/<skill-name>/SKILL.md <<'MD'
+mkdir -p ~/.kapybara/skills/<group>/<skill-name>
+cat > ~/.kapybara/skills/<group>/<skill-name>/SKILL.md <<'MD'
 ---
 name: <lowercase-hyphen-name>
 description: <one-line, third-person>
@@ -47,11 +47,11 @@ MD
 ```
 
 ## Sidecar script (optional)
-If the skill needs an executable helper script, put it next to the doc (e.g. `~/skills/<group>/<skill-name>/tool`) and make it runnable directly.
+If the skill needs an executable helper script, put it next to the doc (e.g. `~/.kapybara/skills/<group>/<skill-name>/tool`) and make it runnable directly.
 
 Remember to `chmod +x tool`. And use it like this in the skill doc:
 ```bash
 ./tool
 ```
 
-For the recommended `uv` shebang + PEP 723 inline-dependencies pattern (and copy/paste examples), see: `~/skills/meta/execute-code/SKILLS.md`.
+For the recommended `uv` shebang + PEP 723 inline-dependencies pattern (and copy/paste examples), see: `skills:meta/execute-code/SKILLS.md`.

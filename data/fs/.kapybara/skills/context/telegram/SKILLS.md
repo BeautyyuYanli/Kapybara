@@ -17,7 +17,7 @@ The recommended entrypoint is the bundled **Stage A** script, which does a paral
 ### Usage
 
 ```bash
-~/skills/context/telegram/stage_a \
+~/.kapybara/skills/context/telegram/stage_a \
   --chat-id <chat_id> \
   [--from-id <from_id>] \
   [--kw <regex>] \
@@ -33,7 +33,7 @@ Notes:
 ### Example
 
 ```bash
-~/skills/context/telegram/stage_a \
+~/.kapybara/skills/context/telegram/stage_a \
   --chat-id 567113516 \
   --from-id 567113516 \
   --kw 'retrieve-memory|telegram-context' \

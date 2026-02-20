@@ -15,7 +15,7 @@ Rules:
 
 Direct use:
 ```bash
-python3 ~/skills/meta/edit-file/edit.py \
+python3 ~/.kapybara/skills/meta/edit-file/edit.py \
   --filename path/to/file.txt \
   --start-line 12 \
   --old-content '...'

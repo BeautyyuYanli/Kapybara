@@ -3,7 +3,7 @@
 
 This script is used as a "skill" implementation and is also exercised by
 `core/tests/test_edit_file_skill.py`.
-It is intended to live at `~/skills/meta/edit-file/edit.py`.
+It is intended to live at `~/.kapybara/skills/meta/edit-file/edit.py`.
 
 Contract:
 - `--start-line` is 1-based (like editors). If provided, `old_content` must match
