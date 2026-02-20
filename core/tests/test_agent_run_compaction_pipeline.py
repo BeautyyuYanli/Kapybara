@@ -28,7 +28,13 @@ class _FakeRunResult:
 async def test_agent_run_returns_compacted_memory_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    async def fake_agent_run(**_: Any) -> _FakeRunResult:
+    captured_user_prompt: tuple[Any, ...] | None = None
+
+    async def fake_agent_run(**kwargs: Any) -> _FakeRunResult:
+        nonlocal captured_user_prompt
+        user_prompt = kwargs.get("user_prompt")
+        if isinstance(user_prompt, tuple):
+            captured_user_prompt = user_prompt
         messages: list[ModelRequest | ModelResponse] = [
             ModelRequest(parts=[UserPromptPart(content=("old prompt",))]),
             ModelResponse(parts=[TextPart(content="assistant did a thing")]),
@@ -57,7 +63,7 @@ async def test_agent_run_returns_compacted_memory_record(
         model="test-model",
         config=config,
         memory_store=memory_store,
-        instruct=Event(kind="test", content="do something"),
+        instruct=Event(in_channel="test", content="do something"),
         parent_memories=[],
     )
 
@@ -65,3 +71,11 @@ async def test_agent_run_returns_compacted_memory_record(
     payload = json.loads(output_json)
     assert payload["from_where_and_response_to_where"] == "test"
     assert payload["user_intents"] == "test"
+
+    assert captured_user_prompt is not None
+    assert captured_user_prompt[3] == "do something"
+    event_meta = captured_user_prompt[2]
+    assert isinstance(event_meta, str)
+    assert event_meta.startswith("<EventMeta>")
+    assert '"in_channel":"test"' in event_meta
+    assert '"content"' not in event_meta

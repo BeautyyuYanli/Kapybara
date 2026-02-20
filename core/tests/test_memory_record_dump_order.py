@@ -7,7 +7,7 @@ from k.agent.memory.entities import MemoryRecord
 
 def test_memory_record_dump_order_is_input_compacted_output() -> None:
     r = MemoryRecord(
-        kind="test",
+        in_channel="test",
         created_at=datetime(2026, 2, 13, 2, 8, 10, tzinfo=UTC),
         id_="--------",
         parents=[],

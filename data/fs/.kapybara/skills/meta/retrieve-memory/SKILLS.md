@@ -20,6 +20,8 @@ A record is defined as:
 ```
 class MemoryRecord(BaseModel):
     created_at: datetime
+    in_channel: str
+    out_channel: str | None
     id_: str
     parents: list[str]
     children: list[str]

@@ -18,7 +18,7 @@ def test_store_get_latest_and_get_by_id(tmp_path) -> None:
     path = tmp_path / "mem.jsonl"
 
     r1 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -26,7 +26,7 @@ def test_store_get_latest_and_get_by_id(tmp_path) -> None:
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
     r2 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",
@@ -50,7 +50,7 @@ def test_store_get_parents_and_children(tmp_path) -> None:
     path = tmp_path / "mem.jsonl"
 
     parent = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -59,7 +59,7 @@ def test_store_get_parents_and_children(tmp_path) -> None:
         children=[],
     )
     child = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",
@@ -80,7 +80,7 @@ def test_store_get_parents_and_children(tmp_path) -> None:
 
     missing_child_id = "zzzzzzzz"
     missing = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i3",
         compacted=["c3"],
         output="o3",
@@ -110,7 +110,7 @@ def test_store_get_between(tmp_path) -> None:
     path = tmp_path / "mem.jsonl"
 
     r1 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -118,7 +118,7 @@ def test_store_get_between(tmp_path) -> None:
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
     r2 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",
@@ -126,7 +126,7 @@ def test_store_get_between(tmp_path) -> None:
         created_at=datetime(2026, 1, 1, 12, 0, 0),
     )
     r3 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i3",
         compacted=["c3"],
         output="o3",
@@ -153,7 +153,7 @@ def test_store_auto_refreshes_on_external_append(tmp_path) -> None:
     path = tmp_path / "mem.jsonl"
 
     r1 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -166,7 +166,7 @@ def test_store_auto_refreshes_on_external_append(tmp_path) -> None:
     assert store.get_latest() == r1.id_
 
     r2 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",

@@ -21,6 +21,9 @@ Design notes / invariants:
   max `created_at`.
 - Parsing is strict: invalid ids in `order.jsonl`, invalid JSON, or invalid
   `MemoryRecord` data raises `ValueError` with path/line context.
+- `MemoryRecord` loading expects channel fields (`in_channel`, optional
+  `out_channel`). Legacy `kind`-only records are not read directly; migrate them
+  first via `k.agent.memory.folder_migrate_kind_to_channel`.
 - `append()` updates each referenced parent's `children` list (persisting parent
   records) before persisting the new record.
 - Cache invalidation is keyed off `order.jsonl` mtime/size. If record files are
@@ -63,7 +66,8 @@ class _OrderEntry:
 
 _CORE_FIELDS: set[str] = {
     "created_at",
-    "kind",
+    "in_channel",
+    "out_channel",
     "id_",
     "parents",
     "children",
@@ -75,7 +79,8 @@ class _CoreRecordOnDisk(BaseModel):
     """On-disk schema for `<id>.core.json` in the split core/detailed format."""
 
     created_at: datetime
-    kind: str
+    in_channel: str
+    out_channel: str | None = None
     id_: str
     parents: list[str] = Field(default_factory=list)
     children: list[str] = Field(default_factory=list)
@@ -268,7 +273,8 @@ def _load_memory_record_from_disk(
     )
     return MemoryRecord(
         created_at=core.created_at,
-        kind=core.kind,
+        in_channel=core.in_channel,
+        out_channel=core.out_channel,
         id_=core.id_,
         parents=list(core.parents),
         children=list(core.children),
@@ -696,7 +702,7 @@ class FolderMemoryStore(MemoryStore):
             path = self._record_path_for(record)
 
         # Split persistence:
-        # - core: metadata + compacted + output (one JSON blob, one line)
+        # - core: metadata + channel routing + compacted (one JSON blob, one line)
         # - detailed: raw input + output + tool_calls per response (JSONL)
         self._atomic_write_text(
             path,

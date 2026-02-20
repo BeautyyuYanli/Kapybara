@@ -14,7 +14,7 @@ def test_folder_store_get_latest_and_get_by_id(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     r1 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -27,6 +27,8 @@ def test_folder_store_get_latest_and_get_by_id(tmp_path) -> None:
     assert r1_path.exists()
     assert (root / "order.jsonl").exists()
     core_payload = json.loads(r1_path.read_text(encoding="utf-8"))
+    assert core_payload["in_channel"] == "test"
+    assert core_payload["out_channel"] is None
     assert core_payload["compacted"] == ["c1"]
     assert "input" not in core_payload
     assert "output" not in core_payload
@@ -46,7 +48,7 @@ def test_folder_store_get_latest_and_get_by_id(tmp_path) -> None:
     ).exists()
 
     r2 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",
@@ -72,7 +74,7 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     parent = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -83,7 +85,7 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     store.append(parent)
 
     child = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",
@@ -101,7 +103,7 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
 
     missing_child_id = "zzzzzzzz"
     missing = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i3",
         compacted=["c3"],
         output="o3",
@@ -131,7 +133,7 @@ def test_folder_store_get_between(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     r1 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -139,7 +141,7 @@ def test_folder_store_get_between(tmp_path) -> None:
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
     r2 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",
@@ -147,7 +149,7 @@ def test_folder_store_get_between(tmp_path) -> None:
         created_at=datetime(2026, 1, 1, 12, 0, 0),
     )
     r3 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i3",
         compacted=["c3"],
         output="o3",
@@ -175,7 +177,7 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     r1 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",
@@ -187,7 +189,7 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
 
     external = FolderMemoryStore(root)
     r2 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i2",
         compacted=["c2"],
         output="o2",
@@ -204,7 +206,7 @@ def test_folder_store_rebuild_order_ignores_detailed_files(tmp_path) -> None:
     store = FolderMemoryStore(root)
 
     r1 = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i1",
         compacted=["c1"],
         output="o1",

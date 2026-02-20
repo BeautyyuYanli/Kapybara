@@ -14,10 +14,35 @@ def test_telegram_updates_to_event_joins_updates_by_newline() -> None:
     ]
 
     event = telegram_updates_to_event(updates)
-    assert event.kind == "telegram"
+    assert event.in_channel == "telegram"
+    assert event.out_channel is None
 
     lines = event.content.splitlines()
     assert [json.loads(line)["update_id"] for line in lines] == [1, 2]
+
+
+def test_telegram_updates_to_event_uses_chat_prefix_for_multi_update_batch() -> None:
+    updates = [
+        {
+            "update_id": 1,
+            "message": {
+                "chat": {"id": 99, "type": "supergroup"},
+                "message_thread_id": 1,
+                "text": "a",
+            },
+        },
+        {
+            "update_id": 2,
+            "message": {
+                "chat": {"id": 99, "type": "supergroup"},
+                "message_thread_id": 2,
+                "text": "b",
+            },
+        },
+    ]
+
+    event = telegram_updates_to_event(updates)
+    assert event.in_channel == "telegram/chat/99"
 
 
 def test_filter_updates_in_time_window_filters_by_age_and_keeps_no_date() -> None:

@@ -18,7 +18,8 @@ def test_telegram_update_to_event_json_roundtrip() -> None:
 
     event_json = telegram_update_to_event_json(update)
     event = json.loads(event_json)
-    assert event["kind"] == "telegram"
+    assert event["in_channel"] == "telegram/chat/99"
+    assert event["out_channel"] is None
 
     body = json.loads(event["content"])
     assert body["update_id"] == 123
@@ -91,6 +92,41 @@ def test_telegram_event_content_keeps_stage_a_chat_and_from_layout() -> None:
     # familiar nested shape, with `id` as the first key.
     assert '\\"chat\\":{\\"id\\":-100123' in event_json
     assert '\\"from\\":{\\"id\\":555' in event_json
+
+
+def test_telegram_event_in_channel_includes_thread_id_when_present() -> None:
+    update = {
+        "update_id": 7,
+        "message": {
+            "message_id": 70,
+            "message_thread_id": 9001,
+            "is_topic_message": True,
+            "from": {"id": 555},
+            "chat": {"id": -100123, "type": "supergroup"},
+            "date": 1_700_000_000,
+            "text": "thread hi",
+        },
+    }
+
+    event = json.loads(telegram_update_to_event_json(update))
+    assert event["in_channel"] == "telegram/chat/-100123/thread/9001"
+
+
+def test_telegram_event_ignores_thread_id_when_not_topic_message() -> None:
+    update = {
+        "update_id": 8,
+        "message": {
+            "message_id": 80,
+            "message_thread_id": 9002,
+            "from": {"id": 555},
+            "chat": {"id": -100123, "type": "supergroup"},
+            "date": 1_700_000_000,
+            "text": "general hi",
+        },
+    }
+
+    event = json.loads(telegram_update_to_event_json(update))
+    assert event["in_channel"] == "telegram/chat/-100123"
 
 
 def test_telegram_event_keeps_media_file_id_but_drops_size_noise() -> None:

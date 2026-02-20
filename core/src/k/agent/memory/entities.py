@@ -27,8 +27,14 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_ai.messages import ModelRequest, ModelResponse
+
+from k.agent.channels import (
+    effective_out_channel,
+    normalize_out_channel,
+    validate_channel_path,
+)
 
 _ORDERED_B64_MILLIS_8_RE = re.compile(r"^[-0-9A-Z_a-z]{8}$")
 _ORDERED_B64_ALPHABET = (
@@ -94,8 +100,16 @@ def is_memory_record_id(value: str) -> bool:
 
 
 class MemoryRecord(BaseModel):
+    """Persisted memory record with hierarchical channel routing metadata.
+
+    Notes:
+    - `in_channel` is required for all records.
+    - `out_channel=None` means "same destination as input channel".
+    """
+
     created_at: datetime = Field(default_factory=datetime.now)
-    kind: str
+    in_channel: str
+    out_channel: str | None = None
     id_: str = ""
     parents: list[str] = Field(default_factory=list)
     children: list[str] = Field(default_factory=list)
@@ -105,8 +119,25 @@ class MemoryRecord(BaseModel):
     output: str
     detailed: list[ModelRequest | ModelResponse] = Field(default_factory=list)
 
+    @field_validator("in_channel")
+    @classmethod
+    def _validate_in_channel(cls, value: str) -> str:
+        return validate_channel_path(value, field_name="in_channel")
+
+    @field_validator("out_channel")
+    @classmethod
+    def _validate_out_channel(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_channel_path(value, field_name="out_channel")
+
     @model_validator(mode="after")
     def _finalize_and_validate_ids(self) -> MemoryRecord:
+        self.out_channel = normalize_out_channel(
+            in_channel=self.in_channel,
+            out_channel=self.out_channel,
+        )
+
         if not self.id_:
             self.id_ = memory_record_id_from_created_at(self.created_at)
         if not is_memory_record_id(self.id_):
@@ -117,6 +148,13 @@ class MemoryRecord(BaseModel):
             if bad:
                 raise ValueError(f"Invalid MemoryRecord {link_name} id(s): {bad!r}")
         return self
+
+    @property
+    def effective_out_channel(self) -> str:
+        return effective_out_channel(
+            in_channel=self.in_channel,
+            out_channel=self.out_channel,
+        )
 
     @property
     def short_id(self) -> str:

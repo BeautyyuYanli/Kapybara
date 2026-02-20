@@ -229,6 +229,9 @@ class ShellSessionManager:
 
         This is mostly a guard for callers that start a session but never call
         `next()`; `ShellSession.next()` normally detects exit and auto-closes.
+        We use a tiny bounded wait when polling process status because a strict
+        zero-timeout cancel scope can prevent the backend from refreshing
+        `process.returncode` in time.
         """
 
         to_remove: list[str] = []
@@ -242,8 +245,8 @@ class ShellSessionManager:
                 continue
 
             if process.returncode is None:
-                # Non-blocking poll to refresh returncode if the process has exited.
-                with anyio.move_on_after(0):
+                # Keep this short to avoid blocking list/prune for active sessions.
+                with anyio.move_on_after(0.01):
                     await process.wait()
 
             if process.returncode is not None:

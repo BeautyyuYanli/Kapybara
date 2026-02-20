@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from k.agent.channels import channel_root
 from k.agent.core.skills_uri import skills_root_from_fs_base, skills_uri
 
 
@@ -45,31 +46,30 @@ def concat_skills_md(base_path: str | Path) -> str:
     return "\n".join(chunks).rstrip() + "\n"
 
 
-def maybe_load_kind_skill_md(
+def maybe_load_channel_skill_md(
     base_path: str | Path,
     *,
     group: str,
-    kind: str | None,
+    channel: str | None,
 ) -> str | None:
-    """Load `skills:<group>/<kind>/SKILLS.md` if present.
+    """Load `skills:<group>/<channel_root>/SKILLS.md` if present.
 
-    The agent uses `context/<kind>` and `messager/<kind>` skills to route and
-    contextualize replies for structured `Event` inputs. We only inject the
-    specific kind's skills (instead of all `context/*` / `messager/*`) to keep
-    the system prompt compact.
+    The agent uses `context/<platform>` and `messager/<platform>` skills where
+    `<platform>` is the first segment of an input/output channel path.
     """
 
-    if not kind:
+    if not channel:
         return None
 
-    md = skills_root_from_fs_base(base_path) / group / kind / "SKILLS.md"
+    root = channel_root(channel)
+    md = skills_root_from_fs_base(base_path) / group / root / "SKILLS.md"
     if not md.exists():
         return None
 
     content = md.read_text()
     return "\n".join(
         [
-            f"# ===== {skills_uri(f'{group}/{kind}/SKILLS.md')} =====",
+            f"# ===== {skills_uri(f'{group}/{root}/SKILLS.md')} =====",
             content.rstrip(),
             "",
         ]

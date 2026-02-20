@@ -56,7 +56,7 @@ from k.agent.core.shell_tools import (
     bash_wait,
     edit_file,
 )
-from k.agent.core.skills_md import concat_skills_md, maybe_load_kind_skill_md
+from k.agent.core.skills_md import concat_skills_md, maybe_load_channel_skill_md
 from k.agent.memory.compactor import run_compaction
 from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
@@ -76,8 +76,9 @@ class MyDeps:
 
     Input event:
         Some system prompts (e.g. skills selection) depend on the input event's
-        `kind`. Populate `input_event_kind` for runs that provide a structured
-        `Event` payload.
+        channels. Populate `input_event_in_channel` (and optional
+        `input_event_out_channel`) for runs that provide a structured `Event`
+        payload.
 
     Bash tool cadence:
         `count_down` is decremented once per bash-like tool call (tools that may
@@ -89,7 +90,8 @@ class MyDeps:
     config: Config
     memory_storage: FolderMemoryStore
     memory_parents: list[str]
-    input_event_kind: str
+    input_event_in_channel: str
+    input_event_out_channel: str | None = None
     start_event: Event | None = None
     bash_cmd_history: list[str] = field(default_factory=list)
     count_down: int = 6
@@ -159,7 +161,8 @@ async def fork(
             config=ctx.deps.config,
             memory_store=ctx.deps.memory_storage,
             instruct=Event(
-                kind=ctx.deps.input_event_kind,
+                in_channel=ctx.deps.input_event_in_channel,
+                out_channel=ctx.deps.input_event_out_channel,
                 content="You are the forked agent to complete only the following instruct, ignoring the previous ones.\nInstruction: "
                 + instruct,
             ),
@@ -245,16 +248,17 @@ agent.system_prompt(lambda: intent_instruct_prompt)
 def concat_skills_prompt(ctx: RunContext[MyDeps]) -> str:
     base_path: str | Path = ctx.deps.config.fs_base
     skills_md = concat_skills_md(base_path)
-    kind = ctx.deps.input_event_kind
+    in_channel = ctx.deps.input_event_in_channel
+    out_channel = ctx.deps.input_event_out_channel or in_channel
 
-    kind_chunks = [
-        maybe_load_kind_skill_md(base_path, group="context", kind=kind),
-        maybe_load_kind_skill_md(base_path, group="messager", kind=kind),
+    channel_chunks = [
+        maybe_load_channel_skill_md(base_path, group="context", channel=in_channel),
+        maybe_load_channel_skill_md(base_path, group="messager", channel=out_channel),
     ]
-    kind_md = "\n".join(x for x in kind_chunks if x is not None).rstrip()
+    channel_md = "\n".join(x for x in channel_chunks if x is not None).rstrip()
 
-    if kind_md:
-        return f"<BasicSkills>{skills_md}</BasicSkills>\n<KindSkills>{kind_md}\n</KindSkills>"
+    if channel_md:
+        return f"<BasicSkills>{skills_md}</BasicSkills>\n<ChannelSkills>{channel_md}\n</ChannelSkills>"
     return f"<BasicSkills>{skills_md}</BasicSkills>"
 
 
@@ -279,6 +283,17 @@ def _strip_history(
         *msgs[1:-1],
     ]  # remove initial message and final finish message
     return msgs
+
+
+def _event_meta_prompt(event: Event) -> str:
+    """Return a prompt chunk with event routing metadata (excluding body text).
+
+    This keeps channel/routing context explicit for the model without duplicating
+    the potentially large free-form `Event.content` body.
+    """
+
+    meta_json = event.model_dump_json(exclude={"content"})
+    return f"<EventMeta>{meta_json}</EventMeta>\n"
 
 
 async def _memory_select(
@@ -320,7 +335,8 @@ async def agent_run(
         config=config,
         memory_storage=memory_store,
         memory_parents=parent_memories,
-        input_event_kind=instruct.kind,
+        input_event_in_channel=instruct.in_channel,
+        input_event_out_channel=instruct.out_channel,
     ) as my_deps:
         res = await agent.run(
             model=model,
@@ -328,6 +344,7 @@ async def agent_run(
             user_prompt=(
                 f"<Memory>{memory_string}</Memory>\n" if parent_memories else "",
                 f"<System>Now: {datetime.now()}</System>\n",
+                _event_meta_prompt(instruct),
                 instruct.content,
             ),
             message_history=message_history,
@@ -348,7 +365,8 @@ async def agent_run(
         output=output_hint.model_dump_json(exclude={"referenced_memory_ids"}),
         parents=list(set(parent_memories + ref_mem)),
         detailed=msgs,
-        kind=instruct.kind,
+        in_channel=instruct.in_channel,
+        out_channel=instruct.out_channel,
     )
     return output_hint.model_dump_json(exclude={"referenced_memory_ids"}), mem
 
@@ -368,7 +386,7 @@ if __name__ == "__main__":
         )
         memory_store = FolderMemoryStore(config.fs_base / "memories")
         instruct = Event(
-            kind="test",
+            in_channel="test",
             content="use `read_media` tool to read image and describe them to ~/image.txt : 1. https://fastly.picsum.photos/id/59/536/354.jpg?hmac=HQ1B2iVRsA2r75Mxt18dSuJa241-Wggf0VF9BxKQhPc \n 2. ./data/fs/961-536x354.jpg",
         )
         output, mem = await agent_run(

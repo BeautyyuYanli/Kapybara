@@ -6,37 +6,107 @@
 # ]
 # ///
 
-import subprocess
 import json
-import tempfile
+import re
+import subprocess
 from pathlib import Path
 from typing import Optional, Annotated
+
 import typer
 
 app = typer.Typer(add_completion=False)
 
-def get_detailed_files(root: Path) -> list[Path]:
-    """Find all detailed.jsonl files that correspond to telegram memories."""
+
+def _channel_has_prefix(*, channel: str, prefix: str) -> bool:
+    return channel == prefix or channel.startswith(prefix + "/")
+
+
+def _record_in_channel(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    in_channel = payload.get("in_channel")
+    if isinstance(in_channel, str):
+        return in_channel
+
+    # Backward compatibility for legacy records.
+    legacy_kind = payload.get("kind")
+    if isinstance(legacy_kind, str):
+        return legacy_kind
+    return None
+
+
+def _infer_chat_id_from_channel(in_channel: str) -> str | None:
+    parts = in_channel.split("/")
+    for idx, part in enumerate(parts[:-1]):
+        if part == "chat":
+            return parts[idx + 1]
+    return None
+
+
+def _validate_channel_path(name: str, value: str) -> str:
+    channel = value.strip()
+    if not channel:
+        raise ValueError(f"{name} must not be empty")
+    if channel.startswith("/") or channel.endswith("/") or "//" in channel:
+        raise ValueError(f"Invalid {name}: {value!r}")
+    return channel
+
+
+def get_detailed_files(root: Path, *, in_channel_prefix: str) -> list[Path]:
+    """Find detailed files whose core record `in_channel` matches a prefix."""
+
+    root_segment = in_channel_prefix.split("/", 1)[0]
+    root_pattern = re.escape(root_segment)
+    grep_pattern = rf'"(?:in_channel|kind)"\s*:\s*"{root_pattern}(?:/|")'
+
     try:
         res = subprocess.run(
-            ["rg", "-l", "--sort", "path", "-g", "*.core.json", r'"kind"\s*:\s*"telegram"', str(root)],
-            capture_output=True, text=True, check=True
+            [
+                "rg",
+                "-l",
+                "--sort",
+                "path",
+                "-g",
+                "*.core.json",
+                grep_pattern,
+                str(root),
+            ],
+            capture_output=True,
+            text=True,
         )
-        core_files = res.stdout.strip().split('\n')
-    except subprocess.CalledProcessError:
+    except OSError:
         return []
 
+    if res.returncode not in (0, 1):
+        return []
+
+    core_files = [line for line in res.stdout.splitlines() if line]
     detailed_files = []
     for cf in core_files:
-        if not cf: continue
-        # cf is like /path/to/id.core.json
-        df = Path(cf).parent / (Path(cf).name.removesuffix(".core.json") + ".detailed.jsonl")
+        core_path = Path(cf)
+        try:
+            payload = json.loads(core_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+
+        record_channel = _record_in_channel(payload)
+        if record_channel is None:
+            continue
+        if not _channel_has_prefix(channel=record_channel, prefix=in_channel_prefix):
+            continue
+
+        df = core_path.parent / (
+            core_path.name.removesuffix(".core.json") + ".detailed.jsonl"
+        )
         if df.exists():
             detailed_files.append(df)
     return detailed_files
 
+
 LineMatch = tuple[int, str]
 FileMatches = list[tuple[Path, list[LineMatch]]]
+
 
 def _parse_rg_lines_with_numbers(output: str) -> list[tuple[Path, int, str]]:
     """Parse ripgrep output lines in `path:line:match` form."""
@@ -137,10 +207,46 @@ class _OutputWriter:
         print(s)
 
 
+def _preference_candidates(
+    *, in_channel: str, from_id: str | None
+) -> list[tuple[Path, str]]:
+    """Build preference lookup candidates in root-to-leaf channel order."""
+
+    pref_root = Path.home() / "preferences"
+    parts = in_channel.split("/")
+    prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+
+    paths: list[tuple[Path, str]] = []
+    for prefix in prefixes:
+        paths.append((pref_root / f"{prefix}.md", f"Preference ({prefix}.md):"))
+        paths.append(
+            (
+                pref_root / prefix / "PREFERENCES.md",
+                f"Preference ({prefix}/PREFERENCES.md):",
+            )
+        )
+
+    # Keep by_user behavior as-is for now.
+    if from_id:
+        platform = parts[0]
+        paths.append(
+            (
+                pref_root / platform / "by_user" / f"{from_id}.md",
+                f"User-specific Preference (from_id: {from_id}):",
+            )
+        )
+
+    return paths
+
+
 @app.command()
 def main(
-    chat_id: Annotated[str, typer.Option(help="Telegram chat.id")],
-    from_id: Annotated[Optional[str], typer.Option(help="Sender id (defaults to chat-id)")] = None,
+    in_channel: Annotated[
+        str, typer.Option(help="Input channel prefix, e.g. telegram/chat/123")
+    ],
+    from_id: Annotated[
+        Optional[str], typer.Option(help="Sender id (defaults to channel chat id)")
+    ] = None,
     kw: Annotated[Optional[str], typer.Option(help="Regex for extra narrowing")] = None,
     root: Annotated[Path, typer.Option(help="Memories root")] = Path.home() / "memories/records",
     n: Annotated[int, typer.Option(help="Lines kept per route")] = 6,
@@ -152,8 +258,14 @@ def main(
         ),
     ] = None,
 ):
+    try:
+        in_channel = _validate_channel_path("in_channel", in_channel)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=2) from e
+
     if from_id is None:
-        from_id = chat_id
+        from_id = _infer_chat_id_from_channel(in_channel)
 
     if out is None:
         typer.echo("Error: missing required option '--out'.", err=True)
@@ -167,30 +279,22 @@ def main(
 
     try:
         with _OutputWriter(out_path=out_path) as w:
-            detailed_files = get_detailed_files(root)
-            
-            # Regexes (matching escaped quotes in detailed.jsonl)
-            chat_re = rf'\\"chat\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{chat_id}'
-            from_re = rf'\\"from\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{from_id}'
-            
-            matches_chat = search_files_first_match_per_file(detailed_files, chat_re, n)
-            matches_user = search_files_first_match_per_file(detailed_files, from_re, n)
-            
+            detailed_files = get_detailed_files(root, in_channel_prefix=in_channel)
+            matches_channel: FileMatches = [
+                (path, []) for path in sorted(detailed_files)[-n:]
+            ]
+
+            matches_user: FileMatches = []
+            if from_id is not None:
+                # Regex matching escaped quotes in detailed.jsonl lines.
+                from_re = rf'\\"from\\"\s*:\s*\{{\s*\\"id\\"\s*:\s*{from_id}'
+                matches_user = search_files_first_match_per_file(
+                    detailed_files, from_re, n
+                )
+
             matches_kw = []
             if kw:
-                # Find all files matching chat_re first
-                try:
-                    res = subprocess.run(
-                        ["rg", "-l", "--sort", "path", chat_re] + [str(f) for f in detailed_files],
-                        capture_output=True, text=True
-                    )
-                    if res.returncode not in (0, 1):  # 1 = no matches, 2 = rg error
-                        raise RuntimeError(f"rg failed for chat filter: rc={res.returncode}")
-                    all_chat_files = [Path(p) for p in res.stdout.strip().split('\n') if p]
-                    if all_chat_files:
-                        matches_kw = search_files_all_matches_grouped(all_chat_files, kw, n)
-                except Exception:
-                    pass
+                matches_kw = search_files_all_matches_grouped(detailed_files, kw, n)
 
             # Collect results
             results = {} # id -> {routes: set, core_json: str, matched_detailed_lines: list[dict]}
@@ -212,29 +316,24 @@ def main(
                         results[mem_id]["routes"].add(route_name)
 
                     # Only the kw route is treated as a "content match" worth surfacing
-                    # in the main TSV output; chat/user routes are just for candidate finding.
+                    # in the main TSV output; channel/user routes are candidate finding.
                     if route_name == "kw" and line_matches:
                         results[mem_id]["matched_detailed_lines"] = [
                             {"line": line_no, "text": text} for line_no, text in line_matches
                         ]
 
-            add_match(matches_chat, "chat")
+            add_match(matches_channel, "channel")
             add_match(matches_user, "user")
             add_match(matches_kw, "kw")
 
             # Preferences
-            kind = "telegram"
             prefs = []
-            pref_paths = [
-                (Path.home() / f"preferences/{kind}/preferences.md", f"Global Preference ({kind}):"),
-                (Path.home() / f"preferences/{kind}/by_chat/{chat_id}.md", f"Chat-specific Preference (chat_id: {chat_id}):"),
-                (Path.home() / f"preferences/{kind}/by_user/{from_id}.md", f"User-specific Preference (from_id: {from_id}):"),
-            ]
-            
-            for path, title in pref_paths:
+            for path, title in _preference_candidates(
+                in_channel=in_channel, from_id=from_id
+            ):
                 if path.exists():
                     prefs.append(f"{title}\n{path.read_text()}\n---")
-            
+
             if prefs:
                 for block in "\n".join(prefs).splitlines():
                     w.line(block)
@@ -254,7 +353,10 @@ def main(
         )
         raise typer.Exit(code=1)
 
-    typer.echo(f"Output saved to: {out_path} (candidates: {len(results)})", err=True)
+    typer.echo(
+        f"Output saved to: {out_path} (channel={in_channel}, candidates: {len(results)})",
+        err=True,
+    )
 
 if __name__ == "__main__":
     app()

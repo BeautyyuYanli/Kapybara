@@ -13,9 +13,14 @@ from collections.abc import Awaitable, Callable
 from logging import getLogger
 from typing import Protocol, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from pydantic_ai import ModelRetry, RunContext
 
+from k.agent.channels import (
+    effective_out_channel,
+    normalize_out_channel,
+    validate_channel_path,
+)
 from k.agent.memory.entities import is_memory_record_id
 from k.agent.memory.store import MemoryStore
 
@@ -23,8 +28,52 @@ logger = getLogger(__name__)
 
 
 class Event(BaseModel):
-    kind: str
+    """Structured input event with hierarchical channel routing."""
+
+    in_channel: str
+    out_channel: str | None = None
     content: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_kind(cls, data: object) -> object:
+        """Map legacy `kind` payloads to the new channel schema."""
+
+        if isinstance(data, dict):
+            payload = dict(cast(dict[str, object], data))
+            if "in_channel" not in payload:
+                legacy_kind = payload.get("kind")
+                if isinstance(legacy_kind, str):
+                    payload["in_channel"] = legacy_kind
+            data = payload
+        return data
+
+    @field_validator("in_channel")
+    @classmethod
+    def _validate_in_channel(cls, value: str) -> str:
+        return validate_channel_path(value, field_name="in_channel")
+
+    @field_validator("out_channel")
+    @classmethod
+    def _validate_out_channel(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_channel_path(value, field_name="out_channel")
+
+    @model_validator(mode="after")
+    def _normalize_out_channel(self) -> Event:
+        self.out_channel = normalize_out_channel(
+            in_channel=self.in_channel,
+            out_channel=self.out_channel,
+        )
+        return self
+
+    @property
+    def effective_out_channel(self) -> str:
+        return effective_out_channel(
+            in_channel=self.in_channel,
+            out_channel=self.out_channel,
+        )
 
 
 class MemoryHint(BaseModel):

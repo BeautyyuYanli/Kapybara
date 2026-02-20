@@ -12,7 +12,7 @@ def test_memory_record_id_is_ordered_base64_millis() -> None:
     assert memory_record_id_from_created_at(created_at) == "--------"
 
     r = MemoryRecord(
-        kind="test",
+        in_channel="test",
         input="i",
         compacted=["c"],
         output="o",
@@ -35,7 +35,7 @@ def test_memory_record_id_lexicographic_order_matches_created_at() -> None:
 def test_memory_record_id_rejects_legacy_ids() -> None:
     with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
         MemoryRecord(
-            kind="test",
+            in_channel="test",
             id_="019c52f782ec",
             input="i",
             compacted=["c"],
@@ -46,7 +46,7 @@ def test_memory_record_id_rejects_legacy_ids() -> None:
 
     with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
         MemoryRecord(
-            kind="test",
+            in_channel="test",
             id_="00000000-0000-0000-0000-000000000000",
             input="i",
             compacted=["c"],
@@ -59,7 +59,7 @@ def test_memory_record_id_rejects_legacy_ids() -> None:
 def test_memory_record_id_rejects_invalid_ids() -> None:
     with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
         MemoryRecord(
-            kind="test",
+            in_channel="test",
             id_="not-a-uuid",
             input="i",
             compacted=["c"],

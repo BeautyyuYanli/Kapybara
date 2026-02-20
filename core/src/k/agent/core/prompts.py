@@ -38,32 +38,34 @@ input_event_prompt = """
 The user's input is represented as:
 
 class Event(BaseModel):
-    kind: str
+    in_channel: str
+    out_channel: str | None = None
     content: str
 
 Interpretation:
-- `kind` indicates where the input comes from.
+- `in_channel` indicates where the input comes from.
+- `out_channel` indicates where replies should go. If `null`, it means "same as `in_channel`".
 - `content` may be plain text or structured text (and may include IDs).
 - A single `content` may contain zero or multiple intents or requests.
 
 **Rule:** 
-- There is a skill named `messager/{Event.kind}` which describes how to reply for that kind of message. If not existed, just skip the reply.
-- There is a skill named `context/{Event.kind}` which describes how to retrieve context for that kind of message. If not existed, fallback to `meta/retrieve-memory` skill.
+- There is a skill named `context/{root(Event.in_channel)}` which describes how to retrieve context for that channel root. If not existed, fallback to `meta/retrieve-memory` skill.
+- There is a skill named `messager/{root(Event.out_channel or Event.in_channel)}` which describes how to reply for that output channel root. If not existed, skip channel reply.
 </InputEvent>
 """
 
 
 memory_instruct_prompt = """
 <MemoryInstruct>
-Before acting, **always** use the `context/{Event.kind}` skill to retrieve memory/context, then decide intent(s) and whether/how to respond.
+Before acting, **always** use the `context/{root(Event.in_channel)}` skill to retrieve memory/context, then decide intent(s) and whether/how to respond.
 
 Guidance (keep it cheap but always do it):
-- Start with **narrow filters** (same `kind`, and the same chat/thread/user IDs found in `content`).
+- Start with **narrow filters** (same `in_channel` subtree/prefix, and the same chat/thread/user IDs found in `content`).
 - Skim only the most relevant recent items first; broaden the search only if needed.
 - Do multiple retrieval passes if the first pass is low-signal or you discover new IDs/keywords.
 
 Typical filters:
-- The same `kind`
+- `MemoryRecord.in_channel` sharing a useful prefix with `Event.in_channel`
 - The same ID(s) referenced in structured `content`
 
 The filter should be accurate enough to avoid retrieving irrelevant memories.
@@ -73,12 +75,12 @@ The filter should be accurate enough to avoid retrieving irrelevant memories.
 
 response_instruct_prompt = """
 <ResponseInstruct>
-Route your response to the same destination the event came from (inferred from `Event.kind`).
+Route your response to `Event.out_channel` (or `Event.in_channel` when `out_channel` is null).
 The structured `Event.content` may include IDs or other routing hints.
 
 **IMPORTANT:** Your plain/direct reply in this chat will be ignored (it becomes internal memory only) unless the event explicitly supports direct replies.
 **Therefore, when interpreting the user's intent(s), you MUST also figure out how to send the reply via the same channel the event came from.**
-Use `messager/{Event.kind}` to send any required reply via the correct channel (do not rely on a plain/direct reply here).
+Use `messager/{root(Event.out_channel or Event.in_channel)}` to send any required reply via the correct channel (do not rely on a plain/direct reply here).
 
 Response policy:
 - Not every event requires a response; it is OK to finish without replying.
@@ -107,9 +109,11 @@ When deciding whether to respond, use these minimal rules (still 4 rules total):
 
 preference_prompt = """
 <Preference>
-The system may load preference files for specific event kinds or individual users/chats.
-- Global: `~/preferences/{Event.kind}/preferences.md`
-- Specific: `~/preferences/{Event.kind}/...` (folder structure is defined by the kind)
+The system may load preference files for channel paths and individual users.
+- For each prefix of `Event.in_channel`, inject (if exists) in order:
+  - `~/preferences/<prefix>.md`
+  - `~/preferences/<prefix>/PREFERENCES.md`
+- Keep existing by-user selection logic where available (e.g. `by_user/<user_id>.md`).
 
 **Autonomous Updates:**
 You can and should autonomously update these preference files when you learn new things about the user or when the user explicitly gives you instructions about your persona, tone, or behavior.
@@ -146,7 +150,7 @@ Software & storage:
 SOP_prompt = """
 <SOP>
 1) Inspect the input event and determine the response destination(s) (see `<InputEvent>` and `<ResponseInstruct>`).
-   - Identify the channel from `Event.kind` and any routing hints (IDs, thread/channel fields) inside `Event.content`.
+   - Identify channels from `Event.in_channel` and `Event.out_channel` plus routing hints (IDs, thread/channel fields) inside `Event.content`.
    - If the event contains multiple independent destinations, use the `fork` tool to delegate each destination to a separate worker agent, and launch those `fork` calls concurrently.
    - Example input: '{"from": "alice", "content": "What's the best programming language?"}\n{"from": "bob", "content": "Do you love ice cream?"}'
      You should call `fork` tool once with instruction '{"from": "alice", "content": "What's the best programming language?"}' and once with instruction '{"from": "bob", "content": "Do you love ice cream?"}'

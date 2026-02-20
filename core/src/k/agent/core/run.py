@@ -11,18 +11,19 @@ from collections.abc import Sequence
 
 from pydantic_ai.messages import UserContent
 
+from k.agent.channels import channel_root
 from k.agent.core.agent import agent_run
 from k.agent.core.entities import Event
 from k.agent.memory.folder import FolderMemoryStore
 from k.config import Config
 
 
-def _extract_input_event_kind(instruct: Sequence[UserContent]) -> str | None:
-    """Best-effort extraction of an `Event.kind` from `agent_run(..., instruct=...)`.
+def _extract_input_event_channel_root(instruct: Sequence[UserContent]) -> str | None:
+    """Best-effort extraction of an input channel root from Event JSON.
 
     `agent_run` typically receives a structured `Event` JSON as the first user
     prompt item (e.g. from Telegram polling). When present, we use it to inject
-    kind-specific skills in system prompts.
+    channel-root specific skills in system prompts.
     """
 
     for item in instruct:
@@ -32,7 +33,7 @@ def _extract_input_event_kind(instruct: Sequence[UserContent]) -> str | None:
             event = Event.model_validate_json(item)
         except Exception:
             continue
-        return event.kind
+        return channel_root(event.in_channel)
     return None
 
 
@@ -76,7 +77,7 @@ async def main() -> None:
             model,
             config,
             mem_store,
-            Event(kind="direct_input", content=i),
+            Event(in_channel="direct_input", content=i),
         )
         print(output)
         mem_store.append(mem)

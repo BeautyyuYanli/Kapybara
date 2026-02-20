@@ -8,9 +8,9 @@ description: Optimizes Telegram context/memory retrieval for speed and accuracy 
 This skill is a lightweight, **no-index** workflow for retrieving relevant context from the local `~/memories/records` store when replying on Telegram.
 
 The recommended entrypoint is the bundled **Stage A** script, which does a parallel candidate search by:
-- `chat.id`
+- `in_channel` prefix (required)
 - `from.id`
-- optional keyword regex (scoped to the same chat)
+- optional keyword regex (scoped to the same channel prefix)
 
 ## Recommended: Stage A script
 
@@ -18,7 +18,7 @@ The recommended entrypoint is the bundled **Stage A** script, which does a paral
 
 ```bash
 ~/.kapybara/skills/context/telegram/stage_a \
-  --chat-id <chat_id> \
+  --in-channel <channel_prefix> \
   [--from-id <from_id>] \
   [--kw <regex>] \
   [--root <dir>] \
@@ -28,13 +28,16 @@ The recommended entrypoint is the bundled **Stage A** script, which does a paral
 
 Notes:
 - The script records ripgrep match line numbers so you can jump to the exact `.detailed.jsonl` line.
-- `--n` controls how many lines are kept per route (chat / user / kw). Default: `6`.
+- `--n` controls how many lines are kept per route (channel / user / kw). Default: `6`.
+- Prefix matching is subtree-aware: `telegram/chat/<chat_id>` matches all
+  records under that chat, including per-thread channels such as
+  `telegram/chat/<chat_id>/thread/<message_thread_id>`.
 
 ### Example
 
 ```bash
 ~/.kapybara/skills/context/telegram/stage_a \
-  --chat-id 567113516 \
+  --in-channel telegram/chat/567113516 \
   --from-id 567113516 \
   --kw 'retrieve-memory|telegram-context' \
   --out /tmp/tg_ctx_<unique>.tsv \
@@ -50,7 +53,7 @@ Columns (TSV):
 `id`, `routes`, `core_json`, `matched_detailed_lines`
 
 Notes:
-- `routes` is a comma-separated list of which routes matched (`chat`, `user`, `kw`).
+- `routes` is a comma-separated list of which routes matched (`channel`, `user`, `kw`).
 - `matched_detailed_lines` is a JSON array of `{line, text}` objects; it is only non-empty when `--kw` is provided.
 
 ## Follow-ups (manual)

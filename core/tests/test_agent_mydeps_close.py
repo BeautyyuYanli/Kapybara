@@ -16,7 +16,7 @@ async def test_mydeps_async_context_closes_cleanly(tmp_path: Path) -> None:
         config=config,
         memory_storage=memory_store,
         memory_parents=[],
-        input_event_kind="test",
+        input_event_in_channel="test",
     )
 
     async with deps:

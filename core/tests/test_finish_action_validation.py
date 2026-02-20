@@ -20,7 +20,7 @@ def _ctx_for_store(store: FolderMemoryStore) -> RunContext[Any]:
 
 def test_finish_action_accepts_existing_referenced_memory_ids(tmp_path) -> None:
     store = FolderMemoryStore(tmp_path / "memories")
-    parent = MemoryRecord(kind="test", input="in", output="out")
+    parent = MemoryRecord(in_channel="telegram/chat/1", input="in", output="out")
     store.append(parent)
 
     result = finish_action(
@@ -47,7 +47,9 @@ def test_finish_action_retries_for_invalid_memory_id(tmp_path) -> None:
 
 def test_finish_action_retries_for_missing_memory_id(tmp_path) -> None:
     store = FolderMemoryStore(tmp_path / "memories")
-    missing_id = MemoryRecord(kind="test", input="in", output="out").id_
+    missing_id = MemoryRecord(
+        in_channel="telegram/chat/1", input="in", output="out"
+    ).id_
 
     with pytest.raises(ModelRetry, match="Unknown referenced_memory_ids"):
         finish_action(

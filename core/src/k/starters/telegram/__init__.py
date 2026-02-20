@@ -4,7 +4,8 @@ This package polls the Telegram Bot API `getUpdates` endpoint and forwards
 keyword-triggered batches of updates to :func:`k.agent.core.agent_run` as an
 `Event` with:
 
-- `kind="telegram"`
+- `in_channel` derived from Telegram routing ids (chat/thread when available)
+- `out_channel=None` (meaning "same as `in_channel`")
 - `content=<newline-delimited update JSON strings>`
 
 Design notes / boundaries:
