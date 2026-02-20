@@ -10,7 +10,7 @@ from k.config import Config
 
 
 def _write_skill(base: Path, *, group: str, name: str, content: str) -> None:
-    path = base / "skills" / group / name / "SKILLS.md"
+    path = base / ".kapybara" / "skills" / group / name / "SKILLS.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
@@ -40,9 +40,9 @@ def test_concat_skills_prompt_injects_kind_specific_skills(tmp_path: Path) -> No
     prompt = concat_skills_prompt(ctx)  # type: ignore[arg-type]
     assert "<BasicSkills>" in prompt
     assert "<KindSkills>" in prompt
-    assert "# ===== ~/skills/context/telegram/SKILLS.md =====" in prompt
+    assert "# ===== skills:context/telegram/SKILLS.md =====" in prompt
     assert "context telegram" in prompt
-    assert "# ===== ~/skills/messager/telegram/SKILLS.md =====" in prompt
+    assert "# ===== skills:messager/telegram/SKILLS.md =====" in prompt
     assert "messager telegram" in prompt
 
 

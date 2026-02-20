@@ -9,16 +9,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from k.agent.core.skills_uri import skills_root_from_fs_base, skills_uri
+
 
 def concat_skills_md(base_path: str | Path) -> str:
-    """Scan <base_path>/skills/{core,meta}/*/SKILLS.md and concatenate contents.
+    """Scan `<base_path>/.kapybara/skills/{core,meta}/*/SKILLS.md` and concatenate.
 
     Returns a single string which is the concatenation of all found SKILLS.md files,
     separated by clear delimiters.
     """
 
-    base_path = Path(base_path).expanduser().resolve()
-    skills_root = base_path / "skills"
+    skills_root = skills_root_from_fs_base(base_path)
 
     chunks: list[str] = []
 
@@ -34,7 +35,7 @@ def concat_skills_md(base_path: str | Path) -> str:
             chunks.append(
                 "\n".join(
                     [
-                        f"# ===== ~/skills/{group}/{md.parent.name}/SKILLS.md =====",
+                        f"# ===== {skills_uri(f'{group}/{md.parent.name}/SKILLS.md')} =====",
                         content.rstrip(),
                         "",
                     ]
@@ -50,7 +51,7 @@ def maybe_load_kind_skill_md(
     group: str,
     kind: str | None,
 ) -> str | None:
-    """Load `~/skills/<group>/<kind>/SKILLS.md` if present.
+    """Load `skills:<group>/<kind>/SKILLS.md` if present.
 
     The agent uses `context/<kind>` and `messager/<kind>` skills to route and
     contextualize replies for structured `Event` inputs. We only inject the
@@ -61,14 +62,14 @@ def maybe_load_kind_skill_md(
     if not kind:
         return None
 
-    md = Path(base_path).expanduser().resolve() / "skills" / group / kind / "SKILLS.md"
+    md = skills_root_from_fs_base(base_path) / group / kind / "SKILLS.md"
     if not md.exists():
         return None
 
     content = md.read_text()
     return "\n".join(
         [
-            f"# ===== ~/skills/{group}/{kind}/SKILLS.md =====",
+            f"# ===== {skills_uri(f'{group}/{kind}/SKILLS.md')} =====",
             content.rstrip(),
             "",
         ]

@@ -138,7 +138,7 @@ Include failed attempts when they influenced the next step (briefly: what was tr
 - If the trace shows the agent reading or relying on a skill doc (`SKILLS.md`), include a short, task-relevant excerpted summary of the skill instructions and the skill path.
   - Summarize in one line per skill (do not paste the whole doc).
   - Keep only the parts that were relevant to the current task (what was actually used or needed), but include enough to reuse that subset: what it does, required inputs/env vars if mentioned, and the canonical command/API shape.
-  - Example: `Reviewed ~/skills/messager/telegram/SKILLS.md: sendMessage via Bot API; needs TELEGRAM_BOT_TOKEN; requires chat_id`
+  - Example: `Reviewed skills:messager/telegram/SKILLS.md: sendMessage via Bot API; needs TELEGRAM_BOT_TOKEN; requires chat_id`
 
 ## Tool/command representation
 - Keep commands readable and actionable. Keep full URLs (including paths/query strings) when they help trace the step; shorten truly huge non-URL payloads/outputs with "...".

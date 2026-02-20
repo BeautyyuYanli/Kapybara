@@ -26,6 +26,7 @@ from k.runner_helpers.basic_os import BasicOSHelper, single_quote
 _BASH_STDIO_TOKEN_LIMIT = 16000
 _CL100K_BASE_ENCODING: Any | None = None
 _BASH_COUNTDOWN_SYSTEM_MSG = "You've been working for a while. Pause to send a brief progress update to the originating event channel, then continue working."
+_SKILLS_HOME = "~/.kapybara/skills"
 
 
 def _cl100k_base_token_len(text: str) -> int:
@@ -290,7 +291,7 @@ async def edit_file(
 
     return await _bash_impl(
         ctx,
-        f"python3 ~/skills/meta/edit-file/edit.py --filename {single_quote(filename)} --old-content {single_quote(old_content)} --new-content {single_quote(new_content)} "
+        f"python3 {_SKILLS_HOME}/meta/edit-file/edit.py --filename {single_quote(filename)} --old-content {single_quote(old_content)} --new-content {single_quote(new_content)} "
         + (
             f"--start-line {single_quote(str(start_line))}"
             if start_line is not None
