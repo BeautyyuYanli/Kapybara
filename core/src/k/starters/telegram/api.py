@@ -34,6 +34,7 @@ class TelegramBotApi:
         chat_id: int,
         text: str,
         reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
         parse_mode: str = "HTML",
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
@@ -43,6 +44,8 @@ class TelegramBotApi:
         }
         if reply_to_message_id is not None:
             params["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id is not None:
+            params["message_thread_id"] = message_thread_id
 
         data = urllib.parse.urlencode(params).encode("utf-8")
         request = urllib.request.Request(
@@ -94,6 +97,7 @@ class TelegramBotApi:
         chat_id: int,
         text: str,
         reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> dict[str, Any]:
         """Send a message via `sendMessage` (async wrapper).
 
@@ -107,6 +111,7 @@ class TelegramBotApi:
                 chat_id=chat_id,
                 text=safe_text,
                 reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
                 parse_mode="HTML",
             )
         )

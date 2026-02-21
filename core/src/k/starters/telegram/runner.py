@@ -232,6 +232,7 @@ async def run_agent_for_chat_batch(
         print(f"[red]agent_run failed[/red]: {prefix}{type(e).__name__}: {e}")
         reply_to_message_id: int | None = None
         reply_chat_id: int | None = chat_id
+        message_thread_id: int | None = None
         for update in reversed(batch_updates):
             message = update.get("message")
             if not isinstance(message, dict):
@@ -240,6 +241,7 @@ async def run_agent_for_chat_batch(
             if not isinstance(message_id, int):
                 continue
             reply_to_message_id = message_id
+            message_thread_id = message.get("message_thread_id")
             if reply_chat_id is None:
                 chat = message.get("chat")
                 if isinstance(chat, dict) and isinstance(chat.get("id"), int):
@@ -259,6 +261,7 @@ async def run_agent_for_chat_batch(
                     chat_id=reply_chat_id,
                     text=text,
                     reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message_thread_id,
                 )
             except Exception as send_err:  # pragma: no cover (network dependent)
                 print(
