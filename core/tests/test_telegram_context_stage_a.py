@@ -151,3 +151,44 @@ def test_stage_a_user_route_is_cross_in_channel_for_thread_inputs(
     assert routes["bbb"] == {"user"}
     # In-thread, different user.
     assert routes["ccc"] == {"channel"}
+
+
+def test_stage_a_reads_preferences_from_kapybara_preferences(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    records_root = tmp_path / "records"
+    records_root.mkdir()
+
+    preferences_root = home / ".kapybara" / "preferences"
+    preferences_root.mkdir(parents=True)
+    (preferences_root / "telegram.md").write_text(
+        "platform preference", encoding="utf-8", newline="\n"
+    )
+    (preferences_root / "telegram" / "PREFERENCES.md").parent.mkdir(parents=True)
+    (preferences_root / "telegram" / "PREFERENCES.md").write_text(
+        "platform nested preference", encoding="utf-8", newline="\n"
+    )
+    (preferences_root / "telegram" / "by_user" / "567113516.md").parent.mkdir(
+        parents=True
+    )
+    (preferences_root / "telegram" / "by_user" / "567113516.md").write_text(
+        "by-user preference", encoding="utf-8", newline="\n"
+    )
+
+    out_path = tmp_path / "stage_a.tsv"
+    proc = _run_stage_a(
+        home=home,
+        records_root=records_root,
+        in_channel="telegram/chat/-1001/thread/10",
+        from_id=567113516,
+        out_path=out_path,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    output = out_path.read_text(encoding="utf-8")
+    assert "Preference (telegram.md):" in output
+    assert "platform preference" in output
+    assert "Preference (telegram/PREFERENCES.md):" in output
+    assert "platform nested preference" in output
+    assert "User-specific Preference (from_id: 567113516):" in output
+    assert "by-user preference" in output

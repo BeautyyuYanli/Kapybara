@@ -111,8 +111,8 @@ preference_prompt = """
 <Preference>
 The system may load preference files for channel paths and individual users.
 - For each prefix of `Event.in_channel`, inject (if exists) in order:
-  - `~/preferences/<prefix>.md`
-  - `~/preferences/<prefix>/PREFERENCES.md`
+  - `~/.kapybara/preferences/<prefix>.md`
+  - `~/.kapybara/preferences/<prefix>/PREFERENCES.md`
 - Keep existing by-user selection logic where available (e.g. `by_user/<user_id>.md`).
 
 **Autonomous Updates:**

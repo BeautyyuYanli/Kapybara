@@ -13,8 +13,8 @@ Create a skill at `~/.kapybara/skills/context/<platform>/SKILLS.md` to define ho
 ### Preference Management
 The `context/<platform>` skill is responsible for retrieving preference files based on `Event.in_channel` prefixes.
 
-- **Path Preferences**: Inject, in root-to-leaf order, both `<prefix>.md` and `<prefix>/PREFERENCES.md` for each `Event.in_channel` prefix.
-- **Fine-grained Preferences**: Keep by-user files (e.g. `~/preferences/<platform>/by_user/<user_id>.md`) when available.
+- **Path Preferences**: Inject from `~/.kapybara/preferences`, in root-to-leaf order, both `<prefix>.md` and `<prefix>/PREFERENCES.md` for each `Event.in_channel` prefix.
+- **Fine-grained Preferences**: Keep by-user files (e.g. `~/.kapybara/preferences/<platform>/by_user/<user_id>.md`) when available.
 - **Manual Update**: Users or agents can create or update preference information by directly editing the relevant file.
 
 ### Implementation Guide

@@ -34,6 +34,8 @@ Hard requirement:
 Notes:
 - `--in-channel` is not "any matching prefix"; provide the full current-input
   channel string as-is.
+- Preference files are loaded from `~/.kapybara/preferences` using channel-prefix
+  order plus the optional `by_user/<from_id>.md` file.
 - The script records ripgrep match line numbers so you can jump to the exact `.detailed.jsonl` line.
 - `--n` controls how many lines are kept per route (channel / user / kw). Default: `6`.
 - Prefix matching is subtree-aware: `telegram/chat/<chat_id>` matches all

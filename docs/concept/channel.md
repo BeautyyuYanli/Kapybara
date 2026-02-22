@@ -49,6 +49,8 @@ Example:
 For an `in_channel`, inject preferences from root to leaf. For each prefix path
 that exists, inject both files in this order:
 
+Preference files are resolved from `~/.kapybara/preferences`.
+
 1. `<prefix>.md`
 2. `<prefix>/PREFERENCES.md`
 
