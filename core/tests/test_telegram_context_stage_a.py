@@ -12,8 +12,8 @@ def _stage_a_script_path() -> Path:
         / "fs"
         / ".kapybara"
         / "skills"
-        / "context"
-        / "telegram"
+        / "meta"
+        / "retrieve-memory"
         / "stage_a"
     )
 
@@ -57,15 +57,15 @@ def _run_stage_a(
     *,
     home: Path,
     in_channel: str,
-    from_id: int,
+    kw: str,
     out_path: Path,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         str(_stage_a_script_path()),
         "--in-channel",
         in_channel,
-        "--from-id",
-        str(from_id),
+        "--kw",
+        kw,
         "--n",
         "20",
         "--out",
@@ -82,16 +82,16 @@ def _run_stage_a(
     )
 
 
-def _parse_routes(out_text: str) -> dict[str, set[str]]:
-    header = "# id\troutes\tcore_json\tmatched_detailed_lines"
+def _parse_rows(out_text: str) -> dict[str, list[dict[str, object]]]:
+    header = "# id\tcore_json\tmatched_detailed_lines"
     lines = out_text.splitlines()
     start = lines.index(header) + 1
-    parsed: dict[str, set[str]] = {}
+    parsed: dict[str, list[dict[str, object]]] = {}
     for line in lines[start:]:
         if not line.strip():
             continue
-        record_id, routes_s, _core_json, _matched = line.split("\t", 3)
-        parsed[record_id] = set(filter(None, routes_s.split(",")))
+        record_id, _core_json, matched_s = line.split("\t", 2)
+        parsed[record_id] = json.loads(matched_s)
     return parsed
 
 
@@ -99,7 +99,7 @@ def test_stage_a_script_exists() -> None:
     assert _stage_a_script_path().is_file()
 
 
-def test_stage_a_user_route_is_cross_in_channel_for_thread_inputs(
+def test_stage_a_keyword_search_is_scoped_to_in_channel_prefix(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -135,18 +135,14 @@ def test_stage_a_user_route_is_cross_in_channel_for_thread_inputs(
     proc = _run_stage_a(
         home=home,
         in_channel="telegram/chat/-1001/thread/10",
-        from_id=567113516,
+        kw="aaa|bbb|ccc",
         out_path=out_path,
     )
     assert proc.returncode == 0, proc.stderr
 
-    routes = _parse_routes(out_path.read_text(encoding="utf-8"))
-    # In-thread, same user.
-    assert routes["aaa"] == {"channel", "user"}
-    # Cross-thread, same user: user route should still match.
-    assert routes["bbb"] == {"user"}
-    # In-thread, different user.
-    assert routes["ccc"] == {"channel"}
+    rows = _parse_rows(out_path.read_text(encoding="utf-8"))
+    assert set(rows.keys()) == {"aaa", "ccc"}
+    assert all(rows[row_id] for row_id in rows)
 
 
 def test_stage_a_default_root_uses_home_kapybara_memories_records(
@@ -169,13 +165,13 @@ def test_stage_a_default_root_uses_home_kapybara_memories_records(
     proc = _run_stage_a(
         home=home,
         in_channel="telegram/chat/-1001/thread/10",
-        from_id=567113516,
+        kw="aaa",
         out_path=out_path,
     )
     assert proc.returncode == 0, proc.stderr
 
-    routes = _parse_routes(out_path.read_text(encoding="utf-8"))
-    assert routes["aaa"] == {"channel", "user"}
+    rows = _parse_rows(out_path.read_text(encoding="utf-8"))
+    assert set(rows.keys()) == {"aaa"}
 
 
 def test_stage_a_does_not_emit_preference_content(tmp_path: Path) -> None:
@@ -204,7 +200,7 @@ def test_stage_a_does_not_emit_preference_content(tmp_path: Path) -> None:
     proc = _run_stage_a(
         home=home,
         in_channel="telegram/chat/-1001/thread/10",
-        from_id=567113516,
+        kw="anything",
         out_path=out_path,
     )
     assert proc.returncode == 0, proc.stderr

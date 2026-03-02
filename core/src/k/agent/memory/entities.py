@@ -179,10 +179,36 @@ class MemoryRecord(BaseModel):
     def short_id(self) -> str:
         return self.id_[:8]
 
+    def _raw_pair_compacted_context(self) -> list[str]:
+        """Return the compacted context used by `dump_raw_pair`.
+
+        This keeps only boundary context for older memories:
+        - empty compacted -> `[]`
+        - single item -> `[item]`
+        - otherwise -> `[first, last]`
+        """
+
+        if not self.compacted:
+            return []
+        if len(self.compacted) == 1:
+            return [self.compacted[0]]
+        return [self.compacted[0], self.compacted[-1]]
+
     def dump_raw_pair(self) -> str:
-        # return self.model_dump_json(exclude={"detailed", "compacted"})
-        return f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta><Instruct>{self.input}</Instruct><Response>{self.output}</Response>"""
+        """Return core-payload JSON with reduced compacted context.
+
+        This uses the same serialization contract as `dump_compated()`
+        (`exclude={"input", "output", "detailed"}`), but replaces
+        `compacted` with the lightweight boundary context from
+        `_raw_pair_compacted_context()`.
+        """
+
+        record = self.model_copy(
+            update={"compacted": self._raw_pair_compacted_context()}
+        )
+        return record.model_dump_json(exclude={"input", "output", "detailed"})
 
     def dump_compated(self) -> str:
-        # return self.model_dump_json(exclude={"detailed"})
-        return f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta><Instruct>{self.input}</Instruct><Process>{self.compacted}</Process><Response>{self.output}</Response>"""
+        """Return the exact JSON payload persisted to `<id>.core.json`."""
+
+        return self.model_dump_json(exclude={"input", "output", "detailed"})

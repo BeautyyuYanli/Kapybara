@@ -8,7 +8,8 @@ Design notes / invariants:
   record (`parents` / `children`) may refer to missing records; link-resolution
   methods support `strict` mode to surface this.
 - "Latests" are returned in descending store order (newest first) and can be
-  filtered by channel subtree via `in_channel`.
+  filtered by channel subtree via `in_channel` and exact contact-id membership
+  via `contact`, with optional result capping via `num`.
 - `append()` must treat `record.parents` as the source of truth and ensure each
   referenced parent record contains `record.id_` in its `children` list before
   returning.
@@ -45,12 +46,22 @@ class MemoryStore(Protocol):
     def refresh(self) -> None:
         """Force a reload from disk (even if the underlying storage did not change)."""
 
-    def get_latests(self, *, in_channel: str | None = None) -> list[str]:
+    def get_latests(
+        self,
+        *,
+        in_channel: str | None = None,
+        contact: str | None = None,
+        num: int | None = None,
+    ) -> list[str]:
         """Return latest record ids (descending store order).
 
         Args:
             in_channel: Optional channel prefix filter. A record is selected when
                 its `in_channel` equals this prefix or starts with `"{prefix}/"`.
+            contact: Optional contact filter. A record is selected when this
+                contact id exists in `MemoryRecord.contacts`.
+            num: Optional maximum number of ids to return. `None` means no
+                limit.
         """
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
@@ -78,7 +89,13 @@ class MemoryStore(Protocol):
         level: int | None = None,
         strict: bool = False,
     ) -> list[str]:
-        """Return ancestor ids for `record` by repeatedly following parents."""
+        """Return ancestor ids for `record` by repeatedly following parents.
+
+        Level semantics:
+        - `level=0`: return a single-item list with `record` itself.
+        - `level=1`: return direct parent ids.
+        - `level=None`: return all reachable ancestors.
+        """
 
     def get_between(
         self,

@@ -5,25 +5,21 @@ description: Guide and tools for adding a new platform channel root to Kapybara.
 
 # add-event-kind
 
-To add a new communication channel (e.g., Discord, Slack, etc.) to Kapybara, you need to implement three components: **Context Retrieval**, **Message Delivery**, and an **Event Starter**.
+To add a new communication channel (e.g., Discord, Slack, etc.) to Kapybara,
+you need to implement two platform-specific components: **Message Delivery**
+and an **Event Starter**. Memory retrieval is provided by
+`meta/retrieve-memory` (shared across platforms), not `context/<platform>`.
 
-## 1. Context Retrieval Skill
-Create a skill at `~/.kapybara/skills/context/<platform>/SKILLS.md` to define how to fetch history and preferences for that platform.
+## 1. Memory retrieval (shared)
+Use `~/.kapybara/skills/meta/retrieve-memory` for retrieval workflows.
 
-### Preference Management
-The `context/<platform>` skill is responsible for retrieving preference files based on `Event.in_channel` prefixes.
+- Recommended script: `~/.kapybara/skills/meta/retrieve-memory/stage_a`
+- Input contract: pass the exact current `Event.in_channel` and keyword regex.
+- Output contract: candidate memory rows (`id`, `core_json`,
+  `matched_detailed_lines`) for follow-up inspection.
 
-- **Path Preferences**: Inject from `~/.kapybara/preferences`, in root-to-leaf order, both `<prefix>.md` and `<prefix>/PREFERENCES.md` for each `Event.in_channel` prefix.
-- **Fine-grained Preferences**: Keep user-level contact files (e.g. `~/.kapybara/preferences/contacts/<platform>/<user_id>.md`) when available.
-- **Manual Update**: Users or agents can create or update preference information by directly editing the relevant file.
-
-### Implementation Guide
-- **Code**: The skill should include a script (e.g., `stage_a`) that combines channel-prefix lookup (`MemoryRecord.in_channel`) with optional ID routes (e.g., `from.id`), where ID lookup may span the same platform root (for example, across `telegram/*`).
-- **Key Requirement**:
-    - Output a list of candidate memory record paths sorted by time.
-    - Keep output focused on retrieval candidates; preference content is injected by the agent system prompt pipeline.
-
-Example: `~/.kapybara/skills/context/telegram/stage_a` searches local memories by `in_channel` prefix and returns channel/user candidate routes.
+Preference content is injected by the agent system prompt pipeline, so retrieval
+skills should return retrieval candidates only.
 
 ## 2. Message Delivery Skill
 Create a skill at `~/.kapybara/skills/messager/<platform>/SKILLS.md` to define how to reply via the platform's API (e.g., using `curl`).
@@ -47,7 +43,7 @@ Reference: `/core/src/k/starters/telegram.py`
 
 ## Workflow summary
 1. **Identify** the Platform API (REST/WebSocket/Long-poll).
-2. **Implement** `messager/<platform>` skill for replies.
-3. **Implement** `context/<platform>` skill for memory lookup.
+2. **Reuse** `meta/retrieve-memory` for memory lookup.
+3. **Implement** `messager/<platform>` skill for replies.
 4. **Create** `/core/src/k/starters/<platform>.py` to bridge the API to the Agent.
 5. **Update** `~/start.sh` or a similar supervisor to run the new starter.

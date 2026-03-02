@@ -28,16 +28,13 @@ def test_extract_input_event_channel_root_ignores_non_event_strings() -> None:
     assert _extract_input_event_channel_root(["hello"]) is None
 
 
-def test_concat_skills_prompt_injects_channel_root_specific_skills(
+def test_concat_skills_prompt_injects_messager_channel_root_skill(
     tmp_path: Path,
 ) -> None:
     config_base = tmp_path / ".kapybara"
     _write_skill(config_base, group="core", name="web-search", content="core skill")
     _write_skill(
         config_base, group="meta", name="retrieve-memory", content="meta skill"
-    )
-    _write_skill(
-        config_base, group="context", name="telegram", content="context telegram"
     )
     _write_skill(
         config_base,
@@ -63,8 +60,6 @@ def test_concat_skills_prompt_injects_channel_root_specific_skills(
     prompt = concat_skills_prompt(ctx)  # type: ignore[arg-type]
     assert "<BasicSkills>" in prompt
     assert "<ChannelSkills>" in prompt
-    assert "# ===== skills:context/telegram/SKILLS.md =====" in prompt
-    assert "context telegram" in prompt
     assert "# ===== skills:messager/telegram/SKILLS.md =====" in prompt
     assert "messager telegram" in prompt
 

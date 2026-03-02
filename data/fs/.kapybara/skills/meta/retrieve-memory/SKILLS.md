@@ -5,16 +5,53 @@ description: Works with the local ~/.kapybara/memories store.
 
 # retrieve-memory
 
-## What it is
-- `~/.kapybara/memories` is a local memory store
-- **core record files** (`~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.core.json`) that store one conversation memory each (one JSON object per line), including metadata and `compacted`.
-- **detailed record files** (`~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl`) that store high-signal raw context as JSONL:
-  - line 1: the raw `input` (JSON string)
-  - line 2: the record `output` (JSON string)
-  - line 3+: one line per `ModelResponse`, each line is a simplified tool-call list (JSON array)
-- `*.detailed.jsonl` can still be verbose (raw `input` and `output` may be large).
-  Prefer **partial reads** instead of loading whole files.
-- `compacted` is the **working log** for the conversation: a chronological list of concise steps extracted from the agent’s tool traces (what was done, why, and the outcome).
+## Recommended script (Stage A)
+Use this first for channel-scoped keyword retrieval:
+
+```bash
+~/.kapybara/skills/meta/retrieve-memory/stage_a \
+  --in-channel <exact_current_input_in_channel> \
+  --kw <regex> \
+  [--n <N>] \
+  --out /tmp/mem_ctx_<unique>.tsv
+```
+
+### Stage A contract
+- `--in-channel` must be the exact current input channel string.
+- Retrieval is scoped to that channel subtree (`prefix` semantics).
+- `--kw` is a regex matched against detailed memory lines.
+- Output TSV columns: `id`, `core_json`, `matched_detailed_lines`.
+- `matched_detailed_lines` is a JSON array of `{line, text}` matches.
+- Always use a unique `--out` path to avoid races/clobbering.
+
+## Manual fallback (lower-level)
+Use manual commands when Stage A is insufficient or when you need custom filtering.
+
+### Search detailed files by keyword
+```bash
+rg -n --sort path -g "*.detailed.jsonl" 'weather|forecast' ~/.kapybara/memories/records | head -n 10
+```
+
+### Read only the beginning of a detailed file
+```bash
+head -n 2 ~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl
+sed -n '3,8p' ~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl
+```
+
+### Search compacted steps in core files
+```bash
+rg -n --sort path -g "*.core.json" 'ffmpeg|telegram|fish' ~/.kapybara/memories/records | head -n 10
+```
+
+## What this skill reads
+- `~/.kapybara/memories` is the local memory store.
+- **core record files** (`~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.core.json`) store metadata and `compacted`.
+- **detailed record files** (`~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl`) store JSONL:
+  - line 1: raw `input` (JSON string)
+  - line 2: record `output` (JSON string)
+  - line 3+: one simplified tool-call list per `ModelResponse` (JSON array)
+- `*.detailed.jsonl` can still be verbose; prefer partial reads.
+- `compacted` is the working log: concise chronological steps from tool traces.
 
 A record is defined as:
 ```
@@ -34,26 +71,3 @@ class MemoryRecord(BaseModel):
 ## IDs
 An **8-character**, URL-safe encoding of a **48-bit** big-endian
 POSIX-milliseconds timestamp (`created_at`), using a custom alphabet whose ASCII order matches digit values (so lexicographic order matches time order).
-
-## Common tasks
-Combined with `core/file-search` skill for searching.
-
-### Search by keywords
-```bash
-# Search the detailed files (raw input + output + tool calls).
-rg -n --sort path -g "*.detailed.jsonl" 'weather|天气|forecast' ~/.kapybara/memories/records | head -n 10
-```
-
-### Read only the beginning of a detailed file
-```bash
-# Just the first 2 lines: input, output
-head -n 2 ~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl
-
-# If needed, read a few response tool-call lines (each line is a JSON array)
-sed -n '3,8p' ~/.kapybara/memories/records/YYYY/MM/DD/HH/<id>.detailed.jsonl
-```
-
-### Search compacted steps (the core files)
-```bash
-rg -n --sort path -g "*.core.json" 'ffmpeg|telegram|fish' ~/.kapybara/memories/records | head -n 10
-```

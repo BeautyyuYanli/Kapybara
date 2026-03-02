@@ -372,10 +372,11 @@ def finish_action(
 
     Args:
         referenced_memory_ids: Memory record IDs that informed this run.
-            Include only memories directly relevant to this task (do not pass
-            every retrieved memory). Use an empty list when no prior memory was
-            used. Every ID must be a valid `MemoryRecord.id_`; missing IDs are
-            ignored.
+            Include only memories with a direct causal relationship to the
+            current input event (i.e., they materially changed interpretation,
+            decision, or response). Do not pass every retrieved memory. Use an
+            empty list when no prior memory had direct causal impact. Every ID
+            must be a valid `MemoryRecord.id_`; missing IDs are ignored.
         raw_input: See `<CompactedRules>` field contract for `raw_input`.
         raw_output: See `<CompactedRules>` field contract for `raw_output`.
         input_intents: See `<CompactedRules>` field contract for
@@ -459,15 +460,9 @@ def concat_skills_prompt(ctx: RunContext[MyDeps]) -> str:
     config_base: str | Path = ctx.deps.config.config_base
     skills_md = concat_skills_md(config_base)
     event = ctx.deps.start_event
-    in_channel = event.in_channel
     out_channel = event.effective_out_channel
 
     channel_chunks = [
-        maybe_load_channel_skill_md(
-            config_base,
-            group="context",
-            channel=in_channel,
-        ),
         maybe_load_channel_skill_md(
             config_base,
             group="messager",
@@ -540,20 +535,128 @@ async def _system_runtime_prompt(deps: MyDeps) -> str:
     )
 
 
+def _dedupe_memory_ids(ids: Sequence[str]) -> list[str]:
+    """Return ids in first-seen order with duplicates removed."""
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for id_ in ids:
+        if id_ in seen:
+            continue
+        seen.add(id_)
+        out.append(id_)
+    return out
+
+
+def _resolve_parent_memories(
+    *,
+    memory_store: FolderMemoryStore,
+    in_channel: str,
+    contacts: list[str],
+    parent_memories: list[str] | None,
+    in_channel_latest_num: int = 5,
+    contact_latest_num: int = 2,
+) -> list[str]:
+    """Resolve parent memories for `agent_run`.
+
+    Behavior:
+    - If `parent_memories` is provided (including an empty list), use it as the
+      source of truth after stable deduplication.
+    - If `parent_memories` is `None`, auto-select by unioning:
+      1) latest records by `in_channel` subtree (limit `in_channel_latest_num`)
+      2) latest records by each contact id, without channel filter
+         (per-contact limit `contact_latest_num`)
+      The union preserves first-seen order and removes duplicates.
+    """
+
+    if parent_memories is not None:
+        return _dedupe_memory_ids(parent_memories)
+
+    selected: list[str] = []
+    if in_channel_latest_num > 0:
+        selected.extend(
+            memory_store.get_latests(
+                in_channel=in_channel,
+                num=in_channel_latest_num,
+            )
+        )
+
+    if contact_latest_num > 0:
+        for contact in contacts:
+            selected.extend(
+                memory_store.get_latests(
+                    contact=contact,
+                    num=contact_latest_num,
+                )
+            )
+
+    return _dedupe_memory_ids(selected)
+
+
+def _keep_latest_records(
+    records: list[MemoryRecord],
+    *,
+    cap_num: int,
+    name: str,
+) -> list[MemoryRecord]:
+    """Return latest `cap_num` records from a datetime-sorted list."""
+
+    if cap_num < 0:
+        raise ValueError(f"{name} must be >= 0; got {cap_num}")
+    if cap_num == 0:
+        return []
+    return records[-cap_num:]
+
+
 async def _memory_select(
     memory_store: FolderMemoryStore,
     parent_memories: list[str],
-    compacted_level_num: int = 5,
-    raw_pair_level_num: int = 20,
+    compacted_level_num: int = 3,
+    raw_pair_level_num: int = 10,
+    compacted_cap_num: int = 40,
+    raw_pair_cap_num: int = 20,
 ):
+    """Select memory records for compacted/raw-pair injection.
+
+    Selection categories:
+    - compacted memories: `parent_memories` + ancestors up to
+      `compacted_level_num`
+    - raw-pair memories: additional ancestors up to `raw_pair_level_num`
+      excluding compacted memories, plus downgraded compacted overflow
+
+    Caps:
+    - compacted memories are capped by `compacted_cap_num`
+    - overflow compacted memories are downgraded into raw-pair candidates
+    - raw-pair candidates are capped by `raw_pair_cap_num`
+
+    Returned records are sorted by datetime (same order as `get_by_ids`).
+    """
+
     recent_mem = set(parent_memories)
     all_mem = set(parent_memories)
     for mem in parent_memories:
         recent_mem.update(memory_store.get_ancestors(mem, level=compacted_level_num))
         all_mem.update(memory_store.get_ancestors(mem, level=raw_pair_level_num))
 
-    all_mem_rec = memory_store.get_by_ids(all_mem)
-    return all_mem_rec, recent_mem
+    raw_pair_only = all_mem - recent_mem
+    recent_records = memory_store.get_by_ids(recent_mem)
+    compacted_records = _keep_latest_records(
+        recent_records,
+        cap_num=compacted_cap_num,
+        name="compacted_cap_num",
+    )
+    capped_recent_ids = {rec.id_ for rec in compacted_records}
+    downgraded_recent_ids = {rec.id_ for rec in recent_records} - capped_recent_ids
+    raw_pair_candidates = raw_pair_only | downgraded_recent_ids
+    raw_pair_records = _keep_latest_records(
+        memory_store.get_by_ids(raw_pair_candidates),
+        cap_num=raw_pair_cap_num,
+        name="raw_pair_cap_num",
+    )
+
+    selected_ids = capped_recent_ids | {rec.id_ for rec in raw_pair_records}
+    all_mem_rec = memory_store.get_by_ids(selected_ids)
+    return all_mem_rec, capped_recent_ids
 
 
 async def agent_run(
@@ -575,12 +678,22 @@ async def agent_run(
     Contact lifecycle:
     - Resolve `Event.contacts` platform ids to unique ids before model run.
     - Persist those resolved ids in the output `MemoryRecord.contacts`.
+
+    Parent-memory selection:
+    - `parent_memories=None`: auto-select latest records by input channel and
+      by resolved contact ids (union + dedupe).
+    - `parent_memories=[]`: skip auto-selection and run without parent memory.
     """
 
-    parent_memories = parent_memories or []
     resolved_contact_ids = resolve_contact_unique_ids(
         config_base=config.config_base,
         platform_contacts=instruct.contacts,
+    )
+    parent_memories = _resolve_parent_memories(
+        memory_store=memory_store,
+        in_channel=instruct.in_channel,
+        contacts=resolved_contact_ids,
+        parent_memories=parent_memories,
     )
 
     all_mem_rec, recent_mem = await _memory_select(
@@ -614,7 +727,6 @@ async def agent_run(
     msgs = _strip_history(msgs, (instruct.content,))
     memory_record = res.output
     memory_record.input = instruct.content
-    memory_record.parents = parent_memories + memory_record.parents
     memory_record.detailed = msgs
 
     return memory_record

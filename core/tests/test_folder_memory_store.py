@@ -25,6 +25,7 @@ def test_folder_store_get_latests_and_get_by_id(tmp_path) -> None:
 
     r1_path = root / "records" / "2026" / "01" / "01" / "00" / f"{r1.id_}.core.json"
     assert r1_path.exists()
+    assert r1_path.read_text(encoding="utf-8") == r1.dump_compated()
     core_payload = json.loads(r1_path.read_text(encoding="utf-8"))
     assert core_payload["in_channel"] == "test"
     assert core_payload["out_channel"] is None
@@ -122,7 +123,7 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
         store.get_children(missing, strict=True)
 
     assert store.get_ancestors(missing) == [child.id_, parent.id_]
-    assert store.get_ancestors(missing, level=0) == []
+    assert store.get_ancestors(missing, level=0) == [missing.id_]
     assert store.get_ancestors(missing, level=1) == [child.id_]
     assert store.get_ancestors(missing, level=2) == [child.id_, parent.id_]
 
@@ -132,6 +133,57 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     assert reloaded_missing is not None
     assert store.get_children(reloaded_missing) == []
     assert store.get_children(reloaded_missing, strict=True) == []
+
+
+def test_folder_store_get_ancestors_checks_cache_once_per_call(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "mem"
+    store = FolderMemoryStore(root)
+
+    grandparent = MemoryRecord(
+        in_channel="test",
+        input="gp-in",
+        compacted=["gp-c"],
+        output="gp-out",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    parent = MemoryRecord(
+        in_channel="test",
+        input="p-in",
+        compacted=["p-c"],
+        output="p-out",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 1, 0, 0),
+        parents=[grandparent.id_],
+    )
+    child = MemoryRecord(
+        in_channel="test",
+        input="c-in",
+        compacted=["c-c"],
+        output="c-out",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 2, 0, 0),
+        parents=[parent.id_],
+    )
+
+    store.append(grandparent)
+    store.append(parent)
+    store.append(child)
+
+    calls = 0
+    original_stat_key = store._stat_key
+
+    def counted_stat_key():
+        nonlocal calls
+        calls += 1
+        return original_stat_key()
+
+    monkeypatch.setattr(store, "_stat_key", counted_stat_key)
+
+    assert store.get_ancestors(child.id_) == [parent.id_, grandparent.id_]
+    assert calls == 1
 
 
 def test_folder_store_append_ignores_missing_parent_ids(tmp_path) -> None:
@@ -387,6 +439,7 @@ def test_folder_store_get_latests_filters_by_in_channel_prefix(tmp_path) -> None
 
     room = MemoryRecord(
         in_channel="telegram/chat/-1001",
+        contacts=["c1"],
         input="room",
         output="",
         id_="-------0",
@@ -394,6 +447,7 @@ def test_folder_store_get_latests_filters_by_in_channel_prefix(tmp_path) -> None
     )
     thread = MemoryRecord(
         in_channel="telegram/chat/-1001/thread/10",
+        contacts=["c1", "c2"],
         input="thread",
         output="",
         id_="-------1",
@@ -401,6 +455,7 @@ def test_folder_store_get_latests_filters_by_in_channel_prefix(tmp_path) -> None
     )
     other = MemoryRecord(
         in_channel="discord/channel/1",
+        contacts=["c2"],
         input="other",
         output="",
         id_="-------2",
@@ -416,6 +471,25 @@ def test_folder_store_get_latests_filters_by_in_channel_prefix(tmp_path) -> None
     ]
     assert store.get_latests(in_channel="telegram/chat/-1001/thread/10") == [thread.id_]
     assert store.get_latests(in_channel="telegram/chat/-1001/thread/11") == []
+    assert store.get_latests(contact="c1") == [thread.id_, room.id_]
+    assert store.get_latests(contact="c2") == [other.id_, thread.id_]
+    assert store.get_latests(in_channel="telegram/chat/-1001", contact="c2") == [
+        thread.id_
+    ]
+    assert store.get_latests(in_channel="telegram/chat/-1001", contact="c3") == []
+    assert store.get_latests(in_channel="telegram/chat/-1001", num=1) == [thread.id_]
+    assert store.get_latests(contact="c2", num=1) == [other.id_]
+    assert store.get_latests(in_channel="telegram/chat/-1001", contact="c2", num=1) == [
+        thread.id_
+    ]
+    assert store.get_latests(num=0) == []
+
+
+def test_folder_store_get_latests_rejects_negative_num(tmp_path) -> None:
+    store = FolderMemoryStore(tmp_path / "mem")
+
+    with pytest.raises(ValueError, match="num must be >= 0 or None"):
+        store.get_latests(num=-1)
 
 
 def test_folder_store_filter_by_in_channel(tmp_path) -> None:
