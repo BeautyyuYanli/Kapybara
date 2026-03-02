@@ -372,10 +372,11 @@ def finish_action(
 
     Args:
         referenced_memory_ids: Memory record IDs that informed this run.
-            Include only memories directly relevant to this task (do not pass
-            every retrieved memory). Use an empty list when no prior memory was
-            used. Every ID must be a valid `MemoryRecord.id_`; missing IDs are
-            ignored.
+            Include only memories with a direct causal relationship to the
+            current input event (i.e., they materially changed interpretation,
+            decision, or response). Do not pass every retrieved memory. Use an
+            empty list when no prior memory had direct causal impact. Every ID
+            must be a valid `MemoryRecord.id_`; missing IDs are ignored.
         raw_input: See `<CompactedRules>` field contract for `raw_input`.
         raw_output: See `<CompactedRules>` field contract for `raw_output`.
         input_intents: See `<CompactedRules>` field contract for

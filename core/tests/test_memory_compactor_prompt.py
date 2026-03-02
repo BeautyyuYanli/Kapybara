@@ -17,6 +17,8 @@ def test_compacted_actions_prompt_emphasizes_high_fidelity_details() -> None:
     assert "observed (tool outputs, errors, test results, confirmations)" in text
     assert "responded (messages delivered to the user and artifacts produced)" in text
     assert "Include failed attempts" in text
+    assert "0) `referenced_memory_ids`" in text
+    assert "direct causal relationship" in text
     assert "1) `raw_input`" in text
     assert "not a raw structured dump" in text
     assert "Do **not** copy/paste the original structured payload" in text

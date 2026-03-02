@@ -11,6 +11,14 @@ When calling `finish_action`, produce clear and reusable memory fields that can
 be read by humans and reused by later agent runs.
 
 ## Field mapping (`finish_action`)
+0) `referenced_memory_ids`
+- Return only memory ids that have a **direct causal relationship** with the
+  current input event (i.e., they materially changed interpretation, decision,
+  or response).
+- Do not include memories that were merely retrieved but not actually used.
+- Do not include broad/background history unless it directly affected this run.
+- Use an empty list when no prior memory had direct causal impact.
+
 1) `raw_input`
 - Goal: a fluent, human-readable summary, not a raw structured dump.
 - Do **not** copy/paste the original structured payload (JSON/markup/nested
