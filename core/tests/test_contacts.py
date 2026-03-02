@@ -7,6 +7,7 @@ from k.agent.contacts import (
     load_contacts_book,
     migrate_contacts_preferences,
     resolve_contact_unique_ids,
+    save_contacts_book,
 )
 
 
@@ -17,6 +18,7 @@ def test_resolve_contact_unique_ids_creates_and_reuses_ids(tmp_path: Path) -> No
         config_base=config_base,
         platform_contacts=["telegram/42", "telegram/42"],
     )
+    assert first[0] == "c1"
     assert len(first) == 1
 
     second = resolve_contact_unique_ids(
@@ -24,6 +26,7 @@ def test_resolve_contact_unique_ids_creates_and_reuses_ids(tmp_path: Path) -> No
         platform_contacts=["telegram/42", "discord/alice"],
     )
     assert second[0] == first[0]
+    assert second[1] == "c2"
     assert len(second) == 2
 
     book = load_contacts_book(config_base)
@@ -63,3 +66,21 @@ def test_migrate_contacts_preferences_rewrites_relative_symlinks(
     assert second_report.created_contact_ids == 0
     assert second_report.created_data_files == 0
     assert second_report.rewritten_symlinks == 0
+
+
+def test_resolve_contact_unique_ids_ignores_legacy_long_id_format(
+    tmp_path: Path,
+) -> None:
+    config_base = tmp_path / ".kapybara"
+    save_contacts_book(
+        config_base,
+        {
+            "c_legacylongid123456": ["telegram/42"],
+        },
+    )
+
+    resolved = resolve_contact_unique_ids(
+        config_base=config_base,
+        platform_contacts=["discord/alice"],
+    )
+    assert resolved == ["c1"]

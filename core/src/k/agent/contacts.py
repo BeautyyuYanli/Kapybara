@@ -4,7 +4,7 @@
 `dict[unique_contact_id, list[platform_contact_id]]`.
 
 Example:
-`{"c_123...": ["telegram/42", "discord/alice"]}`
+`{"c1": ["telegram/42"], "c2": ["discord/alice"]}`
 
 Runtime contract:
 - Input events carry `contacts` as platform contact ids (`<platform>/<id>`).
@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +30,7 @@ from k.agent.channels import validate_contact_path
 type ContactsBook = dict[str, list[str]]
 
 _CONTACTS_FILENAME = "contacts.json"
+_BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
 @dataclass(slots=True)
@@ -92,7 +92,7 @@ def resolve_contact_unique_ids(
     """Resolve platform contact ids to unique contact ids.
 
     Unknown platform ids are inserted into `contacts.json` with auto-generated
-    unique ids.
+    short unique ids (`c1`, `c2`, ... in base36).
     """
 
     path = contacts_book_path(config_base)
@@ -280,10 +280,48 @@ def _reverse_contacts_index(book: ContactsBook) -> dict[str, str]:
 
 
 def _generate_unique_contact_id(existing_ids: set[str]) -> str:
+    """Generate a short unique contact id using base36 counters.
+
+    IDs are compact and model-friendly (`c1`, `c2`, ..., `cz`, `c10`, ...).
+    Existing non-short ids are ignored when choosing the next counter.
+    """
+
+    next_value = 1
+    for existing_id in existing_ids:
+        parsed = _parse_short_contact_id(existing_id)
+        if parsed is None:
+            continue
+        if parsed >= next_value:
+            next_value = parsed + 1
+
     while True:
-        candidate = f"c_{uuid.uuid4().hex}"
+        candidate = f"c{_to_base36(next_value)}"
         if candidate not in existing_ids:
             return candidate
+        next_value += 1
+
+
+def _parse_short_contact_id(value: str) -> int | None:
+    if len(value) < 2 or not value.startswith("c"):
+        return None
+    suffix = value[1:]
+    if any(ch not in _BASE36_ALPHABET for ch in suffix):
+        return None
+    return int(suffix, 36)
+
+
+def _to_base36(value: int) -> str:
+    if value < 0:
+        raise ValueError(f"value must be >= 0, got {value}")
+    if value == 0:
+        return "0"
+
+    chars: list[str] = []
+    while value > 0:
+        value, remainder = divmod(value, 36)
+        chars.append(_BASE36_ALPHABET[remainder])
+    chars.reverse()
+    return "".join(chars)
 
 
 def _atomic_write_text(path: Path, payload: str) -> None:
