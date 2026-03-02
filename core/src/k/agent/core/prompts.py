@@ -120,11 +120,13 @@ The user's input is represented as:
 
 class Event(BaseModel):
     in_channel: str
+    contact: str | None = None
     out_channel: str | None = None
     content: str
 
 Interpretation:
 - `in_channel` indicates where the input comes from.
+- `contact` indicates who the input sender is, in `<platform>/<user_id>` form when available.
 - `out_channel` indicates where replies should go. If `null`, it means "same as `in_channel`".
 - `content` may be plain text or structured text (and may include IDs).
 - A single `content` may contain zero or multiple intents or requests.

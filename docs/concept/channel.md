@@ -2,12 +2,18 @@
 
 ## Data model
 
-Structured inputs and memories now use:
+Structured input events use:
 
 - `in_channel: str` (required)
+- `contact: str | None` (optional, `<platform>/<user_id>` when known)
 - `out_channel: str | None` (optional)
 
 `out_channel=None` means "same as `in_channel`" for routing and skill selection.
+
+Memory records keep:
+
+- `in_channel: str` (required)
+- `out_channel: str | None` (optional)
 
 ## Channel format
 
@@ -67,9 +73,11 @@ Example for `telegram/chat/<chat_id>`:
 6. `telegram/chat/<chat_id>.md`
 7. `telegram/chat/<chat_id>/PREFERENCES.md`
 
-`by_user`-based preference filtering keeps the current behavior.
+`contacts/<platform>/<user_id>.md`-based user preference filtering keeps the
+current behavior.
 
 ## Required Fields
 
-Runtime and retrieval require records/events to use `in_channel` (and optional
-`out_channel`).
+Runtime input events require `in_channel`, with optional `contact` and
+`out_channel`. Memory retrieval requires records to carry `in_channel` (and
+optional `out_channel`).

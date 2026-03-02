@@ -125,38 +125,6 @@ class _OutputWriter:
         print(s)
 
 
-def _preference_candidates(
-    *, in_channel: str, from_id: str | None
-) -> list[tuple[Path, str]]:
-    """Build preference-file lookup candidates in root-to-leaf channel order."""
-
-    pref_root = Path.home() / ".kapybara" / "preferences"
-    parts = in_channel.split("/")
-    prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
-
-    paths: list[tuple[Path, str]] = []
-    for prefix in prefixes:
-        paths.append((pref_root / f"{prefix}.md", f"Preference ({prefix}.md):"))
-        paths.append(
-            (
-                pref_root / prefix / "PREFERENCES.md",
-                f"Preference ({prefix}/PREFERENCES.md):",
-            )
-        )
-
-    # Keep by_user behavior as-is for Telegram route handling.
-    if from_id:
-        platform = parts[0]
-        paths.append(
-            (
-                pref_root / platform / "by_user" / f"{from_id}.md",
-                f"User-specific Preference (from_id: {from_id}):",
-            )
-        )
-
-    return paths
-
-
 @app.command()
 def main(
     in_channel: Annotated[
@@ -187,8 +155,8 @@ def main(
     inputs, pass the full thread channel path instead of truncating to
     `telegram/chat/<chat_id>`.
 
-    This script emits retrieval candidates and keeps legacy by-user preference
-    output (`<platform>/by_user/<from_id>.md`) for compatibility.
+    This script emits retrieval candidates only. Preference file content is
+    injected by the agent system prompt pipeline.
     """
     try:
         in_channel = _validate_channel_path("in_channel", in_channel)
@@ -277,18 +245,6 @@ def main(
             add_match(matches_channel, "channel")
             add_match(matches_user, "user")
             add_match(matches_kw, "kw")
-
-            # Keep by_user preference output for compatibility while channel
-            # prefix preferences are now injected by agent system prompts.
-            if from_id is not None:
-                for path, title in _preference_candidates(
-                    in_channel=in_channel, from_id=from_id
-                ):
-                    if "by_user" not in path.parts:
-                        continue
-                    if path.exists():
-                        for line in f"{title}\n{path.read_text()}\n---".splitlines():
-                            w.line(line)
 
             # Output TSV
             w.line("# id\troutes\tcore_json\tmatched_detailed_lines")

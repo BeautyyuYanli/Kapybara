@@ -46,6 +46,7 @@ def test_load_preferences_prompt_accepts_root_preference_file(
 
     prompt = _load_preferences_prompt(
         in_channel="telegram/chat/123",
+        contact="telegram/567113516",
         pref_root=pref_root,
     )
 
@@ -66,6 +67,7 @@ def test_load_preferences_prompt_omits_default_when_root_exists(
 
     prompt = _load_preferences_prompt(
         in_channel="telegram/chat/123",
+        contact="telegram/567113516",
         pref_root=pref_root,
     )
 
@@ -73,3 +75,39 @@ def test_load_preferences_prompt_omits_default_when_root_exists(
     assert "preferred root" in prompt
     assert f"Path: {default}" not in prompt
     assert "default root" not in prompt
+
+
+def test_load_preferences_prompt_includes_contact_preference(
+    tmp_path: Path,
+) -> None:
+    pref_root = tmp_path / ".kapybara" / "preferences"
+    contact_pref = pref_root / "contacts" / "telegram" / "567113516.md"
+    contact_pref.parent.mkdir(parents=True)
+    contact_pref.write_text("contact preference", encoding="utf-8")
+
+    prompt = _load_preferences_prompt(
+        in_channel="telegram/chat/123",
+        contact="telegram/567113516",
+        pref_root=pref_root,
+    )
+
+    assert f"Path: {contact_pref}" in prompt
+    assert "contact preference" in prompt
+
+
+def test_load_preferences_prompt_skips_contact_preference_when_contact_missing(
+    tmp_path: Path,
+) -> None:
+    pref_root = tmp_path / ".kapybara" / "preferences"
+    contact_pref = pref_root / "contacts" / "telegram" / "567113516.md"
+    contact_pref.parent.mkdir(parents=True)
+    contact_pref.write_text("contact preference", encoding="utf-8")
+
+    prompt = _load_preferences_prompt(
+        in_channel="telegram/chat/123",
+        contact=None,
+        pref_root=pref_root,
+    )
+
+    assert f"Path: {contact_pref}" not in prompt
+    assert "contact preference" not in prompt

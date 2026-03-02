@@ -9,6 +9,7 @@ from k.agent.channels import (
     iter_channel_prefixes,
     normalize_out_channel,
     validate_channel_path,
+    validate_contact_path,
 )
 
 
@@ -26,6 +27,22 @@ def test_validate_channel_path_accepts_non_empty_segments() -> None:
 def test_validate_channel_path_rejects_invalid_shapes(bad: str) -> None:
     with pytest.raises((TypeError, ValueError)):
         validate_channel_path(bad, field_name="in_channel")
+
+
+def test_validate_contact_path_accepts_platform_user_id() -> None:
+    assert (
+        validate_contact_path("telegram/567113516", field_name="contact")
+        == "telegram/567113516"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", " ", "telegram", "telegram/", "/567113516", "telegram/123/extra"],
+)
+def test_validate_contact_path_rejects_invalid_shapes(bad: str) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        validate_contact_path(bad, field_name="contact")
 
 
 def test_out_channel_helpers() -> None:

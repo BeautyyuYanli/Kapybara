@@ -19,6 +19,7 @@ from k.agent.channels import (
     effective_out_channel,
     normalize_out_channel,
     validate_channel_path,
+    validate_contact_path,
 )
 from k.agent.memory.store import MemoryStore
 
@@ -28,10 +29,14 @@ logger = getLogger(__name__)
 class Event(BaseModel):
     """Structured input event with hierarchical channel routing.
 
-    `in_channel` is required.
+    Required fields:
+    - `in_channel`: source channel path.
+    Optional fields:
+    - `contact`: source user identity path in `<platform>/<user_id>` form.
     """
 
     in_channel: str
+    contact: str | None = None
     out_channel: str | None = None
     content: str
 
@@ -39,6 +44,13 @@ class Event(BaseModel):
     @classmethod
     def _validate_in_channel(cls, value: str) -> str:
         return validate_channel_path(value, field_name="in_channel")
+
+    @field_validator("contact")
+    @classmethod
+    def _validate_contact(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_contact_path(value, field_name="contact")
 
     @field_validator("out_channel")
     @classmethod

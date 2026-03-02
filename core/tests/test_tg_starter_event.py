@@ -19,6 +19,7 @@ def test_telegram_update_to_event_json_roundtrip() -> None:
     event_json = telegram_update_to_event_json(update)
     event = json.loads(event_json)
     assert event["in_channel"] == "telegram/chat/99"
+    assert event["contact"] == "telegram/42"
     assert event["out_channel"] is None
 
     body = json.loads(event["content"])
@@ -47,6 +48,7 @@ def test_telegram_event_renders_message_date_in_default_timezone() -> None:
 
     event_json = telegram_update_to_event_json(update)
     event = json.loads(event_json)
+    assert event["contact"] == "telegram/42"
     body = json.loads(event["content"])
 
     assert body["message"]["date"] == "2023-11-15T06:13:20+08:00"
@@ -67,6 +69,7 @@ def test_telegram_event_renders_message_date_in_configured_timezone() -> None:
 
     event_json = telegram_update_to_event_json(update, tz=UTC)
     event = json.loads(event_json)
+    assert event["contact"] == "telegram/42"
     body = json.loads(event["content"])
 
     assert body["message"]["date"] == "2023-11-14T22:13:20+00:00"
@@ -110,6 +113,7 @@ def test_telegram_event_in_channel_includes_thread_id_when_present() -> None:
 
     event = json.loads(telegram_update_to_event_json(update))
     assert event["in_channel"] == "telegram/chat/-100123/thread/9001"
+    assert event["contact"] == "telegram/555"
 
 
 def test_telegram_event_ignores_thread_id_when_not_topic_message() -> None:
@@ -127,6 +131,7 @@ def test_telegram_event_ignores_thread_id_when_not_topic_message() -> None:
 
     event = json.loads(telegram_update_to_event_json(update))
     assert event["in_channel"] == "telegram/chat/-100123"
+    assert event["contact"] == "telegram/555"
 
 
 def test_telegram_event_keeps_media_file_id_but_drops_size_noise() -> None:
@@ -162,3 +167,18 @@ def test_telegram_event_keeps_media_file_id_but_drops_size_noise() -> None:
     assert "file_size" not in body["message"]["document"]
     assert "file_name" not in body["message"]["document"]
     assert "mime_type" not in body["message"]["document"]
+
+
+def test_telegram_event_contact_falls_back_to_unknown_when_sender_missing() -> None:
+    update = {
+        "update_id": 10,
+        "channel_post": {
+            "message_id": 100,
+            "chat": {"id": -100123, "type": "channel"},
+            "date": 1_700_000_000,
+            "text": "announcement",
+        },
+    }
+
+    event = json.loads(telegram_update_to_event_json(update))
+    assert event["contact"] == "telegram/unknown"

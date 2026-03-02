@@ -12,9 +12,10 @@ Preference injection:
     A root-level preference is injected first (`PREFERENCES.md` when present;
     otherwise `PREFERENCES.default.md`). Then for each channel prefix inject
     `<prefix>.md` and `<prefix>/PREFERENCES.md`.
+    When `Event.contact` is available as `<platform>/<user_id>`, also inject
+    `contacts/<platform>/<user_id>.md`.
     The loaded preference content is injected as a dynamic system prompt before
-    skills are concatenated. `by_user` preference selection remains
-    channel/starter-specific behavior.
+    skills are concatenated.
 
 Memory compaction contract:
     The canonical high-fidelity `compacted_actions` prompt lives in
@@ -94,8 +95,9 @@ class MyDeps:
     Input event:
         Prompt builders use
         `start_event.in_channel` / `start_event.out_channel` as the canonical
-        routing source. System prompts use these channels for preference + skill
-        injection.
+        routing source. `start_event.contact` is optional user identity context
+        for contact-scoped preference injection. System prompts use channels
+        for preference + skill injection.
         Always provide `start_event` for agent runs.
 
     Bash tool cadence:
@@ -189,6 +191,7 @@ async def fork(
             memory_store=ctx.deps.memory_storage,
             instruct=Event(
                 in_channel=ctx.deps.start_event.in_channel,
+                contact=ctx.deps.start_event.contact,
                 out_channel=ctx.deps.start_event.out_channel,
                 content="You are the forked agent to complete only the following instruct, ignoring the previous ones.\nInstruction: "
                 + instruct,
@@ -247,8 +250,23 @@ def _channel_preference_candidates(in_channel: str, *, pref_root: Path) -> list[
     return out
 
 
-def _load_preferences_prompt(*, in_channel: str, pref_root: Path) -> str:
-    """Load root-level + channel-prefix preferences into a prompt chunk.
+def _contact_preference_candidate(
+    *, contact: str | None, pref_root: Path
+) -> Path | None:
+    """Return user-level preference path for `<platform>/<user_id>` contacts."""
+
+    if not contact:
+        return None
+    platform, user_id, *rest = contact.split("/")
+    if not platform or not user_id or rest:
+        return None
+    return pref_root / "contacts" / platform / f"{user_id}.md"
+
+
+def _load_preferences_prompt(
+    *, in_channel: str, contact: str | None, pref_root: Path
+) -> str:
+    """Load root-level, channel-prefix, and contact-level preferences.
 
     Preference files are resolved under `pref_root` (normally
     `<config_base>/preferences`).
@@ -259,8 +277,13 @@ def _load_preferences_prompt(*, in_channel: str, pref_root: Path) -> str:
         Each section starts with its corresponding absolute file path.
     """
 
+    candidates = _channel_preference_candidates(in_channel, pref_root=pref_root)
+    contact_pref = _contact_preference_candidate(contact=contact, pref_root=pref_root)
+    if contact_pref is not None:
+        candidates.append(contact_pref)
+
     blocks: list[str] = []
-    for path in _channel_preference_candidates(in_channel, pref_root=pref_root):
+    for path in candidates:
         if not path.exists():
             continue
         try:
@@ -396,6 +419,7 @@ def preferences_system_prompt(ctx: RunContext[MyDeps]) -> str:
 
     return _load_preferences_prompt(
         in_channel=ctx.deps.start_event.in_channel,
+        contact=ctx.deps.start_event.contact,
         pref_root=ctx.deps.config.config_base / "preferences",
     )
 
@@ -578,6 +602,7 @@ if __name__ == "__main__":
         )
         instruct = Event(
             in_channel="test",
+            contact="test/system",
             content="use `read_media` tool to read image and describe them to ~/image.txt : 1. https://fastly.picsum.photos/id/59/536/354.jpg?hmac=HQ1B2iVRsA2r75Mxt18dSuJa241-Wggf0VF9BxKQhPc \n 2. ./data/fs/961-536x354.jpg",
         )
         mem = await agent_run(
