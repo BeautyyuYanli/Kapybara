@@ -19,9 +19,10 @@ async def test_mydeps_async_context_closes_cleanly(tmp_path: Path) -> None:
         memory_parents=[],
         start_event=Event(
             in_channel="test",
-            contact="test/system",
+            contacts=["test/system"],
             content="healthcheck",
         ),
+        resolved_contact_ids=["c1"],
     )
 
     async with deps:

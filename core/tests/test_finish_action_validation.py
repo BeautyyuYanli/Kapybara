@@ -11,12 +11,23 @@ from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
 
 
-def _ctx_for_store(store: FolderMemoryStore) -> RunContext[Any]:
-    event = SimpleNamespace(in_channel="telegram/chat/1", out_channel=None)
+def _ctx_for_store(
+    store: FolderMemoryStore,
+    *,
+    resolved_contact_ids: list[str] | None = None,
+) -> RunContext[Any]:
+    event = SimpleNamespace(
+        in_channel="telegram/chat/1",
+        out_channel=None,
+    )
     return cast(
         RunContext[Any],
         SimpleNamespace(
-            deps=SimpleNamespace(memory_storage=store, start_event=event),
+            deps=SimpleNamespace(
+                memory_storage=store,
+                start_event=event,
+                resolved_contact_ids=resolved_contact_ids or [],
+            ),
         ),
     )
 
@@ -27,7 +38,10 @@ def test_finish_action_accepts_existing_referenced_memory_ids(tmp_path) -> None:
     store.append(parent)
 
     result = finish_action(
-        _ctx_for_store(store),
+        _ctx_for_store(
+            store,
+            resolved_contact_ids=["c1"],
+        ),
         referenced_memory_ids=[parent.id_],
         raw_input="user asked for test output",
         raw_output="agent replied with final answer",
@@ -44,6 +58,7 @@ def test_finish_action_accepts_existing_referenced_memory_ids(tmp_path) -> None:
         == "Received request -> Tried validation -> Observed success"
     )
     assert result.compacted[3] == "<output>agent replied with final answer</output>"
+    assert result.contacts == ["c1"]
 
 
 def test_finish_action_retries_for_invalid_memory_id(tmp_path) -> None:

@@ -50,14 +50,15 @@ def telegram_update_to_event(
     Channel mapping:
     - `in_channel`: `telegram/chat/<chat_id>` (+ `/thread/<message_thread_id>`
       only when the message is explicitly marked as a topic message)
-    - `contact`: `telegram/<from.id>` (falls back to `telegram/unknown`)
+    - `contacts`: list containing `telegram/<from.id>` (falls back to
+      `["telegram/unknown"]`)
     - `out_channel`: omitted (`None`), which means "same as input channel"
     """
 
     body = _json_dumps(_compact_telegram_update(update, tz=tz) if compact else update)
     return Event(
         in_channel=_in_channel_for_update(update),
-        contact=_contact_for_update(update),
+        contacts=_contacts_for_update(update),
         content=body,
     )
 
@@ -73,9 +74,8 @@ def telegram_updates_to_event(
     The returned `Event.content` is a newline-delimited stream of JSON objects
     (one Telegram update per line). For multi-update batches we keep a stable
     chat-level `in_channel` prefix (`telegram/chat/<chat_id>`) when all updates
-    share the same chat, so retrieval can include all threads in that chat.
-    `contact` is derived from the latest update in the batch that includes a
-    sender id.
+    share the same chat, so retrieval can include all threads in that chat. The
+    returned `contacts` field includes unique sender ids in batch order.
     """
 
     bodies = [
@@ -84,7 +84,7 @@ def telegram_updates_to_event(
     ]
     return Event(
         in_channel=_in_channel_for_updates(updates),
-        contact=_contact_for_updates(updates),
+        contacts=_contacts_for_updates(updates),
         content="\n".join(bodies),
     )
 
@@ -144,19 +144,28 @@ def _in_channel_for_update(update: dict[str, Any]) -> str:
     return f"{channel}/thread/{thread_id}"
 
 
-def _contact_for_update(update: dict[str, Any]) -> str:
+def _contacts_for_update(update: dict[str, Any]) -> list[str]:
     sender_id = _extract_first_int(update, _CONTACT_FROM_ID_PATHS)
     if sender_id is None:
-        return "telegram/unknown"
-    return f"telegram/{sender_id}"
+        return ["telegram/unknown"]
+    return [f"telegram/{sender_id}"]
 
 
-def _contact_for_updates(updates: list[dict[str, Any]]) -> str:
-    for update in reversed(updates):
+def _contacts_for_updates(updates: list[dict[str, Any]]) -> list[str]:
+    contacts: list[str] = []
+    seen: set[str] = set()
+    for update in updates:
         sender_id = _extract_first_int(update, _CONTACT_FROM_ID_PATHS)
-        if sender_id is not None:
-            return f"telegram/{sender_id}"
-    return "telegram/unknown"
+        if sender_id is None:
+            continue
+        contact = f"telegram/{sender_id}"
+        if contact in seen:
+            continue
+        seen.add(contact)
+        contacts.append(contact)
+    if contacts:
+        return contacts
+    return ["telegram/unknown"]
 
 
 def _extract_nested_dict(

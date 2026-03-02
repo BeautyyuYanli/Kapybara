@@ -15,7 +15,7 @@ def test_telegram_updates_to_event_joins_updates_by_newline() -> None:
 
     event = telegram_updates_to_event(updates)
     assert event.in_channel == "telegram"
-    assert event.contact == "telegram/unknown"
+    assert event.contacts == ["telegram/unknown"]
     assert event.out_channel is None
 
     lines = event.content.splitlines()
@@ -44,7 +44,7 @@ def test_telegram_updates_to_event_uses_chat_prefix_for_multi_update_batch() -> 
 
     event = telegram_updates_to_event(updates)
     assert event.in_channel == "telegram/chat/99"
-    assert event.contact == "telegram/unknown"
+    assert event.contacts == ["telegram/unknown"]
 
 
 def test_filter_updates_in_time_window_filters_by_age_and_keeps_no_date() -> None:
