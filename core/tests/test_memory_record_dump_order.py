@@ -59,8 +59,9 @@ def test_memory_record_dump_raw_pair_uses_first_and_last_compacted_items() -> No
     )
 
     assert r.dump_raw_pair() == (
-        '<Record><Meta>{"id_":"--------","parents":[],"children":[]}</Meta>'
-        "<input>in</input>\n<output>out</output></Record>"
+        '{"created_at":"2026-02-13T02:08:10Z","in_channel":"test","out_channel":null,'
+        '"contacts":[],"id_":"--------","parents":[],"children":[],'
+        '"compacted":["<input>in</input>","<output>out</output>"]}'
     )
 
 
@@ -89,8 +90,10 @@ def test_memory_record_dump_raw_pair_handles_empty_and_single_compacted() -> Non
     )
 
     assert empty.dump_raw_pair() == (
-        '<Record><Meta>{"id_":"--------","parents":[],"children":[]}</Meta></Record>'
+        '{"created_at":"2026-02-13T02:08:10Z","in_channel":"test","out_channel":null,'
+        '"contacts":[],"id_":"--------","parents":[],"children":[],"compacted":[]}'
     )
     assert single.dump_raw_pair() == (
-        '<Record><Meta>{"id_":"-------0","parents":[],"children":[]}</Meta>only</Record>'
+        '{"created_at":"2026-02-13T02:08:10Z","in_channel":"test","out_channel":null,'
+        '"contacts":[],"id_":"-------0","parents":[],"children":[],"compacted":["only"]}'
     )

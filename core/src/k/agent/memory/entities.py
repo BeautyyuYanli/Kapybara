@@ -179,24 +179,34 @@ class MemoryRecord(BaseModel):
     def short_id(self) -> str:
         return self.id_[:8]
 
-    def dump_raw_pair(self) -> str:
-        """Return a lightweight raw-pair view from compacted memory.
+    def _raw_pair_compacted_context(self) -> list[str]:
+        """Return the compacted context used by `dump_raw_pair`.
 
-        The output is wrapped as one `<Record>...</Record>` block and always
-        carries a `<Meta>` JSON chunk with `{id_, parents, children}`.
-        Record body keeps only the first and last items from `self.compacted`
-        (joined by a newline). This mirrors the common compacted contract where
-        index `0` is input and the last item is output.
+        This keeps only boundary context for older memories:
+        - empty compacted -> `[]`
+        - single item -> `[item]`
+        - otherwise -> `[first, last]`
         """
 
-        meta = f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta>"""
         if not self.compacted:
-            return f"<Record>{meta}</Record>"
+            return []
         if len(self.compacted) == 1:
-            body = self.compacted[0]
-        else:
-            body = "\n".join((self.compacted[0], self.compacted[-1]))
-        return f"<Record>{meta}{body}</Record>"
+            return [self.compacted[0]]
+        return [self.compacted[0], self.compacted[-1]]
+
+    def dump_raw_pair(self) -> str:
+        """Return core-payload JSON with reduced compacted context.
+
+        This uses the same serialization contract as `dump_compated()`
+        (`exclude={"input", "output", "detailed"}`), but replaces
+        `compacted` with the lightweight boundary context from
+        `_raw_pair_compacted_context()`.
+        """
+
+        record = self.model_copy(
+            update={"compacted": self._raw_pair_compacted_context()}
+        )
+        return record.model_dump_json(exclude={"input", "output", "detailed"})
 
     def dump_compated(self) -> str:
         """Return the exact JSON payload persisted to `<id>.core.json`."""
