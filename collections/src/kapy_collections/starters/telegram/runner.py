@@ -229,8 +229,8 @@ async def run_agent_for_chat_batch(
                 batch_updates,
                 tz=tz,
             ),
-            # Keep starter behavior on auto parent-memory selection.
-            parent_memories=None,
+            # Empty list means: auto-generate memories in `agent_run`.
+            parent_memories=[],
         )
     except Exception as e:  # pragma: no cover (model/runtime dependent)
         prefix = f"[chat_id={chat_id}] " if chat_id is not None else "[chat_id=?] "

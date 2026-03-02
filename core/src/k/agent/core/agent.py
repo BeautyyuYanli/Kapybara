@@ -29,6 +29,7 @@ from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
+from logging import getLogger
 from pathlib import Path
 from typing import cast
 
@@ -82,6 +83,8 @@ from k.runner_helpers.basic_os import (
     BasicOSHelper,
     agent_config_base_value,
 )
+
+logger = getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -543,49 +546,46 @@ def _dedupe_memory_ids(ids: Sequence[str]) -> list[str]:
     return out
 
 
-def _resolve_parent_memories(
+def _resolve_auto_parent_memory_ids(
     *,
     memory_store: FolderMemoryStore,
     in_channel: str,
     contacts: list[str],
-    parent_memories: list[str] | None,
     in_channel_latest_num: int = 5,
-    contact_latest_num: int = 2,
-) -> list[str]:
-    """Resolve parent memories for `agent_run`.
+    contact_latest_num: int = 1,
+) -> tuple[list[str], list[str]]:
+    """Resolve auto-selected memory roots for `agent_run`.
 
-    Behavior:
-    - If `parent_memories` is provided (including an empty list), use it as the
-      source of truth after stable deduplication.
-    - If `parent_memories` is `None`, auto-select by unioning:
-      1) latest records by `in_channel` subtree (limit `in_channel_latest_num`)
-      2) latest records by each contact id, without channel filter
-         (per-contact limit `contact_latest_num`)
-      The union preserves first-seen order and removes duplicates.
+    This helper is used only when `parent_memories` is omitted/empty.
+
+    Returns:
+        A tuple `(channel_roots, contact_roots)` where:
+        - `channel_roots`: latest records by `in_channel` subtree.
+        - `contact_roots`: latest records per contact id.
+
+    Deduplication is stable and first-seen.
     """
 
-    if parent_memories is not None:
-        return _dedupe_memory_ids(parent_memories)
-
-    selected: list[str] = []
+    channel_roots: list[str] = []
     if in_channel_latest_num > 0:
-        selected.extend(
+        channel_roots.extend(
             memory_store.get_latests(
                 in_channel=in_channel,
                 num=in_channel_latest_num,
             )
         )
 
+    contact_roots: list[str] = []
     if contact_latest_num > 0:
         for contact in contacts:
-            selected.extend(
+            contact_roots.extend(
                 memory_store.get_latests(
                     contact=contact,
                     num=contact_latest_num,
                 )
             )
 
-    return _dedupe_memory_ids(selected)
+    return _dedupe_memory_ids(channel_roots), _dedupe_memory_ids(contact_roots)
 
 
 def _keep_latest_records(
@@ -605,51 +605,111 @@ def _keep_latest_records(
 
 async def _memory_select(
     memory_store: FolderMemoryStore,
-    parent_memories: list[str],
-    compacted_level_num: int = 3,
-    raw_pair_level_num: int = 10,
-    compacted_cap_num: int = 15,
-    raw_pair_cap_num: int = 15,
+    *,
+    channel_parent_memories: list[str],
+    contact_parent_memories: list[str],
+    channel_compacted_level_num: int = 1,
+    channel_raw_pair_level_num: int = 3,
+    channel_compacted_cap_num: int = 15,
+    channel_raw_pair_cap_num: int = 15,
+    contact_compacted_level_num: int = 0,
+    contact_raw_pair_level_num: int = 1,
+    contact_compacted_cap_num: int = 5,
+    contact_raw_pair_cap_num: int = 5,
 ):
     """Select memory records for compacted/raw-pair injection.
 
-    Selection categories:
-    - compacted memories: `parent_memories` + ancestors up to
-      `compacted_level_num`
-    - raw-pair memories: additional ancestors up to `raw_pair_level_num`
-      excluding compacted memories, plus downgraded compacted overflow
+    This performs independent selection for two scopes and then unions them:
+    - channel scope:
+      roots=`channel_parent_memories`,
+      compacted ancestors=`channel_compacted_level_num`,
+      raw-pair ancestors=`channel_raw_pair_level_num`,
+      caps=`channel_compacted_cap_num` / `channel_raw_pair_cap_num`.
+    - contact scope:
+      roots=`contact_parent_memories`,
+      compacted ancestors=`contact_compacted_level_num`,
+      raw-pair ancestors=`contact_raw_pair_level_num`,
+      caps=`contact_compacted_cap_num` / `contact_raw_pair_cap_num`.
 
-    Caps:
-    - compacted memories are capped by `compacted_cap_num`
-    - overflow compacted memories are downgraded into raw-pair candidates
-    - raw-pair candidates are capped by `raw_pair_cap_num`
+    Within each scope, compacted overflow is downgraded into raw-pair
+    candidates before applying raw-pair caps.
+
+    Side effects:
+    - Emits `logger.info` with auto-injected memory counts per category.
 
     Returned records are sorted by datetime (same order as `get_by_ids`).
     """
 
-    recent_mem = set(parent_memories)
-    all_mem = set(parent_memories)
-    for mem in parent_memories:
-        recent_mem.update(memory_store.get_ancestors(mem, level=compacted_level_num))
-        all_mem.update(memory_store.get_ancestors(mem, level=raw_pair_level_num))
+    def _select_scope(
+        *,
+        scope_name: str,
+        roots: list[str],
+        compacted_level_num: int,
+        raw_pair_level_num: int,
+        compacted_cap_num: int,
+        raw_pair_cap_num: int,
+    ) -> tuple[set[str], set[str]]:
+        compacted_mem = set(roots)
+        raw_mem = set(roots)
+        for mem in roots:
+            compacted_mem.update(
+                memory_store.get_ancestors(mem, level=compacted_level_num)
+            )
+            raw_mem.update(memory_store.get_ancestors(mem, level=raw_pair_level_num))
 
-    raw_pair_only = all_mem - recent_mem
-    recent_records = memory_store.get_by_ids(recent_mem)
-    compacted_records = _keep_latest_records(
-        recent_records,
-        cap_num=compacted_cap_num,
-        name="compacted_cap_num",
+        raw_pair_only = raw_mem - compacted_mem
+        compacted_source_records = memory_store.get_by_ids(compacted_mem)
+        compacted_records = _keep_latest_records(
+            compacted_source_records,
+            cap_num=compacted_cap_num,
+            name=f"{scope_name}_compacted_cap_num",
+        )
+        compacted_ids = {rec.id_ for rec in compacted_records}
+        downgraded_ids = {rec.id_ for rec in compacted_source_records} - compacted_ids
+        raw_pair_candidates = raw_pair_only | downgraded_ids
+        raw_pair_records = _keep_latest_records(
+            memory_store.get_by_ids(raw_pair_candidates),
+            cap_num=raw_pair_cap_num,
+            name=f"{scope_name}_raw_pair_cap_num",
+        )
+        raw_pair_ids = {rec.id_ for rec in raw_pair_records}
+        return compacted_ids, raw_pair_ids
+
+    channel_compacted_ids, channel_raw_pair_ids = _select_scope(
+        scope_name="channel",
+        roots=channel_parent_memories,
+        compacted_level_num=channel_compacted_level_num,
+        raw_pair_level_num=channel_raw_pair_level_num,
+        compacted_cap_num=channel_compacted_cap_num,
+        raw_pair_cap_num=channel_raw_pair_cap_num,
     )
-    capped_recent_ids = {rec.id_ for rec in compacted_records}
-    downgraded_recent_ids = {rec.id_ for rec in recent_records} - capped_recent_ids
-    raw_pair_candidates = raw_pair_only | downgraded_recent_ids
-    raw_pair_records = _keep_latest_records(
-        memory_store.get_by_ids(raw_pair_candidates),
-        cap_num=raw_pair_cap_num,
-        name="raw_pair_cap_num",
+    contact_compacted_ids, contact_raw_pair_ids = _select_scope(
+        scope_name="contact",
+        roots=contact_parent_memories,
+        compacted_level_num=contact_compacted_level_num,
+        raw_pair_level_num=contact_raw_pair_level_num,
+        compacted_cap_num=contact_compacted_cap_num,
+        raw_pair_cap_num=contact_raw_pair_cap_num,
     )
 
-    selected_ids = capped_recent_ids | {rec.id_ for rec in raw_pair_records}
+    capped_recent_ids = channel_compacted_ids | contact_compacted_ids
+    channel_raw_pair_injected = channel_raw_pair_ids - capped_recent_ids
+    contact_raw_pair_injected = contact_raw_pair_ids - capped_recent_ids
+    selected_raw_pair_ids = channel_raw_pair_injected | contact_raw_pair_injected
+    selected_ids = capped_recent_ids | selected_raw_pair_ids
+    logger.info(
+        "Injected memories counts (auto): "
+        "channel_compacted=%d, channel_raw_pair=%d, "
+        "contact_compacted=%d, contact_raw_pair=%d, "
+        "injected_compacted=%d, injected_raw_pair=%d, injected_total=%d",
+        len(channel_compacted_ids),
+        len(channel_raw_pair_injected),
+        len(contact_compacted_ids),
+        len(contact_raw_pair_injected),
+        len(capped_recent_ids),
+        len(selected_raw_pair_ids),
+        len(selected_ids),
+    )
     all_mem_rec = memory_store.get_by_ids(selected_ids)
     return all_mem_rec, capped_recent_ids
 
@@ -665,7 +725,7 @@ async def agent_run(
     """Run the agent with memory + event context and persistable output.
 
     User prompt order (fixed):
-    1. optional memory context
+    1. optional `<Memories>...</Memories>` context
     2. `<System>Now + agent config-base runtime view</System>`
     3. `<EventMeta>...</EventMeta>`
     4. real instruction content (`Event.content`)
@@ -675,35 +735,56 @@ async def agent_run(
     - Persist those resolved ids in the output `MemoryRecord.contacts`.
 
     Parent-memory selection:
-    - `parent_memories=None`: auto-select latest records by input channel and
-      by resolved contact ids (union + dedupe).
-    - `parent_memories=[]`: skip auto-selection and run without parent memory.
+    - `parent_memories` provided and non-empty: inject directly into
+      `<Memories>` without MemoryStore lookup/parsing.
+    - `parent_memories` omitted or empty: auto-generate from MemoryStore:
+      1) latest 5 records in `in_channel`, expand with 1-level compacted
+         ancestors + 3-level raw-pair-only ancestors.
+      2) latest 1 record per resolved contact id, expand with 1-level
+         raw-pair-only ancestors.
+      Caps:
+      - channel scope: compacted 15, raw-pair 15
+      - contact scope: compacted 5, raw-pair 5
     """
 
     resolved_contact_ids = resolve_contact_unique_ids(
         config_base=config.config_base,
         platform_contacts=instruct.contacts,
     )
-    parent_memories = _resolve_parent_memories(
-        memory_store=memory_store,
-        in_channel=instruct.in_channel,
-        contacts=resolved_contact_ids,
-        parent_memories=parent_memories,
-    )
+    explicit_memories = list(parent_memories or [])
+    memory_parent_ids: list[str] = []
+    memory_blocks: list[str] = []
 
-    all_mem_rec, recent_mem = await _memory_select(
-        memory_store,
-        parent_memories,
-    )
-    memory_string = "\n".join(
-        x.dump_compated() if x.id_ in recent_mem else x.dump_raw_pair()
-        for x in all_mem_rec
-    )
+    if explicit_memories:
+        memory_blocks = explicit_memories
+        logger.info(
+            "Injected memories counts (explicit): explicit=%d, injected_total=%d",
+            len(memory_blocks),
+            len(memory_blocks),
+        )
+    else:
+        channel_roots, contact_roots = _resolve_auto_parent_memory_ids(
+            memory_store=memory_store,
+            in_channel=instruct.in_channel,
+            contacts=resolved_contact_ids,
+        )
+        all_mem_rec, recent_mem = await _memory_select(
+            memory_store,
+            channel_parent_memories=channel_roots,
+            contact_parent_memories=contact_roots,
+        )
+        memory_parent_ids = _dedupe_memory_ids(channel_roots + contact_roots)
+        memory_blocks = [
+            x.dump_compated() if x.id_ in recent_mem else x.dump_raw_pair()
+            for x in all_mem_rec
+        ]
+
+    memory_string = "\n".join(memory_blocks)
 
     async with MyDeps(
         config=config,
         memory_storage=memory_store,
-        memory_parents=parent_memories,
+        memory_parents=memory_parent_ids,
         start_event=instruct,
         resolved_contact_ids=resolved_contact_ids,
     ) as my_deps:
@@ -711,7 +792,7 @@ async def agent_run(
             model=model,
             deps=my_deps,
             user_prompt=(
-                f"<Memory>{memory_string}</Memory>\n" if parent_memories else "",
+                f"<Memories>{memory_string}</Memories>\n" if memory_blocks else "",
                 await _system_runtime_prompt(my_deps),
                 _event_meta_prompt(instruct),
                 instruct.content,
