@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ type ContactsBook = dict[str, list[str]]
 
 _CONTACTS_FILENAME = "contacts.json"
 _BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+_CONTACT_ID_RE = re.compile(r"^c[0-9a-z]+$")
 
 
 @dataclass(slots=True)
@@ -234,6 +236,10 @@ def _coerce_contacts_book(payload: Any, *, source: Path) -> ContactsBook:
                 f"Invalid contacts book at {source}: key must be a non-empty string"
             )
         unique_id = raw_unique_id.strip()
+        if _CONTACT_ID_RE.fullmatch(unique_id) is None:
+            raise ValueError(
+                f"Invalid contacts book at {source}: contact id must match 'c[0-9a-z]+', got {unique_id!r}"
+            )
 
         if not isinstance(raw_platform_contacts, list):
             raise ValueError(
@@ -283,16 +289,15 @@ def _generate_unique_contact_id(existing_ids: set[str]) -> str:
     """Generate a short unique contact id using base36 counters.
 
     IDs are compact and model-friendly (`c1`, `c2`, ..., `cz`, `c10`, ...).
-    Existing non-short ids are ignored when choosing the next counter.
     """
 
-    next_value = 1
-    for existing_id in existing_ids:
-        parsed = _parse_short_contact_id(existing_id)
-        if parsed is None:
-            continue
-        if parsed >= next_value:
-            next_value = parsed + 1
+    if existing_ids:
+        next_value = (
+            max(_parse_short_contact_id(existing_id) for existing_id in existing_ids)
+            + 1
+        )
+    else:
+        next_value = 1
 
     while True:
         candidate = f"c{_to_base36(next_value)}"
@@ -301,12 +306,10 @@ def _generate_unique_contact_id(existing_ids: set[str]) -> str:
         next_value += 1
 
 
-def _parse_short_contact_id(value: str) -> int | None:
-    if len(value) < 2 or not value.startswith("c"):
-        return None
+def _parse_short_contact_id(value: str) -> int:
+    if _CONTACT_ID_RE.fullmatch(value) is None:
+        raise ValueError(f"Invalid short contact id: {value!r}")
     suffix = value[1:]
-    if any(ch not in _BASE36_ALPHABET for ch in suffix):
-        return None
     return int(suffix, 36)
 
 
