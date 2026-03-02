@@ -35,8 +35,9 @@ Example:
 - `Event.contacts`: list of platform contact ids (`<platform>/<platform_id>`)
 - `MemoryRecord.contacts`: list of unique contact ids (`c[0-9a-z]+`)
 
-When `finish_action` writes a memory record, it resolves event platform ids
-through `contacts.json` and stores only the unique ids.
+At `agent_run` startup, event platform ids are resolved through `contacts.json`.
+The resolved unique ids are then persisted to `MemoryRecord.contacts` when
+`finish_action` returns the final record.
 
 ## Preference Files
 
@@ -50,19 +51,3 @@ Canonical content is unique-id-based:
 
 The platform paths are symlinks to data files. Prompt injection displays both
 the symlink path and the resolved absolute target path when applicable.
-
-## Migration
-
-Run:
-
-```bash
-cd core
-pdm run python scripts/migrate_contacts_preferences.py --config-base ~/.kapybara
-```
-
-Migration behavior:
-
-- Ensures `contacts.json` exists
-- Resolves/creates unique ids for existing platform preference files
-- Creates missing `preferences/contacts/data/<unique_id>.md` files
-- Rewrites `preferences/contacts/<platform>/<platform_id>.md` as relative symlinks

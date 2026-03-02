@@ -1,4 +1,4 @@
-"""Contact registry and preference migration helpers.
+"""Contact registry helpers.
 
 `contacts.json` stores a mapping:
 `dict[unique_contact_id, list[platform_contact_id]]`.
@@ -9,20 +9,15 @@ Example:
 Runtime contract:
 - Input events carry `contacts` as platform contact ids (`<platform>/<id>`).
 - Memory records persist `contacts` as unique contact ids from this registry.
-- Contact preference files live at:
-  `preferences/contacts/<platform>/<platform_id>.md`
-  and are migrated into relative symlinks that point to:
-  `preferences/contacts/data/<unique_contact_id>.md`.
+- User preference files are resolved by platform path:
+  `preferences/contacts/<platform>/<platform_id>.md`.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import tempfile
-from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,15 +28,6 @@ type ContactsBook = dict[str, list[str]]
 _CONTACTS_FILENAME = "contacts.json"
 _BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 _CONTACT_ID_RE = re.compile(r"^c[0-9a-z]+$")
-
-
-@dataclass(slots=True)
-class ContactsMigrationReport:
-    """Summary returned by `migrate_contacts_preferences`."""
-
-    created_contact_ids: int = 0
-    created_data_files: int = 0
-    rewritten_symlinks: int = 0
 
 
 def contacts_book_path(config_base: str | Path) -> Path:
@@ -57,8 +43,9 @@ def load_contacts_book(config_base: str | Path) -> ContactsBook:
         Empty dict when the file does not exist.
 
     Raises:
-        ValueError: When the JSON payload is not `dict[str, list[str]]` or when
-            one platform contact id is mapped by multiple unique ids.
+        ValueError: When the JSON payload is not `dict[str, list[str]]`, when
+            contact ids are not short ids (`c[0-9a-z]+`), or when one platform
+            contact id is mapped by multiple unique ids.
     """
 
     path = contacts_book_path(config_base)
@@ -95,6 +82,10 @@ def resolve_contact_unique_ids(
 
     Unknown platform ids are inserted into `contacts.json` with auto-generated
     short unique ids (`c1`, `c2`, ... in base36).
+
+    Side effects:
+        - Writes `contacts.json` when new platform ids are discovered.
+        - Creates `contacts.json` when it does not exist.
     """
 
     path = contacts_book_path(config_base)
@@ -127,85 +118,6 @@ def contact_preference_path(*, pref_root: str | Path, platform_contact: str) -> 
     normalized = validate_contact_path(platform_contact, field_name="platform_contact")
     platform, platform_id = normalized.split("/", 1)
     return Path(pref_root) / "contacts" / platform / f"{platform_id}.md"
-
-
-def migrate_contacts_preferences(config_base: str | Path) -> ContactsMigrationReport:
-    """Migrate contact preferences to unique-id-backed data files + symlinks.
-
-    Migration behavior:
-    - Ensure `<config_base>/contacts.json` exists.
-    - For each `preferences/contacts/<platform>/<platform_id>.md` file:
-      1. Resolve or create the unique contact id in `contacts.json`.
-      2. Ensure `preferences/contacts/data/<unique_id>.md` exists.
-         - If missing, copy current file content.
-      3. Rewrite `<platform>/<platform_id>.md` to a relative symlink targeting
-         `../data/<unique_id>.md` (or equivalent relative path).
-    """
-
-    config_root = Path(config_base)
-    contacts_root = config_root / "preferences" / "contacts"
-    data_root = contacts_root / "data"
-
-    book = load_contacts_book(config_root)
-    reverse = _reverse_contacts_index(book)
-    existing_ids = set(book)
-    report = ContactsMigrationReport()
-
-    for pref_path in _iter_platform_contact_preferences(contacts_root):
-        rel = pref_path.relative_to(contacts_root)
-        platform, filename = rel.parts
-        platform_id = filename.removesuffix(".md")
-        platform_contact = validate_contact_path(
-            f"{platform}/{platform_id}",
-            field_name=str(pref_path),
-        )
-
-        unique_id = reverse.get(platform_contact)
-        if unique_id is None:
-            unique_id = _generate_unique_contact_id(existing_ids)
-            existing_ids.add(unique_id)
-            book[unique_id] = [platform_contact]
-            reverse[platform_contact] = unique_id
-            report.created_contact_ids += 1
-
-        data_path = data_root / f"{unique_id}.md"
-        if not data_path.exists():
-            payload = ""
-            with suppress(OSError):
-                payload = pref_path.read_text(encoding="utf-8")
-            data_path.parent.mkdir(parents=True, exist_ok=True)
-            data_path.write_text(payload, encoding="utf-8")
-            report.created_data_files += 1
-
-        target = Path(os.path.relpath(data_path, start=pref_path.parent))
-        if pref_path.is_symlink():
-            current_target = Path(os.readlink(pref_path))
-            if current_target == target:
-                continue
-
-        pref_path.unlink(missing_ok=True)
-        pref_path.parent.mkdir(parents=True, exist_ok=True)
-        pref_path.symlink_to(target)
-        report.rewritten_symlinks += 1
-
-    save_contacts_book(config_root, book)
-    return report
-
-
-def _iter_platform_contact_preferences(contacts_root: Path) -> list[Path]:
-    if not contacts_root.exists():
-        return []
-
-    out: list[Path] = []
-    for path in contacts_root.rglob("*.md"):
-        rel = path.relative_to(contacts_root)
-        if len(rel.parts) != 2:
-            continue
-        if rel.parts[0] == "data":
-            continue
-        out.append(path)
-    out.sort(key=lambda p: str(p))
-    return out
 
 
 def _normalize_platform_contacts(platform_contacts: list[str]) -> list[str]:

@@ -22,6 +22,7 @@ async def test_mydeps_async_context_closes_cleanly(tmp_path: Path) -> None:
             contacts=["test/system"],
             content="healthcheck",
         ),
+        resolved_contact_ids=["c1"],
     )
 
     async with deps:

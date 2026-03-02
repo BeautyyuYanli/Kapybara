@@ -74,7 +74,7 @@ Example for `telegram/chat/<chat_id>`:
 7. `telegram/chat/<chat_id>/PREFERENCES.md`
 
 `contacts/<platform>/<user_id>.md`-based user preference filtering keeps the
-current behavior. For unique contact ids, symlink layout, and migration, see
+current behavior. For unique contact ids and symlink layout, see
 `docs/concept/contacts.md`.
 
 ## Required Fields

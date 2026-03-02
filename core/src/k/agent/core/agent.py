@@ -99,6 +99,8 @@ class MyDeps:
         routing source. `start_event.contacts` is optional user identity context
         for contact-scoped preference injection. System prompts use channels and
         contacts for preference + skill injection.
+        `resolved_contact_ids` is the unique-id view of `start_event.contacts`,
+        resolved before model execution.
         Always provide `start_event` for agent runs.
 
     Bash tool cadence:
@@ -112,6 +114,7 @@ class MyDeps:
     memory_storage: FolderMemoryStore
     memory_parents: list[str]
     start_event: Event
+    resolved_contact_ids: list[str]
     bash_cmd_history: list[str] = field(default_factory=list)
     count_down: int = 6
     stuck_warning: int = 0
@@ -381,24 +384,19 @@ def finish_action(
             Provide chronological, high-fidelity step lines following
             `<CompactedRules>`.
 
-    Side effect:
-        `ctx.deps.start_event.contacts` platform ids are resolved to unique
-        contact ids in `<config_base>/contacts.json` and written to
-        `MemoryRecord.contacts`.
+    Contract:
+        `ctx.deps.resolved_contact_ids` is prepared before model execution in
+        `agent_run` and persisted directly to `MemoryRecord.contacts`.
     """
 
     validated_ids = _validate_referenced_memory_ids(
         memory_store=ctx.deps.memory_storage,
         referenced_memory_ids=referenced_memory_ids,
     )
-    contact_ids = resolve_contact_unique_ids(
-        config_base=ctx.deps.config.config_base,
-        platform_contacts=ctx.deps.start_event.contacts,
-    )
     return MemoryRecord(
         in_channel=ctx.deps.start_event.in_channel,
         out_channel=ctx.deps.start_event.out_channel,
-        contacts=contact_ids,
+        contacts=ctx.deps.resolved_contact_ids,
         parents=validated_ids,
         input="",
         output=raw_output,
@@ -573,9 +571,17 @@ async def agent_run(
     2. `<System>Now + agent config-base runtime view</System>`
     3. `<EventMeta>...</EventMeta>`
     4. real instruction content (`Event.content`)
+
+    Contact lifecycle:
+    - Resolve `Event.contacts` platform ids to unique ids before model run.
+    - Persist those resolved ids in the output `MemoryRecord.contacts`.
     """
 
     parent_memories = parent_memories or []
+    resolved_contact_ids = resolve_contact_unique_ids(
+        config_base=config.config_base,
+        platform_contacts=instruct.contacts,
+    )
 
     all_mem_rec, recent_mem = await _memory_select(
         memory_store,
@@ -591,6 +597,7 @@ async def agent_run(
         memory_storage=memory_store,
         memory_parents=parent_memories,
         start_event=instruct,
+        resolved_contact_ids=resolved_contact_ids,
     ) as my_deps:
         res = await agent.run(
             model=model,

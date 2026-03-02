@@ -1,6 +1,8 @@
 .ck/
 *.pyc
 *.jsonl
+.venv
+core/.venv
 
 data/*
 !data/fs/
