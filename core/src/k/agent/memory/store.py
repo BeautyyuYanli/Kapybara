@@ -7,8 +7,8 @@ Design notes / invariants:
 - A store is the source of truth for which records exist. Links stored on a
   record (`parents` / `children`) may refer to missing records; link-resolution
   methods support `strict` mode to surface this.
-- "Latest" is defined as the most recently appended record id (i.e. the tail of
-  the store's append order), not necessarily the max `created_at`.
+- "Latests" are returned in descending store order (newest first) and can be
+  filtered by channel subtree via `in_channel`.
 - `append()` must treat `record.parents` as the source of truth and ensure each
   referenced parent record contains `record.id_` in its `children` list before
   returning.
@@ -45,8 +45,13 @@ class MemoryStore(Protocol):
     def refresh(self) -> None:
         """Force a reload from disk (even if the underlying storage did not change)."""
 
-    def get_latest(self) -> str | None:
-        """Return the latest record id (store append order), or `None` if empty."""
+    def get_latests(self, *, in_channel: str | None = None) -> list[str]:
+        """Return latest record ids (descending store order).
+
+        Args:
+            in_channel: Optional channel prefix filter. A record is selected when
+                its `in_channel` equals this prefix or starts with `"{prefix}/"`.
+        """
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
         """Return a record by id, or `None` if missing."""
