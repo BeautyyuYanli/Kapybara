@@ -371,12 +371,7 @@ def finish_action(
     Detailed field contracts are defined in `<CompactedRules>`.
 
     Args:
-        referenced_memory_ids: Memory record IDs that informed this run.
-            Include only memories with a direct causal relationship to the
-            current input event (i.e., they materially changed interpretation,
-            decision, or response). Do not pass every retrieved memory. Use an
-            empty list when no prior memory had direct causal impact. Every ID
-            must be a valid `MemoryRecord.id_`; missing IDs are ignored.
+        referenced_memory_ids: See `<CompactedRules>` field contract for `referenced_memory_ids`.
         raw_input: See `<CompactedRules>` field contract for `raw_input`.
         raw_output: See `<CompactedRules>` field contract for `raw_output`.
         input_intents: See `<CompactedRules>` field contract for
@@ -613,8 +608,8 @@ async def _memory_select(
     parent_memories: list[str],
     compacted_level_num: int = 3,
     raw_pair_level_num: int = 10,
-    compacted_cap_num: int = 40,
-    raw_pair_cap_num: int = 20,
+    compacted_cap_num: int = 15,
+    raw_pair_cap_num: int = 15,
 ):
     """Select memory records for compacted/raw-pair injection.
 
