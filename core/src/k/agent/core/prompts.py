@@ -154,7 +154,7 @@ Interpretation:
 
 memory_instruct_prompt = """
 <MemoryInstruct>
-Start with injected `<Memory>` context when present.
+Start with injected `<Memories>` context when present.
 
 If more context is needed, use `meta/retrieve-memory` for targeted keyword
 retrieval in the same `in_channel` subtree.

@@ -33,7 +33,7 @@ def _memory_store_from_config(config: Config) -> FolderMemoryStore:
 
 
 @pytest.mark.anyio
-async def test_telegram_runner_passes_parent_memories_none_to_agent_run(
+async def test_telegram_runner_passes_parent_memories_empty_list_to_agent_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured_kwargs: dict[str, Any] = {}
@@ -64,11 +64,11 @@ async def test_telegram_runner_passes_parent_memories_none_to_agent_run(
     )
 
     assert "parent_memories" in captured_kwargs
-    assert captured_kwargs["parent_memories"] is None
+    assert captured_kwargs["parent_memories"] == []
 
 
 @pytest.mark.anyio
-async def test_telegram_mq_runner_passes_parent_memories_none_to_agent_run(
+async def test_telegram_mq_runner_passes_parent_memories_empty_list_to_agent_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured_kwargs: dict[str, Any] = {}
@@ -99,4 +99,4 @@ async def test_telegram_mq_runner_passes_parent_memories_none_to_agent_run(
     )
 
     assert "parent_memories" in captured_kwargs
-    assert captured_kwargs["parent_memories"] is None
+    assert captured_kwargs["parent_memories"] == []

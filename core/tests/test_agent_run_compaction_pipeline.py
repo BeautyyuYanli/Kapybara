@@ -111,7 +111,74 @@ async def test_agent_run_returns_compacted_memory_record(
     assert '"content"' not in event_meta
 
 
-def test_resolve_parent_memories_none_unions_channel_and_contacts_with_dedupe(
+@pytest.mark.anyio
+async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured_user_prompt: tuple[Any, ...] | None = None
+    monkeypatch.setenv("HOME", str(tmp_path))
+    agent_view_base = tmp_path / "agent-view" / ".kapybara"
+    monkeypatch.setenv("K_CONFIG_BASE", str(agent_view_base))
+
+    async def fake_agent_config_base_value(**kwargs: Any) -> str:
+        _ = kwargs
+        return str(agent_view_base)
+
+    async def fake_agent_run(**kwargs: Any) -> _FakeRunResult:
+        nonlocal captured_user_prompt
+        user_prompt = kwargs.get("user_prompt")
+        if isinstance(user_prompt, tuple):
+            captured_user_prompt = user_prompt
+        messages: list[ModelRequest | ModelResponse] = [
+            ModelRequest(parts=[UserPromptPart(content=("old prompt",))]),
+            ModelResponse(parts=[TextPart(content="assistant did a thing")]),
+            ModelResponse(parts=[TextPart(content="finish_action")]),
+        ]
+        return _FakeRunResult(
+            output=MemoryRecord(
+                in_channel="test",
+                input="",
+                compacted=["compacted-step"],
+            ),
+            _messages=messages,
+        )
+
+    monkeypatch.setattr(agent, "run", fake_agent_run)
+    monkeypatch.setattr(
+        agent_module, "agent_config_base_value", fake_agent_config_base_value
+    )
+
+    config = Config(config_base=tmp_path / ".kapybara")
+    memory_store = FolderMemoryStore(config.config_base / "memories")
+
+    def fail_get_latests(**kwargs: Any) -> list[str]:
+        _ = kwargs
+        raise AssertionError("explicit parent_memories should not query latest records")
+
+    def fail_get_ancestors(*args: Any, **kwargs: Any) -> list[str]:
+        _ = (args, kwargs)
+        raise AssertionError("explicit parent_memories should not query ancestors")
+
+    monkeypatch.setattr(memory_store, "get_latests", fail_get_latests)
+    monkeypatch.setattr(memory_store, "get_ancestors", fail_get_ancestors)
+
+    await agent_run(
+        model="test-model",
+        config=config,
+        memory_store=memory_store,
+        instruct=Event(
+            in_channel="test",
+            contacts=["test/system"],
+            content="do something",
+        ),
+        parent_memories=["memory-a", "memory-b"],
+    )
+
+    assert captured_user_prompt is not None
+    assert captured_user_prompt[0] == "<Memories>memory-a\nmemory-b</Memories>\n"
+
+
+def test_resolve_auto_parent_memory_ids_collects_channel_then_contacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = FolderMemoryStore(tmp_path / "memories")
@@ -137,26 +204,25 @@ def test_resolve_parent_memories_none_unions_channel_and_contacts_with_dedupe(
 
     monkeypatch.setattr(store, "get_latests", fake_get_latests)
 
-    selected = agent_module._resolve_parent_memories(
+    channel_roots, contact_roots = agent_module._resolve_auto_parent_memory_ids(
         memory_store=store,
         in_channel="telegram/chat/1",
         contacts=["c1", "c2"],
-        parent_memories=None,
     )
 
-    assert selected == ["m5", "m4", "m3", "m2", "m1", "c3", "c4"]
+    assert channel_roots == ["m5", "m4", "m3", "m2", "m1"]
+    assert contact_roots == ["c3", "c4"]
     assert calls == [
         ("telegram/chat/1", None, 5),
-        (None, "c1", 2),
-        (None, "c2", 2),
+        (None, "c1", 1),
+        (None, "c2", 1),
     ]
 
 
-def test_resolve_parent_memories_explicit_empty_skips_auto_selection(
+def test_resolve_auto_parent_memory_ids_dedupes_with_stable_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = FolderMemoryStore(tmp_path / "memories")
-    calls: list[tuple[str | None, str | None, int | None]] = []
 
     def fake_get_latests(
         *,
@@ -164,37 +230,37 @@ def test_resolve_parent_memories_explicit_empty_skips_auto_selection(
         contact: str | None = None,
         num: int | None = None,
     ) -> list[str]:
-        calls.append((in_channel, contact, num))
-        return ["m1"]
+        if in_channel == "telegram/chat/1":
+            return ["m3", "m2", "m3", "m1"]
+        if contact == "c1":
+            return ["m2", "c1"]
+        if contact == "c2":
+            return ["c1", "c2"]
+        return []
 
     monkeypatch.setattr(store, "get_latests", fake_get_latests)
 
-    selected = agent_module._resolve_parent_memories(
+    channel_roots, contact_roots = agent_module._resolve_auto_parent_memory_ids(
         memory_store=store,
         in_channel="telegram/chat/1",
-        contacts=["c1"],
-        parent_memories=[],
+        contacts=["c1", "c2"],
     )
 
-    assert selected == []
-    assert calls == []
+    assert channel_roots == ["m3", "m2", "m1"]
+    assert contact_roots == ["m2", "c1", "c2"]
 
 
-def test_resolve_parent_memories_explicit_list_is_deduped(
-    tmp_path: Path,
-) -> None:
-    store = FolderMemoryStore(tmp_path / "memories")
-    selected = agent_module._resolve_parent_memories(
-        memory_store=store,
-        in_channel="telegram/chat/1",
-        contacts=["c1"],
-        parent_memories=["a", "b", "a", "c", "b"],
-    )
-    assert selected == ["a", "b", "c"]
-
-
-def test_memory_select_default_levels_are_3_and_10() -> None:
-    assert agent_module._memory_select.__defaults__ == (3, 10, 40, 20)
+def test_memory_select_default_levels_and_caps() -> None:
+    assert agent_module._memory_select.__kwdefaults__ == {
+        "channel_compacted_level_num": 1,
+        "channel_raw_pair_level_num": 3,
+        "channel_compacted_cap_num": 15,
+        "channel_raw_pair_cap_num": 15,
+        "contact_compacted_level_num": 0,
+        "contact_raw_pair_level_num": 1,
+        "contact_compacted_cap_num": 5,
+        "contact_raw_pair_cap_num": 5,
+    }
 
 
 @pytest.mark.anyio
@@ -242,11 +308,12 @@ async def test_memory_select_downgrades_exceeded_recent_before_raw_pair_cap(
 
     all_mem_rec, recent_mem = await agent_module._memory_select(
         store,
-        [m5.id_],
-        compacted_level_num=1,
-        raw_pair_level_num=3,
-        compacted_cap_num=1,
-        raw_pair_cap_num=1,
+        channel_parent_memories=[m5.id_],
+        contact_parent_memories=[],
+        channel_compacted_level_num=1,
+        channel_raw_pair_level_num=3,
+        channel_compacted_cap_num=1,
+        channel_raw_pair_cap_num=1,
     )
 
     assert recent_mem == {m5.id_}
@@ -277,11 +344,48 @@ async def test_memory_select_downgraded_recent_can_fill_raw_pair_slot(
 
     all_mem_rec, recent_mem = await agent_module._memory_select(
         store,
-        [newer.id_],
-        compacted_level_num=1,
-        raw_pair_level_num=1,
-        compacted_cap_num=1,
-        raw_pair_cap_num=1,
+        channel_parent_memories=[newer.id_],
+        contact_parent_memories=[],
+        channel_compacted_level_num=1,
+        channel_raw_pair_level_num=1,
+        channel_compacted_cap_num=1,
+        channel_raw_pair_cap_num=1,
+    )
+
+    assert recent_mem == {newer.id_}
+    assert [rec.id_ for rec in all_mem_rec] == [older.id_, newer.id_]
+
+
+@pytest.mark.anyio
+async def test_memory_select_contact_roots_expand_raw_pair_only(
+    tmp_path: Path,
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+
+    older = MemoryRecord(
+        in_channel="other",
+        contacts=["c1"],
+        input="older",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    newer = MemoryRecord(
+        in_channel="other",
+        contacts=["c1"],
+        input="newer",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 2),
+        parents=[older.id_],
+    )
+    for rec in (older, newer):
+        store.append(rec)
+
+    all_mem_rec, recent_mem = await agent_module._memory_select(
+        store,
+        channel_parent_memories=[],
+        contact_parent_memories=[newer.id_],
+        contact_compacted_level_num=0,
+        contact_raw_pair_level_num=1,
     )
 
     assert recent_mem == {newer.id_}
@@ -292,15 +396,31 @@ async def test_memory_select_downgraded_recent_can_fill_raw_pair_slot(
 async def test_memory_select_rejects_negative_caps(tmp_path: Path) -> None:
     store = FolderMemoryStore(tmp_path / "memories")
 
-    with pytest.raises(ValueError, match="compacted_cap_num must be >= 0"):
+    with pytest.raises(ValueError, match="channel_compacted_cap_num must be >= 0"):
         await agent_module._memory_select(
             store,
-            [],
-            compacted_cap_num=-1,
+            channel_parent_memories=[],
+            contact_parent_memories=[],
+            channel_compacted_cap_num=-1,
         )
-    with pytest.raises(ValueError, match="raw_pair_cap_num must be >= 0"):
+    with pytest.raises(ValueError, match="channel_raw_pair_cap_num must be >= 0"):
         await agent_module._memory_select(
             store,
-            [],
-            raw_pair_cap_num=-1,
+            channel_parent_memories=[],
+            contact_parent_memories=[],
+            channel_raw_pair_cap_num=-1,
+        )
+    with pytest.raises(ValueError, match="contact_compacted_cap_num must be >= 0"):
+        await agent_module._memory_select(
+            store,
+            channel_parent_memories=[],
+            contact_parent_memories=[],
+            contact_compacted_cap_num=-1,
+        )
+    with pytest.raises(ValueError, match="contact_raw_pair_cap_num must be >= 0"):
+        await agent_module._memory_select(
+            store,
+            channel_parent_memories=[],
+            contact_parent_memories=[],
+            contact_raw_pair_cap_num=-1,
         )
