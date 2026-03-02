@@ -6,50 +6,74 @@ make the wiring code easier to scan.
 
 compacted_prompt = """
 <CompactedRules>
-## Purpose
-When calling `finish_action`, produce clear and reusable memory fields that can
-be read by humans and reused by later agent runs.
+## Objective
+When calling `finish_action`, produce memory that is reusable, faithful to what
+happened, and easy to scan later.
 
-## Field mapping (`finish_action`)
+## Invocation contract
+Call exactly:
+`finish_action(referenced_memory_ids, raw_input, raw_output, input_intents, compacted_actions)`
+
+Use all fields. If something did not happen, state that explicitly instead of
+leaving ambiguity.
+
+## Single-fact ownership (avoid repetition)
+Assign each fact to exactly one field.
+Assign each fact to exactly one owner field:
+- `referenced_memory_ids`: prior memories with direct causal impact.
+- `raw_input`: what was received.
+- `input_intents`: what the sender wanted.
+- `compacted_actions`: what the agent did and observed.
+- `raw_output`: what was externally delivered (or why nothing was sent).
+
+Do not duplicate the same fact across fields unless a short pointer is required
+for clarity (for example, "see raw_output").
+
+## Field requirements (`finish_action`)
 0) `referenced_memory_ids`
 - Return only memory ids that have a **direct causal relationship** with the
-  current input event (i.e., they materially changed interpretation, decision,
-  or response).
+  current run (they changed interpretation, decisions, or response).
 - Do not include memories that were merely retrieved but not actually used.
 - Do not include broad/background history unless it directly affected this run.
 - Use an empty list when no prior memory had direct causal impact.
 
 1) `raw_input`
-- Goal: a fluent, human-readable summary, not a raw structured dump.
+- Goal: fluent human-readable summary, not a raw structured dump.
 - Do **not** copy/paste the original structured payload (JSON/markup/nested
   object text) as-is.
 - Preserve user-facing message body text verbatim where applicable (no
-  translation or semantic rewrite), but wrap it in readable prose.
-- Preserve sender/participant metadata in human-readable form (for example:
-  display name, username, role, relation to the thread/channel) when present
-  in the input.
-- Rewrite machine-style fields into readable metadata lines (for example:
-  channel/thread, timestamp, routing hints, relevant ids) only when they matter
-  for understanding or replay.
+  translation or semantic rewrite), while wrapping it in readable prose.
+- Keep only metadata that matters for understanding or replay (participants,
+  channel/thread, timestamp, routing hints, relevant ids, constraints).
 - Omit noisy metadata that does not affect task understanding or execution.
 
 2) `raw_output`
-- Human-readable output summary in natural language.
+- Human-readable summary of what was delivered externally.
 - Same standard as `raw_input`: preserve user-facing body text verbatim (no
   translation or semantic rewrite).
-- Capture what the agent actually sent to the user in the current task/run.
-- For upload-mode long text or files, output links instead of inlining full
-  payloads.
+- For upload-mode long text or files, output links instead of inlining payloads.
+- If no external response was sent, state that explicitly and include the reason.
 
 3) `input_intents`
-- Interpreted intent summary.
-- Include who the input sender is and what they want.
+- Interpreted intent summary: who the sender is and what they want.
+- Include key constraints or acceptance criteria that changed execution.
 - If multiple intents exist, include all intents in one structured string
   (for example, a short numbered list).
 
 4) `compacted_actions`
-- Return a chronological list of high-fidelity task-process step lines.
-- Each line should be unambiguous about actor/action and outcome.
+- Return a chronological list of high-fidelity process step lines.
+- Each line must be unambiguous about actor/tool, action, and outcome.
+- Include failed attempts when they influenced the next step (what failed and
+  what changed).
+- Keep one major step per line; merge noisy sub-steps with the same purpose.
+
+## Completeness checklist (avoid missing details)
+Before finalizing, ensure the combined fields cover the full arc:
+- Received: key inputs, constraints, and context.
+- Intended: interpreted user intents.
+- Executed: what was tried and in what order.
+- Observed: outputs/errors/verification that affected next steps.
+- Responded: what was sent (or explicit no-response reason).
 
 ## High-fidelity rule (most important)
 Do **not** over-summarize away the specifics of what the agent:
@@ -58,44 +82,37 @@ Do **not** over-summarize away the specifics of what the agent:
 - observed (tool outputs, errors, test results, confirmations),
 - responded (messages delivered to the user and artifacts produced).
 
-Include failed attempts when they influenced the next step (briefly: what was
-tried, what went wrong, what changed).
-
 ## Output format
-- Return a list of strings.
-- Do not require any fixed per-line prefix, but each line must be unambiguous
-  about who did what (tool result vs agent action).
+- `compacted_actions` must be a list of strings.
+- Do not require a fixed prefix, but each line must clearly indicate who did
+  what (user, agent, or tool) and what happened.
 
 ## What to keep (optimize for reuse)
-- Preserve the full task arc.
-- Keep one major step per line; merge noisy sub-steps that share the same purpose.
-- Prefer concrete, action-oriented phrasing: what was done, why it mattered, and the outcome.
-- Keep details that help someone repeat the work later:
+Preserve details that let someone repeat or audit the work:
 - tool/skill names, key flags/options, file paths (e.g. `/tmp/...`), IDs (e.g.
-  chat_id), extracted facts/results, and verification signals.
-- Keep user-provided specifics that drive correctness (constraints, examples,
-  acceptance criteria, snippets of inputs/outputs). Quote short fragments when
-  useful; do not paste long payloads.
-- Drop filler that doesn't affect decisions or outcomes (chit-chat, apologies, self-talk, repeated instructions).
+  `chat_id`), extracted facts/results, and verification signals.
+- user-provided constraints/examples/acceptance criteria that affected
+  correctness (quote short fragments when helpful).
+
+Drop filler that does not affect decisions or outcomes (chit-chat, apologies,
+self-talk, repeated instructions).
 
 ## Skills (special rule)
-- If the trace shows the agent reading or relying on a skill doc (`SKILLS.md`),
-  include a short, task-relevant excerpted summary of the skill instructions and
-  the skill path.
-- Skill path `skills:<group_path>/<skill>/SKILLS.md`
-- Summarize in one line per skill (including its description; do not paste the
-  whole doc).
-- Keep only the parts that were relevant to the current task (what was actually
-  used or needed), but include enough to reuse that subset: what it does,
-  required inputs/env vars if mentioned, and the canonical command/API shape.
+If the trace shows the agent reading or relying on a skill doc (`SKILLS.md`):
+- Summarize in one concise line per skill; do not paste the whole doc.
+- Include the skill path in this format:
+  `skills:<group_path>/<skill>/SKILLS.md`
+- Keep only the task-relevant subset: what it does, required inputs/env vars
+  (if mentioned), and canonical command/API shape.
 
 ## Tool/command representation
-- Keep commands readable and actionable. Keep full URLs (including
-  paths/query strings) when they help trace the step; shorten truly huge
-  non-URL payloads/outputs with "...".
-- Do not include secrets or raw tokens. Redact them as `$ENV_VAR`,
-  `<REDACTED>`, or "...", including when they appear inside a URL.
-- Avoid dumping raw tool logs, stack traces, or large structured blobs.
+- Keep commands readable and actionable.
+- Keep full URLs when they are important for tracing behavior.
+- Shorten truly huge non-URL payloads/outputs with "...".
+- Do not include secrets or raw tokens; redact as `$ENV_VAR`, `<REDACTED>`,
+  or "...", including when they appear inside a URL.
+- Avoid dumping raw tool logs, stack traces, or large structured blobs; keep
+  intent + outcome.
 </CompactedRules>
 """
 
