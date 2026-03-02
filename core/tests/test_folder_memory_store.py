@@ -135,6 +135,57 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     assert store.get_children(reloaded_missing, strict=True) == []
 
 
+def test_folder_store_get_ancestors_checks_cache_once_per_call(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "mem"
+    store = FolderMemoryStore(root)
+
+    grandparent = MemoryRecord(
+        in_channel="test",
+        input="gp-in",
+        compacted=["gp-c"],
+        output="gp-out",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    parent = MemoryRecord(
+        in_channel="test",
+        input="p-in",
+        compacted=["p-c"],
+        output="p-out",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 1, 0, 0),
+        parents=[grandparent.id_],
+    )
+    child = MemoryRecord(
+        in_channel="test",
+        input="c-in",
+        compacted=["c-c"],
+        output="c-out",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 2, 0, 0),
+        parents=[parent.id_],
+    )
+
+    store.append(grandparent)
+    store.append(parent)
+    store.append(child)
+
+    calls = 0
+    original_stat_key = store._stat_key
+
+    def counted_stat_key():
+        nonlocal calls
+        calls += 1
+        return original_stat_key()
+
+    monkeypatch.setattr(store, "_stat_key", counted_stat_key)
+
+    assert store.get_ancestors(child.id_) == [parent.id_, grandparent.id_]
+    assert calls == 1
+
+
 def test_folder_store_append_ignores_missing_parent_ids(tmp_path) -> None:
     root = tmp_path / "mem"
     store = FolderMemoryStore(root)

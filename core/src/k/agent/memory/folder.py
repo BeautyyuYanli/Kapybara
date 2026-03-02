@@ -509,10 +509,22 @@ class FolderMemoryStore(MemoryStore):
         if level == 0:
             return [current.id_]
 
+        def _checked_parents(rec: MemoryRecord) -> list[str]:
+            parent_ids = list(rec.parents)
+            if strict:
+                missing = [id_ for id_ in parent_ids if id_ not in self._by_id]
+                if missing:
+                    missing_str = ", ".join(str(i) for i in missing)
+                    raise KeyError(f"Missing parent record(s): {missing_str}")
+            return parent_ids
+
         ancestors: list[str] = []
         seen: set[str] = set()
 
-        frontier = self.get_parents(current, strict=strict)
+        # Walk links directly from the in-memory index. Avoid calling
+        # `get_parents()` repeatedly inside traversal because that method
+        # re-checks cache freshness on every call.
+        frontier = _checked_parents(current)
         depth = 0
         while frontier and (level is None or depth < level):
             depth += 1
@@ -528,7 +540,7 @@ class FolderMemoryStore(MemoryStore):
                     if strict:
                         raise KeyError(f"Unknown parent MemoryRecord id: {parent_id}")
                     continue
-                next_frontier.extend(self.get_parents(parent_record, strict=strict))
+                next_frontier.extend(_checked_parents(parent_record))
             frontier = next_frontier
 
         return ancestors
