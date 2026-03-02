@@ -18,5 +18,7 @@ def test_compacted_actions_prompt_emphasizes_high_fidelity_details() -> None:
     assert "responded (messages delivered to the user and artifacts produced)" in text
     assert "Include failed attempts" in text
     assert "1) `raw_input`" in text
+    assert "not a raw structured dump" in text
+    assert "Do **not** copy/paste the original structured payload" in text
     assert "2) `raw_output`" in text
     assert "3) `input_intents`" in text

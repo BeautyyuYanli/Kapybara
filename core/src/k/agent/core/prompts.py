@@ -12,14 +12,18 @@ be read by humans and reused by later agent runs.
 
 ## Field mapping (`finish_action`)
 1) `raw_input`
-- Human-readable input summary in natural language.
-- Preserve the user-facing body text verbatim (no translation or semantic
-  rewrite).
-- Preserve sender/participant metadata needed for replay/attribution from the
-  input content (for example names, usernames, or display names).
-- You may simplify structured payloads (JSON, markup, nested fields) into
-  concise readable statements.
-- Omit metadata that does not affect task understanding or execution.
+- Goal: a fluent, human-readable summary, not a raw structured dump.
+- Do **not** copy/paste the original structured payload (JSON/markup/nested
+  object text) as-is.
+- Preserve user-facing message body text verbatim where applicable (no
+  translation or semantic rewrite), but wrap it in readable prose.
+- Preserve sender/participant metadata in human-readable form (for example:
+  display name, username, role, relation to the thread/channel) when present
+  in the input.
+- Rewrite machine-style fields into readable metadata lines (for example:
+  channel/thread, timestamp, routing hints, relevant ids) only when they matter
+  for understanding or replay.
+- Omit noisy metadata that does not affect task understanding or execution.
 
 2) `raw_output`
 - Human-readable output summary in natural language.
