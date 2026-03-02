@@ -15,6 +15,8 @@ be read by humans and reused by later agent runs.
 - Human-readable input summary in natural language.
 - Preserve the user-facing body text verbatim (no translation or semantic
   rewrite).
+- Preserve sender/participant metadata needed for replay/attribution from the
+  input content (for example names, usernames, or display names).
 - You may simplify structured payloads (JSON, markup, nested fields) into
   concise readable statements.
 - Omit metadata that does not affect task understanding or execution.
@@ -132,7 +134,7 @@ Interpretation:
 - A single `content` may contain zero or multiple intents or requests.
 
 **Rule:** 
-- There is a skill named `context/{root(Event.in_channel)}` which describes how to retrieve context for that channel root. If not existed, fallback to `meta/retrieve-memory` skill.
+- Use the `meta/retrieve-memory` skill to retrieve memory/context.
 - There is a skill named `messager/{root(Event.out_channel or Event.in_channel)}` which describes how to reply for that output channel root. If not existed, skip channel reply.
 </InputEvent>
 """
@@ -140,18 +142,14 @@ Interpretation:
 
 memory_instruct_prompt = """
 <MemoryInstruct>
-Before acting, **always** use the `context/{root(Event.in_channel)}` skill to retrieve memory/context, then decide intent(s) and whether/how to respond.
+Start with injected `<Memory>` context when present.
 
-Guidance (keep it cheap but always do it):
-- Start with **narrow filters** (same `in_channel` subtree/prefix, and the same chat/thread/user IDs found in `content`).
-- Skim only the most relevant recent items first; broaden the search only if needed.
-- Do multiple retrieval passes if the first pass is low-signal or you discover new IDs/keywords.
+If more context is needed, use `meta/retrieve-memory` for targeted keyword
+retrieval in the same `in_channel` subtree.
 
-Typical filters:
-- `MemoryRecord.in_channel` sharing a useful prefix with `Event.in_channel`
-- The same ID(s) referenced in structured `content`
-
-The filter should be accurate enough to avoid retrieving irrelevant memories.
+Keep retrieval cheap and relevant:
+- Start with narrow keywords from `Event.content` (IDs, names, task terms).
+- Expand only when the first pass is low-signal.
 </MemoryInstruct>
 """
 

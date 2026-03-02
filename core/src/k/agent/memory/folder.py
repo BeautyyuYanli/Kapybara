@@ -17,7 +17,8 @@ Layout (relative to `root`):
 Design notes / invariants:
 - Store order is the lexicographic order of `MemoryRecord.id_`.
 - "Latests" are record ids sorted by descending lexicographic id order and can
-  be filtered by `in_channel` subtree prefix.
+  be filtered by `in_channel` subtree prefix, exact contact-id membership, and
+  optional `num` limiting.
 - Parsing is strict: invalid JSON or invalid `MemoryRecord` data raises
   `ValueError` with path/line context.
 - Missing records referenced by parent/child links are treated as deleted
@@ -65,18 +66,6 @@ class _CacheKey:
 
 type LineMatch = tuple[int, str]
 type FileMatches = list[tuple[Path, list[LineMatch]]]
-
-
-_CORE_FIELDS: set[str] = {
-    "created_at",
-    "in_channel",
-    "out_channel",
-    "contacts",
-    "id_",
-    "parents",
-    "children",
-    "compacted",
-}
 
 
 class _CoreRecordOnDisk(BaseModel):
@@ -378,7 +367,8 @@ class FolderMemoryStore(MemoryStore):
 
     Fast retrieval helpers:
     - `get_latests()` returns ids in newest-first store order, optionally
-      filtered by `in_channel` prefix.
+      filtered by `in_channel` prefix and exact `contact` membership, with an
+      optional `num` cap.
     - `filter_by_in_channel()` and `search_by_keywords()` mirror Telegram
       stage_a's no-index lookup strategy and shell out to `rg`.
 
@@ -410,22 +400,42 @@ class FolderMemoryStore(MemoryStore):
         self._cache_key = None
         self._load_if_needed()
 
-    def get_latests(self, *, in_channel: str | None = None) -> list[str]:
+    def get_latests(
+        self,
+        *,
+        in_channel: str | None = None,
+        contact: str | None = None,
+        num: int | None = None,
+    ) -> list[str]:
         """Return latest record ids in descending store order.
 
         Args:
             in_channel: Optional channel prefix filter using subtree semantics.
+            contact: Optional exact contact-id filter against
+                `MemoryRecord.contacts`.
+            num: Optional maximum number of ids to return. `None` means no
+                limit.
         """
 
-        self._load_if_needed()
-        if in_channel is None:
-            return [record.id_ for record in reversed(self._records)]
+        if num is not None and num < 0:
+            raise ValueError(f"num must be >= 0 or None; got {num}")
+        if num == 0:
+            return []
 
-        return [
-            record.id_
-            for record in reversed(self._records)
-            if _in_channel_matches_prefix(record.in_channel, in_channel)
-        ]
+        self._load_if_needed()
+        latests: list[str] = []
+        for record in reversed(self._records):
+            if in_channel is not None and not _in_channel_matches_prefix(
+                record.in_channel, in_channel
+            ):
+                continue
+            if contact is not None and contact not in record.contacts:
+                continue
+            latests.append(record.id_)
+            if num is not None and len(latests) >= num:
+                break
+
+        return latests
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
         self._load_if_needed()
@@ -484,6 +494,12 @@ class FolderMemoryStore(MemoryStore):
         level: int | None = None,
         strict: bool = False,
     ) -> list[str]:
+        """Return ancestor ids for `record` following parent links.
+
+        `level=0` returns `[record.id_]` to preserve a convenient identity case
+        for callers that cap traversal depth dynamically.
+        """
+
         if level is not None and level < 0:
             raise ValueError(f"level must be >= 0 or None; got {level}")
 
@@ -491,7 +507,7 @@ class FolderMemoryStore(MemoryStore):
         current = self._coerce_record(record)
 
         if level == 0:
-            return []
+            return [current.id_]
 
         ancestors: list[str] = []
         seen: set[str] = set()
@@ -893,7 +909,7 @@ class FolderMemoryStore(MemoryStore):
         # - detailed: raw input + output + tool_calls per response (JSONL)
         self._atomic_write_text(
             path,
-            record.model_dump_json(include=_CORE_FIELDS),
+            record.dump_compated(),
         )
 
         detailed_path = self._detailed_path_for_record_path(path)

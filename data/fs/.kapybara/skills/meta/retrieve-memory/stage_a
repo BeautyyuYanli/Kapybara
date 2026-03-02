@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def _ensure_core_src_on_sys_path() -> None:
+    """Make `core/src` importable when this script is run from a repo checkout."""
+
+    for parent in Path(__file__).resolve().parents:
+        core_src = parent / "core" / "src"
+        if core_src.is_dir():
+            sys.path.insert(0, str(core_src))
+            return
+
+
+_ensure_core_src_on_sys_path()
+
+from k.agent.memory.folder import FolderMemoryStore
+from k.agent.memory.paths import memory_records_root_from_config_base
+from k.config import Config
+
+
+LineMatch = tuple[int, str]
+FileMatches = list[tuple[Path, list[LineMatch]]]
+
+
+def _validate_channel_path(name: str, value: str) -> str:
+    channel = value.strip()
+    if not channel:
+        raise ValueError(f"{name} must not be empty")
+    if channel.startswith("/") or channel.endswith("/") or "//" in channel:
+        raise ValueError(f"Invalid {name}: {value!r}")
+    return channel
+
+
+class _OutputWriter:
+    def __init__(self, *, out_path: Path) -> None:
+        self._out_path = out_path
+        self._fh = None
+
+    def __enter__(self) -> "_OutputWriter":
+        self._out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Use exclusive create to avoid clobbering when multiple runs race.
+        self._fh = self._out_path.open("x", encoding="utf-8")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def line(self, s: str) -> None:
+        self._fh.write(s)
+        self._fh.write("\n")
+        print(s)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Retrieve memory candidates by keyword regex "
+            "within the exact input-channel subtree."
+        )
+    )
+    parser.add_argument(
+        "--in-channel",
+        required=True,
+        help=(
+            "Exact current input in_channel. "
+            "Do not replace with a broader parent prefix."
+        ),
+    )
+    parser.add_argument(
+        "--kw",
+        required=True,
+        help="Keyword regex for matching detailed memory lines.",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=6,
+        help="How many matching files/lines to keep.",
+    )
+    parser.add_argument(
+        "--out",
+        required=True,
+        type=Path,
+        help=(
+            "Output TSV file path. "
+            "Use a unique (random) path under /tmp to avoid races."
+        ),
+    )
+    return parser
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    try:
+        in_channel = _validate_channel_path("in_channel", args.in_channel)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    out_path: Path = args.out.expanduser()
+    kw: str = args.kw
+    n: int = args.n
+
+    records_root = memory_records_root_from_config_base(Config().config_base)
+    store = FolderMemoryStore(records_root.parent)
+
+    detailed_files = store.filter_by_in_channel(in_channel_prefix=in_channel)
+    matches_kw: FileMatches = store.search_by_keywords(
+        files=detailed_files,
+        pattern=kw,
+        n=n,
+    )
+
+    try:
+        with _OutputWriter(out_path=out_path) as w:
+            w.line("# id\tcore_json\tmatched_detailed_lines")
+
+            results: dict[str, dict[str, str]] = {}
+            for path, line_matches in matches_kw:
+                core_path = path.parent / (
+                    path.name.removesuffix(".detailed.jsonl") + ".core.json"
+                )
+                if not core_path.exists():
+                    continue
+
+                mem_id = core_path.name.removesuffix(".core.json")
+                matched = json.dumps(
+                    [{"line": line_no, "text": text} for line_no, text in line_matches],
+                    ensure_ascii=False,
+                )
+                results[mem_id] = {
+                    "core_json": core_path.read_text(encoding="utf-8").strip(),
+                    "matched_detailed_lines": matched,
+                }
+
+            for mem_id in sorted(results.keys()):
+                row = results[mem_id]
+                w.line(
+                    f"{mem_id}\t{row['core_json']}\t{row['matched_detailed_lines']}"
+                )
+    except FileExistsError:
+        print(f"Error: output file already exists: {out_path}", file=sys.stderr)
+        print(
+            "Tip: use a unique file to avoid races, "
+            "e.g. --out /tmp/mem_ctx_<unique>.tsv",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"Output saved to: {out_path} (channel={in_channel}, candidates: {len(matches_kw)})",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

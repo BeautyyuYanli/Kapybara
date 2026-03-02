@@ -93,6 +93,7 @@ async def test_agent_run_returns_compacted_memory_record(
         f"Value of `${{K_CONFIG_BASE:-~/.kapybara}}`: {agent_view_base}"
         in system_prompt
     )
+    assert captured_user_prompt[0] == ""
     assert captured_user_prompt[3] == "do something"
     assert all(
         not (isinstance(part, str) and part.startswith("<Preferences>"))
@@ -107,3 +108,89 @@ async def test_agent_run_returns_compacted_memory_record(
     assert '"in_channel":"test"' in event_meta
     assert '"contacts":["test/system"]' in event_meta
     assert '"content"' not in event_meta
+
+
+def test_resolve_parent_memories_none_unions_channel_and_contacts_with_dedupe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+    calls: list[tuple[str | None, str | None, int | None]] = []
+
+    def fake_get_latests(
+        *,
+        in_channel: str | None = None,
+        contact: str | None = None,
+        num: int | None = None,
+    ) -> list[str]:
+        calls.append((in_channel, contact, num))
+        result: list[str]
+        if in_channel == "telegram/chat/1":
+            result = ["m5", "m4", "m3", "m2", "m1", "m0"]
+        elif contact == "c1":
+            result = ["c3", "m5", "c2", "c1"]
+        elif contact == "c2":
+            result = ["c4", "m4", "c2"]
+        else:
+            result = []
+        return result if num is None else result[:num]
+
+    monkeypatch.setattr(store, "get_latests", fake_get_latests)
+
+    selected = agent_module._resolve_parent_memories(
+        memory_store=store,
+        in_channel="telegram/chat/1",
+        contacts=["c1", "c2"],
+        parent_memories=None,
+    )
+
+    assert selected == ["m5", "m4", "m3", "m2", "m1", "c3", "c2", "c4"]
+    assert calls == [
+        ("telegram/chat/1", None, 5),
+        (None, "c1", 3),
+        (None, "c2", 3),
+    ]
+
+
+def test_resolve_parent_memories_explicit_empty_skips_auto_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+    calls: list[tuple[str | None, str | None, int | None]] = []
+
+    def fake_get_latests(
+        *,
+        in_channel: str | None = None,
+        contact: str | None = None,
+        num: int | None = None,
+    ) -> list[str]:
+        calls.append((in_channel, contact, num))
+        return ["m1"]
+
+    monkeypatch.setattr(store, "get_latests", fake_get_latests)
+
+    selected = agent_module._resolve_parent_memories(
+        memory_store=store,
+        in_channel="telegram/chat/1",
+        contacts=["c1"],
+        parent_memories=[],
+    )
+
+    assert selected == []
+    assert calls == []
+
+
+def test_resolve_parent_memories_explicit_list_is_deduped(
+    tmp_path: Path,
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+    selected = agent_module._resolve_parent_memories(
+        memory_store=store,
+        in_channel="telegram/chat/1",
+        contacts=["c1"],
+        parent_memories=["a", "b", "a", "c", "b"],
+    )
+    assert selected == ["a", "b", "c"]
+
+
+def test_memory_select_default_levels_are_3_and_10() -> None:
+    assert agent_module._memory_select.__defaults__ == (3, 10)

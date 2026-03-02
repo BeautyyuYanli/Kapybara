@@ -54,8 +54,8 @@ def maybe_load_channel_skill_md(
 ) -> str | None:
     """Load `skills:<group>/<channel_root>/SKILLS.md` if present.
 
-    The agent uses `context/<platform>` and `messager/<platform>` skills where
-    `<platform>` is the first segment of an input/output channel path.
+    Channel-root groups (for example `messager/<platform>`) use the first
+    segment of the channel path as `<platform>`.
     """
 
     if not channel:

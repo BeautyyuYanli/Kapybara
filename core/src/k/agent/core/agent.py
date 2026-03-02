@@ -459,15 +459,9 @@ def concat_skills_prompt(ctx: RunContext[MyDeps]) -> str:
     config_base: str | Path = ctx.deps.config.config_base
     skills_md = concat_skills_md(config_base)
     event = ctx.deps.start_event
-    in_channel = event.in_channel
     out_channel = event.effective_out_channel
 
     channel_chunks = [
-        maybe_load_channel_skill_md(
-            config_base,
-            group="context",
-            channel=in_channel,
-        ),
         maybe_load_channel_skill_md(
             config_base,
             group="messager",
@@ -540,11 +534,69 @@ async def _system_runtime_prompt(deps: MyDeps) -> str:
     )
 
 
+def _dedupe_memory_ids(ids: Sequence[str]) -> list[str]:
+    """Return ids in first-seen order with duplicates removed."""
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for id_ in ids:
+        if id_ in seen:
+            continue
+        seen.add(id_)
+        out.append(id_)
+    return out
+
+
+def _resolve_parent_memories(
+    *,
+    memory_store: FolderMemoryStore,
+    in_channel: str,
+    contacts: list[str],
+    parent_memories: list[str] | None,
+    in_channel_latest_num: int = 5,
+    contact_latest_num: int = 3,
+) -> list[str]:
+    """Resolve parent memories for `agent_run`.
+
+    Behavior:
+    - If `parent_memories` is provided (including an empty list), use it as the
+      source of truth after stable deduplication.
+    - If `parent_memories` is `None`, auto-select by unioning:
+      1) latest records by `in_channel` subtree (limit `in_channel_latest_num`)
+      2) latest records by each contact id, without channel filter
+         (per-contact limit `contact_latest_num`)
+      The union preserves first-seen order and removes duplicates.
+    """
+
+    if parent_memories is not None:
+        return _dedupe_memory_ids(parent_memories)
+
+    selected: list[str] = []
+    if in_channel_latest_num > 0:
+        selected.extend(
+            memory_store.get_latests(
+                in_channel=in_channel,
+                num=in_channel_latest_num,
+            )
+        )
+
+    if contact_latest_num > 0:
+        for contact in contacts:
+            selected.extend(
+                memory_store.get_latests(
+                    contact=contact,
+                    num=contact_latest_num,
+                )
+            )
+
+    return _dedupe_memory_ids(selected)
+
+
 async def _memory_select(
     memory_store: FolderMemoryStore,
     parent_memories: list[str],
-    compacted_level_num: int = 5,
-    raw_pair_level_num: int = 20,
+    compacted_level_num: int = 3,
+    raw_pair_level_num: int = 10,
 ):
     recent_mem = set(parent_memories)
     all_mem = set(parent_memories)
@@ -575,12 +627,22 @@ async def agent_run(
     Contact lifecycle:
     - Resolve `Event.contacts` platform ids to unique ids before model run.
     - Persist those resolved ids in the output `MemoryRecord.contacts`.
+
+    Parent-memory selection:
+    - `parent_memories=None`: auto-select latest records by input channel and
+      by resolved contact ids (union + dedupe).
+    - `parent_memories=[]`: skip auto-selection and run without parent memory.
     """
 
-    parent_memories = parent_memories or []
     resolved_contact_ids = resolve_contact_unique_ids(
         config_base=config.config_base,
         platform_contacts=instruct.contacts,
+    )
+    parent_memories = _resolve_parent_memories(
+        memory_store=memory_store,
+        in_channel=instruct.in_channel,
+        contacts=resolved_contact_ids,
+        parent_memories=parent_memories,
     )
 
     all_mem_rec, recent_mem = await _memory_select(
@@ -614,7 +676,6 @@ async def agent_run(
     msgs = _strip_history(msgs, (instruct.content,))
     memory_record = res.output
     memory_record.input = instruct.content
-    memory_record.parents = parent_memories + memory_record.parents
     memory_record.detailed = msgs
 
     return memory_record

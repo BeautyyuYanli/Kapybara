@@ -19,8 +19,9 @@ if [ -L "$CORE_VENV_LINK" ]; then
   rm "$CORE_VENV_LINK"
 fi
 
-# Let PDM resolve Python from core/pyproject.toml and create core/.venv first.
-pdm venv -p "$CORE_DIR" create --with venv --force
+# Force in-project virtualenv creation. Without this, some PDM configs create
+# envs under a shared cache path and core/.venv doesn't exist for the move.
+PDM_VENV_IN_PROJECT=1 pdm venv -p "$CORE_DIR" create --with venv --force
 
 # Move the created environment to repo/.venv so both projects can share it.
 if [ -e "$SHARED_VENV" ] || [ -L "$SHARED_VENV" ]; then

@@ -180,9 +180,25 @@ class MemoryRecord(BaseModel):
         return self.id_[:8]
 
     def dump_raw_pair(self) -> str:
-        # return self.model_dump_json(exclude={"detailed", "compacted"})
-        return f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta><Instruct>{self.input}</Instruct><Response>{self.output}</Response>"""
+        """Return a lightweight raw-pair view from compacted memory.
+
+        The output is wrapped as one `<Record>...</Record>` block and always
+        carries a `<Meta>` JSON chunk with `{id_, parents, children}`.
+        Record body keeps only the first and last items from `self.compacted`
+        (joined by a newline). This mirrors the common compacted contract where
+        index `0` is input and the last item is output.
+        """
+
+        meta = f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta>"""
+        if not self.compacted:
+            return f"<Record>{meta}</Record>"
+        if len(self.compacted) == 1:
+            body = self.compacted[0]
+        else:
+            body = "\n".join((self.compacted[0], self.compacted[-1]))
+        return f"<Record>{meta}{body}</Record>"
 
     def dump_compated(self) -> str:
-        # return self.model_dump_json(exclude={"detailed"})
-        return f"""<Meta>{self.model_dump_json(include={"id_", "parents", "children"})}</Meta><Instruct>{self.input}</Instruct><Process>{self.compacted}</Process><Response>{self.output}</Response>"""
+        """Return the exact JSON payload persisted to `<id>.core.json`."""
+
+        return self.model_dump_json(exclude={"input", "output", "detailed"})
