@@ -45,7 +45,7 @@ def test_basic_os_helper_uses_resolved_ssh_key_path(tmp_path: Path) -> None:
 
     assert helper.command_base() == (
         "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-        '-o LogLevel=ERROR -tt -i "/tmp/custom_id_ed25519" -p 2200 '
+        f'-o LogLevel=ERROR -tt -i "{config.ssh_key!s}" -p 2200 '
         "alice@example.com "
     )
 
