@@ -5,7 +5,7 @@
 Structured input events use:
 
 - `in_channel: str` (required)
-- `contact: str | None` (optional, `<platform>/<user_id>` when known)
+- `contacts: list[str]` (optional, `<platform>/<user_id>` entries when known)
 - `out_channel: str | None` (optional)
 
 `out_channel=None` means "same as `in_channel`" for routing and skill selection.
@@ -74,10 +74,11 @@ Example for `telegram/chat/<chat_id>`:
 7. `telegram/chat/<chat_id>/PREFERENCES.md`
 
 `contacts/<platform>/<user_id>.md`-based user preference filtering keeps the
-current behavior.
+current behavior. For unique contact ids, symlink layout, and migration, see
+`docs/concept/contacts.md`.
 
 ## Required Fields
 
-Runtime input events require `in_channel`, with optional `contact` and
+Runtime input events require `in_channel`, with optional `contacts` and
 `out_channel`. Memory retrieval requires records to carry `in_channel` (and
 optional `out_channel`).

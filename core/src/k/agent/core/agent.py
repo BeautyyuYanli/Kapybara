@@ -281,7 +281,8 @@ def _load_preferences_prompt(
     Returns:
         Empty string when no preference files match; otherwise a
         `<Preferences>...</Preferences>` block with one section per loaded file.
-        Each section starts with its corresponding absolute file path.
+        Each section starts with its corresponding preference path. For
+        symlinks, the path header also shows the resolved absolute target path.
     """
 
     candidates = _channel_preference_candidates(in_channel, pref_root=pref_root)
@@ -299,7 +300,9 @@ def _load_preferences_prompt(
             continue
         if not text:
             continue
-        blocks.append("\n".join([f"Path: {path}", text, "---"]))
+        blocks.append(
+            "\n".join([f"Path: {_display_preference_path(path)}", text, "---"])
+        )
 
     if not blocks:
         return ""
@@ -307,6 +310,18 @@ def _load_preferences_prompt(
     return (
         f"<Preferences>\n{comment}\n" + "\n".join(blocks).rstrip() + "\n</Preferences>"
     )
+
+
+def _display_preference_path(path: Path) -> str:
+    """Return display text for preference path headers in system prompts.
+
+    Normal files are shown as-is. Symlinks show both the symlink path and the
+    resolved absolute target (`<path> -> <resolved_abs_target>`).
+    """
+
+    if not path.is_symlink():
+        return str(path)
+    return f"{path} -> {path.resolve()}"
 
 
 def _validate_referenced_memory_ids(

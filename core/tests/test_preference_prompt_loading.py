@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -133,3 +134,26 @@ def test_load_preferences_prompt_includes_all_contact_preferences(
     assert "first contact preference" in prompt
     assert f"Path: {second}" in prompt
     assert "second contact preference" in prompt
+
+
+def test_load_preferences_prompt_shows_resolved_symlink_target_for_contact(
+    tmp_path: Path,
+) -> None:
+    pref_root = tmp_path / ".kapybara" / "preferences"
+    data_path = pref_root / "contacts" / "data" / "c1.md"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    data_path.write_text("contact preference from data", encoding="utf-8")
+
+    link_path = pref_root / "contacts" / "telegram" / "567113516.md"
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    relative_target = Path(os.path.relpath(data_path, start=link_path.parent))
+    link_path.symlink_to(relative_target)
+
+    prompt = _load_preferences_prompt(
+        in_channel="telegram/chat/123",
+        contacts=["telegram/567113516"],
+        pref_root=pref_root,
+    )
+
+    assert f"Path: {link_path} -> {data_path.resolve()}" in prompt
+    assert "contact preference from data" in prompt
