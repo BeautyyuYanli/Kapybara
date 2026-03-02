@@ -24,3 +24,11 @@ def test_compacted_actions_prompt_emphasizes_high_fidelity_details() -> None:
     assert "Do **not** copy/paste the original structured payload" in text
     assert "2) `raw_output`" in text
     assert "3) `input_intents`" in text
+    assert "Invocation contract" in text
+    assert "Use all fields." in text
+    assert "Single-fact ownership (avoid repetition)" in text
+    assert "Assign each fact to exactly one field" in text
+    assert "Do not duplicate the same fact across fields" in text
+    assert "Completeness checklist (avoid missing details)" in text
+    assert "Received: key inputs, constraints, and context." in text
+    assert "Responded: what was sent (or explicit no-response reason)." in text
