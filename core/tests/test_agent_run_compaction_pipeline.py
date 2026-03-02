@@ -144,11 +144,11 @@ def test_resolve_parent_memories_none_unions_channel_and_contacts_with_dedupe(
         parent_memories=None,
     )
 
-    assert selected == ["m5", "m4", "m3", "m2", "m1", "c3", "c2", "c4"]
+    assert selected == ["m5", "m4", "m3", "m2", "m1", "c3", "c4"]
     assert calls == [
         ("telegram/chat/1", None, 5),
-        (None, "c1", 3),
-        (None, "c2", 3),
+        (None, "c1", 2),
+        (None, "c2", 2),
     ]
 
 
@@ -198,7 +198,7 @@ def test_memory_select_default_levels_are_3_and_10() -> None:
 
 
 @pytest.mark.anyio
-async def test_memory_select_caps_each_type_and_sorts_by_datetime(
+async def test_memory_select_downgrades_exceeded_recent_before_raw_pair_cap(
     tmp_path: Path,
 ) -> None:
     store = FolderMemoryStore(tmp_path / "memories")
@@ -250,7 +250,42 @@ async def test_memory_select_caps_each_type_and_sorts_by_datetime(
     )
 
     assert recent_mem == {m5.id_}
-    assert [rec.id_ for rec in all_mem_rec] == [m3.id_, m5.id_]
+    assert [rec.id_ for rec in all_mem_rec] == [m4.id_, m5.id_]
+
+
+@pytest.mark.anyio
+async def test_memory_select_downgraded_recent_can_fill_raw_pair_slot(
+    tmp_path: Path,
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+
+    older = MemoryRecord(
+        in_channel="test",
+        input="older",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    newer = MemoryRecord(
+        in_channel="test",
+        input="newer",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 2),
+        parents=[older.id_],
+    )
+    for rec in (older, newer):
+        store.append(rec)
+
+    all_mem_rec, recent_mem = await agent_module._memory_select(
+        store,
+        [newer.id_],
+        compacted_level_num=1,
+        raw_pair_level_num=1,
+        compacted_cap_num=1,
+        raw_pair_cap_num=1,
+    )
+
+    assert recent_mem == {newer.id_}
+    assert [rec.id_ for rec in all_mem_rec] == [older.id_, newer.id_]
 
 
 @pytest.mark.anyio

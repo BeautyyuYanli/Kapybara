@@ -622,11 +622,12 @@ async def _memory_select(
     - compacted memories: `parent_memories` + ancestors up to
       `compacted_level_num`
     - raw-pair memories: additional ancestors up to `raw_pair_level_num`
-      excluding compacted memories
+      excluding compacted memories, plus downgraded compacted overflow
 
     Caps:
     - compacted memories are capped by `compacted_cap_num`
-    - raw-pair memories are capped by `raw_pair_cap_num`
+    - overflow compacted memories are downgraded into raw-pair candidates
+    - raw-pair candidates are capped by `raw_pair_cap_num`
 
     Returned records are sorted by datetime (same order as `get_by_ids`).
     """
@@ -638,18 +639,21 @@ async def _memory_select(
         all_mem.update(memory_store.get_ancestors(mem, level=raw_pair_level_num))
 
     raw_pair_only = all_mem - recent_mem
+    recent_records = memory_store.get_by_ids(recent_mem)
     compacted_records = _keep_latest_records(
-        memory_store.get_by_ids(recent_mem),
+        recent_records,
         cap_num=compacted_cap_num,
         name="compacted_cap_num",
     )
+    capped_recent_ids = {rec.id_ for rec in compacted_records}
+    downgraded_recent_ids = {rec.id_ for rec in recent_records} - capped_recent_ids
+    raw_pair_candidates = raw_pair_only | downgraded_recent_ids
     raw_pair_records = _keep_latest_records(
-        memory_store.get_by_ids(raw_pair_only),
+        memory_store.get_by_ids(raw_pair_candidates),
         cap_num=raw_pair_cap_num,
         name="raw_pair_cap_num",
     )
 
-    capped_recent_ids = {rec.id_ for rec in compacted_records}
     selected_ids = capped_recent_ids | {rec.id_ for rec in raw_pair_records}
     all_mem_rec = memory_store.get_by_ids(selected_ids)
     return all_mem_rec, capped_recent_ids
