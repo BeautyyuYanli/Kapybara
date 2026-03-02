@@ -169,10 +169,13 @@ def _telegram_updates_to_event_text_only_compaction(
 
     We derive channels from the original batch so routing stays unchanged
     (including topic-thread channel derivation), then compact only those update
-    lines that are plain text messages.
+    lines that are plain text messages. Contact identity is also derived from
+    the original batch.
     """
 
-    in_channel = telegram_updates_to_event(updates, compact=False, tz=tz).in_channel
+    event_meta = telegram_updates_to_event(updates, compact=False, tz=tz)
+    in_channel = event_meta.in_channel
+    contact = event_meta.contact
     bodies = [
         telegram_update_to_event(
             update,
@@ -181,7 +184,7 @@ def _telegram_updates_to_event_text_only_compaction(
         ).content
         for update in updates
     ]
-    return Event(in_channel=in_channel, content="\n".join(bodies))
+    return Event(in_channel=in_channel, contact=contact, content="\n".join(bodies))
 
 
 def filter_dispatch_groups_without_forum_topic_created_updates(

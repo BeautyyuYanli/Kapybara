@@ -178,7 +178,7 @@ def test_stage_a_default_root_uses_home_kapybara_memories_records(
     assert routes["aaa"] == {"channel", "user"}
 
 
-def test_stage_a_emits_by_user_preference_only(tmp_path: Path) -> None:
+def test_stage_a_does_not_emit_preference_content(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     records_root = home / ".kapybara" / "memories" / "records"
@@ -193,11 +193,11 @@ def test_stage_a_emits_by_user_preference_only(tmp_path: Path) -> None:
     (preferences_root / "telegram" / "PREFERENCES.md").write_text(
         "platform nested preference", encoding="utf-8", newline="\n"
     )
-    (preferences_root / "telegram" / "by_user" / "567113516.md").parent.mkdir(
+    (preferences_root / "contacts" / "telegram" / "567113516.md").parent.mkdir(
         parents=True
     )
-    (preferences_root / "telegram" / "by_user" / "567113516.md").write_text(
-        "by-user preference", encoding="utf-8", newline="\n"
+    (preferences_root / "contacts" / "telegram" / "567113516.md").write_text(
+        "contact preference", encoding="utf-8", newline="\n"
     )
 
     out_path = tmp_path / "stage_a.tsv"
@@ -212,5 +212,5 @@ def test_stage_a_emits_by_user_preference_only(tmp_path: Path) -> None:
     output = out_path.read_text(encoding="utf-8")
     assert "Preference (telegram.md):" not in output
     assert "Preference (telegram/PREFERENCES.md):" not in output
-    assert "User-specific Preference (from_id: 567113516):" in output
-    assert "by-user preference" in output
+    assert "User-specific Preference (from_id: 567113516):" not in output
+    assert "contact preference" not in output

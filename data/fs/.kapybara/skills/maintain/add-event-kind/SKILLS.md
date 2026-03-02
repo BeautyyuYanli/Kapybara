@@ -14,16 +14,16 @@ Create a skill at `~/.kapybara/skills/context/<platform>/SKILLS.md` to define ho
 The `context/<platform>` skill is responsible for retrieving preference files based on `Event.in_channel` prefixes.
 
 - **Path Preferences**: Inject from `~/.kapybara/preferences`, in root-to-leaf order, both `<prefix>.md` and `<prefix>/PREFERENCES.md` for each `Event.in_channel` prefix.
-- **Fine-grained Preferences**: Keep by-user files (e.g. `~/.kapybara/preferences/<platform>/by_user/<user_id>.md`) when available.
+- **Fine-grained Preferences**: Keep user-level contact files (e.g. `~/.kapybara/preferences/contacts/<platform>/<user_id>.md`) when available.
 - **Manual Update**: Users or agents can create or update preference information by directly editing the relevant file.
 
 ### Implementation Guide
 - **Code**: The skill should include a script (e.g., `stage_a`) that combines channel-prefix lookup (`MemoryRecord.in_channel`) with optional ID routes (e.g., `from.id`), where ID lookup may span the same platform root (for example, across `telegram/*`).
 - **Key Requirement**:
     - Output a list of candidate memory record paths sorted by time.
-    - Prepend loaded preference contents to the output.
+    - Keep output focused on retrieval candidates; preference content is injected by the agent system prompt pipeline.
 
-Example: `~/.kapybara/skills/context/telegram/stage_a` searches local memories by `in_channel` prefix and loads matching channel-prefix preference files.
+Example: `~/.kapybara/skills/context/telegram/stage_a` searches local memories by `in_channel` prefix and returns channel/user candidate routes.
 
 ## 2. Message Delivery Skill
 Create a skill at `~/.kapybara/skills/messager/<platform>/SKILLS.md` to define how to reply via the platform's API (e.g., using `curl`).

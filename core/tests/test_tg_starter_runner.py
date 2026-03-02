@@ -118,6 +118,7 @@ def test_telegram_updates_to_event_text_only_compacts_plain_text_only() -> None:
     ]
 
     event = _telegram_updates_to_event_text_only_compaction(updates, tz=UTC)
+    assert event.contact == "telegram/43"
     lines = event.content.splitlines()
     assert len(lines) == 2
 
@@ -157,6 +158,7 @@ def test_text_only_compaction_drops_reply_entities() -> None:
     ]
 
     event = _telegram_updates_to_event_text_only_compaction(updates, tz=UTC)
+    assert event.contact == "telegram/43"
     body = json.loads(event.content)
 
     assert body["message"]["from"]["id"] == 43
@@ -191,6 +193,7 @@ def test_text_only_compaction_drops_reply_forum_topic_created() -> None:
     assert _should_compact_update_for_agent(updates[0]) is True
 
     event = _telegram_updates_to_event_text_only_compaction(updates, tz=UTC)
+    assert event.contact == "telegram/46"
     body = json.loads(event.content)
     assert "reply_to_message" not in body["message"]
 
@@ -213,6 +216,7 @@ def test_text_only_compaction_keeps_topic_thread_channel() -> None:
 
     event = _telegram_updates_to_event_text_only_compaction(updates, tz=UTC)
     assert event.in_channel == "telegram/chat/-100123/thread/9001"
+    assert event.contact == "telegram/555"
 
     body = json.loads(event.content)
     assert body["message"]["from"]["id"] == 555

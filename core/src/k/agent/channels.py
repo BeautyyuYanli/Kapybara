@@ -32,6 +32,16 @@ def validate_channel_path(value: str, *, field_name: str) -> str:
     return channel
 
 
+def validate_contact_path(value: str, *, field_name: str) -> str:
+    """Validate `<platform>/<user_id>` contact path and return normalized value."""
+
+    contact = validate_channel_path(value, field_name=field_name)
+    platform, user_id, *rest = contact.split("/")
+    if rest or not platform or not user_id:
+        raise ValueError(f"{field_name} must be '<platform>/<user_id>': {value!r}")
+    return contact
+
+
 def normalize_out_channel(*, in_channel: str, out_channel: str | None) -> str | None:
     """Return canonical out_channel where same-as-input is stored as `None`."""
 

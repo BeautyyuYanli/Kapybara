@@ -20,6 +20,19 @@ _MESSAGE_OBJECT_PATHS: tuple[tuple[str, ...], ...] = (
     ("business_message",),
     ("edited_business_message",),
 )
+_CONTACT_FROM_ID_PATHS: tuple[tuple[str, ...], ...] = (
+    ("message", "from", "id"),
+    ("edited_message", "from", "id"),
+    ("channel_post", "from", "id"),
+    ("edited_channel_post", "from", "id"),
+    ("callback_query", "from", "id"),
+    ("callback_query", "message", "from", "id"),
+    ("my_chat_member", "from", "id"),
+    ("chat_member", "from", "id"),
+    ("chat_join_request", "from", "id"),
+    ("business_message", "from", "id"),
+    ("edited_business_message", "from", "id"),
+)
 
 
 def telegram_update_to_event(
@@ -37,11 +50,16 @@ def telegram_update_to_event(
     Channel mapping:
     - `in_channel`: `telegram/chat/<chat_id>` (+ `/thread/<message_thread_id>`
       only when the message is explicitly marked as a topic message)
+    - `contact`: `telegram/<from.id>` (falls back to `telegram/unknown`)
     - `out_channel`: omitted (`None`), which means "same as input channel"
     """
 
     body = _json_dumps(_compact_telegram_update(update, tz=tz) if compact else update)
-    return Event(in_channel=_in_channel_for_update(update), content=body)
+    return Event(
+        in_channel=_in_channel_for_update(update),
+        contact=_contact_for_update(update),
+        content=body,
+    )
 
 
 def telegram_updates_to_event(
@@ -56,13 +74,19 @@ def telegram_updates_to_event(
     (one Telegram update per line). For multi-update batches we keep a stable
     chat-level `in_channel` prefix (`telegram/chat/<chat_id>`) when all updates
     share the same chat, so retrieval can include all threads in that chat.
+    `contact` is derived from the latest update in the batch that includes a
+    sender id.
     """
 
     bodies = [
         _json_dumps(_compact_telegram_update(update, tz=tz) if compact else update)
         for update in updates
     ]
-    return Event(in_channel=_in_channel_for_updates(updates), content="\n".join(bodies))
+    return Event(
+        in_channel=_in_channel_for_updates(updates),
+        contact=_contact_for_updates(updates),
+        content="\n".join(bodies),
+    )
 
 
 def telegram_update_to_event_json(
@@ -120,6 +144,21 @@ def _in_channel_for_update(update: dict[str, Any]) -> str:
     return f"{channel}/thread/{thread_id}"
 
 
+def _contact_for_update(update: dict[str, Any]) -> str:
+    sender_id = _extract_first_int(update, _CONTACT_FROM_ID_PATHS)
+    if sender_id is None:
+        return "telegram/unknown"
+    return f"telegram/{sender_id}"
+
+
+def _contact_for_updates(updates: list[dict[str, Any]]) -> str:
+    for update in reversed(updates):
+        sender_id = _extract_first_int(update, _CONTACT_FROM_ID_PATHS)
+        if sender_id is not None:
+            return f"telegram/{sender_id}"
+    return "telegram/unknown"
+
+
 def _extract_nested_dict(
     update: dict[str, Any], path: tuple[str, ...]
 ) -> dict[str, Any] | None:
@@ -129,6 +168,21 @@ def _extract_nested_dict(
             return None
         cur = cur.get(key)
     return cur if isinstance(cur, dict) else None
+
+
+def _extract_first_int(
+    payload: dict[str, Any], paths: tuple[tuple[str, ...], ...]
+) -> int | None:
+    for path in paths:
+        cur: Any = payload
+        for key in path:
+            if not isinstance(cur, dict):
+                cur = None
+                break
+            cur = cur.get(key)
+        if isinstance(cur, int):
+            return cur
+    return None
 
 
 def _extract_message_thread_id(update: dict[str, Any]) -> int | None:
