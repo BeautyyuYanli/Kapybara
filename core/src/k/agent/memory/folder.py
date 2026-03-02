@@ -4,7 +4,8 @@ This store persists one record per file under a root folder.
 
 Layout (relative to `root`):
 - `records/YYYY/MM/DD/HH/<id>.core.json`: one JSON blob per record (one line),
-  storing record metadata and `compacted`.
+  storing record metadata (`in_channel`, `out_channel`, `contacts`, links) and
+  `compacted`.
 - `records/YYYY/MM/DD/HH/<id>.detailed.jsonl`: a JSONL file (one JSON value per
   non-empty line). Line 1 is the raw `input` (a JSON string). Line 2 is the
   record `output` (a JSON string). Each subsequent non-empty line corresponds
@@ -24,7 +25,7 @@ Design notes / invariants:
   parent/child neighbors when those neighbors are inferable from existing
   records.
 - `MemoryRecord` loading expects channel fields (`in_channel`, optional
-  `out_channel`).
+  `out_channel`) plus optional `contacts`.
 - `append()` updates each existing referenced parent's `children` list
   (persisting parent records) before persisting the new record. Missing parent
   ids are dropped from the appended record.
@@ -70,6 +71,7 @@ _CORE_FIELDS: set[str] = {
     "created_at",
     "in_channel",
     "out_channel",
+    "contacts",
     "id_",
     "parents",
     "children",
@@ -83,6 +85,7 @@ class _CoreRecordOnDisk(BaseModel):
     created_at: datetime
     in_channel: str
     out_channel: str | None = None
+    contacts: list[str] = Field(default_factory=list)
     id_: str
     parents: list[str] = Field(default_factory=list)
     children: list[str] = Field(default_factory=list)
@@ -277,6 +280,7 @@ def _load_memory_record_from_disk(
         created_at=core.created_at,
         in_channel=core.in_channel,
         out_channel=core.out_channel,
+        contacts=list(core.contacts),
         id_=core.id_,
         parents=list(core.parents),
         children=list(core.children),

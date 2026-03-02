@@ -46,7 +46,7 @@ def test_load_preferences_prompt_accepts_root_preference_file(
 
     prompt = _load_preferences_prompt(
         in_channel="telegram/chat/123",
-        contact="telegram/567113516",
+        contacts=["telegram/567113516"],
         pref_root=pref_root,
     )
 
@@ -67,7 +67,7 @@ def test_load_preferences_prompt_omits_default_when_root_exists(
 
     prompt = _load_preferences_prompt(
         in_channel="telegram/chat/123",
-        contact="telegram/567113516",
+        contacts=["telegram/567113516"],
         pref_root=pref_root,
     )
 
@@ -87,7 +87,7 @@ def test_load_preferences_prompt_includes_contact_preference(
 
     prompt = _load_preferences_prompt(
         in_channel="telegram/chat/123",
-        contact="telegram/567113516",
+        contacts=["telegram/567113516"],
         pref_root=pref_root,
     )
 
@@ -95,7 +95,7 @@ def test_load_preferences_prompt_includes_contact_preference(
     assert "contact preference" in prompt
 
 
-def test_load_preferences_prompt_skips_contact_preference_when_contact_missing(
+def test_load_preferences_prompt_skips_contact_preference_when_contacts_missing(
     tmp_path: Path,
 ) -> None:
     pref_root = tmp_path / ".kapybara" / "preferences"
@@ -105,9 +105,31 @@ def test_load_preferences_prompt_skips_contact_preference_when_contact_missing(
 
     prompt = _load_preferences_prompt(
         in_channel="telegram/chat/123",
-        contact=None,
+        contacts=[],
         pref_root=pref_root,
     )
 
     assert f"Path: {contact_pref}" not in prompt
     assert "contact preference" not in prompt
+
+
+def test_load_preferences_prompt_includes_all_contact_preferences(
+    tmp_path: Path,
+) -> None:
+    pref_root = tmp_path / ".kapybara" / "preferences"
+    first = pref_root / "contacts" / "telegram" / "100.md"
+    second = pref_root / "contacts" / "telegram" / "200.md"
+    first.parent.mkdir(parents=True, exist_ok=True)
+    first.write_text("first contact preference", encoding="utf-8")
+    second.write_text("second contact preference", encoding="utf-8")
+
+    prompt = _load_preferences_prompt(
+        in_channel="telegram/chat/123",
+        contacts=["telegram/100", "telegram/200"],
+        pref_root=pref_root,
+    )
+
+    assert f"Path: {first}" in prompt
+    assert "first contact preference" in prompt
+    assert f"Path: {second}" in prompt
+    assert "second contact preference" in prompt

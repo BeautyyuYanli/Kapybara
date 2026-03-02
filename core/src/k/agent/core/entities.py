@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from logging import getLogger
 from typing import Protocol, cast
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from k.agent.channels import (
     effective_out_channel,
@@ -32,11 +32,13 @@ class Event(BaseModel):
     Required fields:
     - `in_channel`: source channel path.
     Optional fields:
-    - `contact`: source user identity path in `<platform>/<user_id>` form.
+    - `contacts`: source user identity paths in `<platform>/<user_id>` form.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     in_channel: str
-    contact: str | None = None
+    contacts: list[str] = Field(default_factory=list)
     out_channel: str | None = None
     content: str
 
@@ -45,12 +47,21 @@ class Event(BaseModel):
     def _validate_in_channel(cls, value: str) -> str:
         return validate_channel_path(value, field_name="in_channel")
 
-    @field_validator("contact")
+    @field_validator("contacts")
     @classmethod
-    def _validate_contact(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return validate_contact_path(value, field_name="contact")
+    def _validate_contacts(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for idx, contact in enumerate(value):
+            normalized_contact = validate_contact_path(
+                contact,
+                field_name=f"contacts[{idx}]",
+            )
+            if normalized_contact in seen:
+                continue
+            seen.add(normalized_contact)
+            normalized.append(normalized_contact)
+        return normalized
 
     @field_validator("out_channel")
     @classmethod

@@ -18,7 +18,7 @@ def _write_skill(config_base: Path, *, group: str, name: str, content: str) -> N
 def test_extract_input_event_channel_root_from_event_json() -> None:
     event_json = Event(
         in_channel="telegram/chat/1",
-        contact="telegram/1",
+        contacts=["telegram/1"],
         content="{}",
     ).model_dump_json()
     assert _extract_input_event_channel_root([event_json]) == "telegram"
@@ -49,7 +49,7 @@ def test_concat_skills_prompt_injects_channel_root_specific_skills(
     config = Config(config_base=config_base)
     event = Event(
         in_channel="telegram/chat/1",
-        contact="telegram/1",
+        contacts=["telegram/1"],
         out_channel="telegram/chat/1/thread/2",
         content="{}",
     )
@@ -81,7 +81,7 @@ def test_concat_skills_prompt_skips_channel_skills_when_unknown_roots(
     config = Config(config_base=config_base)
     event = Event(
         in_channel="nope/chat/1",
-        contact="nope/1",
+        contacts=["nope/1"],
         out_channel="nope/chat/1",
         content="{}",
     )

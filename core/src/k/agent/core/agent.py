@@ -12,8 +12,8 @@ Preference injection:
     A root-level preference is injected first (`PREFERENCES.md` when present;
     otherwise `PREFERENCES.default.md`). Then for each channel prefix inject
     `<prefix>.md` and `<prefix>/PREFERENCES.md`.
-    When `Event.contact` is available as `<platform>/<user_id>`, also inject
-    `contacts/<platform>/<user_id>.md`.
+    When `Event.contacts` includes `<platform>/<user_id>` ids, also inject
+    `contacts/<platform>/<user_id>.md` for each id.
     The loaded preference content is injected as a dynamic system prompt before
     skills are concatenated.
 
@@ -49,6 +49,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import KnownModelName, Model
 
 from k.agent.channels import iter_channel_prefixes
+from k.agent.contacts import contact_preference_path, resolve_contact_unique_ids
 from k.agent.core.entities import Event, tool_exception_guard
 from k.agent.core.media_tools import read_media
 from k.agent.core.prompts import (
@@ -95,9 +96,9 @@ class MyDeps:
     Input event:
         Prompt builders use
         `start_event.in_channel` / `start_event.out_channel` as the canonical
-        routing source. `start_event.contact` is optional user identity context
-        for contact-scoped preference injection. System prompts use channels
-        for preference + skill injection.
+        routing source. `start_event.contacts` is optional user identity context
+        for contact-scoped preference injection. System prompts use channels and
+        contacts for preference + skill injection.
         Always provide `start_event` for agent runs.
 
     Bash tool cadence:
@@ -191,7 +192,7 @@ async def fork(
             memory_store=ctx.deps.memory_storage,
             instruct=Event(
                 in_channel=ctx.deps.start_event.in_channel,
-                contact=ctx.deps.start_event.contact,
+                contacts=ctx.deps.start_event.contacts,
                 out_channel=ctx.deps.start_event.out_channel,
                 content="You are the forked agent to complete only the following instruct, ignoring the previous ones.\nInstruction: "
                 + instruct,
@@ -250,21 +251,27 @@ def _channel_preference_candidates(in_channel: str, *, pref_root: Path) -> list[
     return out
 
 
-def _contact_preference_candidate(
-    *, contact: str | None, pref_root: Path
-) -> Path | None:
-    """Return user-level preference path for `<platform>/<user_id>` contacts."""
+def _contact_preference_candidates(
+    *, contacts: list[str], pref_root: Path
+) -> list[Path]:
+    """Return user-level preference paths for `<platform>/<user_id>` contacts."""
 
-    if not contact:
-        return None
-    platform, user_id, *rest = contact.split("/")
-    if not platform or not user_id or rest:
-        return None
-    return pref_root / "contacts" / platform / f"{user_id}.md"
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for contact in contacts:
+        path = contact_preference_path(
+            pref_root=pref_root,
+            platform_contact=contact,
+        )
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
 
 
 def _load_preferences_prompt(
-    *, in_channel: str, contact: str | None, pref_root: Path
+    *, in_channel: str, contacts: list[str], pref_root: Path
 ) -> str:
     """Load root-level, channel-prefix, and contact-level preferences.
 
@@ -278,9 +285,9 @@ def _load_preferences_prompt(
     """
 
     candidates = _channel_preference_candidates(in_channel, pref_root=pref_root)
-    contact_pref = _contact_preference_candidate(contact=contact, pref_root=pref_root)
-    if contact_pref is not None:
-        candidates.append(contact_pref)
+    candidates.extend(
+        _contact_preference_candidates(contacts=contacts, pref_root=pref_root)
+    )
 
     blocks: list[str] = []
     for path in candidates:
@@ -358,15 +365,25 @@ def finish_action(
         compacted_actions: Distilled process log of the whole task.
             Provide chronological, high-fidelity step lines following
             `<CompactedRules>`.
+
+    Side effect:
+        `ctx.deps.start_event.contacts` platform ids are resolved to unique
+        contact ids in `<config_base>/contacts.json` and written to
+        `MemoryRecord.contacts`.
     """
 
     validated_ids = _validate_referenced_memory_ids(
         memory_store=ctx.deps.memory_storage,
         referenced_memory_ids=referenced_memory_ids,
     )
+    contact_ids = resolve_contact_unique_ids(
+        config_base=ctx.deps.config.config_base,
+        platform_contacts=ctx.deps.start_event.contacts,
+    )
     return MemoryRecord(
         in_channel=ctx.deps.start_event.in_channel,
         out_channel=ctx.deps.start_event.out_channel,
+        contacts=contact_ids,
         parents=validated_ids,
         input="",
         output=raw_output,
@@ -419,7 +436,7 @@ def preferences_system_prompt(ctx: RunContext[MyDeps]) -> str:
 
     return _load_preferences_prompt(
         in_channel=ctx.deps.start_event.in_channel,
-        contact=ctx.deps.start_event.contact,
+        contacts=ctx.deps.start_event.contacts,
         pref_root=ctx.deps.config.config_base / "preferences",
     )
 
@@ -602,7 +619,7 @@ if __name__ == "__main__":
         )
         instruct = Event(
             in_channel="test",
-            contact="test/system",
+            contacts=["test/system"],
             content="use `read_media` tool to read image and describe them to ~/image.txt : 1. https://fastly.picsum.photos/id/59/536/354.jpg?hmac=HQ1B2iVRsA2r75Mxt18dSuJa241-Wggf0VF9BxKQhPc \n 2. ./data/fs/961-536x354.jpg",
         )
         mem = await agent_run(

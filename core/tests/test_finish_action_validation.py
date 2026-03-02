@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -11,12 +12,25 @@ from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
 
 
-def _ctx_for_store(store: FolderMemoryStore) -> RunContext[Any]:
-    event = SimpleNamespace(in_channel="telegram/chat/1", out_channel=None)
+def _ctx_for_store(
+    store: FolderMemoryStore,
+    *,
+    config_base,
+    contacts: list[str] | None = None,
+) -> RunContext[Any]:
+    event = SimpleNamespace(
+        in_channel="telegram/chat/1",
+        out_channel=None,
+        contacts=contacts or [],
+    )
     return cast(
         RunContext[Any],
         SimpleNamespace(
-            deps=SimpleNamespace(memory_storage=store, start_event=event),
+            deps=SimpleNamespace(
+                memory_storage=store,
+                start_event=event,
+                config=SimpleNamespace(config_base=config_base),
+            ),
         ),
     )
 
@@ -27,7 +41,11 @@ def test_finish_action_accepts_existing_referenced_memory_ids(tmp_path) -> None:
     store.append(parent)
 
     result = finish_action(
-        _ctx_for_store(store),
+        _ctx_for_store(
+            store,
+            config_base=tmp_path / ".kapybara",
+            contacts=["telegram/42"],
+        ),
         referenced_memory_ids=[parent.id_],
         raw_input="user asked for test output",
         raw_output="agent replied with final answer",
@@ -44,6 +62,9 @@ def test_finish_action_accepts_existing_referenced_memory_ids(tmp_path) -> None:
         == "Received request -> Tried validation -> Observed success"
     )
     assert result.compacted[3] == "<output>agent replied with final answer</output>"
+    assert len(result.contacts) == 1
+    contacts_book = json.loads((tmp_path / ".kapybara" / "contacts.json").read_text())
+    assert contacts_book[result.contacts[0]] == ["telegram/42"]
 
 
 def test_finish_action_retries_for_invalid_memory_id(tmp_path) -> None:
@@ -51,7 +72,7 @@ def test_finish_action_retries_for_invalid_memory_id(tmp_path) -> None:
 
     with pytest.raises(ModelRetry, match="Invalid referenced_memory_ids"):
         finish_action(
-            _ctx_for_store(store),
+            _ctx_for_store(store, config_base=tmp_path / ".kapybara"),
             referenced_memory_ids=["not-a-memory-id"],
             raw_input="user asked for test output",
             raw_output="agent replied with final answer",
@@ -69,7 +90,7 @@ def test_finish_action_ignores_missing_memory_id(tmp_path) -> None:
     ).id_
 
     result = finish_action(
-        _ctx_for_store(store),
+        _ctx_for_store(store, config_base=tmp_path / ".kapybara"),
         referenced_memory_ids=[missing_id],
         raw_input="user asked for test output",
         raw_output="agent replied with final answer",

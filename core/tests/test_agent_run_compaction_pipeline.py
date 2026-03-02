@@ -75,7 +75,7 @@ async def test_agent_run_returns_compacted_memory_record(
         memory_store=memory_store,
         instruct=Event(
             in_channel="test",
-            contact="test/system",
+            contacts=["test/system"],
             content="do something",
         ),
         parent_memories=[],
@@ -105,5 +105,5 @@ async def test_agent_run_returns_compacted_memory_record(
     assert isinstance(event_meta, str)
     assert event_meta.startswith("<EventMeta>")
     assert '"in_channel":"test"' in event_meta
-    assert '"contact":"test/system"' in event_meta
+    assert '"contacts":["test/system"]' in event_meta
     assert '"content"' not in event_meta

@@ -78,7 +78,11 @@ async def main() -> None:
             model,
             config,
             mem_store,
-            Event(in_channel="direct_input", contact="direct_input/local", content=i),
+            Event(
+                in_channel="direct_input",
+                contacts=["direct_input/local"],
+                content=i,
+            ),
         )
         mem_store.append(mem)
         print(mem.dump_compated())

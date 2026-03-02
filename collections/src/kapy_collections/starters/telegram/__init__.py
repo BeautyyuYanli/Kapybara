@@ -5,7 +5,7 @@ keyword-triggered batches of updates to :func:`k.agent.core.agent_run` as an
 `Event` with:
 
 - `in_channel` derived from Telegram routing ids (chat/thread when available)
-- `contact` derived from Telegram sender id (`telegram/<from.id>`)
+- `contacts` derived from Telegram sender ids (`telegram/<from.id>`)
 - `out_channel=None` (meaning "same as `in_channel`")
 - `content=<newline-delimited update JSON strings>`
 

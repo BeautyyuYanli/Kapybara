@@ -105,11 +105,13 @@ class MemoryRecord(BaseModel):
     Notes:
     - `in_channel` is required for all records.
     - `out_channel=None` means "same destination as input channel".
+    - `contacts` stores unique contact ids from `config_base/contacts.json`.
     """
 
     created_at: datetime = Field(default_factory=datetime.now)
     in_channel: str
     out_channel: str | None = None
+    contacts: list[str] = Field(default_factory=list)
     id_: str = ""
     parents: list[str] = Field(default_factory=list)
     children: list[str] = Field(default_factory=list)
@@ -130,6 +132,23 @@ class MemoryRecord(BaseModel):
         if value is None:
             return None
         return validate_channel_path(value, field_name="out_channel")
+
+    @field_validator("contacts")
+    @classmethod
+    def _validate_contacts(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for idx, contact_id in enumerate(value):
+            if not isinstance(contact_id, str):
+                raise TypeError(f"contacts[{idx}] must be a string")
+            normalized_id = contact_id.strip()
+            if not normalized_id:
+                raise ValueError(f"contacts[{idx}] must not be empty")
+            if normalized_id in seen:
+                continue
+            seen.add(normalized_id)
+            normalized.append(normalized_id)
+        return normalized
 
     @model_validator(mode="after")
     def _finalize_and_validate_ids(self) -> MemoryRecord:
