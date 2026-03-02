@@ -555,7 +555,7 @@ def _resolve_parent_memories(
     contacts: list[str],
     parent_memories: list[str] | None,
     in_channel_latest_num: int = 5,
-    contact_latest_num: int = 3,
+    contact_latest_num: int = 2,
 ) -> list[str]:
     """Resolve parent memories for `agent_run`.
 
@@ -596,8 +596,8 @@ def _resolve_parent_memories(
 async def _memory_select(
     memory_store: FolderMemoryStore,
     parent_memories: list[str],
-    compacted_level_num: int = 3,
-    raw_pair_level_num: int = 10,
+    compacted_level_num: int = 1,
+    raw_pair_level_num: int = 3,
 ):
     recent_mem = set(parent_memories)
     all_mem = set(parent_memories)
