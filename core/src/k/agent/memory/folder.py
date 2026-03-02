@@ -15,8 +15,8 @@ Layout (relative to `root`):
 
 Design notes / invariants:
 - Store order is the lexicographic order of `MemoryRecord.id_`.
-- "Latest" means the largest id in lexicographic order, not necessarily the max
-  `created_at`.
+- "Latests" are record ids sorted by descending lexicographic id order and can
+  be filtered by `in_channel` subtree prefix.
 - Parsing is strict: invalid JSON or invalid `MemoryRecord` data raises
   `ValueError` with path/line context.
 - Missing records referenced by parent/child links are treated as deleted
@@ -359,12 +359,22 @@ def _parse_rg_lines_with_numbers(output: str) -> list[tuple[Path, int, str]]:
     return parsed
 
 
+def _in_channel_matches_prefix(record_channel: str, in_channel_prefix: str) -> bool:
+    """Return whether `record_channel` belongs to the `in_channel_prefix` subtree."""
+
+    return record_channel == in_channel_prefix or record_channel.startswith(
+        in_channel_prefix + "/"
+    )
+
+
 class FolderMemoryStore(MemoryStore):
     """Query and append `MemoryRecord` objects stored in a folder.
 
     Record order is defined as lexicographic sort by `record.id_`.
 
     Fast retrieval helpers:
+    - `get_latests()` returns ids in newest-first store order, optionally
+      filtered by `in_channel` prefix.
     - `filter_by_in_channel()` and `search_by_keywords()` mirror Telegram
       stage_a's no-index lookup strategy and shell out to `rg`.
 
@@ -396,9 +406,22 @@ class FolderMemoryStore(MemoryStore):
         self._cache_key = None
         self._load_if_needed()
 
-    def get_latest(self) -> str | None:
+    def get_latests(self, *, in_channel: str | None = None) -> list[str]:
+        """Return latest record ids in descending store order.
+
+        Args:
+            in_channel: Optional channel prefix filter using subtree semantics.
+        """
+
         self._load_if_needed()
-        return self._records[-1].id_ if self._records else None
+        if in_channel is None:
+            return [record.id_ for record in reversed(self._records)]
+
+        return [
+            record.id_
+            for record in reversed(self._records)
+            if _in_channel_matches_prefix(record.in_channel, in_channel)
+        ]
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
         self._load_if_needed()
@@ -583,10 +606,7 @@ class FolderMemoryStore(MemoryStore):
             )
             if not isinstance(record_channel, str):
                 continue
-            if not (
-                record_channel == in_channel_prefix
-                or record_channel.startswith(in_channel_prefix + "/")
-            ):
+            if not _in_channel_matches_prefix(record_channel, in_channel_prefix):
                 continue
 
             detailed_path = self._detailed_path_for_record_path(core_path)

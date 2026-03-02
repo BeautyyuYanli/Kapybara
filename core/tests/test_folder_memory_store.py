@@ -9,7 +9,7 @@ from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
 
 
-def test_folder_store_get_latest_and_get_by_id(tmp_path) -> None:
+def test_folder_store_get_latests_and_get_by_id(tmp_path) -> None:
     root = tmp_path / "mem"
     store = FolderMemoryStore(root)
 
@@ -60,7 +60,7 @@ def test_folder_store_get_latest_and_get_by_id(tmp_path) -> None:
     # Force a reload from disk so assertions cover the (de)serialization path.
     store.refresh()
 
-    assert store.get_latest() == r2.id_
+    assert store.get_latests() == [r2.id_, r1.id_]
     assert store.get_by_id(r1.id_) == r1
     assert store.get_by_id(str(r1.id_)) == r1
     assert store.get_by_ids({r2.id_, r1.id_}) == [r1, r2]
@@ -309,7 +309,7 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
     store.append(r1)
-    assert store.get_latest() == r1.id_
+    assert store.get_latests() == [r1.id_]
 
     external = FolderMemoryStore(root)
     r2 = MemoryRecord(
@@ -322,7 +322,7 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
     )
     external.append(r2)
 
-    assert store.get_latest() == r2.id_
+    assert store.get_latests() == [r2.id_, r1.id_]
 
 
 def test_folder_store_order_is_lexicographic_by_id(tmp_path) -> None:
@@ -352,8 +352,8 @@ def test_folder_store_order_is_lexicographic_by_id(tmp_path) -> None:
     store.append(low_id)
     store.refresh()
 
-    # Latest is lexicographic max id, not append order.
-    assert store.get_latest() == high_id.id_
+    # Latests are sorted by descending lexicographic id, not append order.
+    assert store.get_latests() == [high_id.id_, low_id.id_]
 
 
 def test_folder_store_scan_ignores_detailed_files(tmp_path) -> None:
@@ -377,8 +377,45 @@ def test_folder_store_scan_ignores_detailed_files(tmp_path) -> None:
     detailed_json.write_text('{"not":"a record"}\n', encoding="utf-8")
 
     rebuilt = FolderMemoryStore(root)
-    assert rebuilt.get_latest() == r1.id_
+    assert rebuilt.get_latests() == [r1.id_]
     assert rebuilt.get_by_id(r1.id_) == r1
+
+
+def test_folder_store_get_latests_filters_by_in_channel_prefix(tmp_path) -> None:
+    root = tmp_path / "mem"
+    store = FolderMemoryStore(root)
+
+    room = MemoryRecord(
+        in_channel="telegram/chat/-1001",
+        input="room",
+        output="",
+        id_="-------0",
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    thread = MemoryRecord(
+        in_channel="telegram/chat/-1001/thread/10",
+        input="thread",
+        output="",
+        id_="-------1",
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    other = MemoryRecord(
+        in_channel="discord/channel/1",
+        input="other",
+        output="",
+        id_="-------2",
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    store.append(room)
+    store.append(thread)
+    store.append(other)
+
+    assert store.get_latests(in_channel="telegram/chat/-1001") == [
+        thread.id_,
+        room.id_,
+    ]
+    assert store.get_latests(in_channel="telegram/chat/-1001/thread/10") == [thread.id_]
+    assert store.get_latests(in_channel="telegram/chat/-1001/thread/11") == []
 
 
 def test_folder_store_filter_by_in_channel(tmp_path) -> None:
