@@ -423,22 +423,17 @@ async def test_memory_select_logs_injected_category_counts(
         created_at=datetime(2026, 1, 1, 0, 0, 2),
         parents=[channel_older.id_],
     )
-    contact_older = MemoryRecord(
-        in_channel="contact",
-        contacts=["c1"],
-        input="contact_older",
-        output="",
-        created_at=datetime(2026, 1, 1, 0, 0, 3),
-    )
     contact_newer = MemoryRecord(
         in_channel="contact",
         contacts=["c1"],
         input="contact_newer",
         output="",
-        created_at=datetime(2026, 1, 1, 0, 0, 4),
-        parents=[contact_older.id_],
+        created_at=datetime(2026, 1, 1, 0, 0, 3),
+        # Cross-scope link: contact raw-pair selects channel_newer, but it is
+        # later removed from injected raw-pair because channel compacted keeps it.
+        parents=[channel_newer.id_],
     )
-    for rec in (channel_older, channel_newer, contact_older, contact_newer):
+    for rec in (channel_older, channel_newer, contact_newer):
         store.append(rec)
 
     def fake_log_info(msg: str, *args: Any, **kwargs: Any) -> None:
@@ -451,7 +446,7 @@ async def test_memory_select_logs_injected_category_counts(
         store,
         channel_parent_memories=[channel_newer.id_],
         contact_parent_memories=[contact_newer.id_],
-        channel_compacted_level_num=1,
+        channel_compacted_level_num=0,
         channel_raw_pair_level_num=1,
         channel_compacted_cap_num=1,
         channel_raw_pair_cap_num=1,
@@ -465,16 +460,15 @@ async def test_memory_select_logs_injected_category_counts(
     assert [rec.id_ for rec in all_mem_rec] == [
         channel_older.id_,
         channel_newer.id_,
-        contact_older.id_,
         contact_newer.id_,
     ]
     assert logged == [
         (
             "Injected memories counts (auto): "
-            "channel_compacted=%d, channel_raw_pair=%d, "
-            "contact_compacted=%d, contact_raw_pair=%d, "
+            "channel_compacted_selected=%d, channel_raw_pair_selected=%d, "
+            "contact_compacted_selected=%d, contact_raw_pair_selected=%d, "
             "injected_compacted=%d, injected_raw_pair=%d, injected_total=%d",
-            (1, 1, 1, 1, 2, 2, 4),
+            (1, 1, 1, 1, 2, 1, 3),
         )
     ]
 

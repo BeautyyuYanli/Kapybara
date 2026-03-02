@@ -635,7 +635,8 @@ async def _memory_select(
     candidates before applying raw-pair caps.
 
     Side effects:
-    - Emits `logger.info` with auto-injected memory counts per category.
+    - Emits `logger.info` with selected per-category counts and final
+      injected counts after global deduplication.
 
     Returned records are sorted by datetime (same order as `get_by_ids`).
     """
@@ -693,19 +694,21 @@ async def _memory_select(
     )
 
     capped_recent_ids = channel_compacted_ids | contact_compacted_ids
-    channel_raw_pair_injected = channel_raw_pair_ids - capped_recent_ids
-    contact_raw_pair_injected = contact_raw_pair_ids - capped_recent_ids
+    channel_raw_pair_selected = channel_raw_pair_ids
+    contact_raw_pair_selected = contact_raw_pair_ids
+    channel_raw_pair_injected = channel_raw_pair_selected - capped_recent_ids
+    contact_raw_pair_injected = contact_raw_pair_selected - capped_recent_ids
     selected_raw_pair_ids = channel_raw_pair_injected | contact_raw_pair_injected
     selected_ids = capped_recent_ids | selected_raw_pair_ids
     logger.info(
         "Injected memories counts (auto): "
-        "channel_compacted=%d, channel_raw_pair=%d, "
-        "contact_compacted=%d, contact_raw_pair=%d, "
+        "channel_compacted_selected=%d, channel_raw_pair_selected=%d, "
+        "contact_compacted_selected=%d, contact_raw_pair_selected=%d, "
         "injected_compacted=%d, injected_raw_pair=%d, injected_total=%d",
         len(channel_compacted_ids),
-        len(channel_raw_pair_injected),
+        len(channel_raw_pair_selected),
         len(contact_compacted_ids),
-        len(contact_raw_pair_injected),
+        len(contact_raw_pair_selected),
         len(capped_recent_ids),
         len(selected_raw_pair_ids),
         len(selected_ids),
