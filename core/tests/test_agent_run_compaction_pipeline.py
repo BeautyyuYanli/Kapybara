@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -193,4 +194,78 @@ def test_resolve_parent_memories_explicit_list_is_deduped(
 
 
 def test_memory_select_default_levels_are_3_and_10() -> None:
-    assert agent_module._memory_select.__defaults__ == (3, 10)
+    assert agent_module._memory_select.__defaults__ == (3, 10, 40, 20)
+
+
+@pytest.mark.anyio
+async def test_memory_select_caps_each_type_and_sorts_by_datetime(
+    tmp_path: Path,
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+
+    m1 = MemoryRecord(
+        in_channel="test",
+        input="m1",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    m2 = MemoryRecord(
+        in_channel="test",
+        input="m2",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 2),
+        parents=[m1.id_],
+    )
+    m3 = MemoryRecord(
+        in_channel="test",
+        input="m3",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 3),
+        parents=[m2.id_],
+    )
+    m4 = MemoryRecord(
+        in_channel="test",
+        input="m4",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 4),
+        parents=[m3.id_],
+    )
+    m5 = MemoryRecord(
+        in_channel="test",
+        input="m5",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 5),
+        parents=[m4.id_],
+    )
+    for rec in (m1, m2, m3, m4, m5):
+        store.append(rec)
+
+    all_mem_rec, recent_mem = await agent_module._memory_select(
+        store,
+        [m5.id_],
+        compacted_level_num=1,
+        raw_pair_level_num=3,
+        compacted_cap_num=1,
+        raw_pair_cap_num=1,
+    )
+
+    assert recent_mem == {m5.id_}
+    assert [rec.id_ for rec in all_mem_rec] == [m3.id_, m5.id_]
+
+
+@pytest.mark.anyio
+async def test_memory_select_rejects_negative_caps(tmp_path: Path) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+
+    with pytest.raises(ValueError, match="compacted_cap_num must be >= 0"):
+        await agent_module._memory_select(
+            store,
+            [],
+            compacted_cap_num=-1,
+        )
+    with pytest.raises(ValueError, match="raw_pair_cap_num must be >= 0"):
+        await agent_module._memory_select(
+            store,
+            [],
+            raw_pair_cap_num=-1,
+        )

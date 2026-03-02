@@ -593,20 +593,66 @@ def _resolve_parent_memories(
     return _dedupe_memory_ids(selected)
 
 
+def _keep_latest_records(
+    records: list[MemoryRecord],
+    *,
+    cap_num: int,
+    name: str,
+) -> list[MemoryRecord]:
+    """Return latest `cap_num` records from a datetime-sorted list."""
+
+    if cap_num < 0:
+        raise ValueError(f"{name} must be >= 0; got {cap_num}")
+    if cap_num == 0:
+        return []
+    return records[-cap_num:]
+
+
 async def _memory_select(
     memory_store: FolderMemoryStore,
     parent_memories: list[str],
-    compacted_level_num: int = 1,
-    raw_pair_level_num: int = 3,
+    compacted_level_num: int = 3,
+    raw_pair_level_num: int = 10,
+    compacted_cap_num: int = 40,
+    raw_pair_cap_num: int = 20,
 ):
+    """Select memory records for compacted/raw-pair injection.
+
+    Selection categories:
+    - compacted memories: `parent_memories` + ancestors up to
+      `compacted_level_num`
+    - raw-pair memories: additional ancestors up to `raw_pair_level_num`
+      excluding compacted memories
+
+    Caps:
+    - compacted memories are capped by `compacted_cap_num`
+    - raw-pair memories are capped by `raw_pair_cap_num`
+
+    Returned records are sorted by datetime (same order as `get_by_ids`).
+    """
+
     recent_mem = set(parent_memories)
     all_mem = set(parent_memories)
     for mem in parent_memories:
         recent_mem.update(memory_store.get_ancestors(mem, level=compacted_level_num))
         all_mem.update(memory_store.get_ancestors(mem, level=raw_pair_level_num))
 
-    all_mem_rec = memory_store.get_by_ids(all_mem)
-    return all_mem_rec, recent_mem
+    raw_pair_only = all_mem - recent_mem
+    compacted_records = _keep_latest_records(
+        memory_store.get_by_ids(recent_mem),
+        cap_num=compacted_cap_num,
+        name="compacted_cap_num",
+    )
+    raw_pair_records = _keep_latest_records(
+        memory_store.get_by_ids(raw_pair_only),
+        cap_num=raw_pair_cap_num,
+        name="raw_pair_cap_num",
+    )
+
+    capped_recent_ids = {rec.id_ for rec in compacted_records}
+    selected_ids = capped_recent_ids | {rec.id_ for rec in raw_pair_records}
+    all_mem_rec = memory_store.get_by_ids(selected_ids)
+    return all_mem_rec, capped_recent_ids
 
 
 async def agent_run(
