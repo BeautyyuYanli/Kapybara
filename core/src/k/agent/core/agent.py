@@ -29,6 +29,7 @@ from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
+from logging import getLogger
 from pathlib import Path
 from typing import cast
 
@@ -82,6 +83,8 @@ from k.runner_helpers.basic_os import (
     BasicOSHelper,
     agent_config_base_value,
 )
+
+logger = getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -631,6 +634,9 @@ async def _memory_select(
     Within each scope, compacted overflow is downgraded into raw-pair
     candidates before applying raw-pair caps.
 
+    Side effects:
+    - Emits `logger.info` with auto-injected memory counts per category.
+
     Returned records are sorted by datetime (same order as `get_by_ids`).
     """
 
@@ -687,10 +693,23 @@ async def _memory_select(
     )
 
     capped_recent_ids = channel_compacted_ids | contact_compacted_ids
-    selected_raw_pair_ids = (
-        channel_raw_pair_ids | contact_raw_pair_ids
-    ) - capped_recent_ids
+    channel_raw_pair_injected = channel_raw_pair_ids - capped_recent_ids
+    contact_raw_pair_injected = contact_raw_pair_ids - capped_recent_ids
+    selected_raw_pair_ids = channel_raw_pair_injected | contact_raw_pair_injected
     selected_ids = capped_recent_ids | selected_raw_pair_ids
+    logger.info(
+        "Injected memories counts (auto): "
+        "channel_compacted=%d, channel_raw_pair=%d, "
+        "contact_compacted=%d, contact_raw_pair=%d, "
+        "injected_compacted=%d, injected_raw_pair=%d, injected_total=%d",
+        len(channel_compacted_ids),
+        len(channel_raw_pair_injected),
+        len(contact_compacted_ids),
+        len(contact_raw_pair_injected),
+        len(capped_recent_ids),
+        len(selected_raw_pair_ids),
+        len(selected_ids),
+    )
     all_mem_rec = memory_store.get_by_ids(selected_ids)
     return all_mem_rec, capped_recent_ids
 
@@ -738,6 +757,11 @@ async def agent_run(
 
     if explicit_memories:
         memory_blocks = explicit_memories
+        logger.info(
+            "Injected memories counts (explicit): explicit=%d, injected_total=%d",
+            len(memory_blocks),
+            len(memory_blocks),
+        )
     else:
         channel_roots, contact_roots = _resolve_auto_parent_memory_ids(
             memory_store=memory_store,

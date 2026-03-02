@@ -116,6 +116,7 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured_user_prompt: tuple[Any, ...] | None = None
+    logged: list[tuple[str, tuple[Any, ...]]] = []
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_view_base = tmp_path / "agent-view" / ".kapybara"
     monkeypatch.setenv("K_CONFIG_BASE", str(agent_view_base))
@@ -148,6 +149,12 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
         agent_module, "agent_config_base_value", fake_agent_config_base_value
     )
 
+    def fake_log_info(msg: str, *args: Any, **kwargs: Any) -> None:
+        _ = kwargs
+        logged.append((msg, args))
+
+    monkeypatch.setattr(agent_module.logger, "info", fake_log_info)
+
     config = Config(config_base=tmp_path / ".kapybara")
     memory_store = FolderMemoryStore(config.config_base / "memories")
 
@@ -176,6 +183,10 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
 
     assert captured_user_prompt is not None
     assert captured_user_prompt[0] == "<Memories>memory-a\nmemory-b</Memories>\n"
+    assert (
+        "Injected memories counts (explicit): explicit=%d, injected_total=%d",
+        (2, 2),
+    ) in logged
 
 
 def test_resolve_auto_parent_memory_ids_collects_channel_then_contacts(
@@ -390,6 +401,82 @@ async def test_memory_select_contact_roots_expand_raw_pair_only(
 
     assert recent_mem == {newer.id_}
     assert [rec.id_ for rec in all_mem_rec] == [older.id_, newer.id_]
+
+
+@pytest.mark.anyio
+async def test_memory_select_logs_injected_category_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+    logged: list[tuple[str, tuple[Any, ...]]] = []
+
+    channel_older = MemoryRecord(
+        in_channel="channel",
+        input="channel_older",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    channel_newer = MemoryRecord(
+        in_channel="channel",
+        input="channel_newer",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 2),
+        parents=[channel_older.id_],
+    )
+    contact_older = MemoryRecord(
+        in_channel="contact",
+        contacts=["c1"],
+        input="contact_older",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 3),
+    )
+    contact_newer = MemoryRecord(
+        in_channel="contact",
+        contacts=["c1"],
+        input="contact_newer",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 4),
+        parents=[contact_older.id_],
+    )
+    for rec in (channel_older, channel_newer, contact_older, contact_newer):
+        store.append(rec)
+
+    def fake_log_info(msg: str, *args: Any, **kwargs: Any) -> None:
+        _ = kwargs
+        logged.append((msg, args))
+
+    monkeypatch.setattr(agent_module.logger, "info", fake_log_info)
+
+    all_mem_rec, recent_mem = await agent_module._memory_select(
+        store,
+        channel_parent_memories=[channel_newer.id_],
+        contact_parent_memories=[contact_newer.id_],
+        channel_compacted_level_num=1,
+        channel_raw_pair_level_num=1,
+        channel_compacted_cap_num=1,
+        channel_raw_pair_cap_num=1,
+        contact_compacted_level_num=0,
+        contact_raw_pair_level_num=1,
+        contact_compacted_cap_num=1,
+        contact_raw_pair_cap_num=1,
+    )
+
+    assert recent_mem == {channel_newer.id_, contact_newer.id_}
+    assert [rec.id_ for rec in all_mem_rec] == [
+        channel_older.id_,
+        channel_newer.id_,
+        contact_older.id_,
+        contact_newer.id_,
+    ]
+    assert logged == [
+        (
+            "Injected memories counts (auto): "
+            "channel_compacted=%d, channel_raw_pair=%d, "
+            "contact_compacted=%d, contact_raw_pair=%d, "
+            "injected_compacted=%d, injected_raw_pair=%d, injected_total=%d",
+            (1, 1, 1, 1, 2, 2, 4),
+        )
+    ]
 
 
 @pytest.mark.anyio
