@@ -9,26 +9,32 @@ def _prompts_py() -> Path:
 def test_compacted_actions_prompt_emphasizes_high_fidelity_details() -> None:
     text = _prompts_py().read_text(encoding="utf-8")
 
-    # Guardrails for memory quality: preserve what the agent received, tried,
-    # observed, and responded (including failures when they matter).
-    assert "High-fidelity rule (most important)" in text
-    assert "received (inputs/constraints/context)" in text
-    assert "tried (actions, commands, edits, tool calls)" in text
-    assert "observed (tool outputs, errors, test results, confirmations)" in text
-    assert "responded (messages delivered to the user and artifacts produced)" in text
-    assert "Include failed attempts" in text
-    assert "0) `referenced_memory_ids`" in text
-    assert "direct causal relationship" in text
-    assert "1) `raw_input`" in text
-    assert "not a raw structured dump" in text
-    assert "Do **not** copy/paste the original structured payload" in text
-    assert "2) `raw_output`" in text
-    assert "3) `input_intents`" in text
-    assert "Invocation contract" in text
-    assert "Use all fields." in text
-    assert "Single-fact ownership (avoid repetition)" in text
-    assert "Assign each fact to exactly one field" in text
-    assert "Do not duplicate the same fact across fields" in text
-    assert "Completeness checklist (avoid missing details)" in text
-    assert "Received: key inputs, constraints, and context." in text
-    assert "Responded: what was sent (or explicit no-response reason)." in text
+    # Guardrails for memory quality: keep the API contract, preserve
+    # high-fidelity process details, and avoid cross-field duplication.
+    required_markers = [
+        "<CompactedRules>",
+        "Invocation contract",
+        "finish_action(referenced_memory_ids, raw_input, raw_output, input_intents, compacted_actions)",
+        "Single-fact ownership (avoid repetition)",
+        "Do not duplicate the same fact across fields",
+        "0) `referenced_memory_ids`",
+        "direct causal relationship",
+        "1) `raw_input`",
+        "not a raw structured dump",
+        "Do **not** copy/paste the original structured payload",
+        "2) `raw_output`",
+        "3) `input_intents`",
+        "4) `compacted_actions`",
+        "Include failed attempts",
+        "Exclude facts already captured in `raw_input` or `raw_output`",
+        "Completeness checklist (avoid missing details)",
+        "High-fidelity rule (most important)",
+        "received (inputs/constraints/context)",
+        "tried (actions, commands, edits, tool calls)",
+        "observed (tool outputs, errors, test results, confirmations)",
+        "responded (messages delivered to the user and artifacts produced)",
+        "`compacted_actions` must be a list of strings.",
+        "</CompactedRules>",
+    ]
+    for marker in required_markers:
+        assert marker in text

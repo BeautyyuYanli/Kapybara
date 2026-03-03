@@ -7,23 +7,21 @@ make the wiring code easier to scan.
 compacted_prompt = """
 <CompactedRules>
 ## Objective
-When calling `finish_action`, produce memory that is reusable, faithful to what
-happened, and easy to scan later.
+When calling `finish_action`, produce memory that is reusable, faithful to the
+run, and easy to audit.
 
 ## Invocation contract
 Call exactly:
 `finish_action(referenced_memory_ids, raw_input, raw_output, input_intents, compacted_actions)`
 
-Use all fields. If something did not happen, state that explicitly instead of
-leaving ambiguity.
+Always populate all fields. If something did not happen, say so explicitly.
 
 ## Single-fact ownership (avoid repetition)
-Assign each fact to exactly one field.
-Assign each fact to exactly one owner field:
+Each fact should have one owner field:
 - `referenced_memory_ids`: prior memories with direct causal impact.
 - `raw_input`: what was received.
 - `input_intents`: what the sender wanted.
-- `compacted_actions`: what the agent did and observed.
+- `compacted_actions`: what the agent did and observed while executing.
 - `raw_output`: what was externally delivered (or why nothing was sent).
 
 Do not duplicate the same fact across fields unless a short pointer is required
@@ -63,9 +61,13 @@ for clarity (for example, "see raw_output").
 4) `compacted_actions`
 - Return a chronological list of high-fidelity process step lines.
 - Each line must be unambiguous about actor/tool, action, and outcome.
+- Prefer dense step lines that make the run replayable: Received -> Tried ->
+  Observed -> Responded (omit segments that truly do not apply).
 - Include failed attempts when they influenced the next step (what failed and
   what changed).
 - Keep one major step per line; merge noisy sub-steps with the same purpose.
+- Exclude facts already captured in `raw_input` or `raw_output`; keep this
+  field focused on process and observations between receive and respond.
 
 ## Completeness checklist (avoid missing details)
 Before finalizing, ensure the combined fields cover the full arc:
@@ -81,11 +83,6 @@ Do **not** over-summarize away the specifics of what the agent:
 - tried (actions, commands, edits, tool calls),
 - observed (tool outputs, errors, test results, confirmations),
 - responded (messages delivered to the user and artifacts produced).
-
-## Output format
-- `compacted_actions` must be a list of strings.
-- Do not require a fixed prefix, but each line must clearly indicate who did
-  what (user, agent, or tool) and what happened.
 
 ## What to keep (optimize for reuse)
 Preserve details that let someone repeat or audit the work:
@@ -113,6 +110,11 @@ If the trace shows the agent reading or relying on a skill doc (`SKILLS.md`):
   or "...", including when they appear inside a URL.
 - Avoid dumping raw tool logs, stack traces, or large structured blobs; keep
   intent + outcome.
+
+## Output format
+- `compacted_actions` must be a list of strings.
+- No fixed prefix is required, but each line must clearly indicate who did what
+  (user, agent, or tool) and what happened.
 </CompactedRules>
 """
 
