@@ -14,8 +14,8 @@ Preference injection:
     `<prefix>.md` and `<prefix>/PREFERENCES.md`.
     When `Event.contacts` includes `<platform>/<user_id>` ids, also inject
     `contacts/<platform>/<user_id>.md` for each id.
-    The loaded preference content is injected as a dynamic system prompt before
-    skills are concatenated.
+    The loaded preference content is injected as a system prompt before skills
+    are concatenated.
 
 Memory compaction contract:
     The canonical high-fidelity `compacted_actions` prompt lives in
@@ -102,6 +102,8 @@ class MyDeps:
         routing source. `start_event.contacts` is optional user identity context
         for contact-scoped preference injection. System prompts use channels and
         contacts for preference + skill injection.
+        `injected_memories_prompt` stores the `<Memories>` block prepared once
+        in `agent_run` and injected via a non-dynamic system prompt.
         `resolved_contact_ids` is the unique-id view of `start_event.contacts`,
         resolved before model execution.
         Always provide `start_event` for agent runs.
@@ -118,6 +120,7 @@ class MyDeps:
     memory_parents: list[str]
     start_event: Event
     resolved_contact_ids: list[str]
+    injected_memories_prompt: str = ""
     bash_cmd_history: list[str] = field(default_factory=list)
     count_down: int = 6
     stuck_warning: int = 0
@@ -454,6 +457,13 @@ def preferences_system_prompt(ctx: RunContext[MyDeps]) -> str:
 
 
 @agent.system_prompt
+def injected_memories_system_prompt(ctx: RunContext[MyDeps]) -> str:
+    """Inject run-scoped memory context computed once in `agent_run`."""
+
+    return ctx.deps.injected_memories_prompt
+
+
+@agent.system_prompt
 def concat_skills_prompt(ctx: RunContext[MyDeps]) -> str:
     config_base: str | Path = ctx.deps.config.config_base
     skills_md = concat_skills_md(config_base)
@@ -544,6 +554,14 @@ def _dedupe_memory_ids(ids: Sequence[str]) -> list[str]:
         seen.add(id_)
         out.append(id_)
     return out
+
+
+def _memories_system_prompt(memory_blocks: Sequence[str]) -> str:
+    """Serialize selected memory blocks into one `<Memories>` system prompt."""
+
+    if not memory_blocks:
+        return ""
+    return f"<Memories>{'\n'.join(memory_blocks)}</Memories>"
 
 
 def _resolve_auto_parent_memory_ids(
@@ -728,10 +746,15 @@ async def agent_run(
     """Run the agent with memory + event context and persistable output.
 
     User prompt order (fixed):
-    1. optional `<Memories>...</Memories>` context
-    2. `<System>Now + agent config-base runtime view</System>`
-    3. `<EventMeta>...</EventMeta>`
-    4. real instruction content (`Event.content`)
+    1. `<System>Now + agent config-base runtime view</System>`
+    2. `<EventMeta>...</EventMeta>`
+    3. real instruction content (`Event.content`)
+
+    Memory injection:
+    - The optional `<Memories>...</Memories>` block is injected as a
+      non-dynamic system prompt.
+    - Selection and serialization happen once inside `agent_run` before
+      entering `agent.run`.
 
     Contact lifecycle:
     - Resolve `Event.contacts` platform ids to unique ids before model run.
@@ -781,8 +804,7 @@ async def agent_run(
             x.dump_compated() if x.id_ in recent_mem else x.dump_raw_pair()
             for x in all_mem_rec
         ]
-
-    memory_string = "\n".join(memory_blocks)
+    memory_prompt = _memories_system_prompt(memory_blocks)
 
     async with MyDeps(
         config=config,
@@ -790,12 +812,12 @@ async def agent_run(
         memory_parents=memory_parent_ids,
         start_event=instruct,
         resolved_contact_ids=resolved_contact_ids,
+        injected_memories_prompt=memory_prompt,
     ) as my_deps:
         res = await agent.run(
             model=model,
             deps=my_deps,
             user_prompt=(
-                f"<Memories>{memory_string}</Memories>\n" if memory_blocks else "",
                 await _system_runtime_prompt(my_deps),
                 _event_meta_prompt(instruct),
                 instruct.content,
