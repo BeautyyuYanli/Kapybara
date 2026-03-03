@@ -87,15 +87,19 @@ async def test_agent_run_returns_compacted_memory_record(
     assert mem.in_channel == "test"
 
     assert captured_user_prompt is not None
-    system_prompt = captured_user_prompt[1]
+    assert len(captured_user_prompt) == 3
+    system_prompt = captured_user_prompt[0]
     assert isinstance(system_prompt, str)
     assert system_prompt.startswith("<System>")
     assert (
         f"Value of `${{K_CONFIG_BASE:-~/.kapybara}}`: {agent_view_base}"
         in system_prompt
     )
-    assert captured_user_prompt[0] == ""
-    assert captured_user_prompt[3] == "do something"
+    assert captured_user_prompt[2] == "do something"
+    assert all(
+        not (isinstance(part, str) and part.startswith("<Memories>"))
+        for part in captured_user_prompt
+    )
     assert all(
         not (isinstance(part, str) and part.startswith("<Preferences>"))
         for part in captured_user_prompt
@@ -103,7 +107,7 @@ async def test_agent_run_returns_compacted_memory_record(
     assert f"Path: {pref_path}" not in "".join(
         part for part in captured_user_prompt if isinstance(part, str)
     )
-    event_meta = captured_user_prompt[2]
+    event_meta = captured_user_prompt[1]
     assert isinstance(event_meta, str)
     assert event_meta.startswith("<EventMeta>")
     assert '"in_channel":"test"' in event_meta
@@ -182,7 +186,14 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
     )
 
     assert captured_user_prompt is not None
-    assert captured_user_prompt[0] == "<Memories>memory-a\nmemory-b</Memories>\n"
+    assert len(captured_user_prompt) == 3
+    assert isinstance(captured_user_prompt[0], str)
+    assert captured_user_prompt[0].startswith("<System>")
+    assert captured_user_prompt[2] == "do something"
+    assert all(
+        not (isinstance(part, str) and part.startswith("<Memories>"))
+        for part in captured_user_prompt
+    )
     assert (
         "Injected memories counts (explicit): explicit=%d, injected_total=%d",
         (2, 2),
