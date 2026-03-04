@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 from pydantic_ai import RunContext
 
-from k.agent.core.shell_tools import bash, bash_input, bash_wait, edit_file
+from k.agent.core.shell_tools import BashEvent, bash, bash_input, bash_wait, edit_file
 from k.io_helpers.shell import ShellSessionOptions
 
 
@@ -74,8 +74,16 @@ class _FakeDeps:
     count_down: int = 20
 
 
-def _ctx(deps: _FakeDeps) -> RunContext[_FakeDeps]:
-    return cast(RunContext[_FakeDeps], SimpleNamespace(deps=deps))
+def _ctx(
+    deps: _FakeDeps,
+    *,
+    run_step: int = 0,
+    metadata: dict[str, int] | None = None,
+) -> RunContext[_FakeDeps]:
+    return cast(
+        RunContext[_FakeDeps],
+        SimpleNamespace(deps=deps, run_step=run_step, metadata=metadata),
+    )
 
 
 @pytest.mark.anyio
@@ -104,6 +112,35 @@ async def test_bash_appends_after_existing_system_msg() -> None:
     assert res.system_msg.startswith("You seems to be stuck.")
     assert "\nYou've been working for a while." in res.system_msg
     assert "progress update" in res.system_msg
+
+
+@pytest.mark.anyio
+async def test_bash_wait_appends_request_limit_warning_to_system_msg() -> None:
+    deps = _FakeDeps(count_down=20)
+    deps.shell_manager.next_results.append((b"ok\n", b"", 0))
+
+    res = await bash_wait(
+        _ctx(deps, run_step=45, metadata={"request_limit": 50}),
+        "whatever",
+    )
+    assert isinstance(res, BashEvent)
+    assert res.system_msg is not None
+    assert "run step 45/50" in res.system_msg
+    assert "IMMEDIATELY STOP ALL CURRENT WORK RIGHT NOW" in res.system_msg
+    assert "call `finish_action` immediately" in res.system_msg
+
+
+@pytest.mark.anyio
+async def test_bash_wait_skips_request_limit_warning_before_threshold() -> None:
+    deps = _FakeDeps(count_down=20)
+    deps.shell_manager.next_results.append((b"ok\n", b"", 0))
+
+    res = await bash_wait(
+        _ctx(deps, run_step=44, metadata={"request_limit": 50}),
+        "whatever",
+    )
+    assert isinstance(res, BashEvent)
+    assert res.system_msg is None
 
 
 @pytest.mark.anyio

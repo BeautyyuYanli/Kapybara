@@ -32,6 +32,8 @@ async def test_agent_run_returns_compacted_memory_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured_user_prompt: tuple[Any, ...] | None = None
+    captured_run_metadata: dict[str, Any] | None = None
+    captured_usage_limits: Any = None
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_view_base = tmp_path / "agent-view" / ".kapybara"
     monkeypatch.setenv("K_CONFIG_BASE", str(agent_view_base))
@@ -45,9 +47,15 @@ async def test_agent_run_returns_compacted_memory_record(
 
     async def fake_agent_run(**kwargs: Any) -> _FakeRunResult:
         nonlocal captured_user_prompt
+        nonlocal captured_run_metadata
+        nonlocal captured_usage_limits
         user_prompt = kwargs.get("user_prompt")
         if isinstance(user_prompt, tuple):
             captured_user_prompt = user_prompt
+        maybe_metadata = kwargs.get("metadata")
+        if isinstance(maybe_metadata, dict):
+            captured_run_metadata = maybe_metadata
+        captured_usage_limits = kwargs.get("usage_limits")
         messages: list[ModelRequest | ModelResponse] = [
             ModelRequest(parts=[UserPromptPart(content=("old prompt",))]),
             ModelResponse(parts=[TextPart(content="assistant did a thing")]),
@@ -113,6 +121,9 @@ async def test_agent_run_returns_compacted_memory_record(
     assert '"in_channel":"test"' in event_meta
     assert '"contacts":["test/system"]' in event_meta
     assert '"content"' not in event_meta
+    assert captured_usage_limits is not None
+    assert captured_run_metadata is not None
+    assert captured_run_metadata["request_limit"] == captured_usage_limits.request_limit
 
 
 @pytest.mark.anyio
