@@ -48,6 +48,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import KnownModelName, Model
+from pydantic_ai.usage import UsageLimits
 
 from k.agent.channels import iter_channel_prefixes
 from k.agent.contacts import contact_preference_path, resolve_contact_unique_ids
@@ -113,6 +114,7 @@ class MyDeps:
         return a `BashEvent`). When it reaches zero, the tool response appends a
         system message reminding the agent to post a progress update, then
         continue working.
+
     """
 
     config: Config
@@ -771,6 +773,12 @@ async def agent_run(
       Caps:
       - channel scope: compacted 15, raw-pair 15
       - contact scope: compacted 5, raw-pair 5
+
+    Request limits:
+    - Uses default pydantic-ai `UsageLimits()` for request counting
+      (`request_limit=50` unless overridden upstream).
+    - The active request limit is also mirrored to run metadata so bash tools
+      can emit near-limit warnings in `BashEvent.system_msg`.
     """
 
     resolved_contact_ids = resolve_contact_unique_ids(
@@ -806,6 +814,8 @@ async def agent_run(
         ]
     memory_prompt = _memories_system_prompt(memory_blocks)
 
+    usage_limits = UsageLimits()
+
     async with MyDeps(
         config=config,
         memory_storage=memory_store,
@@ -823,6 +833,12 @@ async def agent_run(
                 instruct.content,
             ),
             message_history=message_history,
+            usage_limits=usage_limits,
+            metadata={
+                # `RunContext` doesn't expose UsageLimits directly; make the
+                # active request cap available to dynamic system prompts.
+                "request_limit": usage_limits.request_limit,
+            },
         )
     msgs: list[ModelRequest | ModelResponse] = res.new_messages()
     msgs = _strip_history(msgs, (instruct.content,))

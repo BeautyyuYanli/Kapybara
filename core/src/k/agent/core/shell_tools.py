@@ -30,6 +30,43 @@ from k.runner_helpers.basic_os import (
 _BASH_STDIO_TOKEN_LIMIT = 16000
 _CL100K_BASE_ENCODING: Any | None = None
 _BASH_COUNTDOWN_SYSTEM_MSG = "You've been working for a while. Pause to send a brief progress update to the originating event channel, then continue working."
+_REQUEST_LIMIT_WARNING_BUFFER = 5
+
+
+def _near_request_limit_step(
+    *,
+    request_limit: int | None,
+    warning_buffer: int,
+) -> int | None:
+    """Return the step threshold where near-limit warnings should start."""
+
+    if request_limit is None:
+        return None
+    if warning_buffer < 0:
+        raise ValueError(f"warning_buffer must be >= 0; got {warning_buffer}")
+    return max(1, request_limit - warning_buffer)
+
+
+def _request_limit_from_runtime_metadata(metadata: dict[str, Any] | None) -> int | None:
+    """Read `request_limit` from `RunContext.metadata` if present and valid."""
+
+    if not metadata:
+        return None
+    value = metadata.get("request_limit")
+    return value if isinstance(value, int) else None
+
+
+def _near_request_limit_system_msg(*, run_step: int, request_limit: int) -> str:
+    """Return a near-limit warning message for `BashEvent.system_msg`."""
+
+    remaining = max(request_limit - run_step, 0)
+    return (
+        f"You are at run step {run_step}/{request_limit}. "
+        f"Remaining model requests before limit: {remaining}. "
+        "IMMEDIATELY STOP ALL CURRENT WORK RIGHT NOW. Do not run any additional "
+        "commands or continue ongoing tasks. If a response is required, send it "
+        "now via the channel skill(s), then call `finish_action` immediately."
+    )
 
 
 def _cl100k_base_token_len(text: str) -> int:
@@ -81,10 +118,13 @@ class ShellToolDeps(Protocol):
 def bash_countdown_tool[**P, R](
     fn: Callable[Concatenate[RunContext[ShellToolDeps], P], Awaitable[R]],
 ) -> Callable[Concatenate[RunContext[ShellToolDeps], P], Awaitable[R]]:
-    """Decorator that decrements `ctx.deps.count_down` and appends a reminder.
+    """Decorator that appends runtime reminders to `BashEvent.system_msg`.
 
-    This is applied to bash-like tools (tools that may return `BashEvent`) so the
-    agent periodically gets nudged to post a progress update.
+    This is applied to bash-like tools (tools that may return `BashEvent`).
+    It currently injects:
+    - countdown-based progress reminders (`ctx.deps.count_down`)
+    - near-request-limit wrap-up reminders based on run metadata
+      (`RunContext.metadata['request_limit']`).
     """
 
     @functools.wraps(fn)
@@ -98,10 +138,25 @@ def bash_countdown_tool[**P, R](
         if deps.count_down > 0:
             deps.count_down -= 1
 
-        if should_append and isinstance(result, BashEvent):
-            result.system_msg = _append_system_msg(
-                result.system_msg, _BASH_COUNTDOWN_SYSTEM_MSG
+        if isinstance(result, BashEvent):
+            if should_append:
+                result.system_msg = _append_system_msg(
+                    result.system_msg, _BASH_COUNTDOWN_SYSTEM_MSG
+                )
+            request_limit = _request_limit_from_runtime_metadata(ctx.metadata)
+            warning_step = _near_request_limit_step(
+                request_limit=request_limit,
+                warning_buffer=_REQUEST_LIMIT_WARNING_BUFFER,
             )
+            if warning_step is not None and ctx.run_step >= warning_step:
+                assert request_limit is not None
+                result.system_msg = _append_system_msg(
+                    result.system_msg,
+                    _near_request_limit_system_msg(
+                        run_step=ctx.run_step,
+                        request_limit=request_limit,
+                    ),
+                )
 
         return result
 
