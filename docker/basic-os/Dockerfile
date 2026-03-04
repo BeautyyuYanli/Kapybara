@@ -22,6 +22,7 @@ RUN apt-get update \
         plocate \
         xz-utils \
         build-essential \
+	    libnspr4 libnss3 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libxcomposite1 libxdamage1 libgtk-3-0 libcups2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv ast-grep-cli
