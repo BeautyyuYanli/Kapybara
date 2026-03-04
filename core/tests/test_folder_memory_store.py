@@ -377,6 +377,54 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
     assert store.get_latests() == [r2.id_, r1.id_]
 
 
+def test_folder_store_auto_refreshes_on_external_record_drift(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "mem"
+    store = FolderMemoryStore(root)
+
+    r1 = MemoryRecord(
+        in_channel="test",
+        input="i1",
+        compacted=["c1"],
+        output="o1",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    store.append(r1)
+
+    # Force drift probe on every call for deterministic testing.
+    monkeypatch.setattr(store, "_AUTO_REFRESH_PROBE_INTERVAL_NS", 0)
+
+    r2 = MemoryRecord(
+        in_channel="test",
+        input="i2",
+        compacted=["c2"],
+        output="o2",
+        detailed=[],
+        created_at=datetime(2026, 1, 2, 0, 0, 0),
+    )
+    r2_core = root / "records" / "2026" / "01" / "02" / "00" / f"{r2.id_}.core.json"
+    r2_detailed = (
+        root / "records" / "2026" / "01" / "02" / "00" / f"{r2.id_}.detailed.jsonl"
+    )
+    r2_core.parent.mkdir(parents=True, exist_ok=True)
+    r2_core.write_text(r2.dump_compated(), encoding="utf-8")
+    r2_detailed.write_text(
+        "\n".join(
+            (
+                json.dumps(r2.input, ensure_ascii=False),
+                json.dumps(r2.output, ensure_ascii=False),
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    # Store should detect out-of-band record-file drift and rebuild sidecar index.
+    assert store.get_latests() == [r2.id_, r1.id_]
+
+
 def test_folder_store_order_is_lexicographic_by_id(tmp_path) -> None:
     root = tmp_path / "mem"
     store = FolderMemoryStore(root)

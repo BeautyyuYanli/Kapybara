@@ -2,6 +2,10 @@
 
 This store persists one record per file under a root folder.
 
+Collaborators:
+- `k.agent.memory.folder_store.sidecar`: sidecar-index lifecycle, cache
+  invalidation, and auto-refresh drift probing.
+
 Layout (relative to `root`):
 - `records/YYYY/MM/DD/HH/<id>.core.json`: one JSON blob per record (one line),
   storing record metadata (`in_channel`, `out_channel`, `contacts`, links) and
@@ -13,6 +17,11 @@ Layout (relative to `root`):
   extracted from that response. Each element is an object with only `tool_name`
   and `args`. `ModelRequest` messages and full `ModelResponse` objects are not
   persisted in this detailed file.
+- `index/by-id/<prefix>/<id>.json`: per-record filesystem metadata index used
+  for scalable lookups (id/path mapping + routing/link metadata).
+- `index/order.ids`: lexicographically sorted record ids (one id per line).
+- `index/records.epoch`: writer-touched stamp used for cheap cache
+  invalidation across multiple `FolderMemoryStore` instances.
 
 Design notes / invariants:
 - Store order is the lexicographic order of `MemoryRecord.id_`.
@@ -30,8 +39,11 @@ Design notes / invariants:
 - `append()` updates each existing referenced parent's `children` list
   (persisting parent records) before persisting the new record. Missing parent
   ids are dropped from the appended record.
-- Cache invalidation is keyed off stat snapshots of record-related files under
-  `records/`.
+- Process-local hot-record caches are intentionally small and invalidated by
+  `index/records.epoch` checks rather than recursive file stat snapshots.
+- A full on-disk rebuild pass is still used to bootstrap/repair the filesystem
+  index (including missing-link self-healing) so correctness remains tied to
+  the authoritative record files.
 - Datetime ordering/range checks compare normalized POSIX-millisecond keys so
   legacy timezone-aware records and newer timezone-naive records can coexist.
 """
@@ -43,7 +55,6 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Set
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -51,18 +62,13 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai.messages import BaseToolCallPart, ModelResponse
 
 from k.agent.memory.entities import MemoryRecord, datetime_to_posix_millis
+from k.agent.memory.folder_store import FolderSidecarIndexMixin
 from k.agent.memory.store import (
     MemoryRecordId,
     MemoryRecordRef,
     MemoryStore,
     coerce_record_id,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _CacheKey:
-    file_stats: tuple[tuple[str, int, int], ...]
-
 
 type LineMatch = tuple[int, str]
 type FileMatches = list[tuple[Path, list[LineMatch]]]
@@ -360,45 +366,45 @@ def _in_channel_matches_prefix(record_channel: str, in_channel_prefix: str) -> b
     )
 
 
-class FolderMemoryStore(MemoryStore):
+class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
     """Query and append `MemoryRecord` objects stored in a folder.
 
-    Record order is defined as lexicographic sort by `record.id_`.
+    Record order is defined as lexicographic sort by `record.id_` and persisted
+    under `index/order.ids` (filesystem text index).
 
     Fast retrieval helpers:
     - `get_latests()` returns ids in newest-first store order, optionally
       filtered by `in_channel` prefix and exact `contact` membership, with an
       optional `num` cap.
-    - `filter_by_in_channel()` and `search_by_keywords()` mirror Telegram
-      stage_a's no-index lookup strategy and shell out to `rg`.
+    - `filter_by_in_channel()` remains stage_a-like (`rg` + core validation)
+      to keep retrieval tolerant for partially populated core files.
+    - `search_by_keywords()` mirrors Telegram stage_a and shells out to `rg`.
 
     Load behavior is self-healing for missing records:
     - Parent/child ids pointing to missing records are removed.
     - When both sides are inferable, existing records on each side are bridged
       directly (`missing.parents -> missing.children`).
+
+    Runtime cache policy:
+    - Only a small LRU cache of hot records/metadata is kept in memory.
+    - The canonical source of truth remains on-disk `records/**/*.core.json` +
+      `records/**/*.detailed.jsonl`.
+    - `refresh()` is explicit, and the sidecar layer also performs a throttled
+      drift probe to auto-refresh when out-of-band record-file changes are
+      detected.
     """
 
     root: Path
     encoding: str
 
-    _cache_key: _CacheKey | None
-    _records: list[MemoryRecord]
-    _by_id: dict[str, MemoryRecord]
-    _record_paths: dict[str, Path]
+    _RECORD_CACHE_LIMIT = 256
+    _META_CACHE_LIMIT = 4096
+    _AUTO_REFRESH_PROBE_INTERVAL_NS = 5_000_000_000
 
     def __init__(self, root: str | Path, *, encoding: str = "utf-8") -> None:
         self.root = Path(root)
         self.encoding = encoding
-        self._cache_key = None
-        self._records = []
-        self._by_id = {}
-        self._record_paths = {}
-
-    def refresh(self) -> None:
-        """Force a reload from disk (even if cache stat snapshots did not change)."""
-
-        self._cache_key = None
-        self._load_if_needed()
+        self._init_sidecar_state()
 
     def get_latests(
         self,
@@ -423,15 +429,35 @@ class FolderMemoryStore(MemoryStore):
             return []
 
         self._load_if_needed()
+        if not self.root.exists():
+            return []
+
         latests: list[str] = []
-        for record in reversed(self._records):
+        for record_id in self._iter_order_ids_desc():
+            meta = self._read_meta(record_id)
+            if meta is None:
+                continue
+            record_channel = meta["in_channel"]
+            if not isinstance(record_channel, str):
+                raise ValueError(
+                    f"Invalid in_channel in metadata for record id {record_id}"
+                )
             if in_channel is not None and not _in_channel_matches_prefix(
-                record.in_channel, in_channel
+                record_channel, in_channel
             ):
                 continue
-            if contact is not None and contact not in record.contacts:
+
+            contacts = meta["contacts"]
+            if not isinstance(contacts, list) or any(
+                not isinstance(v, str) for v in contacts
+            ):
+                raise ValueError(
+                    f"Invalid contacts in metadata for record id {record_id}"
+                )
+            if contact is not None and contact not in contacts:
                 continue
-            latests.append(record.id_)
+
+            latests.append(record_id)
             if num is not None and len(latests) >= num:
                 break
 
@@ -439,26 +465,41 @@ class FolderMemoryStore(MemoryStore):
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
         self._load_if_needed()
+        if not self.root.exists():
+            coerce_record_id(id_)
+            return None
+
         record_id = coerce_record_id(id_)
-        return self._by_id.get(record_id)
+        return self._get_by_id(record_id, allow_rebuild=True)
 
     def get_by_ids(
         self, ids: Set[MemoryRecordId], *, strict: bool = False
     ) -> list[MemoryRecord]:
         self._load_if_needed()
+        if not self.root.exists():
+            record_ids = {coerce_record_id(id_) for id_ in ids}
+            if strict and record_ids:
+                missing_str = ", ".join(str(i) for i in sorted(record_ids))
+                raise KeyError(f"Missing record(s): {missing_str}")
+            return []
 
         record_ids = {coerce_record_id(id_) for id_ in ids}
-        missing = [id_ for id_ in record_ids if id_ not in self._by_id]
+        missing = [id_ for id_ in record_ids if self._read_meta(id_) is None]
         if strict and missing:
             missing_str = ", ".join(str(i) for i in sorted(missing))
             raise KeyError(f"Missing record(s): {missing_str}")
 
-        records = [self._by_id[id_] for id_ in record_ids if id_ in self._by_id]
-        order = {record.id_: idx for idx, record in enumerate(self._records)}
+        records: list[MemoryRecord] = []
+        for record_id in record_ids:
+            rec = self._get_by_id(record_id, allow_rebuild=True)
+            if rec is None:
+                continue
+            records.append(rec)
+
         records.sort(
             key=lambda r: (
                 datetime_to_posix_millis(r.created_at),
-                order.get(r.id_, 1_000_000_000),
+                r.id_,
             )
         )
         return records
@@ -469,7 +510,7 @@ class FolderMemoryStore(MemoryStore):
         self._load_if_needed()
         rec = self._coerce_record(record)
         if strict:
-            missing = [id_ for id_ in rec.parents if id_ not in self._by_id]
+            missing = [id_ for id_ in rec.parents if self._read_meta(id_) is None]
             if missing:
                 missing_str = ", ".join(str(i) for i in missing)
                 raise KeyError(f"Missing parent record(s): {missing_str}")
@@ -481,7 +522,7 @@ class FolderMemoryStore(MemoryStore):
         self._load_if_needed()
         rec = self._coerce_record(record)
         if strict:
-            missing = [id_ for id_ in rec.children if id_ not in self._by_id]
+            missing = [id_ for id_ in rec.children if self._read_meta(id_) is None]
             if missing:
                 missing_str = ", ".join(str(i) for i in missing)
                 raise KeyError(f"Missing child record(s): {missing_str}")
@@ -509,10 +550,9 @@ class FolderMemoryStore(MemoryStore):
         if level == 0:
             return [current.id_]
 
-        def _checked_parents(rec: MemoryRecord) -> list[str]:
-            parent_ids = list(rec.parents)
+        def _checked_parents(parent_ids: list[str]) -> list[str]:
             if strict:
-                missing = [id_ for id_ in parent_ids if id_ not in self._by_id]
+                missing = [id_ for id_ in parent_ids if self._read_meta(id_) is None]
                 if missing:
                     missing_str = ", ".join(str(i) for i in missing)
                     raise KeyError(f"Missing parent record(s): {missing_str}")
@@ -521,10 +561,10 @@ class FolderMemoryStore(MemoryStore):
         ancestors: list[str] = []
         seen: set[str] = set()
 
-        # Walk links directly from the in-memory index. Avoid calling
+        # Walk links from the filesystem metadata index. Avoid calling
         # `get_parents()` repeatedly inside traversal because that method
         # re-checks cache freshness on every call.
-        frontier = _checked_parents(current)
+        frontier = _checked_parents(list(current.parents))
         depth = 0
         while frontier and (level is None or depth < level):
             depth += 1
@@ -535,12 +575,17 @@ class FolderMemoryStore(MemoryStore):
                 seen.add(parent_id)
                 ancestors.append(parent_id)
 
-                parent_record = self._by_id.get(parent_id)
-                if parent_record is None:
+                parent_meta = self._read_meta(parent_id)
+                if parent_meta is None:
                     if strict:
                         raise KeyError(f"Unknown parent MemoryRecord id: {parent_id}")
                     continue
-                next_frontier.extend(_checked_parents(parent_record))
+                parent_parents = self._validate_list_of_strings(
+                    record_id=parent_id,
+                    field_name="parents",
+                    value=parent_meta["parents"],
+                )
+                next_frontier.extend(_checked_parents(parent_parents))
             frontier = next_frontier
 
         return ancestors
@@ -559,22 +604,30 @@ class FolderMemoryStore(MemoryStore):
             raise ValueError(f"start must be <= end; got start={start!r}, end={end!r}")
 
         self._load_if_needed()
+        if not self.root.exists():
+            return []
 
-        indexed: list[tuple[int, str, int]] = []
-        for idx, record in enumerate(self._records):
-            if _in_datetime_range(
-                record.created_at,
-                start,
-                end,
+        indexed: list[tuple[int, str]] = []
+        for record_id in self._iter_order_ids():
+            meta = self._read_meta(record_id)
+            if meta is None:
+                continue
+            created_at_ms = meta["created_at_ms"]
+            if not isinstance(created_at_ms, int):
+                raise ValueError(
+                    f"Invalid created_at_ms in metadata for record id {record_id}"
+                )
+            if _in_datetime_range_ms(
+                created_at_ms,
+                start_key,
+                end_key,
                 include_start=include_start,
                 include_end=include_end,
             ):
-                indexed.append(
-                    (idx, record.id_, datetime_to_posix_millis(record.created_at))
-                )
+                indexed.append((created_at_ms, record_id))
 
-        indexed.sort(key=lambda t: (t[2], t[0]))
-        return [record_id for _, record_id, _ in indexed]
+        indexed.sort(key=lambda t: (t[0], t[1]))
+        return [record_id for _, record_id in indexed]
 
     def filter_by_in_channel(
         self,
@@ -600,6 +653,19 @@ class FolderMemoryStore(MemoryStore):
         if not records_dir.exists():
             return []
 
+        # Keep this stage_a-like and tolerant: only parse `in_channel` from
+        # candidate core files and avoid full-store bootstrap validation.
+        return self._filter_by_in_channel_via_rg(
+            in_channel_prefix=in_channel_prefix,
+            records_dir=records_dir,
+        )
+
+    def _filter_by_in_channel_via_rg(
+        self,
+        *,
+        in_channel_prefix: str,
+        records_dir: Path,
+    ) -> list[Path]:
         root_segment = in_channel_prefix.split("/", 1)[0]
         root_pattern = re.escape(root_segment)
         grep_pattern = rf'"in_channel"\s*:\s*"{root_pattern}(?:/|")'
@@ -702,19 +768,25 @@ class FolderMemoryStore(MemoryStore):
         return selected
 
     def append(self, record: MemoryRecord) -> None:
+        if not self.root.exists():
+            self.root.mkdir(parents=True, exist_ok=True)
         self._load_if_needed()
 
-        if record.id_ in self._by_id:
+        if self._read_meta(record.id_) is not None:
             raise ValueError(
                 f"Duplicate MemoryRecord id encountered while appending: {record.id_}"
             )
 
-        existing_ids = set(self._by_id)
+        existing_ids = {
+            parent_id
+            for parent_id in record.parents
+            if self._read_meta(parent_id) is not None
+        }
         record.parents = _dedupe_existing_ids(record.parents, existing_ids=existing_ids)
 
         updated_parents: list[MemoryRecord] = []
         for parent_id in record.parents:
-            parent = self._by_id.get(parent_id)
+            parent = self._get_by_id(parent_id, allow_rebuild=True)
             if parent is None:
                 continue
             if record.id_ not in parent.children:
@@ -722,13 +794,16 @@ class FolderMemoryStore(MemoryStore):
                 updated_parents.append(parent)
 
         for parent in updated_parents:
-            self._persist_record(parent)
+            parent_path = self._record_paths.get(parent.id_)
+            persisted_parent_path = self._persist_record(parent, path_hint=parent_path)
+            self._upsert_meta(parent, core_path=persisted_parent_path)
+            self._cache_record(parent)
 
-        self._persist_record(record)
-
-        self._records.append(record)
-        self._records.sort(key=lambda r: r.id_)
-        self._by_id[record.id_] = record
+        persisted_path = self._persist_record(record, path_hint=None)
+        self._upsert_meta(record, core_path=persisted_path)
+        self._cache_record(record)
+        self._insert_id_into_order(record.id_)
+        self._touch_epoch()
         self._cache_key = self._stat_key()
 
     def _detailed_path_for_record_path(self, record_path: Path) -> Path:
@@ -749,74 +824,26 @@ class FolderMemoryStore(MemoryStore):
             raise ValueError(f"Unexpected record filename: {record_path}")
         return record_path.with_name(f"{record_id}.detailed.jsonl")
 
-    def _load_if_needed(self) -> None:
-        if not self.root.exists():
-            self._cache_key = None
-            self._records = []
-            self._by_id = {}
-            self._record_paths = {}
-            return
+    def _load_record_from_record_path(self, record_path: Path) -> MemoryRecord:
+        try:
+            raw = record_path.read_text(encoding=self.encoding)
+        except OSError as e:
+            raise ValueError(
+                f"Failed to read MemoryRecord at {record_path}: {e}"
+            ) from e
 
-        key = self._stat_key()
-        if self._cache_key is not None and key == self._cache_key:
-            return
-
-        records: list[MemoryRecord] = []
-        by_id: dict[str, MemoryRecord] = {}
-        record_paths: dict[str, Path] = {}
-        for record_path in self._list_loadable_record_paths():
-            try:
-                raw = record_path.read_text(encoding=self.encoding)
-            except OSError as e:
-                raise ValueError(
-                    f"Failed to read MemoryRecord at {record_path}: {e}"
-                ) from e
-            try:
-                record = _load_memory_record_from_disk(
-                    record_path,
-                    raw,
-                    encoding=self.encoding,
-                    detailed_path=self._detailed_path_for_record_path(record_path),
-                )
-            except ValidationError as e:
-                raise ValueError(
-                    f"Invalid MemoryRecord JSON at {record_path}: {e}"
-                ) from e
-            except ValueError as e:
-                raise ValueError(f"{e}") from e
-
-            expected_id = self._expected_id_for_record_path(record_path)
-            if record.id_ != expected_id:
-                raise ValueError(
-                    f"Record id mismatch at {record_path}: expected {expected_id}, got {record.id_}"
-                )
-            if record.id_ in by_id:
-                existing_path = record_paths[record.id_]
-                raise ValueError(
-                    f"Duplicate MemoryRecord id on disk: {record.id_} ({existing_path}, {record_path})"
-                )
-
-            records.append(record)
-            by_id[record.id_] = record
-            record_paths[record.id_] = record_path
-
-        records.sort(key=lambda record: record.id_)
-        repaired_record_ids = self._repair_missing_links(
-            records=records,
-            by_id=by_id,
-            missing_record_ids=set(),
+        record = _load_memory_record_from_disk(
+            record_path,
+            raw,
+            encoding=self.encoding,
+            detailed_path=self._detailed_path_for_record_path(record_path),
         )
-
-        if repaired_record_ids:
-            self._record_paths = dict(record_paths)
-            for record_id in sorted(repaired_record_ids):
-                record_paths[record_id] = self._persist_record(by_id[record_id])
-            key = self._stat_key()
-
-        self._records = records
-        self._by_id = by_id
-        self._record_paths = record_paths
-        self._cache_key = key
+        expected_id = self._expected_id_for_record_path(record_path)
+        if record.id_ != expected_id:
+            raise ValueError(
+                f"Record id mismatch at {record_path}: expected {expected_id}, got {record.id_}"
+            )
+        return record
 
     def _list_loadable_record_paths(self) -> list[Path]:
         records_dir = self._records_dir()
@@ -852,32 +879,6 @@ class FolderMemoryStore(MemoryStore):
         except ValueError as e:
             raise ValueError(f"Invalid record filename at {path}: {raw_id!r}") from e
 
-    def _stat_key(self) -> _CacheKey | None:
-        if not self.root.exists():
-            return None
-
-        records_dir = self._records_dir()
-        if not records_dir.exists():
-            return _CacheKey(file_stats=tuple())
-
-        stats: list[tuple[str, int, int]] = []
-        for path in records_dir.rglob("*"):
-            if not path.is_file() or not _is_record_related_file(path):
-                continue
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-            stats.append(
-                (
-                    str(path.relative_to(self.root)),
-                    stat.st_mtime_ns,
-                    stat.st_size,
-                )
-            )
-        stats.sort(key=lambda item: item[0])
-        return _CacheKey(file_stats=tuple(stats))
-
     def _records_dir(self) -> Path:
         return self.root / "records"
 
@@ -911,8 +912,10 @@ class FolderMemoryStore(MemoryStore):
             tf.write(text)
         tmp_path.replace(path)
 
-    def _persist_record(self, record: MemoryRecord) -> Path:
-        path = self._record_paths.get(record.id_)
+    def _persist_record(self, record: MemoryRecord, *, path_hint: Path | None) -> Path:
+        path = (
+            path_hint if path_hint is not None else self._record_paths.get(record.id_)
+        )
         if path is None or not path.name.endswith(".core.json"):
             path = self._record_path_for(record)
 
@@ -1009,7 +1012,7 @@ class FolderMemoryStore(MemoryStore):
         if isinstance(record, MemoryRecord):
             return record
         record_id = coerce_record_id(record)
-        rec = self._by_id.get(record_id)
+        rec = self._get_by_id(record_id, allow_rebuild=True)
         if rec is None:
             raise KeyError(f"Unknown MemoryRecord id: {record_id}")
         return rec
@@ -1034,4 +1037,23 @@ def _in_datetime_range(
         right_ok = value_key <= end_key
     else:
         right_ok = value_key < end_key
+    return left_ok and right_ok
+
+
+def _in_datetime_range_ms(
+    value_ms: int,
+    start_ms: int,
+    end_ms: int,
+    *,
+    include_start: bool,
+    include_end: bool,
+) -> bool:
+    if include_start:
+        left_ok = value_ms >= start_ms
+    else:
+        left_ok = value_ms > start_ms
+    if include_end:
+        right_ok = value_ms <= end_ms
+    else:
+        right_ok = value_ms < end_ms
     return left_ok and right_ok
