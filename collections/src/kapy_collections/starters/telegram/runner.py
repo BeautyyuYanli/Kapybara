@@ -276,7 +276,7 @@ async def run_agent_for_chat_batch(
         return
 
     # `FolderMemoryStore.append()` mutates on-disk files; serialize appends
-    # across concurrent chat runs to avoid corrupting `order.jsonl`.
+    # across concurrent chat runs to avoid racing `index/order.ids` updates.
     async with append_lock:
         await to_thread.run_sync(memory_store.append, mem)
     if mem.output.strip():
