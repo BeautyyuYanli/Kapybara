@@ -1,56 +1,108 @@
+import httpx
 import pytest
-from kapy_collections.starters.telegram import TelegramBotApi
+from kapy_collections.starters.telegram import TelegramBotApi, TelegramBotApiError
+from kapy_collections.starters.telegram import api as telegram_api_module
 
 
 @pytest.mark.anyio
-async def test_telegram_bot_api_async_wrappers_call_sync_impl(monkeypatch) -> None:
+async def test_telegram_bot_api_async_methods_call_request_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     api = TelegramBotApi(token="test-token")
+    calls: list[
+        tuple[str, str, dict[str, object] | None, dict[str, object] | None, float]
+    ] = []
 
-    got_me_called = False
-    got_updates: tuple[int | None, int] | None = None
-    got_send_message: tuple[int, str, int | None, int | None, str] | None = None
-
-    def fake_get_me_sync(self):
-        nonlocal got_me_called
-        got_me_called = True
-        return {"id": 123, "username": "MyBot"}
-
-    def fake_get_updates_sync(self, *, offset: int | None, timeout_seconds: int):
-        nonlocal got_updates
-        got_updates = (offset, timeout_seconds)
-        return [{"update_id": 1, "message": {"text": "hi"}}]
-
-    def fake_send_message_sync(
-        self,
+    async def fake_request_json(
+        self: TelegramBotApi,
         *,
-        chat_id: int,
-        text: str,
-        reply_to_message_id: int | None = None,
-        message_thread_id: int | None = None,
-        parse_mode: str = "HTML",
-    ):
-        nonlocal got_send_message
-        got_send_message = (
-            chat_id,
-            text,
-            reply_to_message_id,
-            message_thread_id,
-            parse_mode,
-        )
-        return {"message_id": 999}
+        operation: str,
+        method: str,
+        params: dict[str, object] | None = None,
+        data: dict[str, object] | None = None,
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        calls.append((operation, method, params, data, timeout_seconds))
+        if operation == "getMe":
+            return {"ok": True, "result": {"id": 123, "username": "MyBot"}}
+        if operation == "getUpdates":
+            return {"ok": True, "result": [{"update_id": 1, "message": {"text": "hi"}}]}
+        if operation == "sendMessage":
+            return {"ok": True, "result": {"message_id": 999}}
+        raise AssertionError(f"unexpected operation: {operation}")
 
-    monkeypatch.setattr(TelegramBotApi, "_get_me_sync", fake_get_me_sync)
-    monkeypatch.setattr(TelegramBotApi, "_get_updates_sync", fake_get_updates_sync)
-    monkeypatch.setattr(TelegramBotApi, "_send_message_sync", fake_send_message_sync)
+    monkeypatch.setattr(TelegramBotApi, "_request_json", fake_request_json)
 
     me = await api.get_me()
-    assert got_me_called is True
     assert me["id"] == 123
 
     updates = await api.get_updates(offset=5, timeout_seconds=12)
-    assert got_updates == (5, 12)
     assert updates[0]["update_id"] == 1
 
-    msg = await api.send_message(chat_id=42, text="hello", reply_to_message_id=7)
-    assert got_send_message == (42, "hello", 7, None, "HTML")
+    msg = await api.send_message(chat_id=42, text="hello\x00", reply_to_message_id=7)
     assert msg["message_id"] == 999
+
+    assert len(calls) == 3
+    assert calls[0] == ("getMe", "GET", None, None, 10)
+    assert calls[1] == (
+        "getUpdates",
+        "GET",
+        {"timeout": 12, "limit": 10, "offset": 5},
+        None,
+        27,
+    )
+    assert calls[2] == (
+        "sendMessage",
+        "POST",
+        None,
+        {
+            "chat_id": 42,
+            "text": "hello\ufffd",
+            "parse_mode": "HTML",
+            "reply_to_message_id": 7,
+        },
+        10,
+    )
+
+
+@pytest.mark.anyio
+async def test_request_json_wraps_remote_protocol_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = TelegramBotApi(token="test-token")
+
+    async def fake_request(self: httpx.AsyncClient, *args: object, **kwargs: object):
+        raise httpx.RemoteProtocolError("peer disconnected")
+
+    monkeypatch.setattr(telegram_api_module.httpx.AsyncClient, "request", fake_request)
+
+    with pytest.raises(
+        TelegramBotApiError, match="Telegram getUpdates failed: network error"
+    ) as exc_info:
+        await api._request_json(
+            operation="getUpdates",
+            method="GET",
+            timeout_seconds=5,
+        )
+
+    assert isinstance(exc_info.value.__cause__, httpx.RemoteProtocolError)
+
+
+@pytest.mark.anyio
+async def test_request_json_wraps_http_status_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = TelegramBotApi(token="test-token")
+
+    async def fake_request(self: httpx.AsyncClient, *args: object, **kwargs: object):
+        request = httpx.Request("GET", "https://api.telegram.org")
+        return httpx.Response(status_code=503, request=request, content=b"{}")
+
+    monkeypatch.setattr(telegram_api_module.httpx.AsyncClient, "request", fake_request)
+
+    with pytest.raises(TelegramBotApiError, match="Telegram getMe failed: HTTP 503"):
+        await api._request_json(
+            operation="getMe",
+            method="GET",
+            timeout_seconds=5,
+        )

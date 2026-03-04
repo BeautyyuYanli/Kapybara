@@ -5,7 +5,7 @@ description = "Default template for PDM package"
 authors = [
     {name = "盐粒 Yanli", email = "mail@yanli.one"},
 ]
-dependencies = ["anyio>=4.12.1", "pydantic-ai-slim>=1.62.0", "aio-pika>=9.6.1"]
+dependencies = ["anyio>=4.12.1", "pydantic-ai-slim>=1.62.0", "aio-pika>=9.6.1", "httpx>=0.28.1"]
 requires-python = ">=3.13"
 readme = "README.md"
 license = {text = "MIT"}
