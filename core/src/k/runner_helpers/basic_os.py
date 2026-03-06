@@ -3,11 +3,14 @@
 `BasicOSHelper` always exports `K_CONFIG_BASE`, defaulting it to `~/.kapybara`
 when the runtime shell does not already define it, and then sources
 `$K_CONFIG_BASE/.bashrc`.
+All payloads are executed through `bash -lc` so shell behavior stays consistent
+even when the transport shell is `sh`, `zsh`, or a remote login shell.
 When `Config.ssh_user` + `Config.ssh_addr` are configured, commands run over SSH.
-When both are `None`, commands run locally via `script -q -c ... /dev/null` to
+When both are `None`, commands run locally via `script ... bash -lc ...` to
 preserve pseudo-terminal behavior expected by shell-session tools.
 """
 
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -35,6 +38,25 @@ def _shell_bootstrap_prefix() -> str:
         "else export K_CONFIG_BASE; fi; "
         '. "$K_CONFIG_BASE/.bashrc"; '
     )
+
+
+def _bash_login_command(payload: str) -> str:
+    """Return a shell token that executes `payload` via `bash -lc`."""
+
+    return single_quote(f"bash -lc {single_quote(payload)}")
+
+
+def _local_script_command_prefix() -> str:
+    """Return the platform-specific `script` prefix for local bash PTYs.
+
+    BSD/macOS `script` accepts `script file command ...`, while util-linux
+    expects `script file -- command ...` when the command is passed as argv
+    instead of `-c`.
+    """
+
+    if sys.platform == "darwin":
+        return "script -q /dev/null bash -lc "
+    return "script -q /dev/null -- bash -lc "
 
 
 async def agent_config_base_value(
@@ -77,7 +99,7 @@ def single_quote(s: str) -> str:
 
 @dataclass(slots=True)
 class BasicOSHelper:
-    """Build shell launcher commands from runtime config."""
+    """Build transport commands that always execute payloads inside bash."""
 
     config: Config
 
@@ -85,7 +107,7 @@ class BasicOSHelper:
         """Return the transport command prefix for shell execution."""
 
         if self.config.ssh_user is None or self.config.ssh_addr is None:
-            return "script -q -c "
+            return _local_script_command_prefix()
         return (
             "ssh -o StrictHostKeyChecking=no "
             "-o UserKnownHostsFile=/dev/null "
@@ -94,31 +116,20 @@ class BasicOSHelper:
             f"{self.config.ssh_user}@{self.config.ssh_addr} "
         )
 
-    def command(self, command: str, env: dict[str, str] | None = None) -> str:
-        """Build the final command including shell bootstrap and env injection.
+    def command(self, command: str) -> str:
+        """Build the final command including shell bootstrap.
 
         Exports `K_CONFIG_BASE` first, defaulting to `~/.kapybara`, and then
-        sources `$K_CONFIG_BASE/.bashrc` so shell behavior matches the runtime
-        view visible to the agent, even if
+        sources `$K_CONFIG_BASE/.bashrc` before invoking the payload with
+        `bash -lc`, so shell behavior matches the runtime view visible to the
+        agent even if
         `Config.config_base` points elsewhere in the Python process.
         """
 
-        if env is None:
-            env = {}
-        payload = (
-            _shell_bootstrap_prefix()
-            + single_quote_escape(
-                "".join(
-                    f"{key}='{single_quote_escape(value)}'; "
-                    for key, value in env.items()
-                )
-            )
-            + single_quote_escape(command)
-        )
-        wrapped_payload = "'" + payload + "'"
+        payload = _shell_bootstrap_prefix() + command
         if self.config.ssh_user is None or self.config.ssh_addr is None:
-            return self.command_base() + wrapped_payload + " /dev/null"
-        return self.command_base() + wrapped_payload
+            return self.command_base() + single_quote(payload)
+        return self.command_base() + _bash_login_command(payload)
 
 
 async def main():

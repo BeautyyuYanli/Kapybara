@@ -21,8 +21,7 @@ class _FakeConfig:
 class _FakeBasicOSHelper:
     config: _FakeConfig = field(default_factory=_FakeConfig)
 
-    def command(self, command: str, env: dict[str, str] | None = None) -> str:
-        _ = env
+    def command(self, command: str) -> str:
         return command
 
 
