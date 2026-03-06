@@ -395,6 +395,7 @@ def test_folder_store_auto_refreshes_on_external_record_drift(
 
     # Force drift probe on every call for deterministic testing.
     monkeypatch.setattr(store, "_AUTO_REFRESH_PROBE_INTERVAL_NS", 0)
+    monkeypatch.setattr(store, "_AUTO_REFRESH_DEEP_PROBE_INTERVAL_NS", 0)
 
     r2 = MemoryRecord(
         in_channel="test",
@@ -423,6 +424,64 @@ def test_folder_store_auto_refreshes_on_external_record_drift(
 
     # Store should detect out-of-band record-file drift and rebuild sidecar index.
     assert store.get_latests() == [r2.id_, r1.id_]
+
+
+def test_folder_store_writes_index_stats_sidecar(tmp_path) -> None:
+    root = tmp_path / "mem"
+    store = FolderMemoryStore(root)
+
+    r1 = MemoryRecord(
+        in_channel="test",
+        input="i1",
+        compacted=["c1"],
+        output="o1",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    r2 = MemoryRecord(
+        in_channel="test",
+        input="i2",
+        compacted=["c2"],
+        output="o2",
+        detailed=[],
+        created_at=datetime(2026, 1, 2, 0, 0, 0),
+    )
+    store.append(r1)
+    store.append(r2)
+
+    stats_path = root / "index" / "stats.json"
+    assert stats_path.exists()
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    assert stats["record_count"] == 2
+    assert stats["latest_id"] == max(r1.id_, r2.id_)
+    assert isinstance(stats["latest_core_relpath"], str)
+    assert isinstance(stats["latest_bucket_relpath"], str)
+    assert isinstance(stats["latest_record_mtime_ns"], int)
+
+
+def test_folder_store_bootstrap_repairs_missing_stats_sidecar(tmp_path) -> None:
+    root = tmp_path / "mem"
+    writer = FolderMemoryStore(root)
+
+    record = MemoryRecord(
+        in_channel="test",
+        input="x",
+        compacted=[],
+        output="",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    writer.append(record)
+
+    stats_path = root / "index" / "stats.json"
+    assert stats_path.exists()
+    stats_path.unlink()
+
+    reader = FolderMemoryStore(root)
+    assert reader.get_latests() == [record.id_]
+    repaired_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    assert repaired_stats["record_count"] == 1
+    assert repaired_stats["latest_id"] == record.id_
 
 
 def test_folder_store_order_is_lexicographic_by_id(tmp_path) -> None:
