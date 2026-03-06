@@ -18,10 +18,11 @@ to wait for completion.
    Do not use the blocking style directly from an active run because it would
    block the current reply.
 2. Preserve the current runtime config base.
-   Read the concrete `Agent config base (...)` value from the `<System>` prompt
-   and pass it with `--config-base` so the child sees the same memories,
-   skills, and preferences tree as the current run.
-3. Pass the **Current run memory id** from the `<System>` prompt as
+   Read the concrete `Agent config base (...)` value from the `<System>`
+   section of prompt and explicitly set `K_CONFIG_BASE='<that path>'` for the
+   child `kapy` process so it sees the same memories, skills, and preferences
+   tree as the current run.
+3. Pass the **Current run memory id** from the `<System>` section of prompt as
    `--parent-memory`.
    This makes the child wait until this run's memory record exists before it
    starts.
@@ -37,7 +38,9 @@ to wait for completion.
    contact.
    If the current run has no contacts, omit `--contact` entirely.
 7. If you need more than one dependency, repeat `--parent-memory` once per id.
-8. Do not `wait` on the background PID in the current run.
+8. Use the `--flag='value'` (or `--flag="value"`) format for all arguments.
+   This is critical when values (like memory IDs) start with a hyphen (`-`).
+9. Do not `wait` on the background PID in the current run.
    Report the PID and log path instead.
 
 ## Why these rules matter
@@ -48,7 +51,7 @@ to wait for completion.
 - If the parent run never writes that reserved memory record, the child timing
   out is intentional. It prevents the follow-up from running against missing or
   incomplete parent context.
-- Reusing the same `--config-base` keeps the child on the same on-disk memory
+- Reusing the same `K_CONFIG_BASE` keeps the child on the same on-disk memory
   and skills graph, so the parent-memory wait loop can see the record it
   depends on.
 
@@ -57,13 +60,13 @@ to wait for completion.
 ```bash
 HOOK_LOG="/tmp/kapy_self_hook_$(date +%Y%m%d_%H%M%S).log"
 
-nohup kapy \
-  --config-base='<Agent config base path from the <System> prompt>' \
+nohup env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
+  kapy \
   --in-channel='self-hook/default' \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
   --contact='<current_contact_1>' \
   --contact='<current_contact_2_if_any>' \
-  --parent-memory='<Current run memory id from the <System> prompt>' \
+  --parent-memory='<Current run memory id from the <System> section of prompt>' \
   "$(cat <<'EOF'
 <follow-up prompt>
 EOF
@@ -82,13 +85,13 @@ such as a shell script or cronjob. Do not call this pattern directly from an
 active run.
 
 ```bash
-kapy \
-  --config-base='<Agent config base path from the <System> prompt>' \
+env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
+  kapy \
   --in-channel='self-hook/default' \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
   --contact='<current_contact_1>' \
   --contact='<current_contact_2_if_any>' \
-  --parent-memory='<Current run memory id from the <System> prompt>' \
+  --parent-memory='<Current run memory id from the <System> section of prompt>' \
   "$(cat <<'EOF'
 <follow-up prompt>
 EOF
@@ -103,6 +106,8 @@ The caller is responsible for handling exit status, stdout, and stderr.
   should do and what output or side effects it should produce.
 - Prefer `--flag='value'` or `--flag='<placeholder>'` for literal arguments to
   reduce shell-escaping mistakes.
+- Set `K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>'`
+  explicitly in the command instead of relying on inherited shell state.
 - Prefer an inline single-quoted here-doc (`$(cat <<'EOF' ... EOF)`) for the
   prompt body. This keeps `$VAR`, backticks, and backslashes literal inside the
   follow-up instruction.

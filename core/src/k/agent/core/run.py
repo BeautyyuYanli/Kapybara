@@ -12,7 +12,6 @@ import asyncio
 import logging
 import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
@@ -88,6 +87,13 @@ def claim_read_and_empty(path: str) -> str:
 
 
 def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse installed `kapy` CLI arguments.
+
+    `config_base` is no longer configurable on the command line; the process
+    always uses `Config()` so the default/env-backed config root stays
+    consistent with the rest of the runtime.
+    """
+
     parser = argparse.ArgumentParser(
         prog="kapy",
         description="Direct-input CLI wrapper around k.agent.core.agent_run.",
@@ -96,11 +102,6 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         "prompt",
         nargs="?",
         help="Optional one-shot prompt. When omitted, start an interactive REPL.",
-    )
-    parser.add_argument(
-        "--config-base",
-        default=None,
-        help="Override Config.config_base for this process.",
     )
     parser.add_argument(
         "--in-channel",
@@ -313,10 +314,7 @@ async def main(argv: list[str] | None = None) -> None:
 
     _configure_cli_logfire()
     args = _parse_cli_args(argv)
-    if args.config_base is not None:
-        config = Config(config_base=Path(args.config_base))
-    else:
-        config = Config()
+    config = Config()
     memory_store = FolderMemoryStore(
         root=memory_root_from_config_base(config.config_base),
     )

@@ -286,8 +286,9 @@ async def test_main_omits_contacts_by_default(
         parents_timeout_seconds: float = 300.0,
         model: Any = None,
     ) -> str:
-        _ = config, memory_store, prompt, out_channel, parent_memories
+        _ = memory_store, prompt, out_channel, parent_memories
         _ = parents_timeout_seconds, model
+        captured["config_base"] = config.config_base
         captured["in_channel"] = in_channel
         captured["contacts"] = contacts
         return '{"compacted":["ok"]}'
@@ -296,10 +297,9 @@ async def test_main_omits_contacts_by_default(
     monkeypatch.setattr(run_module, "_agent_run_model_from_config", lambda config: "m")
 
     config_base = tmp_path / ".kapybara"
+    monkeypatch.setenv("HOME", str(tmp_path))
     await run_module.main(
         [
-            "--config-base",
-            str(config_base),
             "--in-channel",
             "self-hook/test",
             "hello from cli",
@@ -307,6 +307,7 @@ async def test_main_omits_contacts_by_default(
     )
 
     assert captured == {
+        "config_base": config_base.resolve(),
         "in_channel": "self-hook/test",
         "contacts": [],
     }
