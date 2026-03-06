@@ -48,6 +48,46 @@ def test_load_kapybara_toml_config_reads_agent_run_model_name(tmp_path: Path) ->
     assert loaded.agent_run.model_name == "gpt-5.2"
 
 
+def test_load_kapybara_toml_config_reads_optional_openai_settings(
+    tmp_path: Path,
+) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[agent_run]\n"
+        'model_name = "gpt-5.2"\n'
+        'openai_api_key = "test-key"\n'
+        'openai_base_url = "https://gateway.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_kapybara_toml_config(config_base)
+
+    assert loaded.agent_run.openai_api_key == "test-key"
+    assert loaded.agent_run.openai_base_url == "https://gateway.example/v1"
+
+
+def test_load_kapybara_toml_config_treats_blank_optional_openai_settings_as_none(
+    tmp_path: Path,
+) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[agent_run]\n"
+        'model_name = "gpt-5.2"\n'
+        'openai_api_key = "   "\n'
+        'openai_base_url = "   "\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_kapybara_toml_config(config_base)
+
+    assert loaded.agent_run.openai_api_key is None
+    assert loaded.agent_run.openai_base_url is None
+
+
 def test_load_kapybara_toml_config_rejects_blank_model_name(tmp_path: Path) -> None:
     config_base = tmp_path / ".kapybara"
     path = config_toml_path(config_base)

@@ -29,10 +29,20 @@ class _CapturedLogger:
         self.exception_messages.append(msg % args if args else msg)
 
 
-def _write_cli_config(config_base: Path) -> None:
+def _write_cli_config(
+    config_base: Path,
+    *,
+    openai_api_key: str | None = None,
+    openai_base_url: str | None = None,
+) -> None:
     path = config_toml_path(config_base)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('[agent_run]\nmodel_name = "gpt-5.2"\n', encoding="utf-8")
+    lines = ["[agent_run]", 'model_name = "gpt-5.2"']
+    if openai_api_key is not None:
+        lines.append(f'openai_api_key = "{openai_api_key}"')
+    if openai_base_url is not None:
+        lines.append(f'openai_base_url = "{openai_base_url}"')
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_configure_cli_logfire_uses_token_optional_mode(
@@ -82,6 +92,24 @@ def test_child_cli_argv_omits_async_flag() -> None:
         "self-hook/test",
         "hello from cli",
     ]
+
+
+def test_agent_run_model_from_config_uses_optional_openai_overrides(
+    tmp_path: Path,
+) -> None:
+    config_base = tmp_path / ".kapybara"
+    _write_cli_config(
+        config_base,
+        openai_api_key="toml-key",
+        openai_base_url="https://gateway.example/v1",
+    )
+
+    model = run_module._agent_run_model_from_config(Config(config_base=config_base))
+
+    assert isinstance(model, OpenAIChatModel)
+    assert model.model_name == "gpt-5.2"
+    assert str(model.client.base_url) == "https://gateway.example/v1/"
+    assert model.client.api_key == "toml-key"
 
 
 @pytest.mark.anyio

@@ -173,13 +173,22 @@ def _agent_run_model_from_config(config: Config) -> Model:
     """Build the `agent_run` model from `<config_base>/config.toml`.
 
     `kapy` uses `OpenAIChatModel`, so `model_name` must be an OpenAI model id
-    such as `gpt-5.2`.
+    such as `gpt-5.2`. Optional TOML `openai_api_key` and `openai_base_url`
+    values override the default OpenAI provider resolution for CLI runs; when
+    omitted, the provider still falls back to environment/default behavior.
     """
 
     from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
 
     file_config = load_kapybara_toml_config(config.config_base)
-    return OpenAIChatModel(file_config.agent_run.model_name)
+    return OpenAIChatModel(
+        file_config.agent_run.model_name,
+        provider=OpenAIProvider(
+            api_key=file_config.agent_run.openai_api_key,
+            base_url=file_config.agent_run.openai_base_url,
+        ),
+    )
 
 
 def _normalize_parent_memory_ids(parent_memories: list[str] | None) -> list[str]:
