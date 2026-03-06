@@ -8,10 +8,13 @@ This module owns:
 Preference injection:
     Channel preferences are injected from
     `<config_base>/preferences` (`Config.config_base`) using root-to-leaf
-    `Event.in_channel` prefixes, following `docs/concept/channel.md`.
+    `Event.in_channel` prefixes plus the effective output-channel prefixes
+    (`Event.out_channel` or fallback to `Event.in_channel`), following
+    `docs/concept/channel.md`.
     A root-level preference is injected first (`PREFERENCES.md` when present;
-    otherwise `PREFERENCES.default.md`). Then for each channel prefix inject
-    `<prefix>.md` and `<prefix>/PREFERENCES.md`.
+    otherwise `PREFERENCES.default.md`). Then for each routed channel prefix
+    inject `<prefix>.md` and `<prefix>/PREFERENCES.md`, deduping repeated
+    paths.
     When `Event.contacts` includes `<platform>/<user_id>` ids, also inject
     `contacts/<platform>/<user_id>.md` for each id.
     The loaded preference content is injected as a system prompt before skills
@@ -58,7 +61,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.usage import UsageLimits
 
-from k.agent.channels import iter_channel_prefixes
+from k.agent.channels import effective_out_channel, iter_channel_prefixes
 from k.agent.contacts import contact_preference_path, resolve_contact_unique_ids
 from k.agent.core.entities import Event, tool_exception_guard
 from k.agent.core.media_tools import read_media
@@ -269,25 +272,52 @@ def _root_preference_candidates(pref_root: Path) -> list[Path]:
     return [default]
 
 
-def _channel_preference_candidates(in_channel: str, *, pref_root: Path) -> list[Path]:
+def _channel_preference_candidates(
+    in_channel: str,
+    *,
+    out_channel: str | None = None,
+    pref_root: Path,
+) -> list[Path]:
     """Build preference candidate paths in deterministic load order.
 
     Order:
     1. Root-level preference (`PREFERENCES.md` or fallback `PREFERENCES.default.md`)
-    2. Channel prefixes from root to leaf:
+    2. `in_channel` prefixes from root to leaf:
+       - `<prefix>.md`
+       - `<prefix>/PREFERENCES.md`
+    3. Effective `out_channel` prefixes from root to leaf (deduped against the
+       previously added paths):
        - `<prefix>.md`
        - `<prefix>/PREFERENCES.md`
 
     Args:
-        in_channel: Input channel used for root-to-leaf prefix expansion.
+        in_channel: Input channel used for source-route prefix expansion.
+        out_channel: Optional output channel used for destination-route prefix
+            expansion. `None` means "same as `in_channel`".
         pref_root: Preference root directory, typically
             `<config_base>/preferences`.
     """
 
     out: list[Path] = _root_preference_candidates(pref_root)
-    for prefix in iter_channel_prefixes(in_channel):
-        out.append(pref_root / f"{prefix}.md")
-        out.append(pref_root / prefix / "PREFERENCES.md")
+    seen: set[Path] = set(out)
+    routed_channels = [in_channel]
+    resolved_out_channel = effective_out_channel(
+        in_channel=in_channel,
+        out_channel=out_channel,
+    )
+    if resolved_out_channel != in_channel:
+        routed_channels.append(resolved_out_channel)
+
+    for channel in routed_channels:
+        for prefix in iter_channel_prefixes(channel):
+            for candidate in (
+                pref_root / f"{prefix}.md",
+                pref_root / prefix / "PREFERENCES.md",
+            ):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                out.append(candidate)
     return out
 
 
@@ -311,9 +341,13 @@ def _contact_preference_candidates(
 
 
 def _load_preferences_prompt(
-    *, in_channel: str, contacts: list[str], pref_root: Path
+    *,
+    in_channel: str,
+    contacts: list[str],
+    pref_root: Path,
+    out_channel: str | None = None,
 ) -> str:
-    """Load root-level, channel-prefix, and contact-level preferences.
+    """Load root-level, routed-channel, and contact-level preferences.
 
     Preference files are resolved under `pref_root` (normally
     `<config_base>/preferences`).
@@ -325,7 +359,11 @@ def _load_preferences_prompt(
         symlinks, the path header also shows the resolved absolute target path.
     """
 
-    candidates = _channel_preference_candidates(in_channel, pref_root=pref_root)
+    candidates = _channel_preference_candidates(
+        in_channel,
+        out_channel=out_channel,
+        pref_root=pref_root,
+    )
     candidates.extend(
         _contact_preference_candidates(contacts=contacts, pref_root=pref_root)
     )
@@ -477,7 +515,7 @@ agent.system_prompt(lambda: compacted_prompt)
 
 @agent.system_prompt
 def preferences_system_prompt(ctx: RunContext[MyDeps]) -> str:
-    """Inject channel-scoped preferences ahead of skill documents.
+    """Inject routed channel-scoped preferences ahead of skill documents.
 
     Registration order matters: this function is intentionally declared before
     `concat_skills_prompt` so preference guidance appears first.
@@ -487,6 +525,7 @@ def preferences_system_prompt(ctx: RunContext[MyDeps]) -> str:
         in_channel=ctx.deps.start_event.in_channel,
         contacts=ctx.deps.start_event.contacts,
         pref_root=ctx.deps.config.config_base / "preferences",
+        out_channel=ctx.deps.start_event.out_channel,
     )
 
 
