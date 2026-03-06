@@ -14,6 +14,20 @@ from k.agent.memory.paths import memory_root_from_config_base
 from k.config import Config, config_toml_path
 
 
+class _CapturedLogger:
+    """Minimal logger double for asserting visible wait failures."""
+
+    def __init__(self) -> None:
+        self.error_messages: list[str] = []
+        self.exception_messages: list[str] = []
+
+    def error(self, msg: str, *args: object) -> None:
+        self.error_messages.append(msg % args if args else msg)
+
+    def exception(self, msg: str, *args: object) -> None:
+        self.exception_messages.append(msg % args if args else msg)
+
+
 def _write_cli_config(config_base: Path) -> None:
     path = config_toml_path(config_base)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +240,9 @@ async def test_run_once_times_out_when_parent_memories_never_appear(
     tmp_path: Path,
 ) -> None:
     called = False
+    logger = _CapturedLogger()
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(run_module, "logger", logger)
     config_base = tmp_path / ".kapybara"
     _write_cli_config(config_base)
 
@@ -270,6 +286,44 @@ async def test_run_once_times_out_when_parent_memories_never_appear(
         )
 
     assert called is False
+    assert logger.error_messages == [
+        f"Timed out waiting for parent memories: {missing_parent_id}"
+    ]
+    assert logger.exception_messages == []
+
+
+@pytest.mark.anyio
+async def test_wait_for_parent_memories_logs_store_errors_before_reraising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = _CapturedLogger()
+    monkeypatch.setattr(run_module, "logger", logger)
+
+    parent_id = MemoryRecord(
+        in_channel="dependency",
+        input="parent",
+        output="",
+    ).id_
+
+    class BrokenMemoryStore:
+        def refresh(self) -> None:
+            raise RuntimeError("disk unavailable")
+
+        def get_by_id(self, id_: str) -> MemoryRecord | None:
+            _ = id_
+            return None
+
+    with pytest.raises(RuntimeError, match="disk unavailable"):
+        await run_module._wait_for_parent_memories(
+            memory_store=BrokenMemoryStore(),
+            parent_memories=[parent_id],
+            timeout_seconds=1,
+        )
+
+    assert logger.error_messages == []
+    assert logger.exception_messages == [
+        f"Failed while waiting for parent memories: {parent_id}"
+    ]
 
 
 @pytest.mark.anyio
