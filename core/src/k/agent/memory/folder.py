@@ -20,6 +20,8 @@ Layout (relative to `root`):
 - `index/by-id/<prefix>/<id>.json`: per-record filesystem metadata index used
   for scalable lookups (id/path mapping + routing/link metadata).
 - `index/order.ids`: lexicographically sorted record ids (one id per line).
+- `index/stats.json`: small aggregate index stats (`record_count` + latest-id
+  pointer) used to keep hot paths O(1) for large memory sets.
 - `index/records.epoch`: writer-touched stamp used for cheap cache
   invalidation across multiple `FolderMemoryStore` instances.
 
@@ -400,6 +402,7 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
     _RECORD_CACHE_LIMIT = 256
     _META_CACHE_LIMIT = 4096
     _AUTO_REFRESH_PROBE_INTERVAL_NS = 5_000_000_000
+    _AUTO_REFRESH_DEEP_PROBE_INTERVAL_NS = 300_000_000_000
 
     def __init__(self, root: str | Path, *, encoding: str = "utf-8") -> None:
         self.root = Path(root)
@@ -803,6 +806,7 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         self._upsert_meta(record, core_path=persisted_path)
         self._cache_record(record)
         self._insert_id_into_order(record.id_)
+        self._update_stats_after_append(id_=record.id_, core_path=persisted_path)
         self._touch_epoch()
         self._cache_key = self._stat_key()
 
