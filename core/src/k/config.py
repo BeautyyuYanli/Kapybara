@@ -34,7 +34,7 @@ class AgentRunCliConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_name: str = "gpt-5.2"
+    model_name: str
 
     @field_validator("model_name")
     @classmethod
@@ -57,7 +57,7 @@ class KapybaraTomlConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    agent_run: AgentRunCliConfig = Field(default_factory=AgentRunCliConfig)
+    agent_run: AgentRunCliConfig
 
 
 def config_toml_path(config_base: str | Path) -> Path:
@@ -75,7 +75,7 @@ def load_kapybara_toml_config(config_base: str | Path) -> KapybaraTomlConfig:
 
     path = config_toml_path(config_base)
     if not path.exists():
-        return KapybaraTomlConfig()
+        raise ValueError(f"Expected config file at {path}, but no such file exists")
     if not path.is_file():
         raise ValueError(f"Expected config file at {path}, found non-file entry")
 
