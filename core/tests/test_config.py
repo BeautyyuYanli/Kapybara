@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from k.config import Config
+from k.config import Config, config_toml_path, load_kapybara_toml_config
 from k.runner_helpers.basic_os import BasicOSHelper, agent_config_base_value
 
 
@@ -17,6 +17,39 @@ def test_config_defaults_expand_to_home_paths(tmp_path: Path, monkeypatch) -> No
     assert config.ssh_key == (home / ".ssh" / "id_ed25519").resolve()
     assert config.ssh_user is None
     assert config.ssh_addr is None
+
+
+def test_load_kapybara_toml_config_defaults_when_file_missing(tmp_path: Path) -> None:
+    config_base = tmp_path / ".kapybara"
+
+    loaded = load_kapybara_toml_config(config_base)
+
+    assert loaded.agent_run.model_name == "gpt-5.2"
+    assert config_toml_path(config_base) == (config_base / "config.toml").resolve()
+
+
+def test_load_kapybara_toml_config_reads_agent_run_model_name(tmp_path: Path) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '[agent_run]\nmodel_name = "gpt-5.2"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_kapybara_toml_config(config_base)
+
+    assert loaded.agent_run.model_name == "gpt-5.2"
+
+
+def test_load_kapybara_toml_config_rejects_blank_model_name(tmp_path: Path) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[agent_run]\nmodel_name = "   "\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="model_name must not be empty"):
+        _ = load_kapybara_toml_config(config_base)
 
 
 def test_ssh_key_relative_path_resolves_from_cwd(tmp_path: Path, monkeypatch) -> None:
