@@ -31,6 +31,9 @@ if TYPE_CHECKING:
     from pydantic_ai.models import Model
 
 
+logger = logging.getLogger(__name__)
+
+
 def _configure_cli_logfire() -> None:
     """Configure Logfire for CLI runs without requiring project credentials.
 
@@ -214,6 +217,9 @@ async def _wait_for_parent_memories(
     The default poll interval is 1 second to keep detached follow-up waiting
     cheap while still reacting promptly once the parent record lands.
 
+    Unexpected storage errors are logged with the full parent-id set before
+    being re-raised so detached CLI waits do not appear to stall silently.
+
     Raises:
         ValueError: if `timeout_seconds` is not positive.
         TimeoutError: if any parent memory ids are still missing at timeout.
@@ -225,24 +231,34 @@ async def _wait_for_parent_memories(
         return
 
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        # Parent memories may be produced by another process. `refresh()` is a
-        # compatibility hook here; the subsequent `get_by_id()` must observe the
-        # latest on-disk state even when this store keeps no derived indexes.
-        memory_store.refresh()
-        missing = [
-            parent_id
-            for parent_id in parent_memories
-            if memory_store.get_by_id(parent_id) is None
-        ]
-        if not missing:
-            return
+    parent_ids_str = ", ".join(parent_memories)
+    try:
+        while True:
+            # Parent memories may be produced by another process. `refresh()` is a
+            # compatibility hook here; the subsequent `get_by_id()` must observe the
+            # latest on-disk state even when this store keeps no derived indexes.
+            memory_store.refresh()
+            missing = [
+                parent_id
+                for parent_id in parent_memories
+                if memory_store.get_by_id(parent_id) is None
+            ]
+            if not missing:
+                return
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            missing_str = ", ".join(missing)
-            raise TimeoutError("Timed out waiting for parent memories: " + missing_str)
-        await anyio.sleep(min(poll_interval_seconds, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                missing_str = ", ".join(missing)
+                raise TimeoutError(
+                    "Timed out waiting for parent memories: " + missing_str
+                )
+            await anyio.sleep(min(poll_interval_seconds, remaining))
+    except TimeoutError:
+        logger.error("Timed out waiting for parent memories: %s", parent_ids_str)
+        raise
+    except Exception:
+        logger.exception("Failed while waiting for parent memories: %s", parent_ids_str)
+        raise
 
 
 async def run_once(
