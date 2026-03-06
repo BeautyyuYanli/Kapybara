@@ -102,10 +102,20 @@ def test_folder_store_get_latests_and_get_by_id(tmp_path) -> None:
     store.refresh()
 
     assert store.get_latests() == [r2.id_, r1.id_]
+    assert store.contains_id(r1.id_) is True
+    assert store.contains_id(r2.id_) is True
     expected_r1 = r1.model_copy(update={"children": [r2.id_]})
     assert store.get_by_id(r1.id_) == expected_r1
     assert store.get_by_id(str(r1.id_)) == expected_r1
     assert store.get_by_ids({r2.id_, r1.id_}) == [expected_r1, r2]
+    missing_id = MemoryRecord(
+        in_channel="test",
+        input="missing",
+        output="",
+    ).id_
+    assert store.contains_id(missing_id) is False
+    with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
+        store.contains_id("not-a-uuid")
     with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
         store.get_by_id("not-a-uuid")
 

@@ -7,6 +7,10 @@ Design notes / invariants:
 - A store is the source of truth for which records exist. Links stored on a
   record (`parents` / `children`) may refer to missing records; link-resolution
   methods support `strict` mode to surface this.
+- `contains_id()` is the cheap existence probe for orchestration code that only
+  needs to know whether a record is present yet. Implementations should avoid
+  full record loads when possible, while preserving the same visible existence
+  semantics as `get_by_id(id_) is not None`.
 - "Latests" are returned in descending store order (newest first) and can be
   filtered by channel subtree via `in_channel` and exact contact-id membership
   via `contact`, with optional result capping via `num`.
@@ -45,6 +49,9 @@ class MemoryStore(Protocol):
 
     def refresh(self) -> None:
         """Force a reload from disk (even if the underlying storage did not change)."""
+
+    def contains_id(self, id_: MemoryRecordId) -> bool:
+        """Return whether `id_` exists, preferring metadata-only checks when possible."""
 
     def get_latests(
         self,

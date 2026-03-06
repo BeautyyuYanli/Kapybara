@@ -309,6 +309,45 @@ async def test_run_once_times_out_when_parent_memories_never_appear(
 
 
 @pytest.mark.anyio
+async def test_wait_for_parent_memories_prefers_contains_id_when_available() -> None:
+    parent_id = MemoryRecord(
+        in_channel="dependency",
+        input="parent",
+        output="",
+    ).id_
+
+    class CheapMemoryStore:
+        def __init__(self) -> None:
+            self.contains_calls = 0
+            self.get_by_id_calls = 0
+
+        def refresh(self) -> None:
+            return None
+
+        def contains_id(self, id_: str) -> bool:
+            assert id_ == parent_id
+            self.contains_calls += 1
+            return self.contains_calls >= 2
+
+        def get_by_id(self, id_: str) -> MemoryRecord | None:
+            _ = id_
+            self.get_by_id_calls += 1
+            raise AssertionError("wait path should prefer contains_id()")
+
+    store = CheapMemoryStore()
+
+    await run_module._wait_for_parent_memories(
+        memory_store=store,
+        parent_memories=[parent_id],
+        timeout_seconds=1,
+        poll_interval_seconds=0.01,
+    )
+
+    assert store.contains_calls >= 2
+    assert store.get_by_id_calls == 0
+
+
+@pytest.mark.anyio
 async def test_wait_for_parent_memories_logs_store_errors_before_reraising(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -323,6 +362,10 @@ async def test_wait_for_parent_memories_logs_store_errors_before_reraising(
 
     class BrokenMemoryStore:
         def refresh(self) -> None:
+            raise RuntimeError("disk unavailable")
+
+        def contains_id(self, id_: str) -> bool:
+            _ = id_
             raise RuntimeError("disk unavailable")
 
         def get_by_id(self, id_: str) -> MemoryRecord | None:
