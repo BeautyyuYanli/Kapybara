@@ -3,8 +3,8 @@
 This store persists one record per file under a root folder.
 
 Collaborators:
-- `k.agent.memory.folder_store.sidecar`: sidecar-index lifecycle, cache
-  invalidation, and auto-refresh drift probing.
+- `k.agent.memory.entities`: `MemoryRecord` validation plus id/datetime helpers.
+- `k.agent.memory.store`: query/append protocol consumed by agents.
 
 Layout (relative to `root`):
 - `records/YYYY/MM/DD/HH/<id>.core.json`: one JSON blob per record (one line),
@@ -17,50 +17,47 @@ Layout (relative to `root`):
   extracted from that response. Each element is an object with only `tool_name`
   and `args`. `ModelRequest` messages and full `ModelResponse` objects are not
   persisted in this detailed file.
-- `index/by-id/<prefix>/<id>.json`: per-record filesystem metadata index used
-  for scalable lookups (id/path mapping + routing/link metadata).
-- `index/order.ids`: lexicographically sorted record ids (one id per line).
-- `index/stats.json`: small aggregate index stats (`record_count` + latest-id
-  pointer) used to keep hot paths O(1) for large memory sets.
-- `index/records.epoch`: writer-touched stamp used for cheap cache
-  invalidation across multiple `FolderMemoryStore` instances.
+- Optional legacy `<id>.compacted.json` sidecars may exist next to legacy
+  `<id>.json` records and remain readable for backward compatibility.
 
 Design notes / invariants:
+- The canonical source of truth is always `records/**/*.core.json` plus
+  `records/**/*.detailed.jsonl`. No derived `index/` tree is maintained.
 - Store order is the lexicographic order of `MemoryRecord.id_`.
-- "Latests" are record ids sorted by descending lexicographic id order and can
-  be filtered by `in_channel` subtree prefix, exact contact-id membership, and
-  optional `num` limiting.
+- Queries read the filesystem directly and only parse what they need:
+  `get_latests()` without filters can answer from filenames, metadata-only
+  queries read only `*.core.json`, and full record loads read the sibling
+  detailed file.
 - Parsing is strict: invalid JSON or invalid `MemoryRecord` data raises
   `ValueError` with path/line context.
-- Missing records referenced by parent/child links are treated as deleted
-  records: load removes dangling links to them and tries to bridge their
-  parent/child neighbors when those neighbors are inferable from existing
-  records.
-- `MemoryRecord` loading expects channel fields (`in_channel`, optional
-  `out_channel`) plus optional `contacts`.
+- Missing records referenced by parent/child links are treated as deleted.
+  Record loads repair the visible graph on the fly by dropping dangling links
+  and bridging a single missing hop when existing neighbors reveal both sides.
 - `append()` updates each existing referenced parent's `children` list
   (persisting parent records) before persisting the new record. Missing parent
   ids are dropped from the appended record.
-- Canonical record writes and sidecar rebuilds share one advisory lock under
-  the store root so cross-process append/rebuild operations never overlap.
+- Canonical record writes share one advisory lock under the store root so
+  cross-process append operations never overlap.
 - New records publish `*.core.json` last so disk scans never observe a visible
   record before its required `*.detailed.jsonl` payload exists.
-- Process-local hot-record caches are intentionally small and invalidated by
-  `index/records.epoch` checks rather than recursive file stat snapshots.
-- A full on-disk rebuild pass is still used to bootstrap/repair the filesystem
-  index (including missing-link self-healing) so correctness remains tied to
-  the authoritative record files.
+- `refresh()` is retained for `MemoryStore` compatibility but is a no-op:
+  disk-backed queries already observe external filesystem changes directly.
 - Datetime ordering/range checks compare normalized POSIX-millisecond keys so
   legacy timezone-aware records and newer timezone-naive records can coexist.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Set
+import threading
+from collections.abc import Iterator, Set
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -68,7 +65,6 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai.messages import BaseToolCallPart, ModelResponse
 
 from k.agent.memory.entities import MemoryRecord, datetime_to_posix_millis
-from k.agent.memory.folder_store import FolderSidecarIndexMixin
 from k.agent.memory.store import (
     MemoryRecordId,
     MemoryRecordRef,
@@ -93,6 +89,53 @@ class _CoreRecordOnDisk(BaseModel):
     compacted: list[str] = Field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class _RecordHeader:
+    """Metadata that can be answered from a record's core JSON alone."""
+
+    id_: str
+    created_at_ms: int
+    in_channel: str
+    contacts: tuple[str, ...]
+    parents: tuple[str, ...]
+    children: tuple[str, ...]
+    path: Path
+
+
+@dataclass(slots=True)
+class _ProcessStoreLockState:
+    """Per-process bookkeeping for a root-scoped advisory store lock."""
+
+    mutex: threading.RLock
+    fd: int | None = None
+    depth: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _LinkSnapshot:
+    """Ephemeral record graph used to repair missing on-disk links."""
+
+    headers_by_id: dict[str, _RecordHeader]
+    missing_to_parents: dict[str, list[str]]
+    missing_to_children: dict[str, list[str]]
+
+
+_PROCESS_STORE_LOCKS: dict[str, _ProcessStoreLockState] = {}
+_PROCESS_STORE_LOCKS_GUARD = threading.Lock()
+
+
+def _process_store_lock_state(lock_path: Path) -> _ProcessStoreLockState:
+    """Return shared in-process lock state for `lock_path`."""
+
+    key = str(lock_path)
+    with _PROCESS_STORE_LOCKS_GUARD:
+        state = _PROCESS_STORE_LOCKS.get(key)
+        if state is None:
+            state = _ProcessStoreLockState(mutex=threading.RLock())
+            _PROCESS_STORE_LOCKS[key] = state
+        return state
+
+
 def _compacted_sidecar_path_for_record_path(record_path: Path) -> Path:
     """Return the legacy `*.compacted.json` sidecar path for `record_path`."""
 
@@ -104,6 +147,21 @@ def _compacted_sidecar_path_for_record_path(record_path: Path) -> Path:
     else:
         raise ValueError(f"Unexpected record filename: {record_path}")
     return record_path.with_name(f"{record_id}.compacted.json")
+
+
+def _detailed_path_for_record_path(record_path: Path) -> Path:
+    """Return the sibling detailed path for a record path."""
+
+    name = record_path.name
+    if name.endswith(".core.json"):
+        record_id = name[: -len(".core.json")]
+    elif name.endswith(".json") and not name.endswith(
+        (".detailed.json", ".detailed.jsonl")
+    ):
+        record_id = name[: -len(".json")]
+    else:
+        raise ValueError(f"Unexpected record filename: {record_path}")
+    return record_path.with_name(f"{record_id}.detailed.jsonl")
 
 
 def _read_detailed_file(
@@ -246,7 +304,7 @@ def _load_memory_record_from_disk(
         try:
             record = MemoryRecord.model_validate(decoded)
         except ValidationError as e:
-            raise e
+            raise ValueError(f"Invalid MemoryRecord JSON at {record_path}: {e}") from e
 
         if "compacted" not in decoded:
             compacted_path = _compacted_sidecar_path_for_record_path(record_path)
@@ -258,10 +316,12 @@ def _load_memory_record_from_disk(
                         )
                     }
                 )
-
         return record
 
-    core = _CoreRecordOnDisk.model_validate(decoded)
+    try:
+        core = _CoreRecordOnDisk.model_validate(decoded)
+    except ValidationError as e:
+        raise ValueError(f"Invalid MemoryRecord JSON at {record_path}: {e}") from e
 
     # Backward compatibility: some stores used a `*.compacted.json` sidecar.
     if "compacted" not in decoded:
@@ -292,6 +352,57 @@ def _load_memory_record_from_disk(
     )
 
 
+def _load_record_header_from_disk(record_path: Path, *, encoding: str) -> _RecordHeader:
+    """Load metadata required for queries without touching the detailed payload."""
+
+    try:
+        raw = record_path.read_text(encoding=encoding)
+    except OSError as e:
+        raise ValueError(f"Failed to read MemoryRecord at {record_path}: {e}") from e
+
+    try:
+        decoded = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"Invalid JSON at {record_path}: {e}") from e
+
+    if not isinstance(decoded, dict):
+        raise ValueError(f"Invalid MemoryRecord JSON at {record_path}: expected object")
+
+    if "input" in decoded:
+        try:
+            record = MemoryRecord.model_validate(decoded)
+        except ValidationError as e:
+            raise ValueError(f"Invalid MemoryRecord JSON at {record_path}: {e}") from e
+        return _RecordHeader(
+            id_=record.id_,
+            created_at_ms=datetime_to_posix_millis(record.created_at),
+            in_channel=record.in_channel,
+            contacts=tuple(record.contacts),
+            parents=tuple(record.parents),
+            children=tuple(record.children),
+            path=record_path,
+        )
+
+    try:
+        core = _CoreRecordOnDisk.model_validate(decoded)
+    except ValidationError as e:
+        raise ValueError(f"Invalid MemoryRecord JSON at {record_path}: {e}") from e
+
+    detailed_path = _detailed_path_for_record_path(record_path)
+    if not detailed_path.exists():
+        raise ValueError(f"Missing detailed file for id {core.id_}: {detailed_path}")
+
+    return _RecordHeader(
+        id_=core.id_,
+        created_at_ms=datetime_to_posix_millis(core.created_at),
+        in_channel=core.in_channel,
+        contacts=tuple(core.contacts),
+        parents=tuple(core.parents),
+        children=tuple(core.children),
+        path=record_path,
+    )
+
+
 def _read_legacy_compacted_sidecar(path: Path, *, encoding: str) -> list[str]:
     try:
         raw = path.read_text(encoding=encoding)
@@ -310,13 +421,13 @@ def _read_legacy_compacted_sidecar(path: Path, *, encoding: str) -> list[str]:
     return decoded
 
 
-def _dedupe_existing_ids(ids: list[str], *, existing_ids: set[str]) -> list[str]:
-    """Return ids in original order, keeping only existing ids and removing dups."""
+def _dedupe_ids_preserving_order(ids: list[str]) -> list[str]:
+    """Return `ids` without duplicates while preserving the first occurrence."""
 
     out: list[str] = []
     seen: set[str] = set()
     for id_ in ids:
-        if id_ in seen or id_ not in existing_ids:
+        if id_ in seen:
             continue
         seen.add(id_)
         out.append(id_)
@@ -334,15 +445,6 @@ def _is_loadable_record_file(path: Path) -> bool:
     if name.endswith(".compacted.json"):
         return False
     return name.endswith(".json")
-
-
-def _is_record_related_file(path: Path) -> bool:
-    """Return whether `path` should participate in cache invalidation."""
-
-    name = path.name
-    return name.endswith(
-        (".core.json", ".detailed.json", ".detailed.jsonl", ".compacted.json")
-    ) or _is_loadable_record_file(path)
 
 
 def _parse_rg_lines_with_numbers(output: str) -> list[tuple[Path, int, str]]:
@@ -372,11 +474,11 @@ def _in_channel_matches_prefix(record_channel: str, in_channel_prefix: str) -> b
     )
 
 
-class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
+class FolderMemoryStore(MemoryStore):
     """Query and append `MemoryRecord` objects stored in a folder.
 
-    Record order is defined as lexicographic sort by `record.id_` and persisted
-    under `index/order.ids` (filesystem text index).
+    Record order is defined as lexicographic sort by `record.id_` and derived
+    directly from the record filenames on disk.
 
     Fast retrieval helpers:
     - `get_latests()` returns ids in newest-first store order, optionally
@@ -387,31 +489,56 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
     - `search_by_keywords()` mirrors Telegram stage_a and shells out to `rg`.
 
     Load behavior is self-healing for missing records:
-    - Parent/child ids pointing to missing records are removed.
+    - Parent/child ids pointing to missing records are dropped from the visible
+      record returned by `get_by_id()`.
     - When both sides are inferable, existing records on each side are bridged
-      directly (`missing.parents -> missing.children`).
-
-    Runtime cache policy:
-    - Only a small LRU cache of hot records/metadata is kept in memory.
-    - The canonical source of truth remains on-disk `records/**/*.core.json` +
-      `records/**/*.detailed.jsonl`.
-    - `refresh()` is explicit, and the sidecar layer also performs a throttled
-      drift probe to auto-refresh when out-of-band record-file changes are
-      detected.
+      directly (`missing.parents -> missing.children`) in the returned view.
     """
 
     root: Path
     encoding: str
 
-    _RECORD_CACHE_LIMIT = 256
-    _META_CACHE_LIMIT = 4096
-    _AUTO_REFRESH_PROBE_INTERVAL_NS = 5_000_000_000
-    _AUTO_REFRESH_DEEP_PROBE_INTERVAL_NS = 300_000_000_000
-
     def __init__(self, root: str | Path, *, encoding: str = "utf-8") -> None:
         self.root = Path(root)
         self.encoding = encoding
-        self._init_sidecar_state()
+
+    def refresh(self) -> None:
+        """Retained for `MemoryStore` compatibility; direct disk queries need no rebuild."""
+
+        return None
+
+    def _store_lock_path(self) -> Path:
+        return self.root / ".folder-memory-store.lock"
+
+    @contextmanager
+    def _exclusive_store_lock(self) -> Iterator[None]:
+        """Serialize cross-process canonical writes under the store root."""
+
+        lock_path = self._store_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        state = _process_store_lock_state(lock_path)
+        with state.mutex:
+            if state.depth == 0:
+                fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                state.fd = fd
+            state.depth += 1
+            try:
+                yield
+            finally:
+                state.depth -= 1
+                if state.depth == 0:
+                    fd = state.fd
+                    state.fd = None
+                    if fd is not None:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
 
     def get_latests(
         self,
@@ -434,36 +561,27 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
             raise ValueError(f"num must be >= 0 or None; got {num}")
         if num == 0:
             return []
-
-        self._load_if_needed()
         if not self.root.exists():
             return []
 
+        record_paths = self._list_loadable_record_paths()
+        if not record_paths:
+            return []
+
+        if in_channel is None and contact is None:
+            ids = self._sorted_record_ids_from_paths(record_paths)
+            return ids if num is None else ids[:num]
+
+        headers_by_id = self._scan_record_headers_by_id(record_paths=record_paths)
         latests: list[str] = []
-        for record_id in self._iter_order_ids_desc():
-            meta = self._read_meta(record_id)
-            if meta is None:
-                continue
-            record_channel = meta["in_channel"]
-            if not isinstance(record_channel, str):
-                raise ValueError(
-                    f"Invalid in_channel in metadata for record id {record_id}"
-                )
+        for record_id in sorted(headers_by_id, reverse=True):
+            header = headers_by_id[record_id]
             if in_channel is not None and not _in_channel_matches_prefix(
-                record_channel, in_channel
+                header.in_channel, in_channel
             ):
                 continue
-
-            contacts = meta["contacts"]
-            if not isinstance(contacts, list) or any(
-                not isinstance(v, str) for v in contacts
-            ):
-                raise ValueError(
-                    f"Invalid contacts in metadata for record id {record_id}"
-                )
-            if contact is not None and contact not in contacts:
+            if contact is not None and contact not in header.contacts:
                 continue
-
             latests.append(record_id)
             if num is not None and len(latests) >= num:
                 break
@@ -471,37 +589,35 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         return latests
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
-        self._load_if_needed()
         if not self.root.exists():
             coerce_record_id(id_)
             return None
 
         record_id = coerce_record_id(id_)
-        return self._get_by_id(record_id, allow_rebuild=True)
+        return self._get_by_id(record_id)
 
     def get_by_ids(
         self, ids: Set[MemoryRecordId], *, strict: bool = False
     ) -> list[MemoryRecord]:
-        self._load_if_needed()
+        record_ids = {coerce_record_id(id_) for id_ in ids}
         if not self.root.exists():
-            record_ids = {coerce_record_id(id_) for id_ in ids}
             if strict and record_ids:
                 missing_str = ", ".join(str(i) for i in sorted(record_ids))
                 raise KeyError(f"Missing record(s): {missing_str}")
             return []
 
-        record_ids = {coerce_record_id(id_) for id_ in ids}
-        missing = [id_ for id_ in record_ids if self._read_meta(id_) is None]
+        records: list[MemoryRecord] = []
+        missing: list[str] = []
+        for record_id in record_ids:
+            rec = self._get_by_id(record_id)
+            if rec is None:
+                missing.append(record_id)
+                continue
+            records.append(rec)
+
         if strict and missing:
             missing_str = ", ".join(str(i) for i in sorted(missing))
             raise KeyError(f"Missing record(s): {missing_str}")
-
-        records: list[MemoryRecord] = []
-        for record_id in record_ids:
-            rec = self._get_by_id(record_id, allow_rebuild=True)
-            if rec is None:
-                continue
-            records.append(rec)
 
         records.sort(
             key=lambda r: (
@@ -514,25 +630,17 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
     def get_parents(
         self, record: MemoryRecordRef, *, strict: bool = False
     ) -> list[str]:
-        self._load_if_needed()
         rec = self._coerce_record(record)
         if strict:
-            missing = [id_ for id_ in rec.parents if self._read_meta(id_) is None]
-            if missing:
-                missing_str = ", ".join(str(i) for i in missing)
-                raise KeyError(f"Missing parent record(s): {missing_str}")
+            self._ensure_records_exist(rec.parents, link_name="parent")
         return list(rec.parents)
 
     def get_children(
         self, record: MemoryRecordRef, *, strict: bool = False
     ) -> list[str]:
-        self._load_if_needed()
         rec = self._coerce_record(record)
         if strict:
-            missing = [id_ for id_ in rec.children if self._read_meta(id_) is None]
-            if missing:
-                missing_str = ", ".join(str(i) for i in missing)
-                raise KeyError(f"Missing child record(s): {missing_str}")
+            self._ensure_records_exist(rec.children, link_name="child")
         return list(rec.children)
 
     def get_ancestors(
@@ -551,27 +659,16 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         if level is not None and level < 0:
             raise ValueError(f"level must be >= 0 or None; got {level}")
 
-        self._load_if_needed()
         current = self._coerce_record(record)
-
         if level == 0:
             return [current.id_]
 
-        def _checked_parents(parent_ids: list[str]) -> list[str]:
-            if strict:
-                missing = [id_ for id_ in parent_ids if self._read_meta(id_) is None]
-                if missing:
-                    missing_str = ", ".join(str(i) for i in missing)
-                    raise KeyError(f"Missing parent record(s): {missing_str}")
-            return parent_ids
+        frontier = list(current.parents)
+        if strict:
+            self._ensure_records_exist(frontier, link_name="parent")
 
         ancestors: list[str] = []
         seen: set[str] = set()
-
-        # Walk links from the filesystem metadata index. Avoid calling
-        # `get_parents()` repeatedly inside traversal because that method
-        # re-checks cache freshness on every call.
-        frontier = _checked_parents(list(current.parents))
         depth = 0
         while frontier and (level is None or depth < level):
             depth += 1
@@ -582,17 +679,14 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
                 seen.add(parent_id)
                 ancestors.append(parent_id)
 
-                parent_meta = self._read_meta(parent_id)
-                if parent_meta is None:
+                parent = self._get_by_id(parent_id)
+                if parent is None:
                     if strict:
                         raise KeyError(f"Unknown parent MemoryRecord id: {parent_id}")
                     continue
-                parent_parents = self._validate_list_of_strings(
-                    record_id=parent_id,
-                    field_name="parents",
-                    value=parent_meta["parents"],
-                )
-                next_frontier.extend(_checked_parents(parent_parents))
+                if strict:
+                    self._ensure_records_exist(parent.parents, link_name="parent")
+                next_frontier.extend(parent.parents)
             frontier = next_frontier
 
         return ancestors
@@ -609,29 +703,19 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         end_key = datetime_to_posix_millis(end)
         if start_key > end_key:
             raise ValueError(f"start must be <= end; got start={start!r}, end={end!r}")
-
-        self._load_if_needed()
         if not self.root.exists():
             return []
 
         indexed: list[tuple[int, str]] = []
-        for record_id in self._iter_order_ids():
-            meta = self._read_meta(record_id)
-            if meta is None:
-                continue
-            created_at_ms = meta["created_at_ms"]
-            if not isinstance(created_at_ms, int):
-                raise ValueError(
-                    f"Invalid created_at_ms in metadata for record id {record_id}"
-                )
+        for header in self._scan_record_headers_by_id().values():
             if _in_datetime_range_ms(
-                created_at_ms,
+                header.created_at_ms,
                 start_key,
                 end_key,
                 include_start=include_start,
                 include_end=include_end,
             ):
-                indexed.append((created_at_ms, record_id))
+                indexed.append((header.created_at_ms, header.id_))
 
         indexed.sort(key=lambda t: (t[0], t[1]))
         return [record_id for _, record_id in indexed]
@@ -661,7 +745,7 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
             return []
 
         # Keep this stage_a-like and tolerant: only parse `in_channel` from
-        # candidate core files and avoid full-store bootstrap validation.
+        # candidate core files and avoid full-store validation.
         return self._filter_by_in_channel_via_rg(
             in_channel_prefix=in_channel_prefix,
             records_dir=records_dir,
@@ -775,72 +859,221 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         return selected
 
     def append(self, record: MemoryRecord) -> None:
-        """Persist `record` and serialize against concurrent rebuilds.
-
-        The append holds the store's advisory write lock for the full operation
-        so other processes cannot rebuild sidecars from partially written record
-        files while this record or its parents are being updated.
-        """
+        """Persist `record` and serialize against concurrent appends."""
 
         with self._exclusive_store_lock():
-            self._load_if_needed()
-
-            if self._read_meta(record.id_) is not None:
+            if self._find_record_path_by_id(record.id_) is not None:
                 raise ValueError(
                     f"Duplicate MemoryRecord id encountered while appending: {record.id_}"
                 )
 
-            existing_ids = {
-                parent_id
-                for parent_id in record.parents
-                if self._read_meta(parent_id) is not None
-            }
-            record.parents = _dedupe_existing_ids(
-                record.parents, existing_ids=existing_ids
-            )
-
             updated_parents: list[MemoryRecord] = []
-            for parent_id in record.parents:
-                parent = self._get_by_id(parent_id, allow_rebuild=True)
+            resolved_parent_ids: list[str] = []
+            for parent_id in _dedupe_ids_preserving_order(record.parents):
+                parent = self._get_by_id(parent_id)
                 if parent is None:
                     continue
+                resolved_parent_ids.append(parent_id)
                 if record.id_ not in parent.children:
                     parent.children.append(record.id_)
                     updated_parents.append(parent)
 
-            for parent in updated_parents:
-                parent_path = self._record_paths.get(parent.id_)
-                persisted_parent_path = self._persist_record(
-                    parent, path_hint=parent_path
-                )
-                self._upsert_meta(parent, core_path=persisted_parent_path)
-                self._cache_record(parent)
+            record.parents = resolved_parent_ids
 
-            persisted_path = self._persist_record(record, path_hint=None)
-            self._upsert_meta(record, core_path=persisted_path)
-            self._cache_record(record)
-            self._insert_id_into_order(record.id_)
-            self._update_stats_after_append(id_=record.id_, core_path=persisted_path)
-            self._touch_epoch()
-            self._cache_key = self._stat_key()
+            for parent in updated_parents:
+                parent_path = self._find_record_path_by_id(parent.id_)
+                if parent_path is None:
+                    continue
+                self._persist_record(parent, path_hint=parent_path)
+
+            self._persist_record(record, path_hint=None)
+
+    def _get_by_id(self, record_id: str) -> MemoryRecord | None:
+        record_path = self._find_record_path_by_id(record_id)
+        if record_path is None:
+            return None
+
+        record = self._load_record_from_record_path(record_path)
+        return self._repair_record_links(record)
+
+    def _repair_record_links(self, record: MemoryRecord) -> MemoryRecord:
+        if not record.parents and not record.children:
+            return record
+
+        snapshot = self._load_link_snapshot()
+        resolved_parents = self._resolve_parent_ids(
+            list(record.parents),
+            snapshot=snapshot,
+        )
+        resolved_children = self._resolve_child_ids(
+            list(record.children),
+            snapshot=snapshot,
+        )
+        if resolved_parents == list(record.parents) and resolved_children == list(
+            record.children
+        ):
+            return record
+        return record.model_copy(
+            update={
+                "parents": resolved_parents,
+                "children": resolved_children,
+            }
+        )
+
+    def _load_link_snapshot(self) -> _LinkSnapshot:
+        headers_by_id = self._scan_record_headers_by_id()
+        existing_ids = set(headers_by_id)
+        missing_to_parents: dict[str, list[str]] = {}
+        missing_to_children: dict[str, list[str]] = {}
+
+        for header in headers_by_id.values():
+            for child_id in header.children:
+                if child_id in existing_ids:
+                    continue
+                missing_to_parents.setdefault(child_id, [])
+                if header.id_ not in missing_to_parents[child_id]:
+                    missing_to_parents[child_id].append(header.id_)
+
+            for parent_id in header.parents:
+                if parent_id in existing_ids:
+                    continue
+                missing_to_children.setdefault(parent_id, [])
+                if header.id_ not in missing_to_children[parent_id]:
+                    missing_to_children[parent_id].append(header.id_)
+
+        return _LinkSnapshot(
+            headers_by_id=headers_by_id,
+            missing_to_parents=missing_to_parents,
+            missing_to_children=missing_to_children,
+        )
+
+    def _resolve_parent_ids(
+        self,
+        parent_ids: list[str],
+        *,
+        snapshot: _LinkSnapshot,
+    ) -> list[str]:
+        return self._resolve_link_ids(
+            parent_ids,
+            snapshot=snapshot,
+            bridge_map=snapshot.missing_to_parents,
+        )
+
+    def _resolve_child_ids(
+        self,
+        child_ids: list[str],
+        *,
+        snapshot: _LinkSnapshot,
+    ) -> list[str]:
+        return self._resolve_link_ids(
+            child_ids,
+            snapshot=snapshot,
+            bridge_map=snapshot.missing_to_children,
+        )
+
+    def _resolve_link_ids(
+        self,
+        ids: list[str],
+        *,
+        snapshot: _LinkSnapshot,
+        bridge_map: dict[str, list[str]],
+    ) -> list[str]:
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for id_ in ids:
+            if id_ in snapshot.headers_by_id:
+                if id_ not in seen:
+                    seen.add(id_)
+                    resolved.append(id_)
+                continue
+
+            for bridged_id in bridge_map.get(id_, []):
+                if bridged_id in seen or bridged_id not in snapshot.headers_by_id:
+                    continue
+                seen.add(bridged_id)
+                resolved.append(bridged_id)
+
+        return resolved
+
+    def _sorted_record_ids_from_paths(self, record_paths: list[Path]) -> list[str]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        record_paths_sorted = sorted(
+            record_paths,
+            key=lambda path: self._expected_id_for_record_path(path),
+            reverse=True,
+        )
+        for record_path in record_paths_sorted:
+            record_id = self._expected_id_for_record_path(record_path)
+            if record_id in seen:
+                raise ValueError(f"Duplicate MemoryRecord id on disk: {record_id}")
+            seen.add(record_id)
+            ids.append(record_id)
+        return ids
+
+    def _scan_record_headers_by_id(
+        self, *, record_paths: list[Path] | None = None
+    ) -> dict[str, _RecordHeader]:
+        headers: dict[str, _RecordHeader] = {}
+        paths = (
+            record_paths
+            if record_paths is not None
+            else self._list_loadable_record_paths()
+        )
+        for record_path in paths:
+            header = _load_record_header_from_disk(record_path, encoding=self.encoding)
+            expected_id = self._expected_id_for_record_path(record_path)
+            if header.id_ != expected_id:
+                raise ValueError(
+                    f"Record id mismatch at {record_path}: expected {expected_id}, got {header.id_}"
+                )
+            if header.id_ in headers:
+                existing_path = headers[header.id_].path
+                raise ValueError(
+                    f"Duplicate MemoryRecord id on disk: {header.id_} ({existing_path}, {record_path})"
+                )
+            headers[header.id_] = header
+        return headers
+
+    def _find_record_path_by_id(self, record_id: str) -> Path | None:
+        records_dir = self._records_dir()
+        if not records_dir.exists():
+            return None
+
+        core_paths = sorted(
+            records_dir.glob(f"**/{record_id}.core.json"),
+            key=self._relative_path_sort_key,
+        )
+        if len(core_paths) > 1:
+            raise ValueError(f"Duplicate MemoryRecord id on disk: {record_id}")
+        if core_paths:
+            return core_paths[0]
+
+        legacy_paths = sorted(
+            (
+                path
+                for path in records_dir.glob(f"**/{record_id}.json")
+                if _is_loadable_record_file(path)
+            ),
+            key=self._relative_path_sort_key,
+        )
+        if len(legacy_paths) > 1:
+            raise ValueError(f"Duplicate MemoryRecord id on disk: {record_id}")
+        return legacy_paths[0] if legacy_paths else None
+
+    def _ensure_records_exist(self, record_ids: list[str], *, link_name: str) -> None:
+        missing = [
+            record_id
+            for record_id in record_ids
+            if self._find_record_path_by_id(record_id) is None
+        ]
+        if not missing:
+            return
+        missing_str = ", ".join(str(i) for i in missing)
+        raise KeyError(f"Missing {link_name} record(s): {missing_str}")
 
     def _detailed_path_for_record_path(self, record_path: Path) -> Path:
-        """Return the sibling detailed path for a record path.
-
-        The record path may be the canonical `<id>.core.json` file or a legacy
-        `<id>.json` file.
-        """
-
-        name = record_path.name
-        if name.endswith(".core.json"):
-            record_id = name[: -len(".core.json")]
-        elif name.endswith(".json") and not name.endswith(
-            (".detailed.json", ".detailed.jsonl")
-        ):
-            record_id = name[: -len(".json")]
-        else:
-            raise ValueError(f"Unexpected record filename: {record_path}")
-        return record_path.with_name(f"{record_id}.detailed.jsonl")
+        return _detailed_path_for_record_path(record_path)
 
     def _load_record_from_record_path(self, record_path: Path) -> MemoryRecord:
         try:
@@ -875,13 +1108,13 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
             if (
                 path.name.endswith(".json")
                 and not path.name.endswith(".core.json")
-                and (path.with_name(f"{path.stem}.core.json")).exists()
+                and path.with_name(f"{path.stem}.core.json").exists()
             ):
                 # If both legacy "<id>.json" and "<id>.core.json" exist, the core
                 # file is authoritative.
                 continue
             paths.append(path)
-        paths.sort(key=lambda p: str(p.relative_to(self.root)))
+        paths.sort(key=self._relative_path_sort_key)
         return paths
 
     def _expected_id_for_record_path(self, path: Path) -> str:
@@ -915,6 +1148,9 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
             / f"{id_}.core.json"
         )
 
+    def _relative_path_sort_key(self, path: Path) -> str:
+        return str(path.relative_to(self.root))
+
     def _atomic_write_text(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir = path.parent if path.parent.exists() else None
@@ -931,11 +1167,7 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         tmp_path.replace(path)
 
     def _persist_record(self, record: MemoryRecord, *, path_hint: Path | None) -> Path:
-        path = (
-            path_hint if path_hint is not None else self._record_paths.get(record.id_)
-        )
-        if path is None or not path.name.endswith(".core.json"):
-            path = self._record_path_for(record)
+        path = path_hint if path_hint is not None else self._record_path_for(record)
 
         # Split persistence:
         # - core: metadata + channel routing + compacted (one JSON blob, one line)
@@ -952,111 +1184,16 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
             record.dump_compated(),
         )
 
-        self._record_paths[record.id_] = path
         return path
-
-    def _repair_missing_links(
-        self,
-        *,
-        records: list[MemoryRecord],
-        by_id: dict[str, MemoryRecord],
-        missing_record_ids: set[str],
-    ) -> set[str]:
-        """Repair links affected by missing records and return touched record ids."""
-
-        existing_ids = set(by_id)
-        missing_ids = set(missing_record_ids)
-        for record in records:
-            missing_ids.update(id_ for id_ in record.parents if id_ not in existing_ids)
-            missing_ids.update(
-                id_ for id_ in record.children if id_ not in existing_ids
-            )
-
-        if not missing_ids:
-            return set()
-
-        # Infer a missing node's parents from `children` pointers and infer its
-        # children from `parents` pointers, then connect those neighbors directly.
-        missing_to_parents: dict[str, list[str]] = {id_: [] for id_ in missing_ids}
-        missing_to_children: dict[str, list[str]] = {id_: [] for id_ in missing_ids}
-        for record in records:
-            for child_id in record.children:
-                if child_id not in missing_ids:
-                    continue
-                if record.id_ not in missing_to_parents[child_id]:
-                    missing_to_parents[child_id].append(record.id_)
-            for parent_id in record.parents:
-                if parent_id not in missing_ids:
-                    continue
-                if record.id_ not in missing_to_children[parent_id]:
-                    missing_to_children[parent_id].append(record.id_)
-
-        repaired: set[str] = set()
-        for missing_id in missing_ids:
-            parent_ids = missing_to_parents.get(missing_id, [])
-            child_ids = missing_to_children.get(missing_id, [])
-            for parent_id in parent_ids:
-                parent = by_id[parent_id]
-                for child_id in child_ids:
-                    if child_id == parent_id:
-                        continue
-                    child = by_id[child_id]
-                    if child_id not in parent.children:
-                        parent.children.append(child_id)
-                        repaired.add(parent_id)
-                    if parent_id not in child.parents:
-                        child.parents.append(parent_id)
-                        repaired.add(child_id)
-
-        for record in records:
-            cleaned_parents = _dedupe_existing_ids(
-                record.parents,
-                existing_ids=existing_ids,
-            )
-            if cleaned_parents != record.parents:
-                record.parents = cleaned_parents
-                repaired.add(record.id_)
-
-            cleaned_children = _dedupe_existing_ids(
-                record.children,
-                existing_ids=existing_ids,
-            )
-            if cleaned_children != record.children:
-                record.children = cleaned_children
-                repaired.add(record.id_)
-
-        return repaired
 
     def _coerce_record(self, record: MemoryRecordRef) -> MemoryRecord:
         if isinstance(record, MemoryRecord):
             return record
         record_id = coerce_record_id(record)
-        rec = self._get_by_id(record_id, allow_rebuild=True)
+        rec = self._get_by_id(record_id)
         if rec is None:
             raise KeyError(f"Unknown MemoryRecord id: {record_id}")
         return rec
-
-
-def _in_datetime_range(
-    value: datetime,
-    start: datetime,
-    end: datetime,
-    *,
-    include_start: bool,
-    include_end: bool,
-) -> bool:
-    value_key = datetime_to_posix_millis(value)
-    start_key = datetime_to_posix_millis(start)
-    end_key = datetime_to_posix_millis(end)
-    if include_start:
-        left_ok = value_key >= start_key
-    else:
-        left_ok = value_key > start_key
-    if include_end:
-        right_ok = value_key <= end_key
-    else:
-        right_ok = value_key < end_key
-    return left_ok and right_ok
 
 
 def _in_datetime_range_ms(

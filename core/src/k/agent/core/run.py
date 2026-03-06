@@ -203,8 +203,9 @@ async def _wait_for_parent_memories(
 
     deadline = time.monotonic() + timeout_seconds
     while True:
-        # Parent memories may be produced by another process, so force a disk
-        # refresh on each poll instead of relying on this store instance's cache.
+        # Parent memories may be produced by another process. `refresh()` is a
+        # compatibility hook here; the subsequent `get_by_id()` must observe the
+        # latest on-disk state even when this store keeps no derived indexes.
         memory_store.refresh()
         missing = [
             parent_id

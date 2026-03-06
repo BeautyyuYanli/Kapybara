@@ -19,13 +19,12 @@ def test_config_defaults_expand_to_home_paths(tmp_path: Path, monkeypatch) -> No
     assert config.ssh_addr is None
 
 
-def test_load_kapybara_toml_config_defaults_when_file_missing(tmp_path: Path) -> None:
+def test_load_kapybara_toml_config_requires_file_when_missing(tmp_path: Path) -> None:
     config_base = tmp_path / ".kapybara"
 
-    loaded = load_kapybara_toml_config(config_base)
-
-    assert loaded.agent_run.model_name == "gpt-5.2"
     assert config_toml_path(config_base) == (config_base / "config.toml").resolve()
+    with pytest.raises(ValueError, match="Expected config file"):
+        _ = load_kapybara_toml_config(config_base)
 
 
 def test_load_kapybara_toml_config_reads_agent_run_model_name(tmp_path: Path) -> None:

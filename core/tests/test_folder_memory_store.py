@@ -102,9 +102,10 @@ def test_folder_store_get_latests_and_get_by_id(tmp_path) -> None:
     store.refresh()
 
     assert store.get_latests() == [r2.id_, r1.id_]
-    assert store.get_by_id(r1.id_) == r1
-    assert store.get_by_id(str(r1.id_)) == r1
-    assert store.get_by_ids({r2.id_, r1.id_}) == [r1, r2]
+    expected_r1 = r1.model_copy(update={"children": [r2.id_]})
+    assert store.get_by_id(r1.id_) == expected_r1
+    assert store.get_by_id(str(r1.id_)) == expected_r1
+    assert store.get_by_ids({r2.id_, r1.id_}) == [expected_r1, r2]
     with pytest.raises(ValueError, match="Invalid MemoryRecord id"):
         store.get_by_id("not-a-uuid")
 
@@ -138,7 +139,6 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
 
     assert store.get_parents(child) == [parent.id_]
     assert store.get_parents(child.id_) == [parent.id_]
-    assert store.get_children(parent) == [child.id_]
     assert store.get_children(parent.id_) == [child.id_]
 
     missing_child_id = "zzzzzzzz"
@@ -167,63 +167,13 @@ def test_folder_store_get_parents_children_and_ancestors(tmp_path) -> None:
     assert store.get_ancestors(missing, level=1) == [child.id_]
     assert store.get_ancestors(missing, level=2) == [child.id_, parent.id_]
 
-    # After reload, dangling child links are dropped.
+    # After reload, dangling child links are dropped from the visible record.
     store.refresh()
     reloaded_missing = store.get_by_id(missing.id_)
     assert reloaded_missing is not None
+    assert reloaded_missing.children == []
     assert store.get_children(reloaded_missing) == []
     assert store.get_children(reloaded_missing, strict=True) == []
-
-
-def test_folder_store_get_ancestors_checks_cache_once_per_call(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "mem"
-    store = FolderMemoryStore(root)
-
-    grandparent = MemoryRecord(
-        in_channel="test",
-        input="gp-in",
-        compacted=["gp-c"],
-        output="gp-out",
-        detailed=[],
-        created_at=datetime(2026, 1, 1, 0, 0, 0),
-    )
-    parent = MemoryRecord(
-        in_channel="test",
-        input="p-in",
-        compacted=["p-c"],
-        output="p-out",
-        detailed=[],
-        created_at=datetime(2026, 1, 1, 1, 0, 0),
-        parents=[grandparent.id_],
-    )
-    child = MemoryRecord(
-        in_channel="test",
-        input="c-in",
-        compacted=["c-c"],
-        output="c-out",
-        detailed=[],
-        created_at=datetime(2026, 1, 1, 2, 0, 0),
-        parents=[parent.id_],
-    )
-
-    store.append(grandparent)
-    store.append(parent)
-    store.append(child)
-
-    calls = 0
-    original_stat_key = store._stat_key
-
-    def counted_stat_key():
-        nonlocal calls
-        calls += 1
-        return original_stat_key()
-
-    monkeypatch.setattr(store, "_stat_key", counted_stat_key)
-
-    assert store.get_ancestors(child.id_) == [parent.id_, grandparent.id_]
-    assert calls == 1
 
 
 def test_folder_store_append_ignores_missing_parent_ids(tmp_path) -> None:
@@ -258,7 +208,7 @@ def test_folder_store_append_ignores_missing_parent_ids(tmp_path) -> None:
 
     assert child.parents == [parent.id_]
     assert store.get_parents(child) == [parent.id_]
-    assert store.get_children(parent) == [child.id_]
+    assert store.get_children(parent.id_) == [child.id_]
 
 
 def test_folder_store_repairs_links_when_middle_record_missing(tmp_path) -> None:
@@ -490,9 +440,7 @@ def test_folder_store_refresh_is_safe_during_external_append(tmp_path) -> None:
     assert seed.id_ in observed_ids
 
 
-def test_folder_store_auto_refreshes_on_external_record_drift(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_folder_store_reads_external_record_writes_directly(tmp_path) -> None:
     root = tmp_path / "mem"
     store = FolderMemoryStore(root)
 
@@ -505,10 +453,6 @@ def test_folder_store_auto_refreshes_on_external_record_drift(
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
     store.append(r1)
-
-    # Force drift probe on every call for deterministic testing.
-    monkeypatch.setattr(store, "_AUTO_REFRESH_PROBE_INTERVAL_NS", 0)
-    monkeypatch.setattr(store, "_AUTO_REFRESH_DEEP_PROBE_INTERVAL_NS", 0)
 
     r2 = MemoryRecord(
         in_channel="test",
@@ -535,11 +479,11 @@ def test_folder_store_auto_refreshes_on_external_record_drift(
         encoding="utf-8",
     )
 
-    # Store should detect out-of-band record-file drift and rebuild sidecar index.
+    # Disk-backed queries should see out-of-band record files without a rebuild step.
     assert store.get_latests() == [r2.id_, r1.id_]
 
 
-def test_folder_store_writes_index_stats_sidecar(tmp_path) -> None:
+def test_folder_store_does_not_write_index_sidecars(tmp_path) -> None:
     root = tmp_path / "mem"
     store = FolderMemoryStore(root)
 
@@ -562,17 +506,10 @@ def test_folder_store_writes_index_stats_sidecar(tmp_path) -> None:
     store.append(r1)
     store.append(r2)
 
-    stats_path = root / "index" / "stats.json"
-    assert stats_path.exists()
-    stats = json.loads(stats_path.read_text(encoding="utf-8"))
-    assert stats["record_count"] == 2
-    assert stats["latest_id"] == max(r1.id_, r2.id_)
-    assert isinstance(stats["latest_core_relpath"], str)
-    assert isinstance(stats["latest_bucket_relpath"], str)
-    assert isinstance(stats["latest_record_mtime_ns"], int)
+    assert not (root / "index").exists()
 
 
-def test_folder_store_bootstrap_repairs_missing_stats_sidecar(tmp_path) -> None:
+def test_folder_store_ignores_stale_index_sidecars(tmp_path) -> None:
     root = tmp_path / "mem"
     writer = FolderMemoryStore(root)
 
@@ -586,15 +523,23 @@ def test_folder_store_bootstrap_repairs_missing_stats_sidecar(tmp_path) -> None:
     )
     writer.append(record)
 
+    index_dir = root / "index"
+    index_dir.mkdir(parents=True)
     stats_path = root / "index" / "stats.json"
-    assert stats_path.exists()
-    stats_path.unlink()
+    order_path = root / "index" / "order.ids"
+    stats_path.write_text(
+        '{"record_count":999,"latest_id":"zzzzzzzz"}\n', encoding="utf-8"
+    )
+    order_path.write_text("zzzzzzzz\n", encoding="utf-8")
 
     reader = FolderMemoryStore(root)
     assert reader.get_latests() == [record.id_]
-    repaired_stats = json.loads(stats_path.read_text(encoding="utf-8"))
-    assert repaired_stats["record_count"] == 1
-    assert repaired_stats["latest_id"] == record.id_
+    assert reader.get_by_id(record.id_) == record
+    assert (
+        stats_path.read_text(encoding="utf-8")
+        == '{"record_count":999,"latest_id":"zzzzzzzz"}\n'
+    )
+    assert order_path.read_text(encoding="utf-8") == "zzzzzzzz\n"
 
 
 def test_folder_store_order_is_lexicographic_by_id(tmp_path) -> None:
