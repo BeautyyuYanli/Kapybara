@@ -12,8 +12,10 @@ Design notes / invariants:
   full record loads when possible, while preserving the same visible existence
   semantics as `get_by_id(id_) is not None`.
 - "Latests" are returned in descending store order (newest first) and can be
-  filtered by channel subtree via `in_channel` and exact contact-id membership
-  via `contact`, with optional result capping via `num`.
+  filtered by routing subtree via `in_channel` and exact contact-id membership
+  via `contact`, with optional result capping via `num`. A routing match
+  succeeds when either `record.in_channel` or its effective output channel is
+  in the requested subtree.
 - `append()` must treat `record.parents` as the source of truth and ensure each
   referenced parent record contains `record.id_` in its `children` list before
   returning.
@@ -63,8 +65,9 @@ class MemoryStore(Protocol):
         """Return latest record ids (descending store order).
 
         Args:
-            in_channel: Optional channel prefix filter. A record is selected when
-                its `in_channel` equals this prefix or starts with `"{prefix}/"`.
+            in_channel: Optional routing-channel prefix filter. A record is
+                selected when either its `in_channel` or its effective output
+                channel equals this prefix or starts with `"{prefix}/"`.
             contact: Optional contact filter. A record is selected when this
                 contact id exists in `MemoryRecord.contacts`.
             num: Optional maximum number of ids to return. `None` means no
