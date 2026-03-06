@@ -66,6 +66,7 @@ def _near_request_limit_system_msg(*, run_step: int, request_limit: int) -> str:
         "IMMEDIATELY STOP ALL CURRENT WORK RIGHT NOW. Do not run any additional "
         "commands or continue ongoing tasks. If a response is required, send it "
         "now via the channel skill(s), then call `finish_action` immediately."
+        "Be honest about the situation in your response and admit that the request limit has been reached."
     )
 
 
