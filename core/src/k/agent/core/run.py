@@ -150,17 +150,30 @@ def _normalize_parent_memory_ids(parent_memories: list[str] | None) -> list[str]
     return out
 
 
+def _resolve_cli_contacts(contacts: list[str] | None) -> list[str]:
+    """Resolve CLI contacts without injecting synthetic defaults.
+
+    `kapy` should preserve the caller-supplied contact set exactly. Omitting
+    `--contact` now means "run without contacts" instead of manufacturing a
+    placeholder contact like `direct_input/local`.
+    """
+
+    return list(contacts or [])
+
+
 async def _wait_for_parent_memories(
     *,
     memory_store: MemoryStore,
     parent_memories: list[str],
     timeout_seconds: float,
-    poll_interval_seconds: float = 0.2,
+    poll_interval_seconds: float = 1.0,
 ) -> None:
     """Wait until every parent memory id exists in `memory_store`.
 
     This is intended for cross-process orchestration where one `kapy` command
     depends on parent records written by another process shortly beforehand.
+    The default poll interval is 1 second to keep detached follow-up waiting
+    cheap while still reacting promptly once the parent record lands.
 
     Raises:
         ValueError: if `timeout_seconds` is not positive.
@@ -210,10 +223,15 @@ async def run_once(
     - Reads `<config_base>/config.toml` when `model` is omitted.
     - Waits for caller-specified `parent_memories` to exist before running.
     - Appends the returned `MemoryRecord` to `memory_store`.
+
+    Contact semantics:
+    - `contacts=None` and `contacts=[]` both preserve an empty
+      `Event.contacts` list.
     """
 
     resolved_model = model or _agent_run_model_from_config(config)
     resolved_parent_memories = _normalize_parent_memory_ids(parent_memories)
+    resolved_contacts = _resolve_cli_contacts(contacts)
     if resolved_parent_memories:
         await _wait_for_parent_memories(
             memory_store=memory_store,
@@ -222,7 +240,7 @@ async def run_once(
         )
     event = Event(
         in_channel=in_channel,
-        contacts=list(contacts or ["direct_input/local"]),
+        contacts=resolved_contacts,
         out_channel=out_channel,
         content=prompt,
     )
@@ -264,7 +282,7 @@ async def run_repl(
                 memory_store=memory_store,
                 prompt=i,
                 in_channel=in_channel,
-                contacts=contacts,
+                contacts=_resolve_cli_contacts(contacts),
                 out_channel=out_channel,
                 parent_memories=parent_memories,
                 parents_timeout_seconds=parents_timeout_seconds,
@@ -287,7 +305,7 @@ async def main(argv: list[str] | None = None) -> None:
         root=memory_root_from_config_base(config.config_base),
     )
     model = _agent_run_model_from_config(config)
-    contacts = list(args.contacts or ["direct_input/local"])
+    contacts = _resolve_cli_contacts(args.contacts)
     parent_memories = _normalize_parent_memory_ids(args.parent_memories)
 
     if args.prompt is not None:
