@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -88,12 +91,58 @@ def test_basic_os_helper_uses_local_script_when_ssh_endpoint_is_unset(
     config = Config(config_base=tmp_path / "state" / ".kapybara")
     helper = BasicOSHelper(config=config)
 
-    assert helper.command_base() == "script -q -c "
+    expected_base = (
+        "script -q /dev/null bash -lc "
+        if sys.platform == "darwin"
+        else "script -q /dev/null -- bash -lc "
+    )
+
+    assert helper.command_base() == expected_base
     assert (
         helper.command("echo hello")
-        == 'script -q -c \'if [ -z "${K_CONFIG_BASE:-}" ]; then export K_CONFIG_BASE=~/.kapybara; else export K_CONFIG_BASE; fi; . "$K_CONFIG_BASE/.bashrc"; echo hello\' '
-        "/dev/null"
+        == expected_base
+        + '\'if [ -z "${K_CONFIG_BASE:-}" ]; then export K_CONFIG_BASE=~/.kapybara; else export K_CONFIG_BASE; fi; . "$K_CONFIG_BASE/.bashrc"; echo hello\''
     )
+
+
+def test_basic_os_helper_wraps_ssh_commands_in_bash(tmp_path: Path) -> None:
+    config = Config(
+        config_base=tmp_path / "state" / ".kapybara",
+        ssh_user="alice",
+        ssh_addr="example.com",
+    )
+    helper = BasicOSHelper(config=config)
+
+    command = helper.command("echo hello")
+
+    assert command.startswith(helper.command_base())
+    assert "bash -lc" in command
+    assert "$K_CONFIG_BASE/.bashrc" in command
+
+
+def test_basic_os_helper_local_command_executes_inside_bash(tmp_path: Path) -> None:
+    runtime_config_base = tmp_path / "runtime" / ".kapybara"
+    runtime_config_base.mkdir(parents=True)
+    (runtime_config_base / ".bashrc").write_text("", encoding="utf-8")
+
+    helper = BasicOSHelper(config=Config(config_base=tmp_path / "state" / ".kapybara"))
+    env = os.environ.copy()
+    env["K_CONFIG_BASE"] = str(runtime_config_base)
+
+    proc = subprocess.run(
+        helper.command('printf "%s" "$0"'),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        shell=True,
+    )
+
+    assert proc.returncode == 0
+    clean_stdout = (
+        proc.stdout.replace("\r", "").replace("\x04", "").replace("\x08", "").strip()
+    )
+    assert clean_stdout.endswith("bash")
 
 
 def test_basic_os_helper_uses_agent_view_config_base_not_python_config_base(
@@ -137,8 +186,7 @@ async def test_agent_config_base_value_reads_shell_runtime_marker() -> None:
     class _FakeBasicOSHelper:
         last_command: str | None = None
 
-        def command(self, command: str, env: dict[str, str] | None = None) -> str:
-            _ = env
+        def command(self, command: str) -> str:
             self.last_command = command
             return f"wrapped:{command}"
 
