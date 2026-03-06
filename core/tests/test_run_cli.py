@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,21 @@ def test_configure_cli_logfire_uses_token_optional_mode(
         "level": logging.INFO,
         "handlers": [handler],
     }
+
+
+def test_child_cli_argv_omits_async_flag() -> None:
+    assert run_module._child_cli_argv(
+        [
+            "--async",
+            "--out-channel",
+            "self-hook/test",
+            "hello from cli",
+        ]
+    ) == [
+        "--out-channel",
+        "self-hook/test",
+        "hello from cli",
+    ]
 
 
 @pytest.mark.anyio
@@ -370,6 +386,75 @@ async def test_main_omits_contacts_by_default(
         "in_channel": "self-hook/test",
         "contacts": [],
     }
+
+
+@pytest.mark.anyio
+async def test_main_async_mode_spawns_detached_child_and_prints_pid_and_logfile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda: None)
+    monkeypatch.setattr(
+        "rich.print", lambda message: captured.setdefault("printed", message)
+    )
+
+    def fake_popen(
+        cmd: list[str],
+        *,
+        stdin: object,
+        stdout: Any,
+        stderr: object,
+        start_new_session: bool,
+        env: dict[str, str],
+    ) -> Any:
+        captured["cmd"] = cmd
+        captured["stdin"] = stdin
+        captured["stdout_name"] = stdout.name
+        captured["stderr"] = stderr
+        captured["start_new_session"] = start_new_session
+        captured["env"] = env
+        return type("FakeProcess", (), {"pid": 43210})()
+
+    monkeypatch.setattr(run_module.subprocess, "Popen", fake_popen)
+
+    await run_module.main(
+        [
+            "--async",
+            "--out-channel",
+            "self-hook/reply",
+            "hello from cli",
+        ]
+    )
+
+    config_base = (tmp_path / ".kapybara").resolve()
+    log_path = Path(captured["stdout_name"])
+    assert captured["cmd"] == [
+        sys.executable,
+        "-m",
+        "k.agent.core.run",
+        "--out-channel",
+        "self-hook/reply",
+        "hello from cli",
+    ]
+    assert captured["stdin"] is run_module.subprocess.DEVNULL
+    assert captured["stderr"] is run_module.subprocess.STDOUT
+    assert captured["start_new_session"] is True
+    assert captured["env"]["K_CONFIG_BASE"] == str(config_base)
+    assert log_path.exists()
+    assert log_path.parent == config_base / "logs" / "kapy"
+    assert captured["printed"] == f"pid=43210 logfile={log_path}"
+
+
+@pytest.mark.anyio
+async def test_main_async_mode_requires_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda: None)
+
+    with pytest.raises(SystemExit, match="--async requires a prompt"):
+        await run_module.main(["--async"])
 
 
 @pytest.mark.anyio
