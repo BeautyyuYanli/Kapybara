@@ -6,8 +6,7 @@ description: Launches a detached follow-up `kapy` run that inherits the current 
 # self-hook
 
 Use this skill when you need to start a follow-up `kapy` run that inherits the
-current run's config base, memory dependency, contacts, and active output
-channel.
+current run's config base, memory dependency, and routing context.
 
 Use the non-blocking style when launching from the current run. A blocking
 style is included later as a reference for scripts or cronjobs that are allowed
@@ -62,6 +61,8 @@ nohup kapy \
   --config-base='<Agent config base path from the <System> prompt>' \
   --in-channel='self-hook/default' \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
+  --contact='<current_contact_1>' \
+  --contact='<current_contact_2_if_any>' \
   --parent-memory='<Current run memory id from the <System> prompt>' \
   "$(cat <<'EOF'
 <follow-up prompt>
@@ -71,9 +72,6 @@ EOF
 
 printf 'pid=%s log=%s\n' "$!" "$HOOK_LOG"
 ```
-
-The example omits `--contact` flags for brevity. Add one
-`--contact='<current_contact>'` flag per current-run contact when needed.
 
 Use this pattern when calling the hook from an active run.
 
@@ -88,6 +86,8 @@ kapy \
   --config-base='<Agent config base path from the <System> prompt>' \
   --in-channel='self-hook/default' \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
+  --contact='<current_contact_1>' \
+  --contact='<current_contact_2_if_any>' \
   --parent-memory='<Current run memory id from the <System> prompt>' \
   "$(cat <<'EOF'
 <follow-up prompt>
