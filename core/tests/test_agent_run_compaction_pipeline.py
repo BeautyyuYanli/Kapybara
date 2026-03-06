@@ -352,6 +352,42 @@ def test_latest_memory_roots_by_in_channel_collects_channel_ids(
     assert calls == [("telegram/chat/1", None, 5)]
 
 
+def test_latest_memory_roots_by_in_channel_matches_effective_out_channel(
+    tmp_path: Path,
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+
+    direct = MemoryRecord(
+        in_channel="telegram/chat/1",
+        input="direct",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    routed = MemoryRecord(
+        in_channel="worker/job/1",
+        out_channel="telegram/chat/1/thread/2",
+        input="routed",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 2),
+    )
+    other = MemoryRecord(
+        in_channel="worker/job/1",
+        out_channel="discord/channel/9",
+        input="other",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 3),
+    )
+    for rec in (direct, routed, other):
+        store.append(rec)
+
+    channel_roots = latest_memory_roots_by_in_channel(
+        store,
+        in_channel="telegram/chat/1",
+    )
+
+    assert channel_roots == [routed.id_, direct.id_]
+
+
 def test_latest_memory_roots_by_contact_dedupes_with_stable_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

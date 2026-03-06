@@ -636,26 +636,41 @@ def test_folder_store_get_latests_filters_by_in_channel_prefix(tmp_path) -> None
         id_="-------2",
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
+    routed = MemoryRecord(
+        in_channel="worker/job/1",
+        out_channel="telegram/chat/-1001/thread/10",
+        contacts=["c2"],
+        input="routed",
+        output="",
+        id_="-------3",
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
     store.append(room)
     store.append(thread)
     store.append(other)
+    store.append(routed)
 
     assert store.get_latests(in_channel="telegram/chat/-1001") == [
+        routed.id_,
         thread.id_,
         room.id_,
     ]
-    assert store.get_latests(in_channel="telegram/chat/-1001/thread/10") == [thread.id_]
+    assert store.get_latests(in_channel="telegram/chat/-1001/thread/10") == [
+        routed.id_,
+        thread.id_,
+    ]
     assert store.get_latests(in_channel="telegram/chat/-1001/thread/11") == []
     assert store.get_latests(contact="c1") == [thread.id_, room.id_]
-    assert store.get_latests(contact="c2") == [other.id_, thread.id_]
+    assert store.get_latests(contact="c2") == [routed.id_, other.id_, thread.id_]
     assert store.get_latests(in_channel="telegram/chat/-1001", contact="c2") == [
-        thread.id_
+        routed.id_,
+        thread.id_,
     ]
     assert store.get_latests(in_channel="telegram/chat/-1001", contact="c3") == []
-    assert store.get_latests(in_channel="telegram/chat/-1001", num=1) == [thread.id_]
-    assert store.get_latests(contact="c2", num=1) == [other.id_]
+    assert store.get_latests(in_channel="telegram/chat/-1001", num=1) == [routed.id_]
+    assert store.get_latests(contact="c2", num=1) == [routed.id_]
     assert store.get_latests(in_channel="telegram/chat/-1001", contact="c2", num=1) == [
-        thread.id_
+        routed.id_
     ]
     assert store.get_latests(num=0) == []
 
@@ -692,14 +707,23 @@ def test_folder_store_filter_by_in_channel(tmp_path) -> None:
         id_="-------1",
         created_at=datetime(2026, 1, 1, 0, 0, 0),
     )
+    r4 = MemoryRecord(
+        in_channel="worker/job/1",
+        out_channel="telegram/chat/-1001/thread/12",
+        input="r4",
+        output="",
+        id_="-------2",
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
     store.append(r1)
     store.append(r2)
     store.append(r3)
+    store.append(r4)
 
     files = store.filter_by_in_channel(in_channel_prefix="telegram/chat/-1001")
     file_ids = [p.name.removesuffix(".detailed.jsonl") for p in files]
 
-    assert file_ids == [r1.id_, r2.id_]
+    assert file_ids == [r1.id_, r2.id_, r4.id_]
 
 
 def test_folder_store_search_by_keywords(tmp_path) -> None:

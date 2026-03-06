@@ -5,6 +5,10 @@ Selection happens in two phases:
 1. Resolve latest root memories from one `in_channel` subtree.
 2. Expand those roots into compacted/raw-pair ids using the shared downgrade
    and cap rules from `k.agent.memory.utils.select_memory_ids_from_roots`.
+
+The underlying store treats the `in_channel` filter as a routing-subtree
+match: either `MemoryRecord.in_channel` or the record's effective output
+channel may satisfy the prefix.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ def latest_memory_roots_by_in_channel(
     in_channel: str,
     latest_num: int = 5,
 ) -> list[str]:
-    """Return latest root ids for the `in_channel` subtree."""
+    """Return latest root ids for the routed `in_channel` subtree."""
 
     if latest_num < 0:
         raise ValueError(f"latest_num must be >= 0; got {latest_num}")

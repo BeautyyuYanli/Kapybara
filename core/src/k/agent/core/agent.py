@@ -688,8 +688,9 @@ async def agent_run(
       resulting injections with the auto-generated scope injections below.
     - `parent_memories` omitted or empty: inject only the auto-generated
       MemoryStore context:
-      1) latest 5 records in `in_channel`, expand with 1-level compacted
-         ancestors + 3-level raw-pair-only ancestors.
+      1) latest 5 records whose `in_channel` or effective `out_channel`
+         routes through the requested `in_channel` subtree, then expand with
+         1-level compacted ancestors + 3-level raw-pair-only ancestors.
       2) latest 1 record per resolved contact id, expand with 1-level
          raw-pair-only ancestors.
       Caps:

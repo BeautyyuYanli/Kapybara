@@ -64,6 +64,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai.messages import BaseToolCallPart, ModelResponse
 
+from k.agent.channels import channel_has_prefix, effective_out_channel
 from k.agent.memory.entities import MemoryRecord, datetime_to_posix_millis
 from k.agent.memory.store import (
     MemoryRecordId,
@@ -96,6 +97,7 @@ class _RecordHeader:
     id_: str
     created_at_ms: int
     in_channel: str
+    out_channel: str | None
     contacts: tuple[str, ...]
     parents: tuple[str, ...]
     children: tuple[str, ...]
@@ -377,6 +379,7 @@ def _load_record_header_from_disk(record_path: Path, *, encoding: str) -> _Recor
             id_=record.id_,
             created_at_ms=datetime_to_posix_millis(record.created_at),
             in_channel=record.in_channel,
+            out_channel=record.out_channel,
             contacts=tuple(record.contacts),
             parents=tuple(record.parents),
             children=tuple(record.children),
@@ -396,6 +399,7 @@ def _load_record_header_from_disk(record_path: Path, *, encoding: str) -> _Recor
         id_=core.id_,
         created_at_ms=datetime_to_posix_millis(core.created_at),
         in_channel=core.in_channel,
+        out_channel=core.out_channel,
         contacts=tuple(core.contacts),
         parents=tuple(core.parents),
         children=tuple(core.children),
@@ -466,11 +470,28 @@ def _parse_rg_lines_with_numbers(output: str) -> list[tuple[Path, int, str]]:
     return parsed
 
 
-def _in_channel_matches_prefix(record_channel: str, in_channel_prefix: str) -> bool:
-    """Return whether `record_channel` belongs to the `in_channel_prefix` subtree."""
+def _record_matches_in_channel_prefix(
+    *,
+    record_in_channel: str,
+    record_out_channel: str | None,
+    in_channel_prefix: str,
+) -> bool:
+    """Return whether a record routes through the `in_channel_prefix` subtree.
 
-    return record_channel == in_channel_prefix or record_channel.startswith(
-        in_channel_prefix + "/"
+    A match succeeds when either the record's source channel or its effective
+    output channel belongs to the requested subtree.
+    """
+
+    resolved_out_channel = effective_out_channel(
+        in_channel=record_in_channel,
+        out_channel=record_out_channel,
+    )
+    return channel_has_prefix(
+        channel=record_in_channel,
+        prefix=in_channel_prefix,
+    ) or channel_has_prefix(
+        channel=resolved_out_channel,
+        prefix=in_channel_prefix,
     )
 
 
@@ -484,8 +505,9 @@ class FolderMemoryStore(MemoryStore):
     - `contains_id()` checks existence from filenames alone, avoiding a full
       record load plus link repair during polling/orchestration paths.
     - `get_latests()` returns ids in newest-first store order, optionally
-      filtered by `in_channel` prefix and exact `contact` membership, with an
-      optional `num` cap.
+      filtered by routed `in_channel` prefix (`record.in_channel` or effective
+      `record.out_channel`) and exact `contact` membership, with an optional
+      `num` cap.
     - `filter_by_in_channel()` remains stage_a-like (`rg` + core validation)
       to keep retrieval tolerant for partially populated core files.
     - `search_by_keywords()` mirrors Telegram stage_a and shells out to `rg`.
@@ -562,7 +584,8 @@ class FolderMemoryStore(MemoryStore):
         """Return latest record ids in descending store order.
 
         Args:
-            in_channel: Optional channel prefix filter using subtree semantics.
+            in_channel: Optional routed-channel prefix filter using subtree
+                semantics against `in_channel` or effective `out_channel`.
             contact: Optional exact contact-id filter against
                 `MemoryRecord.contacts`.
             num: Optional maximum number of ids to return. `None` means no
@@ -588,8 +611,10 @@ class FolderMemoryStore(MemoryStore):
         latests: list[str] = []
         for record_id in sorted(headers_by_id, reverse=True):
             header = headers_by_id[record_id]
-            if in_channel is not None and not _in_channel_matches_prefix(
-                header.in_channel, in_channel
+            if in_channel is not None and not _record_matches_in_channel_prefix(
+                record_in_channel=header.in_channel,
+                record_out_channel=header.out_channel,
+                in_channel_prefix=in_channel,
             ):
                 continue
             if contact is not None and contact not in header.contacts:
@@ -738,16 +763,17 @@ class FolderMemoryStore(MemoryStore):
         in_channel_prefix: str,
         records_dir: Path | None = None,
     ) -> list[Path]:
-        """Return detailed files whose record `in_channel` matches `in_channel_prefix`.
+        """Return detailed files whose record routes through `in_channel_prefix`.
 
         This is intentionally stage_a-like:
         - It shells out to `rg` for coarse file discovery.
         - It then validates each candidate by parsing its sibling `*.core.json`
-          and applying subtree-aware prefix matching.
+          and applying subtree-aware routing prefix matching.
         - Files are returned in path order.
 
         Args:
-            in_channel_prefix: Channel prefix to match by subtree semantics.
+            in_channel_prefix: Routing-channel prefix to match by subtree
+                semantics.
             records_dir: Optional explicit records directory. When omitted,
                 `<self.root>/records` is used.
         """
@@ -756,7 +782,7 @@ class FolderMemoryStore(MemoryStore):
         if not records_dir.exists():
             return []
 
-        # Keep this stage_a-like and tolerant: only parse `in_channel` from
+        # Keep this stage_a-like and tolerant: only parse routing channels from
         # candidate core files and avoid full-store validation.
         return self._filter_by_in_channel_via_rg(
             in_channel_prefix=in_channel_prefix,
@@ -771,7 +797,7 @@ class FolderMemoryStore(MemoryStore):
     ) -> list[Path]:
         root_segment = in_channel_prefix.split("/", 1)[0]
         root_pattern = re.escape(root_segment)
-        grep_pattern = rf'"in_channel"\s*:\s*"{root_pattern}(?:/|")'
+        grep_pattern = rf'"(?:in_channel|out_channel)"\s*:\s*"{root_pattern}(?:/|")'
 
         try:
             res = subprocess.run(
@@ -802,12 +828,23 @@ class FolderMemoryStore(MemoryStore):
             except (OSError, ValueError):
                 continue
 
-            record_channel = (
+            record_in_channel = (
                 payload.get("in_channel") if isinstance(payload, dict) else None
             )
-            if not isinstance(record_channel, str):
+            if not isinstance(record_in_channel, str):
                 continue
-            if not _in_channel_matches_prefix(record_channel, in_channel_prefix):
+            record_out_channel = (
+                payload.get("out_channel") if isinstance(payload, dict) else None
+            )
+            if record_out_channel is not None and not isinstance(
+                record_out_channel, str
+            ):
+                continue
+            if not _record_matches_in_channel_prefix(
+                record_in_channel=record_in_channel,
+                record_out_channel=record_out_channel,
+                in_channel_prefix=in_channel_prefix,
+            ):
                 continue
 
             detailed_path = self._detailed_path_for_record_path(core_path)
