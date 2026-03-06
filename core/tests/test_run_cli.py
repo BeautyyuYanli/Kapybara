@@ -84,6 +84,11 @@ async def test_run_once_uses_model_name_from_config_toml(
         )
 
     monkeypatch.setattr(run_module, "agent_run", fake_agent_run)
+    monkeypatch.setattr(
+        run_module.uuid,
+        "uuid4",
+        lambda: type("FakeUuid", (), {"hex": "oneshot"})(),
+    )
 
     config = Config(config_base=config_base)
     memory_store = FolderMemoryStore(
@@ -102,7 +107,7 @@ async def test_run_once_uses_model_name_from_config_toml(
 
     instruct = captured["instruct"]
     assert instruct == Event(
-        in_channel="direct_input",
+        in_channel="direct/oneshot",
         contacts=[],
         content="hello from cli",
     )
@@ -131,7 +136,7 @@ async def test_run_once_waits_for_parent_memories_before_calling_agent_run(
         _ = model, config, memory_store, instruct, message_history
         captured["parent_memories"] = parent_memories
         return MemoryRecord(
-            in_channel="direct_input",
+            in_channel=instruct.in_channel,
             input="hello from cli",
             compacted=["ok"],
         )
@@ -238,7 +243,7 @@ async def test_run_once_times_out_when_parent_memories_never_appear(
         _ = model, config, memory_store, instruct, message_history, parent_memories
         called = True
         return MemoryRecord(
-            in_channel="direct_input",
+            in_channel=instruct.in_channel,
             input="hello from cli",
             compacted=["ok"],
         )
@@ -279,7 +284,7 @@ async def test_main_omits_contacts_by_default(
         config: Config,
         memory_store: FolderMemoryStore,
         prompt: str,
-        in_channel: str = "direct_input",
+        in_channel: str | None = None,
         contacts: list[str] | None = None,
         out_channel: str | None = None,
         parent_memories: list[str] | None = None,
@@ -309,5 +314,53 @@ async def test_main_omits_contacts_by_default(
     assert captured == {
         "config_base": config_base.resolve(),
         "in_channel": "self-hook/test",
+        "contacts": [],
+    }
+
+
+@pytest.mark.anyio
+async def test_run_repl_uses_direct_default_when_in_channel_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+    prompts = iter(["hello from repl", "quit"])
+
+    async def fake_run_once(
+        *,
+        config: Config,
+        memory_store: FolderMemoryStore,
+        prompt: str,
+        in_channel: str | None = None,
+        contacts: list[str] | None = None,
+        out_channel: str | None = None,
+        parent_memories: list[str] | None = None,
+        parents_timeout_seconds: float = 300.0,
+        model: Any = None,
+    ) -> str:
+        _ = config, memory_store, out_channel, parent_memories
+        _ = parents_timeout_seconds, model
+        captured["prompt"] = prompt
+        captured["in_channel"] = in_channel
+        captured["contacts"] = contacts
+        return '{"compacted":["ok"]}'
+
+    monkeypatch.setattr(run_module, "run_once", fake_run_once)
+    monkeypatch.setattr("builtins.input", lambda _: next(prompts))
+
+    config = Config(config_base=tmp_path / ".kapybara")
+    memory_store = FolderMemoryStore(
+        root=memory_root_from_config_base(config.config_base),
+    )
+
+    await run_module.run_repl(
+        config=config,
+        memory_store=memory_store,
+        model="m",
+    )
+
+    assert captured == {
+        "prompt": "hello from repl",
+        "in_channel": "direct/default",
         "contacts": [],
     }

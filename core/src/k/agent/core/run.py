@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -91,7 +92,9 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     `config_base` is no longer configurable on the command line; the process
     always uses `Config()` so the default/env-backed config root stays
-    consistent with the rest of the runtime.
+    consistent with the rest of the runtime. When `--in-channel` is omitted,
+    the default is resolved later from the execution mode: one-shot runs get a
+    fresh `direct/<random>` channel, while the REPL uses `direct/default`.
     """
 
     parser = argparse.ArgumentParser(
@@ -105,8 +108,12 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--in-channel",
-        default="direct_input",
-        help="Event.in_channel used for prompts sent through this CLI.",
+        default=None,
+        help=(
+            "Event.in_channel used for prompts sent through this CLI. "
+            "Defaults to direct/<random> for one-shot prompts and "
+            "direct/default for the REPL."
+        ),
     )
     parser.add_argument(
         "--contact",
@@ -166,12 +173,28 @@ def _normalize_parent_memory_ids(parent_memories: list[str] | None) -> list[str]
     return out
 
 
+def _resolve_cli_in_channel(in_channel: str | None, *, repl: bool) -> str:
+    """Return a CLI `in_channel`, filling mode-specific defaults when omitted.
+
+    One-shot `kapy` runs should not share history by default, so omitted
+    `--in-channel` generates a fresh `direct/<random>` path per invocation.
+    The REPL keeps the stable `direct/default` channel so repeated turns share
+    context until the session exits.
+    """
+
+    if in_channel is not None:
+        return in_channel
+    if repl:
+        return "direct/default"
+    return f"direct/{uuid.uuid4().hex}"
+
+
 def _resolve_cli_contacts(contacts: list[str] | None) -> list[str]:
     """Resolve CLI contacts without injecting synthetic defaults.
 
     `kapy` should preserve the caller-supplied contact set exactly. Omitting
     `--contact` now means "run without contacts" instead of manufacturing a
-    placeholder contact like `direct_input/local`.
+    placeholder contact.
     """
 
     return list(contacts or [])
@@ -226,7 +249,7 @@ async def run_once(
     config: Config,
     memory_store: FolderMemoryStore,
     prompt: str,
-    in_channel: str = "direct_input",
+    in_channel: str | None = None,
     contacts: list[str] | None = None,
     out_channel: str | None = None,
     parent_memories: list[str] | None = None,
@@ -243,9 +266,12 @@ async def run_once(
     Contact semantics:
     - `contacts=None` and `contacts=[]` both preserve an empty
       `Event.contacts` list.
+    - `in_channel=None` generates a fresh `direct/<random>` channel so
+      one-shot CLI invocations do not accidentally reuse unrelated history.
     """
 
     resolved_model = model or _agent_run_model_from_config(config)
+    resolved_in_channel = _resolve_cli_in_channel(in_channel, repl=False)
     resolved_parent_memories = _normalize_parent_memory_ids(parent_memories)
     resolved_contacts = _resolve_cli_contacts(contacts)
     if resolved_parent_memories:
@@ -255,7 +281,7 @@ async def run_once(
             timeout_seconds=parents_timeout_seconds,
         )
     event = Event(
-        in_channel=in_channel,
+        in_channel=resolved_in_channel,
         contacts=resolved_contacts,
         out_channel=out_channel,
         content=prompt,
@@ -275,18 +301,24 @@ async def run_repl(
     *,
     config: Config,
     memory_store: FolderMemoryStore,
-    in_channel: str = "direct_input",
+    in_channel: str | None = None,
     contacts: list[str] | None = None,
     out_channel: str | None = None,
     parent_memories: list[str] | None = None,
     parents_timeout_seconds: float = 300.0,
     model: Model | None = None,
 ) -> None:
-    """Run the installed direct-input REPL until the user exits."""
+    """Run the installed direct-input REPL until the user exits.
+
+    `in_channel=None` resolves to `direct/default`, giving the REPL one stable
+    conversation channel for the whole interactive session.
+    """
 
     from rich import print
 
     resolved_model = model or _agent_run_model_from_config(config)
+    # Keep a stable REPL channel for the whole session so turns share memory.
+    resolved_in_channel = _resolve_cli_in_channel(in_channel, repl=True)
     while True:
         i = input("\n> ")
         if i.lower() in {"exit", "quit"}:
@@ -297,7 +329,7 @@ async def run_repl(
                 config=config,
                 memory_store=memory_store,
                 prompt=i,
-                in_channel=in_channel,
+                in_channel=resolved_in_channel,
                 contacts=_resolve_cli_contacts(contacts),
                 out_channel=out_channel,
                 parent_memories=parent_memories,

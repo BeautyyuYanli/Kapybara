@@ -5,67 +5,53 @@ description: Launches a detached follow-up `kapy` run that inherits the current 
 
 # self-hook
 
-Use this skill when you need to start a follow-up `kapy` run that inherits the
-current run's config base, memory dependency, and routing context.
+Use this skill to start a follow-up `kapy` run that is detached, shares the
+same config base and memory graph, and waits for the current run's memory
+record before it starts.
 
-Use the non-blocking style when launching from the current run. A blocking
-style is included later as a reference for scripts or cronjobs that are allowed
-to wait for completion.
+## Use this skill when
 
-## Required behavior
+- You need a detached follow-up task.
+- The child run must see the same on-disk config and memory tree as the parent.
+- The child must not start until the current run's memory record exists.
 
-1. When launching from the current run, use the non-blocking `nohup` style.
-   Do not use the blocking style directly from an active run because it would
-   block the current reply.
-2. Preserve the current runtime config base.
-   Read the concrete `Agent config base (...)` value from the `<System>`
-   section of prompt and explicitly set `K_CONFIG_BASE='<that path>'` for the
-   child `kapy` process so it sees the same memories, skills, and preferences
-   tree as the current run.
-3. Pass the **Current run memory id** from the `<System>` section of prompt as
-   `--parent-memory`.
-   This makes the child wait until this run's memory record exists before it
-   starts.
-4. Set `--out-channel` to the current run's active output channel.
-   Use the current `out_channel` when it is set. Otherwise use the current
-   `in_channel`.
-5. Default `--in-channel` to `self-hook/default`.
-   Only switch to `self-hook/<meaningful-unique-slug>` when you explicitly need
-   channel isolation, such as concurrent hooks that should not share
-   channel-scoped retrieval or history. Do not use random ids; the slug should
-   describe the follow-up task.
-6. Preserve the current run's contacts by repeating `--contact` once per
-   contact.
-   If the current run has no contacts, omit `--contact` entirely.
-7. If you need more than one dependency, repeat `--parent-memory` once per id.
-8. Use the `--flag='value'` (or `--flag="value"`) format for all arguments.
-   This is critical when values (like memory IDs) start with a hyphen (`-`).
-9. Do not `wait` on the background PID in the current run.
-   Report the PID and log path instead.
+## Read these values from the current prompt
 
-## Why these rules matter
+- `Agent config base (...)` from the `<System>` section
+- `Current run memory id` from the `<System>` section
+- The active reply channel: `out_channel` if present, otherwise `in_channel`
+- Every current contact, if any
 
-- `kapy` waits for every `--parent-memory` id before it calls `agent_run`.
-- Passing the current run memory id creates an explicit dependency edge from
-  the detached run to the memory produced by this run.
-- If the parent run never writes that reserved memory record, the child timing
-  out is intentional. It prevents the follow-up from running against missing or
-  incomplete parent context.
-- Reusing the same `K_CONFIG_BASE` keeps the child on the same on-disk memory
-  and skills graph, so the parent-memory wait loop can see the record it
-  depends on.
+## Rules
 
-## Non-blocking pattern (direct use)
+1. From an active run, always use the non-blocking `nohup` pattern. Do not use
+   the blocking pattern directly from an active run.
+2. Set `K_CONFIG_BASE='<Agent config base path>'` explicitly so the child sees
+   the same config, skills, and memories.
+3. Pass the current run memory id as
+   `--parent-memory='<Current run memory id>'`. Repeat `--parent-memory` for
+   extra dependencies.
+4. Set `--out-channel` to the active reply channel: `out_channel` if present,
+   otherwise `in_channel`.
+5. Omit `--in-channel` by default. Add
+   `--in-channel='<meaningful-stable-channel>'` only when follow-ups should
+   intentionally share channel-scoped history. Do not use `direct/default`.
+6. Preserve contacts exactly: repeat `--contact='<contact>'` once per contact,
+   or omit `--contact` if there are none.
+7. Quote every argument as `--flag='value'` or `--flag="value"`.
+8. Do not `wait` on the background PID from the current run. Print the PID and
+   log path instead.
+
+## Non-blocking template
+
+Use this from an active run.
 
 ```bash
 HOOK_LOG="/tmp/kapy_self_hook_$(date +%Y%m%d_%H%M%S).log"
 
 nohup env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
   kapy \
-  --in-channel='self-hook/default' \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
-  --contact='<current_contact_1>' \
-  --contact='<current_contact_2_if_any>' \
   --parent-memory='<Current run memory id from the <System> section of prompt>' \
   "$(cat <<'EOF'
 <follow-up prompt>
@@ -76,21 +62,14 @@ EOF
 printf 'pid=%s log=%s\n' "$!" "$HOOK_LOG"
 ```
 
-Use this pattern when calling the hook from an active run.
+## Blocking template
 
-## Blocking pattern (scripts or cronjobs only)
-
-Use this only when the caller is external automation that is expected to wait,
-such as a shell script or cronjob. Do not call this pattern directly from an
-active run.
+Use this only from external automation such as a shell script or cron job.
 
 ```bash
 env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
   kapy \
-  --in-channel='self-hook/default' \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
-  --contact='<current_contact_1>' \
-  --contact='<current_contact_2_if_any>' \
   --parent-memory='<Current run memory id from the <System> section of prompt>' \
   "$(cat <<'EOF'
 <follow-up prompt>
@@ -100,18 +79,15 @@ EOF
 
 The caller is responsible for handling exit status, stdout, and stderr.
 
-## Authoring tips
+## Prompt-writing guidance
 
-- Keep the follow-up prompt self-contained. State exactly what the detached run
-  should do and what output or side effects it should produce.
-- Prefer `--flag='value'` or `--flag='<placeholder>'` for literal arguments to
-  reduce shell-escaping mistakes.
-- Set `K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>'`
-  explicitly in the command instead of relying on inherited shell state.
-- Prefer an inline single-quoted here-doc (`$(cat <<'EOF' ... EOF)`) for the
-  prompt body. This keeps `$VAR`, backticks, and backslashes literal inside the
-  follow-up instruction.
-- Prefer a timestamped log filename so concurrent hooks do not overwrite the
-  same `/tmp` log file.
+- Keep the follow-up prompt self-contained. State exactly what it should do and
+  what output or side effects it should produce.
 - Prefer one detached hook per clear objective instead of bundling unrelated
   work into a single background run.
+- Use an inline single-quoted here-doc (`$(cat <<'EOF' ... EOF)`) so `$VAR`,
+  backticks, and backslashes stay literal inside the prompt body.
+- Set `K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>'`
+  explicitly instead of relying on inherited shell state.
+- Prefer a timestamped log filename so concurrent hooks do not overwrite each
+  other.
