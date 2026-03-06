@@ -29,11 +29,16 @@ class AgentRunCliConfig(BaseModel):
 
     `model_name` is the OpenAI model id used to build the `model` argument
     passed into `k.agent.core.agent.agent_run`.
+    `openai_api_key` and `openai_base_url`, when set, override the default
+    OpenAI provider credentials/endpoint for CLI runs. When omitted, provider
+    resolution falls back to the environment/default OpenAI client behavior.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     model_name: str
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
 
     @field_validator("model_name")
     @classmethod
@@ -44,6 +49,16 @@ class AgentRunCliConfig(BaseModel):
         if not normalized:
             raise ValueError("model_name must not be empty")
         return normalized
+
+    @field_validator("openai_api_key", "openai_base_url")
+    @classmethod
+    def _normalize_optional_openai_setting(cls, value: str | None) -> str | None:
+        """Trim optional OpenAI settings and collapse blank strings to `None`."""
+
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class KapybaraTomlConfig(BaseModel):
