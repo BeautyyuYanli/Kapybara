@@ -66,10 +66,10 @@ def config_toml_path(config_base: str | Path) -> Path:
 
 
 def load_kapybara_toml_config(config_base: str | Path) -> KapybaraTomlConfig:
-    """Load `<config_base>/config.toml`, returning defaults when absent.
+    """Load `<config_base>/config.toml`.
 
     Raises:
-        ValueError: when the file cannot be read, parsed, or validated.
+        ValueError: when the file is missing or cannot be read, parsed, or validated.
     """
 
     path = config_toml_path(config_base)

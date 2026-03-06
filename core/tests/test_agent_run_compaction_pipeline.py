@@ -267,6 +267,13 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
     ):
         memory_store.append(record)
 
+    stored_explicit_parent = memory_store.get_by_id(explicit_parent.id_)
+    stored_channel_parent = memory_store.get_by_id(channel_parent.id_)
+    stored_contact_parent = memory_store.get_by_id(contact_parent.id_)
+    assert stored_explicit_parent is not None
+    assert stored_channel_parent is not None
+    assert stored_contact_parent is not None
+
     await agent_run(
         model="test-model",
         config=config,
@@ -291,11 +298,11 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
     assert captured_injected_memories_prompt is not None
     assert captured_injected_memories_prompt.startswith("<Memories>")
     assert explicit_root.dump_compated() in captured_injected_memories_prompt
-    assert explicit_parent.dump_raw_pair() in captured_injected_memories_prompt
+    assert stored_explicit_parent.dump_raw_pair() in captured_injected_memories_prompt
     assert channel_root.dump_compated() in captured_injected_memories_prompt
-    assert channel_parent.dump_compated() in captured_injected_memories_prompt
+    assert stored_channel_parent.dump_compated() in captured_injected_memories_prompt
     assert contact_root.dump_compated() in captured_injected_memories_prompt
-    assert contact_parent.dump_raw_pair() in captured_injected_memories_prompt
+    assert stored_contact_parent.dump_raw_pair() in captured_injected_memories_prompt
     assert captured_memory_parents == [
         explicit_root.id_,
         channel_root.id_,
