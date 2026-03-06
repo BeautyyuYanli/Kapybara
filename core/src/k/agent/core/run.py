@@ -43,15 +43,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _configure_cli_logfire() -> None:
+def _load_cli_logfire_token(config_base: str | Path) -> str | None:
+    """Best-effort lookup of `[logfire].token` from `<config_base>/config.toml`.
+
+    Logfire setup should not fail earlier than the main CLI config path. When
+    the TOML file is missing or invalid, keep the previous environment-driven
+    behavior here and let the later model-config load surface the real error.
+    """
+
+    try:
+        file_config = load_kapybara_toml_config(config_base)
+    except ValueError:
+        return None
+
+    if file_config.logfire is None:
+        return None
+    return file_config.logfire.token
+
+
+def _configure_cli_logfire(config_base: str | Path) -> None:
     """Configure Logfire for CLI runs without requiring project credentials.
 
     The default `logfire.configure()` behavior prompts for project setup when no
     token or cached credentials are present. `kapy` is often used in ad-hoc or
     automated shells, so only send telemetry when Logfire is already configured.
+    If `<config_base>/config.toml` declares `[logfire].token`, prefer that
+    token for `kapy` CLI runs.
     """
 
-    logfire.configure(send_to_logfire="if-token-present")
+    token = _load_cli_logfire_token(config_base)
+    if token is None:
+        logfire.configure(send_to_logfire="if-token-present")
+    else:
+        logfire.configure(send_to_logfire="if-token-present", token=token)
     logfire.instrument_pydantic_ai()
     logging.basicConfig(level=logging.INFO, handlers=[logfire.LogfireLoggingHandler()])
 
@@ -496,9 +520,9 @@ async def main(argv: list[str] | None = None) -> None:
 
     from rich import print
 
-    _configure_cli_logfire()
     args = _parse_cli_args(argv)
     config = Config()
+    _configure_cli_logfire(config.config_base)
     if args.run_async:
         if args.prompt is None:
             raise SystemExit("--async requires a prompt")

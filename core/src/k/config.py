@@ -6,7 +6,8 @@ to the `.kapybara` directory itself (for example: `./data/fs/.kapybara`).
 This module has two config layers:
 - `Config`: constructor/env-driven transport settings for the Python process.
 - `KapybaraTomlConfig`: user-editable defaults loaded from
-  `<config_base>/config.toml` for installed CLIs such as `kapy`.
+  `<config_base>/config.toml` for installed CLIs such as `kapy`, including
+  model defaults plus optional ancillary integrations like Logfire.
 """
 
 import tomllib
@@ -22,6 +23,15 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _CONFIG_TOML_FILENAME = "config.toml"
+
+
+def _normalize_optional_toml_string(value: str | None) -> str | None:
+    """Trim optional TOML strings and collapse blank values to `None`."""
+
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 class AgentRunCliConfig(BaseModel):
@@ -55,23 +65,43 @@ class AgentRunCliConfig(BaseModel):
     def _normalize_optional_openai_setting(cls, value: str | None) -> str | None:
         """Trim optional OpenAI settings and collapse blank strings to `None`."""
 
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+        return _normalize_optional_toml_string(value)
+
+
+class LogfireCliConfig(BaseModel):
+    """TOML-backed Logfire defaults for installed CLIs.
+
+    `token`, when set, is passed to `logfire.configure()` for `kapy` runs.
+    Omitting the section or leaving the value blank preserves the existing
+    environment/cached-credentials resolution path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str | None = None
+
+    @field_validator("token")
+    @classmethod
+    def _normalize_optional_token(cls, value: str | None) -> str | None:
+        """Trim optional Logfire tokens and collapse blank strings to `None`."""
+
+        return _normalize_optional_toml_string(value)
 
 
 class KapybaraTomlConfig(BaseModel):
     """Contents of `<config_base>/config.toml`.
 
     This file stores persistent, user-editable defaults that should live with
-    the agent's filesystem state. Transport and path settings stay on `Config`
-    so they can still be controlled through `K_*` environment variables.
+    the agent's filesystem state. `[agent_run]` carries required `kapy` model
+    defaults, while optional sections such as `[logfire]` configure ancillary
+    CLI integrations. Transport and path settings stay on `Config` so they can
+    still be controlled through `K_*` environment variables.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     agent_run: AgentRunCliConfig
+    logfire: LogfireCliConfig | None = None
 
 
 def config_toml_path(config_base: str | Path) -> Path:

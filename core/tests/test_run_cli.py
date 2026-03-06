@@ -34,6 +34,7 @@ def _write_cli_config(
     *,
     openai_api_key: str | None = None,
     openai_base_url: str | None = None,
+    logfire_token: str | None = None,
 ) -> None:
     path = config_toml_path(config_base)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,10 +43,13 @@ def _write_cli_config(
         lines.append(f'openai_api_key = "{openai_api_key}"')
     if openai_base_url is not None:
         lines.append(f'openai_base_url = "{openai_base_url}"')
+    if logfire_token is not None:
+        lines.extend(["", "[logfire]", f'token = "{logfire_token}"'])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_configure_cli_logfire_uses_token_optional_mode(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -69,9 +73,49 @@ def test_configure_cli_logfire_uses_token_optional_mode(
     monkeypatch.setattr(run_module.logfire, "LogfireLoggingHandler", lambda: handler)
     monkeypatch.setattr(run_module.logging, "basicConfig", fake_basic_config)
 
-    run_module._configure_cli_logfire()
+    run_module._configure_cli_logfire(tmp_path / ".kapybara")
 
     assert captured["configure"] == {"send_to_logfire": "if-token-present"}
+    assert captured["instrumented"] is True
+    assert captured["basic_config"] == {
+        "level": logging.INFO,
+        "handlers": [handler],
+    }
+
+
+def test_configure_cli_logfire_uses_toml_token_when_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    handler = object()
+    config_base = tmp_path / ".kapybara"
+    _write_cli_config(config_base, logfire_token="test-logfire-token")
+
+    def fake_configure(**kwargs: Any) -> None:
+        captured["configure"] = kwargs
+
+    def fake_instrument_pydantic_ai() -> None:
+        captured["instrumented"] = True
+
+    def fake_basic_config(**kwargs: Any) -> None:
+        captured["basic_config"] = kwargs
+
+    monkeypatch.setattr(run_module.logfire, "configure", fake_configure)
+    monkeypatch.setattr(
+        run_module.logfire,
+        "instrument_pydantic_ai",
+        fake_instrument_pydantic_ai,
+    )
+    monkeypatch.setattr(run_module.logfire, "LogfireLoggingHandler", lambda: handler)
+    monkeypatch.setattr(run_module.logging, "basicConfig", fake_basic_config)
+
+    run_module._configure_cli_logfire(config_base)
+
+    assert captured["configure"] == {
+        "send_to_logfire": "if-token-present",
+        "token": "test-logfire-token",
+    }
     assert captured["instrumented"] is True
     assert captured["basic_config"] == {
         "level": logging.INFO,
@@ -496,7 +540,7 @@ async def test_main_async_mode_spawns_detached_child_and_prints_pid_and_logfile(
 ) -> None:
     captured: dict[str, Any] = {}
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda: None)
+    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda _config_base: None)
     monkeypatch.setattr(
         "rich.print", lambda message: captured.setdefault("printed", message)
     )
@@ -552,7 +596,7 @@ async def test_main_async_mode_spawns_detached_child_and_prints_pid_and_logfile(
 async def test_main_async_mode_requires_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda: None)
+    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda _config_base: None)
 
     with pytest.raises(SystemExit, match="--async requires a prompt"):
         await run_module.main(["--async"])
