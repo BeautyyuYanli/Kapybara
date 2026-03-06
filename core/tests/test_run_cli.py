@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,40 @@ def _write_cli_config(config_base: Path) -> None:
     path = config_toml_path(config_base)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('[agent_run]\nmodel_name = "gpt-5.2"\n', encoding="utf-8")
+
+
+def test_configure_cli_logfire_uses_token_optional_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    handler = object()
+
+    def fake_configure(**kwargs: Any) -> None:
+        captured["configure"] = kwargs
+
+    def fake_instrument_pydantic_ai() -> None:
+        captured["instrumented"] = True
+
+    def fake_basic_config(**kwargs: Any) -> None:
+        captured["basic_config"] = kwargs
+
+    monkeypatch.setattr(run_module.logfire, "configure", fake_configure)
+    monkeypatch.setattr(
+        run_module.logfire,
+        "instrument_pydantic_ai",
+        fake_instrument_pydantic_ai,
+    )
+    monkeypatch.setattr(run_module.logfire, "LogfireLoggingHandler", lambda: handler)
+    monkeypatch.setattr(run_module.logging, "basicConfig", fake_basic_config)
+
+    run_module._configure_cli_logfire()
+
+    assert captured["configure"] == {"send_to_logfire": "if-token-present"}
+    assert captured["instrumented"] is True
+    assert captured["basic_config"] == {
+        "level": logging.INFO,
+        "handlers": [handler],
+    }
 
 
 @pytest.mark.anyio
