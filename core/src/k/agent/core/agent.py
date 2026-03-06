@@ -24,8 +24,10 @@ Memory compaction contract:
 Memory retrieval boundaries:
     Scope-specific auto-retrieval lives in
     `k.agent.memory.retrieval.by_in_channel` and
-    `k.agent.memory.retrieval.by_contact`. This module only merges those scope
-    results into one injected `<Memories>` block.
+    `k.agent.memory.retrieval.by_contact`. Caller-supplied parent-memory ids
+    are resolved through `k.agent.memory.utils.get_memory_ids_from_roots`.
+    This module only merges those injected-memory sources into one
+    `<Memories>` block.
 """
 
 from __future__ import annotations
@@ -91,7 +93,7 @@ from k.agent.memory.retrieval.by_in_channel import (
     select_memory_ids_by_in_channel,
 )
 from k.agent.memory.store import MemoryStore
-from k.agent.memory.utils import dedupe_memory_ids
+from k.agent.memory.utils import dedupe_memory_ids, get_memory_ids_from_roots
 from k.config import Config
 from k.io_helpers.shell import ShellSessionManager
 from k.runner_helpers.basic_os import (
@@ -118,6 +120,9 @@ class MyDeps:
         routing source. `start_event.contacts` is optional user identity context
         for contact-scoped preference injection. System prompts use channels and
         contacts for preference + skill injection.
+        `memory_parents` stores the deduped root ids whose context was injected
+        for this run so forked runs can inherit graph parents without reusing
+        serialized prompt blocks.
         `injected_memories_prompt` stores the `<Memories>` block prepared once
         in `agent_run` and injected via a non-dynamic system prompt.
         `resolved_contact_ids` is the unique-id view of `start_event.contacts`,
@@ -573,13 +578,15 @@ def _select_auto_memory_records(
     *,
     in_channel: str,
     contacts: Sequence[str],
-) -> tuple[list[MemoryRecord], set[str], list[str]]:
+) -> tuple[list[str], set[str], list[str]]:
     """Merge channel/contact retrieval results for `agent_run`.
 
     Scope-specific retrieval lives in the sibling `k.agent.memory.retrieval.*`
     modules. This helper preserves the legacy cross-scope merge semantics:
     compacted ids win over raw-pair ids after the channel/contact results are
     combined, while `memory_parent_ids` remain the latest root ids per scope.
+    Returned selected ids are sorted lexicographically, which matches
+    `MemoryRecord.id_` time order.
     """
 
     channel_roots = latest_memory_roots_by_in_channel(
@@ -620,7 +627,7 @@ def _select_auto_memory_records(
         len(selected_ids),
     )
     return (
-        memory_store.get_by_ids(selected_ids),
+        sorted(selected_ids),
         compacted_ids,
         dedupe_memory_ids(channel_roots + contact_roots),
     )
@@ -652,9 +659,12 @@ async def agent_run(
     - Persist those resolved ids in the output `MemoryRecord.contacts`.
 
     Parent-memory selection:
-    - `parent_memories` provided and non-empty: inject directly into
-      `<Memories>` without MemoryStore lookup/parsing.
-    - `parent_memories` omitted or empty: auto-generate from MemoryStore:
+    - `parent_memories` provided and non-empty: treat them as explicit root
+      memory ids, resolve them through
+      `k.agent.memory.utils.get_memory_ids_from_roots()`, and merge the
+      resulting injections with the auto-generated scope injections below.
+    - `parent_memories` omitted or empty: inject only the auto-generated
+      MemoryStore context:
       1) latest 5 records in `in_channel`, expand with 1-level compacted
          ancestors + 3-level raw-pair-only ancestors.
       2) latest 1 record per resolved contact id, expand with 1-level
@@ -674,27 +684,40 @@ async def agent_run(
         config_base=config.config_base,
         platform_contacts=instruct.contacts,
     )
-    explicit_memories = list(parent_memories or [])
-    memory_parent_ids: list[str] = []
-    memory_blocks: list[str] = []
-
-    if explicit_memories:
-        memory_blocks = explicit_memories
-        logger.info(
-            "Injected memories counts (explicit): explicit=%d, injected_total=%d",
-            len(memory_blocks),
-            len(memory_blocks),
-        )
-    else:
-        all_mem_rec, recent_mem, memory_parent_ids = _select_auto_memory_records(
+    explicit_parent_memory_ids = dedupe_memory_ids(parent_memories or [])
+    selected_mem_ids, compacted_mem_ids, memory_parent_ids = (
+        _select_auto_memory_records(
             memory_store,
             in_channel=instruct.in_channel,
             contacts=resolved_contact_ids,
         )
-        memory_blocks = [
-            x.dump_compated() if x.id_ in recent_mem else x.dump_raw_pair()
-            for x in all_mem_rec
-        ]
+    )
+
+    if explicit_parent_memory_ids:
+        explicit_selected_ids, explicit_compacted_ids, explicit_root_ids = (
+            get_memory_ids_from_roots(
+                memory_store,
+                roots=explicit_parent_memory_ids,
+            )
+        )
+        selected_mem_ids = sorted(set(selected_mem_ids) | set(explicit_selected_ids))
+        compacted_mem_ids |= explicit_compacted_ids
+        memory_parent_ids = dedupe_memory_ids(explicit_root_ids + memory_parent_ids)
+        logger.info(
+            "Injected memories counts (explicit roots): "
+            "roots=%d, injected_compacted=%d, injected_raw_pair=%d, "
+            "injected_total=%d",
+            len(explicit_root_ids),
+            len(explicit_compacted_ids),
+            len(explicit_selected_ids) - len(explicit_compacted_ids),
+            len(explicit_selected_ids),
+        )
+
+    all_mem_rec = memory_store.get_by_ids(set(selected_mem_ids))
+    memory_blocks = [
+        x.dump_compated() if x.id_ in compacted_mem_ids else x.dump_raw_pair()
+        for x in all_mem_rec
+    ]
     memory_prompt = _memories_system_prompt(memory_blocks)
 
     usage_limits = UsageLimits()
