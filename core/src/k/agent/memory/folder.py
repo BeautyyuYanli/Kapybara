@@ -481,6 +481,8 @@ class FolderMemoryStore(MemoryStore):
     directly from the record filenames on disk.
 
     Fast retrieval helpers:
+    - `contains_id()` checks existence from filenames alone, avoiding a full
+      record load plus link repair during polling/orchestration paths.
     - `get_latests()` returns ids in newest-first store order, optionally
       filtered by `in_channel` prefix and exact `contact` membership, with an
       optional `num` cap.
@@ -506,6 +508,16 @@ class FolderMemoryStore(MemoryStore):
         """Retained for `MemoryStore` compatibility; direct disk queries need no rebuild."""
 
         return None
+
+    def contains_id(self, id_: MemoryRecordId) -> bool:
+        """Return whether `id_` exists without loading or repairing the record."""
+
+        if not self.root.exists():
+            coerce_record_id(id_)
+            return False
+
+        record_id = coerce_record_id(id_)
+        return self._find_record_path_by_id(record_id) is not None
 
     def _store_lock_path(self) -> Path:
         return self.root / ".folder-memory-store.lock"

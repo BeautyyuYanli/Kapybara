@@ -216,6 +216,8 @@ async def _wait_for_parent_memories(
     depends on parent records written by another process shortly beforehand.
     The default poll interval is 1 second to keep detached follow-up waiting
     cheap while still reacting promptly once the parent record lands.
+    The existence probe intentionally prefers `MemoryStore.contains_id()` so
+    repeated polling does not force full record loads plus link repair.
 
     Unexpected storage errors are logged with the full parent-id set before
     being re-raised so detached CLI waits do not appear to stall silently.
@@ -235,13 +237,14 @@ async def _wait_for_parent_memories(
     try:
         while True:
             # Parent memories may be produced by another process. `refresh()` is a
-            # compatibility hook here; the subsequent `get_by_id()` must observe the
-            # latest on-disk state even when this store keeps no derived indexes.
+            # compatibility hook here; the subsequent existence probe must observe
+            # the latest on-disk state even when this store keeps no derived
+            # indexes.
             memory_store.refresh()
             missing = [
                 parent_id
                 for parent_id in parent_memories
-                if memory_store.get_by_id(parent_id) is None
+                if not memory_store.contains_id(parent_id)
             ]
             if not missing:
                 return
