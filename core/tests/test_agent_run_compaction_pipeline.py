@@ -12,7 +12,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from k.agent.contacts import resolve_contact_unique_ids
 from k.agent.core.agent import agent, agent_run
 from k.agent.core.entities import Event
-from k.agent.memory.entities import MemoryRecord
+from k.agent.memory.entities import MemoryRecord, memory_record_id_from_created_at
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.retrieval.by_contact import (
     latest_memory_roots_by_contact,
@@ -44,6 +44,7 @@ async def test_agent_run_returns_compacted_memory_record(
     captured_user_prompt: tuple[Any, ...] | None = None
     captured_run_metadata: dict[str, Any] | None = None
     captured_usage_limits: Any = None
+    captured_working_memory_id: str | None = None
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_view_base = tmp_path / "agent-view" / ".kapybara"
     monkeypatch.setenv("K_CONFIG_BASE", str(agent_view_base))
@@ -59,6 +60,7 @@ async def test_agent_run_returns_compacted_memory_record(
         nonlocal captured_user_prompt
         nonlocal captured_run_metadata
         nonlocal captured_usage_limits
+        nonlocal captured_working_memory_id
         user_prompt = kwargs.get("user_prompt")
         if isinstance(user_prompt, tuple):
             captured_user_prompt = user_prompt
@@ -66,6 +68,11 @@ async def test_agent_run_returns_compacted_memory_record(
         if isinstance(maybe_metadata, dict):
             captured_run_metadata = maybe_metadata
         captured_usage_limits = kwargs.get("usage_limits")
+        deps = kwargs.get("deps")
+        assert deps is not None
+        captured_working_memory_id = memory_record_id_from_created_at(
+            deps.working_memory_created_at
+        )
         messages: list[ModelRequest | ModelResponse] = [
             ModelRequest(parts=[UserPromptPart(content=("old prompt",))]),
             ModelResponse(parts=[TextPart(content="assistant did a thing")]),
@@ -73,8 +80,12 @@ async def test_agent_run_returns_compacted_memory_record(
         ]
         return _FakeRunResult(
             output=MemoryRecord(
-                in_channel="test",
+                created_at=deps.working_memory_created_at,
+                in_channel=deps.start_event.in_channel,
+                out_channel=deps.start_event.out_channel,
+                contacts=deps.resolved_contact_ids,
                 input="",
+                output="",
                 compacted=["compacted-step"],
             ),
             _messages=messages,
@@ -109,8 +120,14 @@ async def test_agent_run_returns_compacted_memory_record(
     system_prompt = captured_user_prompt[0]
     assert isinstance(system_prompt, str)
     assert system_prompt.startswith("<System>")
+    assert captured_working_memory_id is not None
+    assert f"Current run memory id: {captured_working_memory_id}" in system_prompt
     assert (
-        f"Value of `${{K_CONFIG_BASE:-~/.kapybara}}`: {agent_view_base}"
+        "This id is reserved for the memory record produced by this run."
+        in system_prompt
+    )
+    assert (
+        f"Agent config base (`${{K_CONFIG_BASE:-~/.kapybara}}`): {agent_view_base}"
         in system_prompt
     )
     assert captured_user_prompt[2] == "do something"
@@ -163,19 +180,28 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
         if deps is not None:
             captured_injected_memories_prompt = deps.injected_memories_prompt
             captured_memory_parents = list(deps.memory_parents)
+            output = MemoryRecord(
+                created_at=deps.working_memory_created_at,
+                in_channel=deps.start_event.in_channel,
+                out_channel=deps.start_event.out_channel,
+                contacts=deps.resolved_contact_ids,
+                input="",
+                output="",
+                compacted=["compacted-step"],
+            )
+        else:
+            output = MemoryRecord(
+                in_channel="test",
+                input="",
+                output="",
+                compacted=["compacted-step"],
+            )
         messages: list[ModelRequest | ModelResponse] = [
             ModelRequest(parts=[UserPromptPart(content=("old prompt",))]),
             ModelResponse(parts=[TextPart(content="assistant did a thing")]),
             ModelResponse(parts=[TextPart(content="finish_action")]),
         ]
-        return _FakeRunResult(
-            output=MemoryRecord(
-                in_channel="test",
-                input="",
-                compacted=["compacted-step"],
-            ),
-            _messages=messages,
-        )
+        return _FakeRunResult(output=output, _messages=messages)
 
     monkeypatch.setattr(agent, "run", fake_agent_run)
     monkeypatch.setattr(

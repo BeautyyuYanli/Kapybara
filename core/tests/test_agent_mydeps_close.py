@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ async def test_mydeps_async_context_closes_cleanly(tmp_path: Path) -> None:
             contacts=["test/system"],
             content="healthcheck",
         ),
+        working_memory_created_at=datetime.now(),
         resolved_contact_ids=["c1"],
     )
 
