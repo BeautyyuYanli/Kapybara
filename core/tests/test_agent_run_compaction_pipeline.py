@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
+from k.agent.contacts import resolve_contact_unique_ids
 from k.agent.core.agent import agent, agent_run
 from k.agent.core.entities import Event
 from k.agent.memory.entities import MemoryRecord
@@ -21,6 +22,7 @@ from k.agent.memory.retrieval.by_in_channel import (
     latest_memory_roots_by_in_channel,
     select_memory_ids_by_in_channel,
 )
+from k.agent.memory.utils import get_memory_ids_from_roots
 from k.config import Config
 
 agent_module = importlib.import_module("k.agent.core.agent")
@@ -135,10 +137,12 @@ async def test_agent_run_returns_compacted_memory_record(
 
 
 @pytest.mark.anyio
-async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
+async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured_user_prompt: tuple[Any, ...] | None = None
+    captured_injected_memories_prompt: str | None = None
+    captured_memory_parents: list[str] | None = None
     logged: list[tuple[str, tuple[Any, ...]]] = []
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_view_base = tmp_path / "agent-view" / ".kapybara"
@@ -150,9 +154,15 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
 
     async def fake_agent_run(**kwargs: Any) -> _FakeRunResult:
         nonlocal captured_user_prompt
+        nonlocal captured_injected_memories_prompt
+        nonlocal captured_memory_parents
         user_prompt = kwargs.get("user_prompt")
         if isinstance(user_prompt, tuple):
             captured_user_prompt = user_prompt
+        deps = kwargs.get("deps")
+        if deps is not None:
+            captured_injected_memories_prompt = deps.injected_memories_prompt
+            captured_memory_parents = list(deps.memory_parents)
         messages: list[ModelRequest | ModelResponse] = [
             ModelRequest(parts=[UserPromptPart(content=("old prompt",))]),
             ModelResponse(parts=[TextPart(content="assistant did a thing")]),
@@ -180,17 +190,61 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
 
     config = Config(config_base=tmp_path / ".kapybara")
     memory_store = FolderMemoryStore(config.config_base / "memories")
+    resolved_contact_ids = resolve_contact_unique_ids(
+        config_base=config.config_base,
+        platform_contacts=["test/system"],
+    )
 
-    def fail_get_latests(**kwargs: Any) -> list[str]:
-        _ = kwargs
-        raise AssertionError("explicit parent_memories should not query latest records")
-
-    def fail_get_ancestors(*args: Any, **kwargs: Any) -> list[str]:
-        _ = (args, kwargs)
-        raise AssertionError("explicit parent_memories should not query ancestors")
-
-    monkeypatch.setattr(memory_store, "get_latests", fail_get_latests)
-    monkeypatch.setattr(memory_store, "get_ancestors", fail_get_ancestors)
+    explicit_parent = MemoryRecord(
+        in_channel="explicit",
+        input="explicit_parent",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    explicit_root = MemoryRecord(
+        in_channel="explicit",
+        input="explicit_root",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 2),
+        parents=[explicit_parent.id_],
+    )
+    channel_parent = MemoryRecord(
+        in_channel="test",
+        input="channel_parent",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 3),
+    )
+    channel_root = MemoryRecord(
+        in_channel="test",
+        input="channel_root",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 4),
+        parents=[channel_parent.id_],
+    )
+    contact_parent = MemoryRecord(
+        in_channel="contact",
+        contacts=resolved_contact_ids,
+        input="contact_parent",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 5),
+    )
+    contact_root = MemoryRecord(
+        in_channel="contact",
+        contacts=resolved_contact_ids,
+        input="contact_root",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 6),
+        parents=[contact_parent.id_],
+    )
+    for record in (
+        explicit_parent,
+        explicit_root,
+        channel_parent,
+        channel_root,
+        contact_parent,
+        contact_root,
+    ):
+        memory_store.append(record)
 
     await agent_run(
         model="test-model",
@@ -201,7 +255,7 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
             contacts=["test/system"],
             content="do something",
         ),
-        parent_memories=["memory-a", "memory-b"],
+        parent_memories=[explicit_root.id_],
     )
 
     assert captured_user_prompt is not None
@@ -213,9 +267,25 @@ async def test_agent_run_injects_explicit_parent_memories_without_store_lookup(
         not (isinstance(part, str) and part.startswith("<Memories>"))
         for part in captured_user_prompt
     )
+    assert captured_injected_memories_prompt is not None
+    assert captured_injected_memories_prompt.startswith("<Memories>")
+    assert explicit_root.dump_compated() in captured_injected_memories_prompt
+    assert explicit_parent.dump_raw_pair() in captured_injected_memories_prompt
+    assert channel_root.dump_compated() in captured_injected_memories_prompt
+    assert channel_parent.dump_compated() in captured_injected_memories_prompt
+    assert contact_root.dump_compated() in captured_injected_memories_prompt
+    assert contact_parent.dump_raw_pair() in captured_injected_memories_prompt
+    assert captured_memory_parents == [
+        explicit_root.id_,
+        channel_root.id_,
+        channel_parent.id_,
+        contact_root.id_,
+    ]
     assert (
-        "Injected memories counts (explicit): explicit=%d, injected_total=%d",
-        (2, 2),
+        "Injected memories counts (explicit roots): "
+        "roots=%d, injected_compacted=%d, injected_raw_pair=%d, "
+        "injected_total=%d",
+        (1, 1, 1, 2),
     ) in logged
 
 
@@ -308,6 +378,16 @@ def test_select_memory_ids_by_contact_default_levels_and_caps() -> None:
         "raw_pair_level_num": 1,
         "compacted_cap_num": 5,
         "raw_pair_cap_num": 5,
+    }
+
+
+def test_get_memory_ids_from_roots_default_levels_and_caps() -> None:
+    assert get_memory_ids_from_roots.__kwdefaults__ == {
+        "compacted_level_num": 0,
+        "raw_pair_level_num": 3,
+        "compacted_cap_num": 15,
+        "raw_pair_cap_num": 15,
+        "cap_name_prefix": "root",
     }
 
 
@@ -479,7 +559,7 @@ async def test_memory_select_logs_injected_category_counts(
 
     monkeypatch.setattr(agent_module.logger, "info", fake_log_info)
 
-    all_mem_rec, recent_mem, memory_parent_ids = (
+    all_mem_ids, recent_mem, memory_parent_ids = (
         agent_module._select_auto_memory_records(
             store,
             in_channel="channel",
@@ -493,7 +573,7 @@ async def test_memory_select_logs_injected_category_counts(
         channel_older.id_,
         contact_newer.id_,
     ]
-    assert [rec.id_ for rec in all_mem_rec] == [
+    assert all_mem_ids == [
         channel_older.id_,
         channel_newer.id_,
         contact_newer.id_,
