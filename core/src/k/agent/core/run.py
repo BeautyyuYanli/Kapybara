@@ -3,6 +3,11 @@
 `agent_run` and `MyDeps` live in `k.agent.core.agent` (per architecture).
 This module keeps small helpers that are useful for callers/tests plus the
 direct-input `kapy` console script.
+
+The installed CLI supports both foreground runs and a detached `--async`
+one-shot mode. Detached runs re-exec the same CLI in a new session, pin the
+child to the resolved `config_base`, and redirect all child output into a
+fresh logfile under `<config_base>/logs/kapy/`.
 """
 
 from __future__ import annotations
@@ -10,9 +15,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
@@ -98,6 +107,8 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     consistent with the rest of the runtime. When `--in-channel` is omitted,
     the default is resolved later from the execution mode: one-shot runs get a
     fresh `direct/<random>` channel, while the REPL uses `direct/default`.
+    Detached `--async` launches are only valid for one-shot prompts, because
+    they re-exec the same CLI with the original prompt/options in a child.
     """
 
     parser = argparse.ArgumentParser(
@@ -144,6 +155,15 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "How long to wait for all --parent-memory ids to exist before "
             "cancelling. Default: 300 seconds."
+        ),
+    )
+    parser.add_argument(
+        "--async",
+        action="store_true",
+        dest="run_async",
+        help=(
+            "Launch one detached child `kapy` process for the prompt, then "
+            "print the child pid and logfile path."
         ),
     )
     return parser.parse_args(argv)
@@ -201,6 +221,63 @@ def _resolve_cli_contacts(contacts: list[str] | None) -> list[str]:
     """
 
     return list(contacts or [])
+
+
+def _detached_log_path(config_base: str | Path) -> Path:
+    """Return a new logfile path for a detached CLI child run.
+
+    The log lives under `<config_base>/logs/kapy/` so detached runs keep their
+    diagnostics next to the config and memory tree they operate on.
+    """
+
+    logs_dir = Path(config_base).expanduser().resolve() / "logs" / "kapy"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    return logs_dir / f"kapy_{timestamp}_{suffix}.log"
+
+
+def _child_cli_argv(argv: Sequence[str] | None) -> list[str]:
+    """Return the current CLI argv with detached-launch flags removed.
+
+    Detached mode works by re-executing the same CLI in a child process. The
+    child must see the original prompt/options but not `--async`, otherwise it
+    would recurse indefinitely.
+    """
+
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    return [arg for arg in raw_argv if arg != "--async"]
+
+
+def _spawn_detached_cli_run(
+    *,
+    argv: Sequence[str] | None,
+    config: Config,
+) -> tuple[int, Path]:
+    """Launch a detached one-shot `kapy` child and return `(pid, logfile)`.
+
+    Side effects:
+    - Creates `<config_base>/logs/kapy/` if needed.
+    - Spawns a new process session whose stdio is redirected to the logfile.
+    - Forces `K_CONFIG_BASE` in the child environment to the resolved
+      `Config.config_base` so the child observes the same skills and memories
+      even when the parent inherited a different shell default.
+    """
+
+    child_argv = _child_cli_argv(argv)
+    log_path = _detached_log_path(config.config_base)
+    env = os.environ.copy()
+    env["K_CONFIG_BASE"] = str(config.config_base)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "k.agent.core.run", *child_argv],
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+    return process.pid, log_path
 
 
 async def _wait_for_parent_memories(
@@ -357,13 +434,25 @@ async def run_repl(
 
 
 async def main(argv: list[str] | None = None) -> None:
-    """Async CLI entrypoint for the installed `kapy` console script."""
+    """Async CLI entrypoint for the installed `kapy` console script.
+
+    `--async` exits early after spawning a detached child one-shot run. All
+    other modes execute in-process and stream the resulting memory dump to the
+    current stdout.
+    """
 
     from rich import print
 
     _configure_cli_logfire()
     args = _parse_cli_args(argv)
     config = Config()
+    if args.run_async:
+        if args.prompt is None:
+            raise SystemExit("--async requires a prompt")
+        pid, log_path = _spawn_detached_cli_run(argv=argv, config=config)
+        print(f"pid={pid} logfile={log_path}")
+        return
+
     memory_store = FolderMemoryStore(
         root=memory_root_from_config_base(config.config_base),
     )

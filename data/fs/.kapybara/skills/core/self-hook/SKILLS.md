@@ -7,7 +7,8 @@ description: Launches a detached follow-up `kapy` run that inherits the current 
 
 Use this skill to start a follow-up `kapy` run that is detached, shares the
 same config base and memory graph, and waits for the current run's memory
-record before it starts.
+record before it starts. Prefer the CLI's built-in `--async` mode so the CLI
+itself allocates the logfile and prints the child pid/log path.
 
 ## Use this skill when
 
@@ -24,8 +25,8 @@ record before it starts.
 
 ## Rules
 
-1. From an active run, always use the non-blocking `nohup` pattern. Do not use
-   the blocking pattern directly from an active run.
+1. From an active run, always use `kapy --async` for detached follow-ups. Do
+   not use the blocking pattern directly from an active run.
 2. Set `K_CONFIG_BASE='<Agent config base path>'` explicitly so the child sees
    the same config, skills, and memories.
 3. Pass the current run memory id as
@@ -39,24 +40,19 @@ record before it starts.
 6. Preserve contacts exactly: repeat `--contact='<contact>'` once per contact,
    or omit `--contact` if there are none.
 7. Quote every argument as `--flag='value'` or `--flag="value"`.
-8. Do not `wait` on the background PID from the current run. Print the PID and
-   log path instead.
+8. `kapy --async` prints the detached child metadata as
+   `pid=<pid> logfile=<path>`. Do not `wait` on that PID from the current run.
 
-## Non-blocking template
+## Detached template
 
 Use this from an active run.
 
 ```bash
-HOOK_LOG="/tmp/kapy_self_hook_$(date +%Y%m%d_%H%M%S).log"
-
-nohup env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
-  kapy \
+env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
+  kapy --async \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
   --parent-memory='<Current run memory id from the <System> section of prompt>' \
-  "<follow-up prompt>" \
-  >"$HOOK_LOG" 2>&1 < /dev/null &
-
-printf 'pid=%s log=%s\n' "$!" "$HOOK_LOG"
+  "<follow-up prompt>"
 ```
 
 ## Blocking template
@@ -81,5 +77,5 @@ The caller is responsible for handling exit status, stdout, and stderr.
   work into a single background run.
 - Set `K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>'`
   explicitly instead of relying on inherited shell state.
-- Prefer a timestamped log filename so concurrent hooks do not overwrite each
-  other.
+- `kapy --async` allocates a fresh logfile automatically, so concurrent hooks
+  do not overwrite each other.
