@@ -53,10 +53,7 @@ nohup env K_CONFIG_BASE='<Agent config base path from the <System> section of pr
   kapy \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
   --parent-memory='<Current run memory id from the <System> section of prompt>' \
-  "$(cat <<'EOF'
-<follow-up prompt>
-EOF
-)" \
+  "<follow-up prompt>" \
   >"$HOOK_LOG" 2>&1 < /dev/null &
 
 printf 'pid=%s log=%s\n' "$!" "$HOOK_LOG"
@@ -71,10 +68,7 @@ env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>'
   kapy \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
   --parent-memory='<Current run memory id from the <System> section of prompt>' \
-  "$(cat <<'EOF'
-<follow-up prompt>
-EOF
-)"
+  "<follow-up prompt>"
 ```
 
 The caller is responsible for handling exit status, stdout, and stderr.
@@ -85,8 +79,6 @@ The caller is responsible for handling exit status, stdout, and stderr.
   what output or side effects it should produce.
 - Prefer one detached hook per clear objective instead of bundling unrelated
   work into a single background run.
-- Use an inline single-quoted here-doc (`$(cat <<'EOF' ... EOF)`) so `$VAR`,
-  backticks, and backslashes stay literal inside the prompt body.
 - Set `K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>'`
   explicitly instead of relying on inherited shell state.
 - Prefer a timestamped log filename so concurrent hooks do not overwrite each
