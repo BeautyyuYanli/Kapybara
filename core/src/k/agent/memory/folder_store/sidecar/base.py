@@ -4,15 +4,21 @@ Design notes:
 - The canonical source of truth remains `records/**/*.core.json` plus
   `records/**/*.detailed.jsonl`.
 - Sidecar files under `index/` are derived, rebuildable acceleration data.
+- Canonical writes and sidecar rebuilds share one advisory lock under the
+  store root so cross-process append/rebuild operations never overlap.
 - Cache invalidation uses `index/records.epoch`.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +31,31 @@ from k.agent.memory.entities import MemoryRecord
 @dataclass(frozen=True, slots=True)
 class _CacheKey:
     epoch_mtime_ns: int | None
+
+
+@dataclass(slots=True)
+class _ProcessStoreLockState:
+    """Per-process bookkeeping for a root-scoped advisory store lock."""
+
+    mutex: threading.RLock
+    fd: int | None = None
+    depth: int = 0
+
+
+_PROCESS_STORE_LOCKS: dict[str, _ProcessStoreLockState] = {}
+_PROCESS_STORE_LOCKS_GUARD = threading.Lock()
+
+
+def _process_store_lock_state(lock_path: Path) -> _ProcessStoreLockState:
+    """Return shared in-process lock state for `lock_path`."""
+
+    key = str(lock_path)
+    with _PROCESS_STORE_LOCKS_GUARD:
+        state = _PROCESS_STORE_LOCKS.get(key)
+        if state is None:
+            state = _ProcessStoreLockState(mutex=threading.RLock())
+            _PROCESS_STORE_LOCKS[key] = state
+        return state
 
 
 class FolderSidecarBaseMixin:
@@ -75,7 +106,11 @@ class FolderSidecarBaseMixin:
         self._last_deep_drift_probe_ns = 0
 
     def refresh(self) -> None:
-        """Force a full on-disk index rebuild from canonical record files."""
+        """Force a full on-disk index rebuild from canonical record files.
+
+        Rebuilds take the store's advisory write lock so concurrent processes do
+        not mutate or swap derived sidecar directories at the same time.
+        """
 
         if not self.root.exists():
             self._clear_runtime_caches()
@@ -86,6 +121,45 @@ class FolderSidecarBaseMixin:
         self._rebuild_index_from_disk()
         self._cache_key = self._stat_key()
         self._bootstrapped = True
+
+    def _store_lock_path(self) -> Path:
+        return self.root / ".folder-memory-store.lock"
+
+    @contextmanager
+    def _exclusive_store_lock(self) -> Iterator[None]:
+        """Serialize cross-process canonical writes and sidecar rebuilds.
+
+        We keep the critical section root-scoped instead of sidecar-scoped
+        because `append()` first mutates canonical record files and only then
+        refreshes derived `index/` data. Readers that trigger rebuilds must not
+        scan the canonical tree while that write is mid-flight.
+        """
+
+        lock_path = self._store_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        state = _process_store_lock_state(lock_path)
+        with state.mutex:
+            if state.depth == 0:
+                fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                state.fd = fd
+            state.depth += 1
+            try:
+                yield
+            finally:
+                state.depth -= 1
+                if state.depth == 0:
+                    fd = state.fd
+                    state.fd = None
+                    if fd is not None:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
 
     def _load_if_needed(self) -> None:
         if not self.root.exists():
@@ -127,6 +201,10 @@ class FolderSidecarBaseMixin:
         self._cache_key = self._stat_key()
 
     def _rebuild_index_from_disk(self) -> None:
+        with self._exclusive_store_lock():
+            self._rebuild_index_from_disk_unlocked()
+
+    def _rebuild_index_from_disk_unlocked(self) -> None:
         records: list[MemoryRecord] = []
         by_id: dict[str, MemoryRecord] = {}
         record_paths: dict[str, Path] = {}

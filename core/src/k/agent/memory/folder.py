@@ -41,6 +41,10 @@ Design notes / invariants:
 - `append()` updates each existing referenced parent's `children` list
   (persisting parent records) before persisting the new record. Missing parent
   ids are dropped from the appended record.
+- Canonical record writes and sidecar rebuilds share one advisory lock under
+  the store root so cross-process append/rebuild operations never overlap.
+- New records publish `*.core.json` last so disk scans never observe a visible
+  record before its required `*.detailed.jsonl` payload exists.
 - Process-local hot-record caches are intentionally small and invalidated by
   `index/records.epoch` checks rather than recursive file stat snapshots.
 - A full on-disk rebuild pass is still used to bootstrap/repair the filesystem
@@ -771,44 +775,54 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         return selected
 
     def append(self, record: MemoryRecord) -> None:
-        if not self.root.exists():
-            self.root.mkdir(parents=True, exist_ok=True)
-        self._load_if_needed()
+        """Persist `record` and serialize against concurrent rebuilds.
 
-        if self._read_meta(record.id_) is not None:
-            raise ValueError(
-                f"Duplicate MemoryRecord id encountered while appending: {record.id_}"
+        The append holds the store's advisory write lock for the full operation
+        so other processes cannot rebuild sidecars from partially written record
+        files while this record or its parents are being updated.
+        """
+
+        with self._exclusive_store_lock():
+            self._load_if_needed()
+
+            if self._read_meta(record.id_) is not None:
+                raise ValueError(
+                    f"Duplicate MemoryRecord id encountered while appending: {record.id_}"
+                )
+
+            existing_ids = {
+                parent_id
+                for parent_id in record.parents
+                if self._read_meta(parent_id) is not None
+            }
+            record.parents = _dedupe_existing_ids(
+                record.parents, existing_ids=existing_ids
             )
 
-        existing_ids = {
-            parent_id
-            for parent_id in record.parents
-            if self._read_meta(parent_id) is not None
-        }
-        record.parents = _dedupe_existing_ids(record.parents, existing_ids=existing_ids)
+            updated_parents: list[MemoryRecord] = []
+            for parent_id in record.parents:
+                parent = self._get_by_id(parent_id, allow_rebuild=True)
+                if parent is None:
+                    continue
+                if record.id_ not in parent.children:
+                    parent.children.append(record.id_)
+                    updated_parents.append(parent)
 
-        updated_parents: list[MemoryRecord] = []
-        for parent_id in record.parents:
-            parent = self._get_by_id(parent_id, allow_rebuild=True)
-            if parent is None:
-                continue
-            if record.id_ not in parent.children:
-                parent.children.append(record.id_)
-                updated_parents.append(parent)
+            for parent in updated_parents:
+                parent_path = self._record_paths.get(parent.id_)
+                persisted_parent_path = self._persist_record(
+                    parent, path_hint=parent_path
+                )
+                self._upsert_meta(parent, core_path=persisted_parent_path)
+                self._cache_record(parent)
 
-        for parent in updated_parents:
-            parent_path = self._record_paths.get(parent.id_)
-            persisted_parent_path = self._persist_record(parent, path_hint=parent_path)
-            self._upsert_meta(parent, core_path=persisted_parent_path)
-            self._cache_record(parent)
-
-        persisted_path = self._persist_record(record, path_hint=None)
-        self._upsert_meta(record, core_path=persisted_path)
-        self._cache_record(record)
-        self._insert_id_into_order(record.id_)
-        self._update_stats_after_append(id_=record.id_, core_path=persisted_path)
-        self._touch_epoch()
-        self._cache_key = self._stat_key()
+            persisted_path = self._persist_record(record, path_hint=None)
+            self._upsert_meta(record, core_path=persisted_path)
+            self._cache_record(record)
+            self._insert_id_into_order(record.id_)
+            self._update_stats_after_append(id_=record.id_, core_path=persisted_path)
+            self._touch_epoch()
+            self._cache_key = self._stat_key()
 
     def _detailed_path_for_record_path(self, record_path: Path) -> Path:
         """Return the sibling detailed path for a record path.
@@ -926,15 +940,16 @@ class FolderMemoryStore(FolderSidecarIndexMixin, MemoryStore):
         # Split persistence:
         # - core: metadata + channel routing + compacted (one JSON blob, one line)
         # - detailed: raw input + output + tool_calls per response (JSONL)
-        self._atomic_write_text(
-            path,
-            record.dump_compated(),
-        )
-
         detailed_path = self._detailed_path_for_record_path(path)
+        # Publish the detailed sidecar first and the core file last so a disk
+        # scan never sees a visible core record without its required payload.
         self._atomic_write_text(
             detailed_path,
             _encode_detailed_jsonl(record),
+        )
+        self._atomic_write_text(
+            path,
+            record.dump_compated(),
         )
 
         self._record_paths[record.id_] = path
