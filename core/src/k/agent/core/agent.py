@@ -555,10 +555,11 @@ def _event_meta_prompt(event: Event) -> str:
 async def _system_runtime_prompt(deps: MyDeps) -> str:
     """Return runtime metadata that should be explicit to the model.
 
-    `AgentConfigBase` is resolved through the shell runtime path (same transport
-    as bash tools), not from Python process environment variables. The reserved
-    run memory id is derived from a `created_at` timestamp captured before model
-    execution so the prompt can name the final record explicitly.
+    `Agent config base` is resolved through the shell runtime path (same
+    transport as bash tools), not from Python process environment variables.
+    The reserved run memory id is derived from a `created_at` timestamp
+    captured before model execution so the prompt can name the final record
+    explicitly.
     """
 
     try:
