@@ -1,12 +1,52 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
 
 from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
+
+
+def _refresh_store_many_times(root: str, iterations: int) -> list[str]:
+    store = FolderMemoryStore(root)
+    for _ in range(iterations):
+        store.refresh()
+    return store.get_latests()
+
+
+def _append_records_with_slow_core_publish(
+    root: str, *, count: int, core_sleep_seconds: float
+) -> list[str]:
+    store = FolderMemoryStore(root)
+    original_atomic_write_text = FolderMemoryStore._atomic_write_text
+
+    def slow_atomic_write_text(self, path, text) -> None:
+        original_atomic_write_text(self, path, text)
+        if path.name.endswith(".core.json"):
+            time.sleep(core_sleep_seconds)
+
+    FolderMemoryStore._atomic_write_text = slow_atomic_write_text
+    try:
+        appended_ids: list[str] = []
+        for second in range(count):
+            record = MemoryRecord(
+                in_channel="test",
+                input=f"append-{second}",
+                compacted=[f"c{second}"],
+                output=f"o{second}",
+                detailed=[],
+                created_at=datetime(2026, 1, 2, 0, 0, second),
+            )
+            store.append(record)
+            appended_ids.append(record.id_)
+        return appended_ids
+    finally:
+        FolderMemoryStore._atomic_write_text = original_atomic_write_text
 
 
 def test_folder_store_get_latests_and_get_by_id(tmp_path) -> None:
@@ -375,6 +415,79 @@ def test_folder_store_auto_refreshes_on_external_append(tmp_path) -> None:
     external.append(r2)
 
     assert store.get_latests() == [r2.id_, r1.id_]
+
+
+def test_folder_store_refresh_is_safe_across_processes(tmp_path) -> None:
+    if "fork" not in mp.get_all_start_methods():
+        pytest.skip("requires fork start method")
+
+    root = tmp_path / "mem"
+    store = FolderMemoryStore(root)
+    older = MemoryRecord(
+        in_channel="test",
+        input="older",
+        compacted=["c1"],
+        output="o1",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    newer = MemoryRecord(
+        in_channel="test",
+        input="newer",
+        compacted=["c2"],
+        output="o2",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 1, 0),
+    )
+    store.append(older)
+    store.append(newer)
+
+    with ProcessPoolExecutor(
+        max_workers=2,
+        mp_context=mp.get_context("fork"),
+    ) as executor:
+        futures = [
+            executor.submit(_refresh_store_many_times, str(root), 200) for _ in range(2)
+        ]
+        results = [future.result() for future in futures]
+
+    assert results == [[newer.id_, older.id_], [newer.id_, older.id_]]
+
+
+def test_folder_store_refresh_is_safe_during_external_append(tmp_path) -> None:
+    if "fork" not in mp.get_all_start_methods():
+        pytest.skip("requires fork start method")
+
+    root = tmp_path / "mem"
+    seed_store = FolderMemoryStore(root)
+    seed = MemoryRecord(
+        in_channel="test",
+        input="seed",
+        compacted=["seed"],
+        output="seed-out",
+        detailed=[],
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    seed_store.append(seed)
+
+    with ProcessPoolExecutor(
+        max_workers=2,
+        mp_context=mp.get_context("fork"),
+    ) as executor:
+        refresh_future = executor.submit(_refresh_store_many_times, str(root), 200)
+        append_future = executor.submit(
+            _append_records_with_slow_core_publish,
+            str(root),
+            count=20,
+            core_sleep_seconds=0.01,
+        )
+        appended_ids = append_future.result()
+        observed_ids = refresh_future.result()
+
+    rebuilt = FolderMemoryStore(root)
+    assert rebuilt.get_by_id(appended_ids[-1]) is not None
+    assert rebuilt.get_latests()[0] == appended_ids[-1]
+    assert seed.id_ in observed_ids
 
 
 def test_folder_store_auto_refreshes_on_external_record_drift(
