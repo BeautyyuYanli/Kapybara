@@ -93,7 +93,7 @@ def get_memory_ids_from_roots(
     memory_store: MemoryStore,
     *,
     roots: Sequence[str],
-    compacted_level_num: int = 0,
+    compacted_level_num: int = 1,
     raw_pair_level_num: int = 3,
     compacted_cap_num: int = 15,
     raw_pair_cap_num: int = 15,
