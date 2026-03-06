@@ -170,7 +170,7 @@ async def test_edit_file_uses_agent_view_config_base_expression() -> None:
         new_content="new\n",
     )
     command = deps.shell_manager.new_shell_commands[0]
-    assert "${K_CONFIG_BASE:-~/.kapybara}/skills/meta/edit-file/edit" in command
+    assert "$K_CONFIG_BASE/skills/meta/edit-file/edit" in command
     assert str(deps.basic_os_helper.config.config_base) not in command
 
 

@@ -47,7 +47,6 @@ async def test_agent_run_returns_compacted_memory_record(
     captured_working_memory_id: str | None = None
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_view_base = tmp_path / "agent-view" / ".kapybara"
-    monkeypatch.setenv("K_CONFIG_BASE", str(agent_view_base))
     pref_path = tmp_path / ".kapybara" / "preferences" / "test.md"
     pref_path.parent.mkdir(parents=True, exist_ok=True)
     pref_path.write_text("test channel preference", encoding="utf-8")
@@ -126,10 +125,7 @@ async def test_agent_run_returns_compacted_memory_record(
         "This id is reserved for the memory record produced by this run."
         in system_prompt
     )
-    assert (
-        f"Agent config base (`${{K_CONFIG_BASE:-~/.kapybara}}`): {agent_view_base}"
-        in system_prompt
-    )
+    assert f"Agent config base (`$K_CONFIG_BASE`): {agent_view_base}" in system_prompt
     assert captured_user_prompt[2] == "do something"
     assert all(
         not (isinstance(part, str) and part.startswith("<Memories>"))
@@ -163,7 +159,6 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
     logged: list[tuple[str, tuple[Any, ...]]] = []
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_view_base = tmp_path / "agent-view" / ".kapybara"
-    monkeypatch.setenv("K_CONFIG_BASE", str(agent_view_base))
 
     async def fake_agent_config_base_value(**kwargs: Any) -> str:
         _ = kwargs
