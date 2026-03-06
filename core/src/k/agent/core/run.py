@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
+import logfire
 from pydantic_ai.messages import UserContent
 
 from k.agent.channels import channel_root
@@ -27,6 +29,19 @@ from k.config import Config, load_kapybara_toml_config
 
 if TYPE_CHECKING:
     from pydantic_ai.models import Model
+
+
+def _configure_cli_logfire() -> None:
+    """Configure Logfire for CLI runs without requiring project credentials.
+
+    The default `logfire.configure()` behavior prompts for project setup when no
+    token or cached credentials are present. `kapy` is often used in ad-hoc or
+    automated shells, so only send telemetry when Logfire is already configured.
+    """
+
+    logfire.configure(send_to_logfire="if-token-present")
+    logfire.instrument_pydantic_ai()
+    logging.basicConfig(level=logging.INFO, handlers=[logfire.LogfireLoggingHandler()])
 
 
 def _extract_input_event_channel_root(instruct: Sequence[UserContent]) -> str | None:
@@ -278,6 +293,7 @@ async def main(argv: list[str] | None = None) -> None:
 
     from rich import print
 
+    _configure_cli_logfire()
     args = _parse_cli_args(argv)
     if args.config_base is not None:
         config = Config(config_base=Path(args.config_base))
