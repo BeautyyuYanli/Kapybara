@@ -6,8 +6,9 @@ when the runtime shell does not already define it, and then sources
 All payloads are executed through `bash -lc` so shell behavior stays consistent
 even when the transport shell is `sh`, `zsh`, or a remote login shell.
 When `Config.ssh_user` + `Config.ssh_addr` are configured, commands run over SSH.
-When both are `None`, commands run locally via `script ... bash -lc ...` to
-preserve pseudo-terminal behavior expected by shell-session tools.
+When both are `None`, commands run locally via `script`, wrapping `bash -lc`
+in the platform-specific syntax required to preserve the pseudo-terminal
+behavior expected by shell-session tools.
 """
 
 import sys
@@ -49,14 +50,27 @@ def _bash_login_command(payload: str) -> str:
 def _local_script_command_prefix() -> str:
     """Return the platform-specific `script` prefix for local bash PTYs.
 
-    BSD/macOS `script` accepts `script file command ...`, while util-linux
-    expects `script file -- command ...` when the command is passed as argv
-    instead of `-c`.
+    BSD/macOS `script` accepts `script file command ...`, so the prefix already
+    includes `bash -lc`. util-linux only accepts `script -c <command> file`, so
+    callers must append the quoted command and trailing `/dev/null` sink.
     """
 
     if sys.platform == "darwin":
         return "script -q /dev/null bash -lc "
-    return "script -q /dev/null -- bash -lc "
+    return "script -q -e -c "
+
+
+def _local_script_command(payload: str) -> str:
+    """Return the full local `script` command for a bash payload.
+
+    util-linux rejects the older argv-style `script ... -- bash -lc ...` form
+    with "unexpected number of arguments". Use `-c` there and `-e` so the
+    wrapper returns the child exit code instead of `script`'s own status.
+    """
+
+    if sys.platform == "darwin":
+        return _local_script_command_prefix() + single_quote(payload)
+    return _local_script_command_prefix() + _bash_login_command(payload) + " /dev/null"
 
 
 async def agent_config_base_value(
@@ -128,7 +142,7 @@ class BasicOSHelper:
 
         payload = _shell_bootstrap_prefix() + command
         if self.config.ssh_user is None or self.config.ssh_addr is None:
-            return self.command_base() + single_quote(payload)
+            return _local_script_command(payload)
         return self.command_base() + _bash_login_command(payload)
 
 

@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from k.config import Config, config_toml_path, load_kapybara_toml_config
-from k.runner_helpers.basic_os import BasicOSHelper, agent_config_base_value
+from k.runner_helpers.basic_os import (
+    BasicOSHelper,
+    agent_config_base_value,
+    single_quote,
+)
 
 
 def test_config_defaults_expand_to_home_paths(tmp_path: Path, monkeypatch) -> None:
@@ -90,19 +94,26 @@ def test_basic_os_helper_uses_local_script_when_ssh_endpoint_is_unset(
 ) -> None:
     config = Config(config_base=tmp_path / "state" / ".kapybara")
     helper = BasicOSHelper(config=config)
+    payload = (
+        'if [ -z "${K_CONFIG_BASE:-}" ]; then export K_CONFIG_BASE=~/.kapybara; '
+        'else export K_CONFIG_BASE; fi; . "$K_CONFIG_BASE/.bashrc"; echo hello'
+    )
 
     expected_base = (
         "script -q /dev/null bash -lc "
         if sys.platform == "darwin"
-        else "script -q /dev/null -- bash -lc "
+        else "script -q -e -c "
+    )
+    expected_command = (
+        expected_base + single_quote(payload)
+        if sys.platform == "darwin"
+        else expected_base
+        + single_quote(f"bash -lc {single_quote(payload)}")
+        + " /dev/null"
     )
 
     assert helper.command_base() == expected_base
-    assert (
-        helper.command("echo hello")
-        == expected_base
-        + '\'if [ -z "${K_CONFIG_BASE:-}" ]; then export K_CONFIG_BASE=~/.kapybara; else export K_CONFIG_BASE; fi; . "$K_CONFIG_BASE/.bashrc"; echo hello\''
-    )
+    assert helper.command("echo hello") == expected_command
 
 
 def test_basic_os_helper_wraps_ssh_commands_in_bash(tmp_path: Path) -> None:
