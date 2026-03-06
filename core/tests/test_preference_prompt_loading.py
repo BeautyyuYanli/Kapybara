@@ -36,6 +36,26 @@ def test_channel_preference_candidates_fall_back_to_default_when_root_missing(
     assert candidates[0] == pref_root / "PREFERENCES.default.md"
 
 
+def test_channel_preference_candidates_include_effective_out_channel(
+    tmp_path: Path,
+) -> None:
+    pref_root = tmp_path / ".kapybara" / "preferences"
+
+    candidates = _channel_preference_candidates(
+        "worker/job/123",
+        out_channel="telegram/chat/456/thread/7",
+        pref_root=pref_root,
+    )
+
+    assert pref_root / "worker.md" in candidates
+    assert pref_root / "worker/job/123.md" in candidates
+    assert pref_root / "telegram.md" in candidates
+    assert pref_root / "telegram/chat/456/thread/7.md" in candidates
+    assert candidates.index(pref_root / "worker.md") < candidates.index(
+        pref_root / "telegram.md"
+    )
+
+
 @pytest.mark.parametrize("filename", ["PREFERENCES.md", "PREFERENCES.default.md"])
 def test_load_preferences_prompt_accepts_root_preference_file(
     tmp_path: Path, filename: str
@@ -76,6 +96,44 @@ def test_load_preferences_prompt_omits_default_when_root_exists(
     assert "preferred root" in prompt
     assert f"Path: {default}" not in prompt
     assert "default root" not in prompt
+
+
+def test_load_preferences_prompt_includes_out_channel_preference(
+    tmp_path: Path,
+) -> None:
+    pref_root = tmp_path / ".kapybara" / "preferences"
+    out_pref = pref_root / "telegram" / "chat" / "123" / "PREFERENCES.md"
+    out_pref.parent.mkdir(parents=True, exist_ok=True)
+    out_pref.write_text("reply via telegram", encoding="utf-8")
+
+    prompt = _load_preferences_prompt(
+        in_channel="worker/job/1",
+        contacts=[],
+        pref_root=pref_root,
+        out_channel="telegram/chat/123",
+    )
+
+    assert f"Path: {out_pref}" in prompt
+    assert "reply via telegram" in prompt
+
+
+def test_load_preferences_prompt_dedupes_overlapping_in_and_out_channel_preferences(
+    tmp_path: Path,
+) -> None:
+    pref_root = tmp_path / ".kapybara" / "preferences"
+    pref_path = pref_root / "telegram.md"
+    pref_path.parent.mkdir(parents=True, exist_ok=True)
+    pref_path.write_text("telegram preference", encoding="utf-8")
+
+    prompt = _load_preferences_prompt(
+        in_channel="telegram/chat/123",
+        contacts=[],
+        pref_root=pref_root,
+        out_channel="telegram/chat/123/thread/5",
+    )
+
+    assert prompt.count(f"Path: {pref_path}") == 1
+    assert prompt.count("telegram preference") == 1
 
 
 def test_load_preferences_prompt_includes_contact_preference(
