@@ -99,6 +99,47 @@ def claim_read_and_empty(path: str) -> str:
     return data
 
 
+def _normalize_parent_memory_flag_values(
+    argv: Sequence[str] | None = None,
+) -> list[str]:
+    """Attach dashed parent-memory ids to `--parent-memory=` before parsing.
+
+    Memory record ids use an ordered base64 alphabet where `-` is a valid first
+    character, so callers often pass values such as `--parent-memory --------`.
+    `argparse` treats that second token as another option rather than as the
+    value for `--parent-memory`. Rewriting only syntactically valid record ids
+    into the `--parent-memory=<id>` form keeps normal option parsing intact
+    while preserving the usual missing/invalid-value errors for everything else.
+    """
+
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    normalized: list[str] = []
+    idx = 0
+    while idx < len(raw_argv):
+        token = raw_argv[idx]
+        if token != "--parent-memory" or idx + 1 >= len(raw_argv):
+            normalized.append(token)
+            idx += 1
+            continue
+
+        candidate = raw_argv[idx + 1]
+        if not candidate.startswith("-"):
+            normalized.append(token)
+            idx += 1
+            continue
+
+        try:
+            normalized_id = coerce_record_id(candidate)
+        except ValueError:
+            normalized.append(token)
+            idx += 1
+            continue
+
+        normalized.append(f"--parent-memory={normalized_id}")
+        idx += 2
+    return normalized
+
+
 def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse installed `kapy` CLI arguments.
 
@@ -166,7 +207,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
             "print the child pid and logfile path."
         ),
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(_normalize_parent_memory_flag_values(argv))
 
 
 def _agent_run_model_from_config(config: Config) -> Model:
