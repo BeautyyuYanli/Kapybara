@@ -81,7 +81,11 @@ from k.agent.core.shell_tools import (
     edit_file,
 )
 from k.agent.core.skills_md import concat_skills_md, maybe_load_channel_skill_md
-from k.agent.memory.entities import MemoryRecord, is_memory_record_id
+from k.agent.memory.entities import (
+    MemoryRecord,
+    is_memory_record_id,
+    memory_record_id_from_created_at,
+)
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.agent.memory.retrieval.by_contact import (
@@ -123,6 +127,10 @@ class MyDeps:
         `memory_parents` stores the deduped root ids whose context was injected
         for this run so forked runs can inherit graph parents without reusing
         serialized prompt blocks.
+        `working_memory_created_at` reserves the final `MemoryRecord`
+        timestamp at the start of `agent_run`. Dynamic system prompts derive
+        the pending memory id from that timestamp, and `finish_action` must
+        preserve the same `created_at` in the final persisted record.
         `injected_memories_prompt` stores the `<Memories>` block prepared once
         in `agent_run` and injected via a non-dynamic system prompt.
         `resolved_contact_ids` is the unique-id view of `start_event.contacts`,
@@ -141,6 +149,7 @@ class MyDeps:
     memory_storage: FolderMemoryStore
     memory_parents: list[str]
     start_event: Event
+    working_memory_created_at: datetime
     resolved_contact_ids: list[str]
     injected_memories_prompt: str = ""
     bash_cmd_history: list[str] = field(default_factory=list)
@@ -409,8 +418,10 @@ def finish_action(
             `<CompactedRules>`.
 
     Contract:
-        `ctx.deps.resolved_contact_ids` is prepared before model execution in
-        `agent_run` and persisted directly to `MemoryRecord.contacts`.
+        `ctx.deps.working_memory_created_at` reserves the final record
+        timestamp before model execution in `agent_run`; this tool must
+        preserve that `created_at` so the `<System>` prompt and persisted
+        memory record agree on the derived memory id.
     """
 
     validated_ids = _validate_referenced_memory_ids(
@@ -418,6 +429,7 @@ def finish_action(
         referenced_memory_ids=referenced_memory_ids,
     )
     return MemoryRecord(
+        created_at=ctx.deps.working_memory_created_at,
         in_channel=ctx.deps.start_event.in_channel,
         out_channel=ctx.deps.start_event.out_channel,
         contacts=ctx.deps.resolved_contact_ids,
@@ -544,7 +556,9 @@ async def _system_runtime_prompt(deps: MyDeps) -> str:
     """Return runtime metadata that should be explicit to the model.
 
     `AgentConfigBase` is resolved through the shell runtime path (same transport
-    as bash tools), not from Python process environment variables.
+    as bash tools), not from Python process environment variables. The reserved
+    run memory id is derived from a `created_at` timestamp captured before model
+    execution so the prompt can name the final record explicitly.
     """
 
     try:
@@ -559,8 +573,11 @@ async def _system_runtime_prompt(deps: MyDeps) -> str:
 
     return (
         "<System>\n"
-        f"Now: {datetime.now()}\n"
-        f"Value of `{AGENT_CONFIG_BASE_EXPR}`: {runtime_config_base}\n"
+        f"Current time: {datetime.now()}\n"
+        "Current run memory id: "
+        f"{memory_record_id_from_created_at(deps.working_memory_created_at)}\n"
+        "This id is reserved for the memory record produced by this run.\n"
+        f"Agent config base (`{AGENT_CONFIG_BASE_EXPR}`): {runtime_config_base}\n"
         "</System>\n"
     )
 
@@ -644,7 +661,7 @@ async def agent_run(
     """Run the agent with memory + event context and persistable output.
 
     User prompt order (fixed):
-    1. `<System>Now + agent config-base runtime view</System>`
+    1. `<System>Now + working-memory id derived from reserved created_at + agent config-base runtime view</System>`
     2. `<EventMeta>...</EventMeta>`
     3. real instruction content (`Event.content`)
 
@@ -657,6 +674,11 @@ async def agent_run(
     Contact lifecycle:
     - Resolve `Event.contacts` platform ids to unique ids before model run.
     - Persist those resolved ids in the output `MemoryRecord.contacts`.
+
+    Working-memory lifecycle:
+    - Reserve the final `MemoryRecord.created_at` before entering `agent.run`.
+    - Expose the derived memory id through `<System>`.
+    - Preserve the same `created_at` in `finish_action`.
 
     Parent-memory selection:
     - `parent_memories` provided and non-empty: treat them as explicit root
@@ -684,6 +706,7 @@ async def agent_run(
         config_base=config.config_base,
         platform_contacts=instruct.contacts,
     )
+    working_memory_created_at = datetime.now()
     explicit_parent_memory_ids = dedupe_memory_ids(parent_memories or [])
     selected_mem_ids, compacted_mem_ids, memory_parent_ids = (
         _select_auto_memory_records(
@@ -727,6 +750,7 @@ async def agent_run(
         memory_storage=memory_store,
         memory_parents=memory_parent_ids,
         start_event=instruct,
+        working_memory_created_at=working_memory_created_at,
         resolved_contact_ids=resolved_contact_ids,
         injected_memories_prompt=memory_prompt,
     ) as my_deps:
