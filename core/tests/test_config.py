@@ -92,7 +92,7 @@ def test_basic_os_helper_uses_local_script_when_ssh_endpoint_is_unset(
     assert helper.command_base() == "script -q -c "
     assert (
         helper.command("echo hello")
-        == "script -q -c '. ${K_CONFIG_BASE:-~/.kapybara}/.bashrc; echo hello' "
+        == 'script -q -c \'if [ -z "${K_CONFIG_BASE:-}" ]; then export K_CONFIG_BASE=~/.kapybara; else export K_CONFIG_BASE; fi; . "$K_CONFIG_BASE/.bashrc"; echo hello\' '
         "/dev/null"
     )
 
@@ -108,7 +108,8 @@ def test_basic_os_helper_uses_agent_view_config_base_not_python_config_base(
     helper = BasicOSHelper(config=config)
     command = helper.command("echo hello")
 
-    assert "${K_CONFIG_BASE:-~/.kapybara}/.bashrc" in command
+    assert "export K_CONFIG_BASE=~/.kapybara" in command
+    assert "$K_CONFIG_BASE/.bashrc" in command
     assert str(config.config_base) not in command
 
 
@@ -177,6 +178,9 @@ async def test_agent_config_base_value_reads_shell_runtime_marker() -> None:
 
     assert value == "/runtime/.kapybara"
     assert helper.last_command is not None
-    assert "K_CONFIG_BASE" in helper.last_command
+    assert (
+        helper.last_command
+        == 'printf "__KAPY_AGENT_CONFIG_BASE__=%s\\n" "$K_CONFIG_BASE"'
+    )
     assert shell_manager.command is not None
     assert shell_manager.command.startswith("wrapped:")

@@ -348,9 +348,9 @@ async def edit_file(
         start_line: 1-based line number where `old_content` is expected to start, or None to auto-detect.
 
     Notes:
-        The edit script path is resolved from `${K_CONFIG_BASE:-~/.kapybara}`
-        at shell runtime so tool behavior follows the same agent-side config
-        view as `BasicOSHelper.command()`.
+        The edit script path is resolved from `$K_CONFIG_BASE` at shell runtime
+        after `BasicOSHelper.command()` normalizes that env var, so tool
+        behavior follows the same agent-side config view.
     """
     edit_script = f"{AGENT_CONFIG_BASE_EXPR}/skills/meta/edit-file/edit"
 
