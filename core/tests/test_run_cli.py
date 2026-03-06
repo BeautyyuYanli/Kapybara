@@ -9,7 +9,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 
 import k.agent.core.run as run_module
 from k.agent.core.entities import Event
-from k.agent.memory.entities import MemoryRecord
+from k.agent.memory.entities import MemoryRecord, memory_record_id_from_millis
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.config import Config, config_toml_path
@@ -92,6 +92,36 @@ def test_child_cli_argv_omits_async_flag() -> None:
         "self-hook/test",
         "hello from cli",
     ]
+
+
+def test_parse_cli_args_accepts_parent_memory_ids_that_start_with_dash() -> None:
+    dashed_parent_id = memory_record_id_from_millis(0)
+
+    args = run_module._parse_cli_args(
+        [
+            "--parent-memory",
+            dashed_parent_id,
+            "--out-channel",
+            "self-hook/reply",
+            "hello from cli",
+        ]
+    )
+
+    assert args.parent_memories == [dashed_parent_id]
+    assert args.out_channel == "self-hook/reply"
+    assert args.prompt == "hello from cli"
+
+
+def test_parse_cli_args_keeps_missing_parent_memory_errors_for_real_options() -> None:
+    with pytest.raises(SystemExit):
+        run_module._parse_cli_args(
+            [
+                "--parent-memory",
+                "--out-channel",
+                "self-hook/reply",
+                "hello from cli",
+            ]
+        )
 
 
 def test_agent_run_model_from_config_uses_optional_openai_overrides(
