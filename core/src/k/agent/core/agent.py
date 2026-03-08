@@ -38,6 +38,7 @@ import asyncio
 from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -376,6 +377,7 @@ async def agent_run(
     instruct: Event,
     message_history: Sequence[ModelMessage] | None = None,
     parent_memories: list[str] | None = None,
+    working_memory_created_at: datetime | None = None,
 ) -> MemoryRecord:
     """Run the agent with memory + event context and persistable output.
 
@@ -400,6 +402,8 @@ async def agent_run(
     - Reserve the final `MemoryRecord.created_at` before entering `agent.run`.
     - Expose the derived memory id through `<System>`.
     - Preserve the same `created_at` in `finish_action`.
+    - Callers may pass `working_memory_created_at` to preserve a previously
+      reserved id across processes; otherwise `agent_run` reserves one locally.
 
     Parent-memory selection:
     - `parent_memories` provided and non-empty: treat them as explicit root
@@ -432,6 +436,7 @@ async def agent_run(
         config_base=config.config_base,
         instruct=instruct,
         parent_memories=parent_memories,
+        working_memory_created_at=working_memory_created_at,
     )
 
     usage_limits = UsageLimits()

@@ -8,22 +8,21 @@ The CLI is one-shot only: callers must pass a prompt, foreground runs use
 `--wait`, and detached execution is the default otherwise. Stdout is reserved
 for exactly one JSON value per invocation. Foreground runs emit the final
 memory JSON, while detached launches emit child metadata JSON and redirect all
-child output into a fresh logfile under `<config_base>/logs/kapy/`.
+child output into a fresh logfile under the system temp directory.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib
 import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Sequence
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,7 +46,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-agent_module = importlib.import_module("k.agent.core.agent")
 
 
 class DetachedCliRunMetadata(BaseModel):
@@ -335,14 +333,15 @@ def _resolve_cli_contacts(contacts: list[str] | None) -> list[str]:
     return list(contacts or [])
 
 
-def _detached_log_path(config_base: str | Path) -> Path:
+def _detached_log_path() -> Path:
     """Return a new logfile path for a detached CLI child run.
 
-    The log lives under `<config_base>/logs/kapy/` so detached runs keep their
-    diagnostics next to the config and memory tree they operate on.
+    The log lives under the system temp directory so detached runs keep stdout
+    and stderr out of the machine-facing JSON channel without depending on a
+    writable config tree.
     """
 
-    logs_dir = Path(config_base).expanduser().resolve() / "logs" / "kapy"
+    logs_dir = Path(tempfile.gettempdir()).resolve()
     logs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     suffix = uuid.uuid4().hex[:8]
@@ -404,30 +403,6 @@ def _created_at_from_millis(millis: int) -> datetime:
     return datetime.fromtimestamp(millis / 1000)
 
 
-@contextmanager
-def _override_agent_now(reserved_created_at: datetime | None):
-    """Temporarily force `agent.py`'s reserved run timestamp when provided."""
-
-    if reserved_created_at is None:
-        yield
-        return
-
-    original_datetime = agent_module.datetime
-
-    class _ReservedDateTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            if tz is None:
-                return reserved_created_at
-            return original_datetime.now(tz)
-
-    agent_module.datetime = _ReservedDateTime
-    try:
-        yield
-    finally:
-        agent_module.datetime = original_datetime
-
-
 def _spawn_detached_cli_run(
     *,
     argv: Sequence[str] | None,
@@ -436,7 +411,7 @@ def _spawn_detached_cli_run(
     """Launch a detached one-shot `kapy` child and return its stdout metadata.
 
     Side effects:
-    - Creates `<config_base>/logs/kapy/` if needed.
+    - Creates the system temp directory if needed.
     - Spawns a new process session whose stdio is redirected to the logfile.
     - Forces `K_CONFIG_BASE` in the child environment to the resolved
       `Config.config_base` so the child observes the same skills and memories
@@ -447,7 +422,7 @@ def _spawn_detached_cli_run(
     reserved_created_at_ms = int(reserved_created_at.timestamp() * 1000)
     reserved_memory_id = memory_record_id_from_created_at(reserved_created_at)
     child_argv = _child_cli_argv(argv)
-    log_path = _detached_log_path(config.config_base)
+    log_path = _detached_log_path()
     env = os.environ.copy()
     env["K_CONFIG_BASE"] = str(config.config_base)
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -552,6 +527,8 @@ async def run_once(
     Side effects:
     - Reads `<config_base>/config.toml` when `model` is omitted.
     - Waits for caller-specified `parent_memories` to exist before running.
+    - Preserves `reserved_memory_created_at` when provided so detached child
+      runs keep the pre-announced memory id.
     - Appends the returned `MemoryRecord` to `memory_store`.
 
     Contact semantics:
@@ -577,14 +554,14 @@ async def run_once(
         out_channel=out_channel,
         content=prompt,
     )
-    with _override_agent_now(reserved_memory_created_at):
-        mem = await agent_run(
-            model=resolved_model,
-            config=config,
-            memory_store=memory_store,
-            instruct=event,
-            parent_memories=resolved_parent_memories,
-        )
+    mem = await agent_run(
+        model=resolved_model,
+        config=config,
+        memory_store=memory_store,
+        instruct=event,
+        parent_memories=resolved_parent_memories,
+        working_memory_created_at=reserved_memory_created_at,
+    )
     memory_store.append(mem)
     return mem.dump_compated()
 

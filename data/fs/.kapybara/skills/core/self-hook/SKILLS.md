@@ -48,5 +48,5 @@ env K_CONFIG_BASE='<Agent config base path>' \
 Example stdout:
 
 ```json
-{"pid":43210,"memory_id":"<reserved-memory-id>","logfile":"/home/k/.kapybara/logs/kapy/kapy_20260309_120000_abcd1234.log"}
+{"pid":43210,"memory_id":"<reserved-memory-id>","logfile":"/tmp/kapy_20260309_120000_abcd1234.log"}
 ```

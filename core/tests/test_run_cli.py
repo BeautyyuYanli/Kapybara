@@ -211,10 +211,12 @@ async def test_run_once_uses_model_name_from_config_toml(
         instruct: Event,
         message_history: Any = None,
         parent_memories: list[str] | None = None,
+        working_memory_created_at: datetime | None = None,
     ) -> MemoryRecord:
         _ = config, memory_store, message_history, parent_memories
         captured["model"] = model
         captured["instruct"] = instruct
+        captured["working_memory_created_at"] = working_memory_created_at
         return MemoryRecord(
             in_channel=instruct.in_channel,
             out_channel=instruct.out_channel,
@@ -250,7 +252,55 @@ async def test_run_once_uses_model_name_from_config_toml(
         contacts=[],
         content="hello from cli",
     )
+    assert captured["working_memory_created_at"] is None
     assert '"compacted":["ok"]' in result
+
+
+@pytest.mark.anyio
+async def test_run_once_forwards_reserved_memory_created_at_to_agent_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config_base = tmp_path / ".kapybara"
+    _write_cli_config(config_base)
+    reserved_created_at = datetime(2026, 3, 10, 1, 2, 3, 456000)
+
+    async def fake_agent_run(
+        *,
+        model: Any,
+        config: Config,
+        memory_store: FolderMemoryStore,
+        instruct: Event,
+        message_history: Any = None,
+        parent_memories: list[str] | None = None,
+        working_memory_created_at: datetime | None = None,
+    ) -> MemoryRecord:
+        _ = model, config, memory_store, instruct, message_history, parent_memories
+        captured["working_memory_created_at"] = working_memory_created_at
+        return MemoryRecord(
+            created_at=working_memory_created_at or datetime.now(),
+            in_channel=instruct.in_channel,
+            input=instruct.content,
+            compacted=["ok"],
+        )
+
+    monkeypatch.setattr(run_module, "agent_run", fake_agent_run)
+
+    config = Config(config_base=config_base)
+    memory_store = FolderMemoryStore(
+        root=memory_root_from_config_base(config.config_base),
+    )
+
+    await run_module.run_once(
+        config=config,
+        memory_store=memory_store,
+        prompt="hello from cli",
+        reserved_memory_created_at=reserved_created_at,
+    )
+
+    assert captured["working_memory_created_at"] == reserved_created_at
 
 
 @pytest.mark.anyio
@@ -271,9 +321,11 @@ async def test_run_once_waits_for_parent_memories_before_calling_agent_run(
         instruct: Event,
         message_history: Any = None,
         parent_memories: list[str] | None = None,
+        working_memory_created_at: datetime | None = None,
     ) -> MemoryRecord:
         _ = model, config, memory_store, instruct, message_history
         captured["parent_memories"] = parent_memories
+        captured["working_memory_created_at"] = working_memory_created_at
         return MemoryRecord(
             in_channel=instruct.in_channel,
             input="hello from cli",
@@ -307,6 +359,7 @@ async def test_run_once_waits_for_parent_memories_before_calling_agent_run(
         )
 
     assert captured["parent_memories"] == [parent.id_]
+    assert captured["working_memory_created_at"] is None
 
 
 @pytest.mark.anyio
@@ -327,8 +380,10 @@ async def test_run_once_preserves_explicit_empty_contacts(
         instruct: Event,
         message_history: Any = None,
         parent_memories: list[str] | None = None,
+        working_memory_created_at: datetime | None = None,
     ) -> MemoryRecord:
         _ = model, config, memory_store, message_history, parent_memories
+        _ = working_memory_created_at
         captured["instruct"] = instruct
         return MemoryRecord(
             in_channel=instruct.in_channel,
@@ -379,9 +434,18 @@ async def test_run_once_times_out_when_parent_memories_never_appear(
         instruct: Event,
         message_history: Any = None,
         parent_memories: list[str] | None = None,
+        working_memory_created_at: datetime | None = None,
     ) -> MemoryRecord:
         nonlocal called
-        _ = model, config, memory_store, instruct, message_history, parent_memories
+        _ = (
+            model,
+            config,
+            memory_store,
+            instruct,
+            message_history,
+            parent_memories,
+            working_memory_created_at,
+        )
         called = True
         return MemoryRecord(
             in_channel=instruct.in_channel,
@@ -567,6 +631,7 @@ async def test_main_defaults_to_detached_mode_and_emits_json_metadata(
         "_reserved_memory_created_at",
         lambda: reserved_created_at,
     )
+    monkeypatch.setattr(run_module.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(
         run_module,
         "_write_stdout_json",
@@ -617,7 +682,7 @@ async def test_main_defaults_to_detached_mode_and_emits_json_metadata(
     assert captured["start_new_session"] is True
     assert captured["env"]["K_CONFIG_BASE"] == str(config_base)
     assert log_path.exists()
-    assert log_path.parent == config_base / "logs" / "kapy"
+    assert log_path.parent == tmp_path.resolve()
     stdout_payload = captured["stdout"]
     assert isinstance(stdout_payload, run_module.DetachedCliRunMetadata)
     assert stdout_payload == run_module.DetachedCliRunMetadata(
