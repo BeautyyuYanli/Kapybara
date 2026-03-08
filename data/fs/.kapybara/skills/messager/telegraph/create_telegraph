@@ -4,11 +4,7 @@
 # dependencies = ["requests", "beautifulsoup4", "lxml"]
 # ///
 
-"""Publish HTML to Telegra.ph and send the page URL to Telegram.
-
-When `--message-thread-id` is provided, delivery is pinned to that Telegram
-thread (`message_thread_id`). This is required when the input message came
-from a private-chat/forum topic thread and replies must stay in-thread.
+"""Publish HTML to Telegra.ph and return the page URL.
 """
 
 import os
@@ -57,34 +53,21 @@ def html_to_node(element):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("content", help="The HTML content to publish")
-    parser.add_argument(
-        "--chat-id",
-        required=True,
-        help="Telegram Chat ID to send the link to",
-    )
-    parser.add_argument(
-        "--message-thread-id",
-        "--message_thread_id",
-        dest="message_thread_id",
-        help="Optional Telegram message_thread_id for thread-scoped delivery",
-    )
     parser.add_argument("--title", default="Note", help="Telegra.ph page title")
     args = parser.parse_args()
 
     telegraph_token = os.environ.get("TELEGRAPH_ACCESS_TOKEN")
-    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
 
     if not telegraph_token:
         print("Error: TELEGRAPH_ACCESS_TOKEN not set", file=sys.stderr)
-        sys.exit(1)
-    if not tg_token:
-        print("Error: TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
         sys.exit(1)
 
     # 1. Create Telegra.ph page
     soup = BeautifulSoup(args.content, "lxml")
     body = soup.body
     if not body:
+        # If it's just a string, wrap it or parse directly
+        # Telegraph expects nodes
         nodes = [args.content]
     else:
         nodes = []
@@ -110,33 +93,7 @@ def main():
             sys.exit(1)
         
         page_url = res["result"]["url"]
-        
-        # 2. Send link to Telegram
-        tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-        
-        message_text = page_url
-        
-        tg_data = {
-            "chat_id": args.chat_id,
-            "text": message_text.strip(),
-            "parse_mode": "HTML",
-            "link_preview_options": json.dumps({
-                "url": page_url,
-                "prefer_large_media": True
-            })
-        }
-        if args.message_thread_id:
-            tg_data["message_thread_id"] = args.message_thread_id
-        
-        tg_r = requests.post(tg_url, data=tg_data)
-        tg_r.raise_for_status()
-        tg_res = tg_r.json()
-        
-        if tg_res.get("ok"):
-            print(page_url)
-        else:
-            print(f"Telegram Error: {tg_res.get('description')}", file=sys.stderr)
-            sys.exit(1)
+        print(page_url)
 
     except Exception as e:
         print(f"Exception: {e}", file=sys.stderr)

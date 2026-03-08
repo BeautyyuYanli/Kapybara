@@ -53,26 +53,16 @@ curl -sS -X POST "$BASE/sendMessage" \
   -d disable_web_page_preview=true | jq
 ```
 
-## sendViaTelegraph
+## Telegra.ph handoff
 
-Use this to publish long/structured content to Telegra.ph and send the link to Telegram.
-If you need to reply inside a thread, pass the same `message_thread_id`.
+For long/structured content, use `skills:messager/telegraph/SKILLS.md`.
+That skill creates the Telegra.ph page and prints the URL to stdout.
 
-Env:
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAPH_ACCESS_TOKEN`
+After you capture the URL, send it back with `sendMessage`.
 
 ```bash
-CHAT_ID=123456789
-THREAD_ID=987654321  # optional unless you need in-thread delivery
-
-# This script creates a page AND sends the link to the specified chat automatically.
-# You do NOT need to call sendMessage afterwards; the script handles the delivery.
-# It posts the Telegra.ph URL directly into the conversation/thread.
-./send_via_telegraph "<h3>HTML content here</h3>" \
-  --chat-id "$CHAT_ID" \
-  --message-thread-id "$THREAD_ID" \
-  --title "Page Title"
+URL=$(~/.kapybara/skills/messager/telegraph/create_telegraph "<h3>HTML content here</h3>" \
+  --title "Page Title")
 ```
 
 
