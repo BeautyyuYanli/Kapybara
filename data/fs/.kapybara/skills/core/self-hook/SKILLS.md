@@ -5,16 +5,8 @@ description: Launches a detached follow-up `kapy` run that inherits the current 
 
 # self-hook
 
-Use this skill to start a follow-up `kapy` run that is detached, shares the
-same config base and memory graph, and waits for the current run's memory
-record before it starts. Prefer the CLI's built-in `--async` mode so the CLI
-itself allocates the logfile and prints the child pid/log path.
+Use this skill to start a detached follow-up `kapy` run, shares the same config base and memory graph, and waits for the current run's memory record before it starts.
 
-## Use this skill when
-
-- You need a detached follow-up task.
-- The child run must see the same on-disk config and memory tree as the parent.
-- The child must not start until the current run's memory record exists.
 
 ## Read these values from the current prompt
 
@@ -25,8 +17,7 @@ itself allocates the logfile and prints the child pid/log path.
 
 ## Rules
 
-1. From an active run, always use `kapy --async` for detached follow-ups. Do
-   not use the blocking pattern directly from an active run.
+1. From an active run, use the default detached `kapy` one-shot form. Do not add `--wait`.
 2. Set `K_CONFIG_BASE='<Agent config base path>'` explicitly so the child sees
    the same config, skills, and memories.
 3. Pass the current run memory id as
@@ -39,43 +30,23 @@ itself allocates the logfile and prints the child pid/log path.
    intentionally share channel-scoped history. Do not use `direct/default`.
 6. Preserve contacts exactly: repeat `--contact='<contact>'` once per contact,
    or omit `--contact` if there are none.
-7. Quote every argument as `--flag='value'` or `--flag="value"`.
-8. `kapy --async` prints the detached child metadata as
-   `pid=<pid> logfile=<path>`. Do not `wait` on that PID from the current run.
+7. Detached `kapy` prints the child metadata JSON to stdout as
+   `{"pid":43210,"memory_id":"<reserved-memory-id>","logfile":"/path/to/kapy.log"}`.
+8. Do not `wait` on the returned PID from the current run.
 
-## Detached template
 
-Use this from an active run.
-
-```bash
-env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
-  kapy --async \
-  --out-channel='<current active out_channel: out_channel or in_channel>' \
-  --parent-memory='<Current run memory id from the <System> section of prompt>' \
-  "<follow-up prompt>"
-```
-
-## Blocking template
-
-Use this only from external automation such as a shell script or cron job.
+## Template
 
 ```bash
-env K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>' \
+env K_CONFIG_BASE='<Agent config base path>' \
   kapy \
   --out-channel='<current active out_channel: out_channel or in_channel>' \
-  --parent-memory='<Current run memory id from the <System> section of prompt>' \
+  --parent-memory='<Current run memory id>' \
   "<follow-up prompt>"
 ```
 
-The caller is responsible for handling exit status, stdout, and stderr.
+Example stdout:
 
-## Prompt-writing guidance
-
-- Keep the follow-up prompt self-contained. State exactly what it should do and
-  what output or side effects it should produce.
-- Prefer one detached hook per clear objective instead of bundling unrelated
-  work into a single background run.
-- Set `K_CONFIG_BASE='<Agent config base path from the <System> section of prompt>'`
-  explicitly instead of relying on inherited shell state.
-- `kapy --async` allocates a fresh logfile automatically, so concurrent hooks
-  do not overwrite each other.
+```json
+{"pid":43210,"memory_id":"<reserved-memory-id>","logfile":"/home/k/.kapybara/logs/kapy/kapy_20260309_120000_abcd1234.log"}
+```

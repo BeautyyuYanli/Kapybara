@@ -1,19 +1,21 @@
-"""Compatibility helpers and installed CLI wrapper.
+"""Compatibility helpers and installed one-shot CLI wrapper.
 
 `agent_run` and `MyDeps` live in `k.agent.core.agent` (per architecture).
 This module keeps small helpers that are useful for callers/tests plus the
-direct-input `kapy` console script.
+installed `kapy` console script.
 
-The installed CLI supports both foreground runs and a detached `--async`
-one-shot mode. Detached runs re-exec the same CLI in a new session, pin the
-child to the resolved `config_base`, and redirect all child output into a
-fresh logfile under `<config_base>/logs/kapy/`.
+The CLI is one-shot only: callers must pass a prompt, foreground runs use
+`--wait`, and detached execution is the default otherwise. Stdout is reserved
+for exactly one JSON value per invocation. Foreground runs emit the final
+memory JSON, while detached launches emit child metadata JSON and redirect all
+child output into a fresh logfile under `<config_base>/logs/kapy/`.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import logging
 import os
 import subprocess
@@ -21,16 +23,20 @@ import sys
 import time
 import uuid
 from collections.abc import Sequence
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
 import logfire
+from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import UserContent
 
 from k.agent.channels import channel_root
 from k.agent.core.agent import agent_run
 from k.agent.core.entities import Event
+from k.agent.memory.entities import memory_record_id_from_created_at
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.agent.memory.store import MemoryStore, coerce_record_id
@@ -41,6 +47,22 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+agent_module = importlib.import_module("k.agent.core.agent")
+
+
+class DetachedCliRunMetadata(BaseModel):
+    """Machine-facing stdout payload for one detached CLI launch.
+
+    `memory_id` is reserved before the child starts so orchestrators can wire
+    dependent runs immediately. `logfile` stays typed as `Path` in Python and
+    is serialized to a JSON string on stdout.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pid: int
+    memory_id: str
+    logfile: Path
 
 
 def _load_cli_logfire_token(config_base: str | Path) -> str | None:
@@ -170,28 +192,28 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     `config_base` is no longer configurable on the command line; the process
     always uses `Config()` so the default/env-backed config root stays
     consistent with the rest of the runtime. When `--in-channel` is omitted,
-    the default is resolved later from the execution mode: one-shot runs get a
-    fresh `direct/<random>` channel, while the REPL uses `direct/default`.
-    Detached `--async` launches are only valid for one-shot prompts, because
-    they re-exec the same CLI with the original prompt/options in a child.
+    one-shot runs get a fresh `direct/<random>` channel so separate CLI
+    invocations do not accidentally share history.
+    One-shot prompts default to detached `--async` mode unless `--wait` is
+    supplied. Detached launches re-exec the same CLI in a child process, so
+    they are only valid for one-shot prompts.
     """
 
     parser = argparse.ArgumentParser(
         prog="kapy",
-        description="Direct-input CLI wrapper around k.agent.core.agent_run.",
+        description="One-shot CLI wrapper around k.agent.core.agent_run.",
     )
     parser.add_argument(
         "prompt",
         nargs="?",
-        help="Optional one-shot prompt. When omitted, start an interactive REPL.",
+        help="Required one-shot prompt.",
     )
     parser.add_argument(
         "--in-channel",
         default=None,
         help=(
             "Event.in_channel used for prompts sent through this CLI. "
-            "Defaults to direct/<random> for one-shot prompts and "
-            "direct/default for the REPL."
+            "Defaults to a fresh direct/<random> channel per invocation."
         ),
     )
     parser.add_argument(
@@ -222,14 +244,29 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
             "cancelling. Default: 300 seconds."
         ),
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--async",
-        action="store_true",
-        dest="run_async",
+        action="store_const",
+        const="async",
+        dest="execution_mode",
         help=(
             "Launch one detached child `kapy` process for the prompt, then "
-            "print the child pid and logfile path."
+            "emit the child pid, memory id, and logfile path as JSON."
         ),
+    )
+    mode_group.add_argument(
+        "--wait",
+        action="store_const",
+        const="wait",
+        dest="execution_mode",
+        help="Run the prompt in the foreground and wait for completion.",
+    )
+    parser.add_argument(
+        "--reserved-memory-created-at-ms",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args(_normalize_parent_memory_flag_values(argv))
 
@@ -270,19 +307,15 @@ def _normalize_parent_memory_ids(parent_memories: list[str] | None) -> list[str]
     return out
 
 
-def _resolve_cli_in_channel(in_channel: str | None, *, repl: bool) -> str:
-    """Return a CLI `in_channel`, filling mode-specific defaults when omitted.
+def _resolve_cli_in_channel(in_channel: str | None) -> str:
+    """Return a CLI `in_channel`, generating a fresh default when omitted.
 
     One-shot `kapy` runs should not share history by default, so omitted
     `--in-channel` generates a fresh `direct/<random>` path per invocation.
-    The REPL keeps the stable `direct/default` channel so repeated turns share
-    context until the session exits.
     """
 
     if in_channel is not None:
         return in_channel
-    if repl:
-        return "direct/default"
     return f"direct/{uuid.uuid4().hex}"
 
 
@@ -311,24 +344,91 @@ def _detached_log_path(config_base: str | Path) -> Path:
     return logs_dir / f"kapy_{timestamp}_{suffix}.log"
 
 
+def _write_stdout_json(payload: str | BaseModel) -> None:
+    """Write exactly one JSON value to stdout plus a trailing newline.
+
+    `kapy` stdout is machine-facing. Foreground runs already produce the
+    persisted record JSON string, while detached launches emit a modeled
+    metadata object via this helper.
+    """
+
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = payload.model_dump_json()
+    sys.stdout.write(text)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _child_cli_argv(argv: Sequence[str] | None) -> list[str]:
     """Return the current CLI argv with detached-launch flags removed.
 
     Detached mode works by re-executing the same CLI in a child process. The
-    child must see the original prompt/options but not `--async`, otherwise it
-    would recurse indefinitely.
+    child must see the original prompt/options but not the parent-facing mode
+    flags, otherwise default async mode would recurse indefinitely.
     """
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    return [arg for arg in raw_argv if arg != "--async"]
+    child_argv: list[str] = []
+    skip_next = False
+    for arg in raw_argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in {"--async", "--wait"}:
+            continue
+        if arg == "--reserved-memory-created-at-ms":
+            skip_next = True
+            continue
+        if arg.startswith("--reserved-memory-created-at-ms="):
+            continue
+        child_argv.append(arg)
+    return child_argv
+
+
+def _reserved_memory_created_at() -> datetime:
+    """Return a reserved local timestamp for one run's final memory record."""
+
+    return datetime.now()
+
+
+def _created_at_from_millis(millis: int) -> datetime:
+    """Decode local naive datetime from a POSIX-millisecond timestamp."""
+
+    return datetime.fromtimestamp(millis / 1000)
+
+
+@contextmanager
+def _override_agent_now(reserved_created_at: datetime | None):
+    """Temporarily force `agent.py`'s reserved run timestamp when provided."""
+
+    if reserved_created_at is None:
+        yield
+        return
+
+    original_datetime = agent_module.datetime
+
+    class _ReservedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return reserved_created_at
+            return original_datetime.now(tz)
+
+    agent_module.datetime = _ReservedDateTime
+    try:
+        yield
+    finally:
+        agent_module.datetime = original_datetime
 
 
 def _spawn_detached_cli_run(
     *,
     argv: Sequence[str] | None,
     config: Config,
-) -> tuple[int, Path]:
-    """Launch a detached one-shot `kapy` child and return `(pid, logfile)`.
+) -> DetachedCliRunMetadata:
+    """Launch a detached one-shot `kapy` child and return its stdout metadata.
 
     Side effects:
     - Creates `<config_base>/logs/kapy/` if needed.
@@ -338,20 +438,34 @@ def _spawn_detached_cli_run(
       even when the parent inherited a different shell default.
     """
 
+    reserved_created_at = _reserved_memory_created_at()
+    reserved_created_at_ms = int(reserved_created_at.timestamp() * 1000)
+    reserved_memory_id = memory_record_id_from_created_at(reserved_created_at)
     child_argv = _child_cli_argv(argv)
     log_path = _detached_log_path(config.config_base)
     env = os.environ.copy()
     env["K_CONFIG_BASE"] = str(config.config_base)
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
-            [sys.executable, "-m", "k.agent.core.run", *child_argv],
+            [
+                sys.executable,
+                "-m",
+                "k.agent.core.run",
+                "--wait",
+                f"--reserved-memory-created-at-ms={reserved_created_at_ms}",
+                *child_argv,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
             env=env,
         )
-    return process.pid, log_path
+    return DetachedCliRunMetadata(
+        pid=process.pid,
+        memory_id=reserved_memory_id,
+        logfile=log_path,
+    )
 
 
 async def _wait_for_parent_memories(
@@ -426,6 +540,7 @@ async def run_once(
     parent_memories: list[str] | None = None,
     parents_timeout_seconds: float = 300.0,
     model: Model | None = None,
+    reserved_memory_created_at: datetime | None = None,
 ) -> str:
     """Run one prompt through `agent_run` and append the resulting memory.
 
@@ -442,7 +557,7 @@ async def run_once(
     """
 
     resolved_model = model or _agent_run_model_from_config(config)
-    resolved_in_channel = _resolve_cli_in_channel(in_channel, repl=False)
+    resolved_in_channel = _resolve_cli_in_channel(in_channel)
     resolved_parent_memories = _normalize_parent_memory_ids(parent_memories)
     resolved_contacts = _resolve_cli_contacts(contacts)
     if resolved_parent_memories:
@@ -457,77 +572,42 @@ async def run_once(
         out_channel=out_channel,
         content=prompt,
     )
-    mem = await agent_run(
-        model=resolved_model,
-        config=config,
-        memory_store=memory_store,
-        instruct=event,
-        parent_memories=resolved_parent_memories,
-    )
+    with _override_agent_now(reserved_memory_created_at):
+        mem = await agent_run(
+            model=resolved_model,
+            config=config,
+            memory_store=memory_store,
+            instruct=event,
+            parent_memories=resolved_parent_memories,
+        )
     memory_store.append(mem)
     return mem.dump_compated()
-
-
-async def run_repl(
-    *,
-    config: Config,
-    memory_store: FolderMemoryStore,
-    in_channel: str | None = None,
-    contacts: list[str] | None = None,
-    out_channel: str | None = None,
-    parent_memories: list[str] | None = None,
-    parents_timeout_seconds: float = 300.0,
-    model: Model | None = None,
-) -> None:
-    """Run the installed direct-input REPL until the user exits.
-
-    `in_channel=None` resolves to `direct/default`, giving the REPL one stable
-    conversation channel for the whole interactive session.
-    """
-
-    from rich import print
-
-    resolved_model = model or _agent_run_model_from_config(config)
-    # Keep a stable REPL channel for the whole session so turns share memory.
-    resolved_in_channel = _resolve_cli_in_channel(in_channel, repl=True)
-    while True:
-        i = input("\n> ")
-        if i.lower() in {"exit", "quit"}:
-            print("Exiting the agent loop.")
-            break
-        print(
-            await run_once(
-                config=config,
-                memory_store=memory_store,
-                prompt=i,
-                in_channel=resolved_in_channel,
-                contacts=_resolve_cli_contacts(contacts),
-                out_channel=out_channel,
-                parent_memories=parent_memories,
-                parents_timeout_seconds=parents_timeout_seconds,
-                model=resolved_model,
-            )
-        )
 
 
 async def main(argv: list[str] | None = None) -> None:
     """Async CLI entrypoint for the installed `kapy` console script.
 
-    `--async` exits early after spawning a detached child one-shot run. All
-    other modes execute in-process and stream the resulting memory dump to the
-    current stdout.
+    A prompt is required because the old REPL mode was removed. One-shot
+    prompts default to detached `--async` mode unless `--wait` is supplied.
+    Detached launches exit early after spawning a child and emit the child pid,
+    reserved memory id, and logfile path as JSON.
     """
 
-    from rich import print
-
     args = _parse_cli_args(argv)
+    if args.prompt is None:
+        raise SystemExit("kapy requires a prompt; REPL mode was removed")
+
     config = Config()
     _configure_cli_logfire(config.config_base)
-    if args.run_async:
-        if args.prompt is None:
-            raise SystemExit("--async requires a prompt")
-        pid, log_path = _spawn_detached_cli_run(argv=argv, config=config)
-        print(f"pid={pid} logfile={log_path}")
+    reserved_memory_created_at = None
+    if args.reserved_memory_created_at_ms is not None:
+        reserved_memory_created_at = _created_at_from_millis(
+            args.reserved_memory_created_at_ms
+        )
+
+    should_run_async = args.execution_mode != "wait"
+    if should_run_async:
+        _write_stdout_json(_spawn_detached_cli_run(argv=argv, config=config))
         return
 
     memory_store = FolderMemoryStore(
@@ -537,31 +617,19 @@ async def main(argv: list[str] | None = None) -> None:
     contacts = _resolve_cli_contacts(args.contacts)
     parent_memories = _normalize_parent_memory_ids(args.parent_memories)
 
-    if args.prompt is not None:
-        print(
-            await run_once(
-                config=config,
-                memory_store=memory_store,
-                prompt=args.prompt,
-                in_channel=args.in_channel,
-                contacts=contacts,
-                out_channel=args.out_channel,
-                parent_memories=parent_memories,
-                parents_timeout_seconds=args.parents_timeout_seconds,
-                model=model,
-            )
+    _write_stdout_json(
+        await run_once(
+            config=config,
+            memory_store=memory_store,
+            prompt=args.prompt,
+            in_channel=args.in_channel,
+            contacts=contacts,
+            out_channel=args.out_channel,
+            parent_memories=parent_memories,
+            parents_timeout_seconds=args.parents_timeout_seconds,
+            model=model,
+            reserved_memory_created_at=reserved_memory_created_at,
         )
-        return
-
-    await run_repl(
-        config=config,
-        memory_store=memory_store,
-        in_channel=args.in_channel,
-        contacts=contacts,
-        out_channel=args.out_channel,
-        parent_memories=parent_memories,
-        parents_timeout_seconds=args.parents_timeout_seconds,
-        model=model,
     )
 
 

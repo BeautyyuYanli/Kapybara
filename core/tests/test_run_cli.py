@@ -1,5 +1,6 @@
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -123,10 +124,12 @@ def test_configure_cli_logfire_uses_toml_token_when_present(
     }
 
 
-def test_child_cli_argv_omits_async_flag() -> None:
+def test_child_cli_argv_omits_parent_only_execution_flags() -> None:
     assert run_module._child_cli_argv(
         [
             "--async",
+            "--wait",
+            "--reserved-memory-created-at-ms=123",
             "--out-channel",
             "self-hook/test",
             "hello from cli",
@@ -505,9 +508,10 @@ async def test_main_omits_contacts_by_default(
         parent_memories: list[str] | None = None,
         parents_timeout_seconds: float = 300.0,
         model: Any = None,
+        reserved_memory_created_at: datetime | None = None,
     ) -> str:
         _ = memory_store, prompt, out_channel, parent_memories
-        _ = parents_timeout_seconds, model
+        _ = parents_timeout_seconds, model, reserved_memory_created_at
         captured["config_base"] = config.config_base
         captured["in_channel"] = in_channel
         captured["contacts"] = contacts
@@ -515,11 +519,18 @@ async def test_main_omits_contacts_by_default(
 
     monkeypatch.setattr(run_module, "run_once", fake_run_once)
     monkeypatch.setattr(run_module, "_agent_run_model_from_config", lambda config: "m")
+    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda _config_base: None)
+    monkeypatch.setattr(
+        run_module,
+        "_write_stdout_json",
+        lambda payload: captured.setdefault("stdout", payload),
+    )
 
     config_base = tmp_path / ".kapybara"
     monkeypatch.setenv("HOME", str(tmp_path))
     await run_module.main(
         [
+            "--wait",
             "--in-channel",
             "self-hook/test",
             "hello from cli",
@@ -530,19 +541,32 @@ async def test_main_omits_contacts_by_default(
         "config_base": config_base.resolve(),
         "in_channel": "self-hook/test",
         "contacts": [],
+        "stdout": '{"compacted":["ok"]}',
     }
 
 
 @pytest.mark.anyio
-async def test_main_async_mode_spawns_detached_child_and_prints_pid_and_logfile(
+async def test_main_defaults_to_detached_mode_and_emits_json_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     captured: dict[str, Any] = {}
+    reserved_created_at = datetime(2026, 3, 9, 12, 34, 56, 789000)
+    expected_memory_id = run_module.memory_record_id_from_created_at(
+        reserved_created_at
+    )
+    expected_reserved_ms = int(reserved_created_at.timestamp() * 1000)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda _config_base: None)
     monkeypatch.setattr(
-        "rich.print", lambda message: captured.setdefault("printed", message)
+        run_module,
+        "_reserved_memory_created_at",
+        lambda: reserved_created_at,
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_write_stdout_json",
+        lambda payload: captured.setdefault("stdout", payload),
     )
 
     def fake_popen(
@@ -566,7 +590,6 @@ async def test_main_async_mode_spawns_detached_child_and_prints_pid_and_logfile(
 
     await run_module.main(
         [
-            "--async",
             "--out-channel",
             "self-hook/reply",
             "hello from cli",
@@ -579,6 +602,8 @@ async def test_main_async_mode_spawns_detached_child_and_prints_pid_and_logfile(
         sys.executable,
         "-m",
         "k.agent.core.run",
+        "--wait",
+        f"--reserved-memory-created-at-ms={expected_reserved_ms}",
         "--out-channel",
         "self-hook/reply",
         "hello from cli",
@@ -589,62 +614,20 @@ async def test_main_async_mode_spawns_detached_child_and_prints_pid_and_logfile(
     assert captured["env"]["K_CONFIG_BASE"] == str(config_base)
     assert log_path.exists()
     assert log_path.parent == config_base / "logs" / "kapy"
-    assert captured["printed"] == f"pid=43210 logfile={log_path}"
+    stdout_payload = captured["stdout"]
+    assert isinstance(stdout_payload, run_module.DetachedCliRunMetadata)
+    assert stdout_payload == run_module.DetachedCliRunMetadata(
+        pid=43210,
+        memory_id=expected_memory_id,
+        logfile=log_path,
+    )
 
 
 @pytest.mark.anyio
-async def test_main_async_mode_requires_prompt(
+async def test_main_requires_prompt_now_that_repl_is_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run_module, "_configure_cli_logfire", lambda _config_base: None)
-
-    with pytest.raises(SystemExit, match="--async requires a prompt"):
-        await run_module.main(["--async"])
-
-
-@pytest.mark.anyio
-async def test_run_repl_uses_direct_default_when_in_channel_omitted(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    captured: dict[str, Any] = {}
-    prompts = iter(["hello from repl", "quit"])
-
-    async def fake_run_once(
-        *,
-        config: Config,
-        memory_store: FolderMemoryStore,
-        prompt: str,
-        in_channel: str | None = None,
-        contacts: list[str] | None = None,
-        out_channel: str | None = None,
-        parent_memories: list[str] | None = None,
-        parents_timeout_seconds: float = 300.0,
-        model: Any = None,
-    ) -> str:
-        _ = config, memory_store, out_channel, parent_memories
-        _ = parents_timeout_seconds, model
-        captured["prompt"] = prompt
-        captured["in_channel"] = in_channel
-        captured["contacts"] = contacts
-        return '{"compacted":["ok"]}'
-
-    monkeypatch.setattr(run_module, "run_once", fake_run_once)
-    monkeypatch.setattr("builtins.input", lambda _: next(prompts))
-
-    config = Config(config_base=tmp_path / ".kapybara")
-    memory_store = FolderMemoryStore(
-        root=memory_root_from_config_base(config.config_base),
-    )
-
-    await run_module.run_repl(
-        config=config,
-        memory_store=memory_store,
-        model="m",
-    )
-
-    assert captured == {
-        "prompt": "hello from repl",
-        "in_channel": "direct/default",
-        "contacts": [],
-    }
+    with pytest.raises(
+        SystemExit, match="kapy requires a prompt; REPL mode was removed"
+    ):
+        await run_module.main([])
