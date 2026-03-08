@@ -5,7 +5,9 @@ set -euo pipefail
 # passwd/group records as needed) and then hands off to Supervisor, which keeps
 # long-running services (currently: sshd and cron) in the foreground. It also
 # ensures SSH keys exist for both the SSH daemon (host keys) and the runtime
-# user (~/.ssh/id_ed25519), and authorizes that user key for SSH login.
+# user (~/.ssh/id_ed25519), authorizes that user key for SSH login, and repairs
+# the Debian crontab spool when it is bind-mounted from the host so `crontab -l`
+# works against the mounted files.
 
 group_name_for_gid() {
   local gid="$1"
@@ -104,6 +106,37 @@ ensure_user_authorized_key() {
   chmod 0600 "${authorized_keys}"
 }
 
+ensure_crontab_spool() {
+  local spool_dir template
+  spool_dir="${CRONTAB_SPOOL_DIR}"
+  template="${CRONTAB_TEMPLATE_DIR}/root"
+
+  if ! getent group crontab >/dev/null; then
+    echo "error: missing crontab group; cron package is not installed correctly." >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${template}" ]]; then
+    echo "error: missing root crontab template: ${template}" >&2
+    exit 1
+  fi
+
+  mkdir -p "${spool_dir}"
+
+  # Debian cron expects a very specific spool mode. Bind mounts inherit host
+  # permissions, so repair the directory before using `crontab` to seed or read
+  # mounted jobs.
+  chown root:crontab "${spool_dir}"
+  chmod 1730 "${spool_dir}"
+
+  if [[ ! -f "${spool_dir}/root" ]]; then
+    crontab -u root "${template}"
+  else
+    chown root:crontab "${spool_dir}/root"
+    chmod 0600 "${spool_dir}/root"
+  fi
+}
+
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "error: entrypoint must start as root to create runtime user/group." >&2
   echo "remove --user and pass -e PUID/-e PGID instead." >&2
@@ -129,6 +162,8 @@ fi
 export WORKSPACE="/home/k"
 export HOME="/home/k"
 export SUPERVISORD_CONFIG="/etc/supervisor/conf.d/supervisord.conf"
+export CRONTAB_SPOOL_DIR="/var/spool/cron/crontabs"
+export CRONTAB_TEMPLATE_DIR="/usr/local/share/kapybara/crontabs"
 
 if [[ ! -d "${WORKSPACE}" ]]; then
   echo "error: ${WORKSPACE} does not exist; mount your workspace at ${WORKSPACE}." >&2
@@ -144,6 +179,7 @@ ensure_group_for_pgid
 ensure_user_for_puid
 ensure_user_ssh_keypair
 ensure_user_authorized_key
+ensure_crontab_spool
 
 if [[ ! -f "${SUPERVISORD_CONFIG}" ]]; then
   echo "error: missing supervisor config: ${SUPERVISORD_CONFIG}" >&2

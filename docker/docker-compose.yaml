@@ -17,6 +17,8 @@ services:
               capabilities: [gpu]
     volumes:
       - ../data/fs:/home/k
+      # Bind the Debian crontab spool so root cron jobs remain visible through
+      # `crontab -l` and persist across container rebuilds.
       - ../data/crontabs:/var/spool/cron/crontabs
       - ../core:/core
       - ../collections:/collections
