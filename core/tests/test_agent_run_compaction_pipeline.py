@@ -180,6 +180,7 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
                 in_channel=deps.start_event.in_channel,
                 out_channel=deps.start_event.out_channel,
                 contacts=deps.resolved_contact_ids,
+                parents=[contact_root.id_],
                 input="",
                 output="",
                 compacted=["compacted-step"],
@@ -274,7 +275,7 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
     assert stored_channel_parent is not None
     assert stored_contact_parent is not None
 
-    await agent_run(
+    mem = await agent_run(
         model="test-model",
         config=config,
         memory_store=memory_store,
@@ -309,6 +310,7 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
         channel_parent.id_,
         contact_root.id_,
     ]
+    assert mem.parents == [contact_root.id_, explicit_root.id_]
     assert (
         "Injected memories counts (explicit roots): "
         "roots=%d, injected_compacted=%d, injected_raw_pair=%d, "
@@ -546,6 +548,69 @@ async def test_memory_select_downgraded_recent_can_fill_raw_pair_slot(
 
     assert compacted_ids == [newer.id_]
     assert raw_pair_ids == [older.id_]
+
+
+@pytest.mark.anyio
+async def test_explicit_parent_memory_roots_stay_compacted_when_over_cap(
+    tmp_path: Path,
+) -> None:
+    store = FolderMemoryStore(tmp_path / "memories")
+
+    root1_parent = MemoryRecord(
+        in_channel="explicit",
+        input="root1_parent",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    root1 = MemoryRecord(
+        in_channel="explicit",
+        input="root1",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 2),
+        parents=[root1_parent.id_],
+    )
+    root2_parent = MemoryRecord(
+        in_channel="explicit",
+        input="root2_parent",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 3),
+    )
+    root2 = MemoryRecord(
+        in_channel="explicit",
+        input="root2",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 4),
+        parents=[root2_parent.id_],
+    )
+    root3_parent = MemoryRecord(
+        in_channel="explicit",
+        input="root3_parent",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 5),
+    )
+    root3 = MemoryRecord(
+        in_channel="explicit",
+        input="root3",
+        output="",
+        created_at=datetime(2026, 1, 1, 0, 0, 6),
+        parents=[root3_parent.id_],
+    )
+    for record in (root1_parent, root1, root2_parent, root2, root3_parent, root3):
+        store.append(record)
+
+    selected_ids, compacted_ids, root_ids = (
+        agent_module._select_explicit_parent_memory_records(
+            store,
+            parent_memory_ids=[root1.id_, root2.id_, root3.id_],
+            compacted_cap_num=2,
+            raw_pair_level_num=3,
+            raw_pair_cap_num=15,
+        )
+    )
+
+    assert selected_ids == [root1.id_, root2.id_, root3.id_]
+    assert compacted_ids == {root1.id_, root2.id_, root3.id_}
+    assert root_ids == [root1.id_, root2.id_, root3.id_]
 
 
 @pytest.mark.anyio

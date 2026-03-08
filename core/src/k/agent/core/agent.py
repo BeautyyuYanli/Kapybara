@@ -28,9 +28,11 @@ Memory retrieval boundaries:
     Scope-specific auto-retrieval lives in
     `k.agent.memory.retrieval.by_in_channel` and
     `k.agent.memory.retrieval.by_contact`. Caller-supplied parent-memory ids
-    are resolved through `k.agent.memory.utils.get_memory_ids_from_roots`.
-    This module only merges those injected-memory sources into one
-    `<Memories>` block.
+    are resolved through `k.agent.memory.utils.get_memory_ids_from_roots`,
+    with extra pinning here so explicit parent roots always stay compacted and
+    are forced back into the final persisted `referenced_memory_ids` at the end
+    of `agent_run`. This module only merges those injected-memory sources into
+    one `<Memories>` block.
 """
 
 from __future__ import annotations
@@ -431,6 +433,26 @@ def _validate_referenced_memory_ids(
     ]
 
 
+def _append_explicit_parent_memory_ids(
+    *,
+    memory_store: MemoryStore,
+    referenced_memory_ids: list[str],
+    explicit_parent_memory_ids: Sequence[str],
+) -> list[str]:
+    """Return validated explicit parents appended to final run parents.
+
+    `finish_action` already validates model-produced `referenced_memory_ids`.
+    `agent_run` uses this helper after model execution so caller-supplied
+    explicit parents remain in the final persisted memory even when omitted
+    from the model output.
+    """
+    validated_explicit_parent_ids = _validate_referenced_memory_ids(
+        memory_store=memory_store,
+        referenced_memory_ids=dedupe_memory_ids(explicit_parent_memory_ids),
+    )
+    return dedupe_memory_ids(referenced_memory_ids + validated_explicit_parent_ids)
+
+
 def finish_action(
     ctx: RunContext[MyDeps],
     referenced_memory_ids: list[str],
@@ -690,6 +712,46 @@ def _select_auto_memory_records(
     )
 
 
+def _select_explicit_parent_memory_records(
+    memory_store: MemoryStore,
+    *,
+    parent_memory_ids: Sequence[str],
+    compacted_cap_num: int = 15,
+    raw_pair_level_num: int = 3,
+    raw_pair_cap_num: int = 15,
+) -> tuple[list[str], set[str], list[str]]:
+    """Resolve explicit `parent_memories` without truncating the roots.
+
+    Explicit parent roots are pinned in compacted form. If those roots already
+    fill or exceed the compacted cap, ancestor expansion stops entirely instead
+    of downgrading or dropping the roots themselves.
+    """
+
+    if compacted_cap_num < 0:
+        raise ValueError(
+            f"explicit_parent_compacted_cap_num must be >= 0; got {compacted_cap_num}"
+        )
+    if raw_pair_cap_num < 0:
+        raise ValueError(
+            f"explicit_parent_raw_pair_cap_num must be >= 0; got {raw_pair_cap_num}"
+        )
+
+    deduped_root_ids = dedupe_memory_ids(parent_memory_ids)
+    if not deduped_root_ids:
+        return [], set(), []
+
+    expand_ancestors = len(deduped_root_ids) < compacted_cap_num
+    return get_memory_ids_from_roots(
+        memory_store,
+        roots=deduped_root_ids,
+        compacted_level_num=0,
+        raw_pair_level_num=raw_pair_level_num if expand_ancestors else 0,
+        compacted_cap_num=max(compacted_cap_num, len(deduped_root_ids)),
+        raw_pair_cap_num=raw_pair_cap_num if expand_ancestors else 0,
+        cap_name_prefix="explicit_parent",
+    )
+
+
 async def agent_run(
     model: Model | KnownModelName,
     config: Config,
@@ -710,6 +772,8 @@ async def agent_run(
       non-dynamic system prompt.
     - Selection and serialization happen once inside `agent_run` before
       entering `agent.run`.
+    - After the run completes, caller-supplied explicit parent ids are merged
+      back into the final `MemoryRecord.parents`.
 
     Contact lifecycle:
     - Resolve `Event.contacts` platform ids to unique ids before model run.
@@ -722,9 +786,12 @@ async def agent_run(
 
     Parent-memory selection:
     - `parent_memories` provided and non-empty: treat them as explicit root
-      memory ids, resolve them through
-      `k.agent.memory.utils.get_memory_ids_from_roots()`, and merge the
+      memory ids, keep every explicit root injected as compacted, and merge the
       resulting injections with the auto-generated scope injections below.
+      When the explicit roots already fill the compacted cap, stop expanding
+      their ancestors instead of truncating those roots.
+      Those explicit roots are also forced back into the final persisted
+      `referenced_memory_ids`.
     - `parent_memories` omitted or empty: inject only the auto-generated
       MemoryStore context:
       1) latest 5 records whose `in_channel` or effective `out_channel`
@@ -759,9 +826,9 @@ async def agent_run(
 
     if explicit_parent_memory_ids:
         explicit_selected_ids, explicit_compacted_ids, explicit_root_ids = (
-            get_memory_ids_from_roots(
+            _select_explicit_parent_memory_records(
                 memory_store,
-                roots=explicit_parent_memory_ids,
+                parent_memory_ids=explicit_parent_memory_ids,
             )
         )
         selected_mem_ids = sorted(set(selected_mem_ids) | set(explicit_selected_ids))
@@ -814,6 +881,11 @@ async def agent_run(
     msgs: list[ModelRequest | ModelResponse] = res.new_messages()
     msgs = _strip_history(msgs, (instruct.content,))
     memory_record = res.output
+    memory_record.parents = _append_explicit_parent_memory_ids(
+        memory_store=memory_store,
+        referenced_memory_ids=memory_record.parents,
+        explicit_parent_memory_ids=explicit_parent_memory_ids,
+    )
     memory_record.input = instruct.content
     memory_record.detailed = msgs
 
