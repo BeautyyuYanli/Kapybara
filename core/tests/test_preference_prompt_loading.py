@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from k.agent.core.agent import _channel_preference_candidates, _load_preferences_prompt
+from k.agent.core.preference_injection import (
+    _channel_preference_candidates,
+    load_preferences_prompt,
+)
 
 
 def test_channel_preference_candidates_use_root_when_present(tmp_path: Path) -> None:
@@ -65,7 +68,7 @@ def test_load_preferences_prompt_accepts_root_preference_file(
     root_pref_path = pref_root / filename
     root_pref_path.write_text("root level preference", encoding="utf-8")
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="telegram/chat/123",
         contacts=["telegram/567113516"],
         pref_root=pref_root,
@@ -86,7 +89,7 @@ def test_load_preferences_prompt_omits_default_when_root_exists(
     preferred.write_text("preferred root", encoding="utf-8")
     default.write_text("default root", encoding="utf-8")
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="telegram/chat/123",
         contacts=["telegram/567113516"],
         pref_root=pref_root,
@@ -106,7 +109,7 @@ def test_load_preferences_prompt_includes_out_channel_preference(
     out_pref.parent.mkdir(parents=True, exist_ok=True)
     out_pref.write_text("reply via telegram", encoding="utf-8")
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="worker/job/1",
         contacts=[],
         pref_root=pref_root,
@@ -125,7 +128,7 @@ def test_load_preferences_prompt_dedupes_overlapping_in_and_out_channel_preferen
     pref_path.parent.mkdir(parents=True, exist_ok=True)
     pref_path.write_text("telegram preference", encoding="utf-8")
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="telegram/chat/123",
         contacts=[],
         pref_root=pref_root,
@@ -144,7 +147,7 @@ def test_load_preferences_prompt_includes_contact_preference(
     contact_pref.parent.mkdir(parents=True)
     contact_pref.write_text("contact preference", encoding="utf-8")
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="telegram/chat/123",
         contacts=["telegram/567113516"],
         pref_root=pref_root,
@@ -162,7 +165,7 @@ def test_load_preferences_prompt_skips_contact_preference_when_contacts_missing(
     contact_pref.parent.mkdir(parents=True)
     contact_pref.write_text("contact preference", encoding="utf-8")
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="telegram/chat/123",
         contacts=[],
         pref_root=pref_root,
@@ -182,7 +185,7 @@ def test_load_preferences_prompt_includes_all_contact_preferences(
     first.write_text("first contact preference", encoding="utf-8")
     second.write_text("second contact preference", encoding="utf-8")
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="telegram/chat/123",
         contacts=["telegram/100", "telegram/200"],
         pref_root=pref_root,
@@ -207,7 +210,7 @@ def test_load_preferences_prompt_shows_resolved_symlink_target_for_contact(
     relative_target = Path(os.path.relpath(data_path, start=link_path.parent))
     link_path.symlink_to(relative_target)
 
-    prompt = _load_preferences_prompt(
+    prompt = load_preferences_prompt(
         in_channel="telegram/chat/123",
         contacts=["telegram/567113516"],
         pref_root=pref_root,

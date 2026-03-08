@@ -29,8 +29,10 @@ def _ctx_for_store(
             deps=SimpleNamespace(
                 memory_storage=store,
                 start_event=event,
-                resolved_contact_ids=contacts,
-                working_memory_created_at=working_memory_created_at,
+                memory_run=SimpleNamespace(
+                    resolved_contact_ids=contacts,
+                    working_memory_created_at=working_memory_created_at,
+                ),
             ),
         ),
     )
@@ -44,7 +46,7 @@ def test_finish_action_accepts_existing_referenced_memory_ids(tmp_path) -> None:
         store,
         resolved_contact_ids=["c1"],
     )
-    working_memory_created_at = ctx.deps.working_memory_created_at
+    working_memory_created_at = ctx.deps.memory_run.working_memory_created_at
 
     result = finish_action(
         ctx,
