@@ -76,7 +76,10 @@ def test_configure_cli_logfire_uses_token_optional_mode(
 
     run_module._configure_cli_logfire(tmp_path / ".kapybara")
 
-    assert captured["configure"] == {"send_to_logfire": "if-token-present"}
+    assert captured["configure"] == {
+        "send_to_logfire": "if-token-present",
+        "console": False,
+    }
     assert captured["instrumented"] is True
     assert captured["basic_config"] == {
         "level": logging.INFO,
@@ -116,6 +119,7 @@ def test_configure_cli_logfire_uses_toml_token_when_present(
     assert captured["configure"] == {
         "send_to_logfire": "if-token-present",
         "token": "test-logfire-token",
+        "console": False,
     }
     assert captured["instrumented"] is True
     assert captured["basic_config"] == {

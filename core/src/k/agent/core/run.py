@@ -89,15 +89,20 @@ def _configure_cli_logfire(config_base: str | Path) -> None:
     The default `logfire.configure()` behavior prompts for project setup when no
     token or cached credentials are present. `kapy` is often used in ad-hoc or
     automated shells, so only send telemetry when Logfire is already configured.
-    If `<config_base>/config.toml` declares `[logfire].token`, prefer that
-    token for `kapy` CLI runs.
+    CLI stdout is machine-facing JSON, so disable Logfire console output
+    entirely. If `<config_base>/config.toml` declares `[logfire].token`,
+    prefer that token for `kapy` CLI runs.
     """
 
     token = _load_cli_logfire_token(config_base)
     if token is None:
-        logfire.configure(send_to_logfire="if-token-present")
+        logfire.configure(send_to_logfire="if-token-present", console=False)
     else:
-        logfire.configure(send_to_logfire="if-token-present", token=token)
+        logfire.configure(
+            send_to_logfire="if-token-present",
+            token=token,
+            console=False,
+        )
     logfire.instrument_pydantic_ai()
     logging.basicConfig(level=logging.INFO, handlers=[logfire.LogfireLoggingHandler()])
 
