@@ -25,7 +25,8 @@ from k.agent.memory.retrieval.by_in_channel import (
 from k.agent.memory.utils import get_memory_ids_from_roots
 from k.config import Config
 
-agent_module = importlib.import_module("k.agent.core.agent")
+memory_injection_module = importlib.import_module("k.agent.core.memory_injection")
+runtime_prompting_module = importlib.import_module("k.agent.core.runtime_prompting")
 
 
 @dataclass(slots=True)
@@ -70,7 +71,7 @@ async def test_agent_run_returns_compacted_memory_record(
         deps = kwargs.get("deps")
         assert deps is not None
         captured_working_memory_id = memory_record_id_from_created_at(
-            deps.working_memory_created_at
+            deps.memory_run.working_memory_created_at
         )
         messages: list[ModelRequest | ModelResponse] = [
             ModelRequest(parts=[UserPromptPart(content=("old prompt",))]),
@@ -79,10 +80,10 @@ async def test_agent_run_returns_compacted_memory_record(
         ]
         return _FakeRunResult(
             output=MemoryRecord(
-                created_at=deps.working_memory_created_at,
+                created_at=deps.memory_run.working_memory_created_at,
                 in_channel=deps.start_event.in_channel,
                 out_channel=deps.start_event.out_channel,
-                contacts=deps.resolved_contact_ids,
+                contacts=deps.memory_run.resolved_contact_ids,
                 input="",
                 output="",
                 compacted=["compacted-step"],
@@ -92,7 +93,9 @@ async def test_agent_run_returns_compacted_memory_record(
 
     monkeypatch.setattr(agent, "run", fake_agent_run)
     monkeypatch.setattr(
-        agent_module, "agent_config_base_value", fake_agent_config_base_value
+        runtime_prompting_module,
+        "agent_config_base_value",
+        fake_agent_config_base_value,
     )
 
     config = Config(config_base=tmp_path / ".kapybara")
@@ -173,13 +176,13 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
             captured_user_prompt = user_prompt
         deps = kwargs.get("deps")
         if deps is not None:
-            captured_injected_memories_prompt = deps.injected_memories_prompt
-            captured_memory_parents = list(deps.memory_parents)
+            captured_injected_memories_prompt = deps.memory_run.injected_memories_prompt
+            captured_memory_parents = list(deps.memory_run.memory_parents)
             output = MemoryRecord(
-                created_at=deps.working_memory_created_at,
+                created_at=deps.memory_run.working_memory_created_at,
                 in_channel=deps.start_event.in_channel,
                 out_channel=deps.start_event.out_channel,
-                contacts=deps.resolved_contact_ids,
+                contacts=deps.memory_run.resolved_contact_ids,
                 parents=[contact_root.id_],
                 input="",
                 output="",
@@ -201,14 +204,16 @@ async def test_agent_run_merges_explicit_parent_memory_ids_with_auto_injection(
 
     monkeypatch.setattr(agent, "run", fake_agent_run)
     monkeypatch.setattr(
-        agent_module, "agent_config_base_value", fake_agent_config_base_value
+        runtime_prompting_module,
+        "agent_config_base_value",
+        fake_agent_config_base_value,
     )
 
     def fake_log_info(msg: str, *args: Any, **kwargs: Any) -> None:
         _ = kwargs
         logged.append((msg, args))
 
-    monkeypatch.setattr(agent_module.logger, "info", fake_log_info)
+    monkeypatch.setattr(memory_injection_module.logger, "info", fake_log_info)
 
     config = Config(config_base=tmp_path / ".kapybara")
     memory_store = FolderMemoryStore(config.config_base / "memories")
@@ -598,19 +603,17 @@ async def test_explicit_parent_memory_roots_stay_compacted_when_over_cap(
     for record in (root1_parent, root1, root2_parent, root2, root3_parent, root3):
         store.append(record)
 
-    selected_ids, compacted_ids, root_ids = (
-        agent_module._select_explicit_parent_memory_records(
-            store,
-            parent_memory_ids=[root1.id_, root2.id_, root3.id_],
-            compacted_cap_num=2,
-            raw_pair_level_num=3,
-            raw_pair_cap_num=15,
-        )
+    selection = memory_injection_module.select_explicit_parent_memory_records(
+        store,
+        parent_memory_ids=[root1.id_, root2.id_, root3.id_],
+        compacted_cap_num=2,
+        raw_pair_level_num=3,
+        raw_pair_cap_num=15,
     )
 
-    assert selected_ids == [root1.id_, root2.id_, root3.id_]
-    assert compacted_ids == {root1.id_, root2.id_, root3.id_}
-    assert root_ids == [root1.id_, root2.id_, root3.id_]
+    assert selection.selected_ids == [root1.id_, root2.id_, root3.id_]
+    assert selection.compacted_ids == {root1.id_, root2.id_, root3.id_}
+    assert selection.memory_parent_ids == [root1.id_, root2.id_, root3.id_]
 
 
 @pytest.mark.anyio
@@ -686,23 +689,25 @@ async def test_memory_select_logs_injected_category_counts(
         _ = kwargs
         logged.append((msg, args))
 
-    monkeypatch.setattr(agent_module.logger, "info", fake_log_info)
+    monkeypatch.setattr(memory_injection_module.logger, "info", fake_log_info)
 
-    all_mem_ids, recent_mem, memory_parent_ids = (
-        agent_module._select_auto_memory_records(
-            store,
-            in_channel="channel",
-            contacts=["c1"],
-        )
+    selection = memory_injection_module.select_auto_memory_records(
+        store,
+        in_channel="channel",
+        contacts=["c1"],
     )
 
-    assert recent_mem == {channel_older.id_, channel_newer.id_, contact_newer.id_}
-    assert memory_parent_ids == [
+    assert selection.compacted_ids == {
+        channel_older.id_,
+        channel_newer.id_,
+        contact_newer.id_,
+    }
+    assert selection.memory_parent_ids == [
         channel_newer.id_,
         channel_older.id_,
         contact_newer.id_,
     ]
-    assert all_mem_ids == [
+    assert selection.selected_ids == [
         channel_older.id_,
         channel_newer.id_,
         contact_newer.id_,

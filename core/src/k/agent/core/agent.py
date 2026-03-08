@@ -25,14 +25,11 @@ Memory compaction contract:
     `k.agent.core.prompts.compacted_prompt`
 
 Memory retrieval boundaries:
-    Scope-specific auto-retrieval lives in
-    `k.agent.memory.retrieval.by_in_channel` and
-    `k.agent.memory.retrieval.by_contact`. Caller-supplied parent-memory ids
-    are resolved through `k.agent.memory.utils.get_memory_ids_from_roots`,
-    with extra pinning here so explicit parent roots always stay compacted and
-    are forced back into the final persisted `referenced_memory_ids` at the end
-    of `agent_run`. This module only merges those injected-memory sources into
-    one `<Memories>` block.
+    Memory selection + persistence lifecycle lives in
+    `k.agent.core.memory_injection`.
+    Preference discovery lives in `k.agent.core.preference_injection`.
+    Runtime prompt builders live in `k.agent.core.runtime_prompting`.
+    This module only wires those collaborators into the runtime entrypoint.
 """
 
 from __future__ import annotations
@@ -41,15 +38,12 @@ import asyncio
 from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, field
-from datetime import datetime
-from logging import getLogger
 from pathlib import Path
 from typing import cast
 
 from pydantic_ai import (
     Agent,
     ModelMessage,
-    ModelRetry,
     RunContext,
     ToolOutput,
 )
@@ -63,10 +57,15 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.usage import UsageLimits
 
-from k.agent.channels import effective_out_channel, iter_channel_prefixes
-from k.agent.contacts import contact_preference_path, resolve_contact_unique_ids
 from k.agent.core.entities import Event, tool_exception_guard
 from k.agent.core.media_tools import read_media
+from k.agent.core.memory_injection import (
+    MemoryRunState,
+    build_finish_action_record,
+    finalize_memory_record,
+    prepare_memory_run_state,
+)
+from k.agent.core.preference_injection import load_preferences_prompt
 from k.agent.core.prompts import (
     SOP_prompt,
     bash_tool_prompt,
@@ -78,6 +77,7 @@ from k.agent.core.prompts import (
     preference_prompt,
     response_instruct_prompt,
 )
+from k.agent.core.runtime_prompting import event_meta_prompt, system_runtime_prompt
 from k.agent.core.shell_tools import (
     bash,
     bash_input,
@@ -86,32 +86,12 @@ from k.agent.core.shell_tools import (
     edit_file,
 )
 from k.agent.core.skills_md import concat_skills_md, maybe_load_channel_skill_md
-from k.agent.memory.entities import (
-    MemoryRecord,
-    is_memory_record_id,
-    memory_record_id_from_created_at,
-)
+from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
-from k.agent.memory.retrieval.by_contact import (
-    latest_memory_roots_by_contact,
-    select_memory_ids_by_contact,
-)
-from k.agent.memory.retrieval.by_in_channel import (
-    latest_memory_roots_by_in_channel,
-    select_memory_ids_by_in_channel,
-)
-from k.agent.memory.store import MemoryStore
-from k.agent.memory.utils import dedupe_memory_ids, get_memory_ids_from_roots
 from k.config import Config
 from k.io_helpers.shell import ShellSessionManager
-from k.runner_helpers.basic_os import (
-    AGENT_CONFIG_BASE_EXPR,
-    BasicOSHelper,
-    agent_config_base_value,
-)
-
-logger = getLogger(__name__)
+from k.runner_helpers.basic_os import BasicOSHelper
 
 
 @dataclass(slots=True)
@@ -129,17 +109,8 @@ class MyDeps:
         routing source. `start_event.contacts` is optional user identity context
         for contact-scoped preference injection. System prompts use channels and
         contacts for preference + skill injection.
-        `memory_parents` stores the deduped root ids whose context was injected
-        for this run so forked runs can inherit graph parents without reusing
-        serialized prompt blocks.
-        `working_memory_created_at` reserves the final `MemoryRecord`
-        timestamp at the start of `agent_run`. Dynamic system prompts derive
-        the pending memory id from that timestamp, and `finish_action` must
-        preserve the same `created_at` in the final persisted record.
-        `injected_memories_prompt` stores the `<Memories>` block prepared once
-        in `agent_run` and injected via a non-dynamic system prompt.
-        `resolved_contact_ids` is the unique-id view of `start_event.contacts`,
-        resolved before model execution.
+        `memory_run` groups the prepared memory prompt, inherited parent ids,
+        resolved contact ids, and reserved output-record timestamp for this run.
         Always provide `start_event` for agent runs.
 
     Bash tool cadence:
@@ -152,11 +123,8 @@ class MyDeps:
 
     config: Config
     memory_storage: FolderMemoryStore
-    memory_parents: list[str]
+    memory_run: MemoryRunState
     start_event: Event
-    working_memory_created_at: datetime
-    resolved_contact_ids: list[str]
-    injected_memories_prompt: str = ""
     bash_cmd_history: list[str] = field(default_factory=list)
     count_down: int = 6
     stuck_warning: int = 0
@@ -248,9 +216,9 @@ async def fork(
     except Exception as e:
         return f"Fork failed: {type(e).__name__}: {e}"
     else:
-        mem.parents = list(set(mem.parents + ctx.deps.memory_parents))
+        mem.parents = list(set(mem.parents + ctx.deps.memory_run.memory_parents))
         ctx.deps.memory_storage.append(mem)
-        ctx.deps.memory_parents.append(mem.id_)
+        ctx.deps.memory_run.memory_parents.append(mem.id_)
         return "\n".join(
             [
                 "Fork succeeded.",
@@ -259,198 +227,6 @@ async def fork(
                 mem.dump_compated(),
             ]
         )
-
-
-def _root_preference_candidates(pref_root: Path) -> list[Path]:
-    """Build root-level preference candidate file paths in priority order.
-
-    If `PREFERENCES.md` exists, do not include `PREFERENCES.default.md`.
-    """
-
-    preferred = pref_root / "PREFERENCES.md"
-    default = pref_root / "PREFERENCES.default.md"
-    if preferred.exists():
-        return [preferred]
-    return [default]
-
-
-def _channel_preference_candidates(
-    in_channel: str,
-    *,
-    out_channel: str | None = None,
-    pref_root: Path,
-) -> list[Path]:
-    """Build preference candidate paths in deterministic load order.
-
-    Order:
-    1. Root-level preference (`PREFERENCES.md` or fallback `PREFERENCES.default.md`)
-    2. `in_channel` prefixes from root to leaf:
-       - `<prefix>.md`
-       - `<prefix>/PREFERENCES.md`
-    3. Effective `out_channel` prefixes from root to leaf (deduped against the
-       previously added paths):
-       - `<prefix>.md`
-       - `<prefix>/PREFERENCES.md`
-
-    Args:
-        in_channel: Input channel used for source-route prefix expansion.
-        out_channel: Optional output channel used for destination-route prefix
-            expansion. `None` means "same as `in_channel`".
-        pref_root: Preference root directory, typically
-            `<config_base>/preferences`.
-    """
-
-    out: list[Path] = _root_preference_candidates(pref_root)
-    seen: set[Path] = set(out)
-    routed_channels = [in_channel]
-    resolved_out_channel = effective_out_channel(
-        in_channel=in_channel,
-        out_channel=out_channel,
-    )
-    if resolved_out_channel != in_channel:
-        routed_channels.append(resolved_out_channel)
-
-    for channel in routed_channels:
-        for prefix in iter_channel_prefixes(channel):
-            for candidate in (
-                pref_root / f"{prefix}.md",
-                pref_root / prefix / "PREFERENCES.md",
-            ):
-                if candidate in seen:
-                    continue
-                seen.add(candidate)
-                out.append(candidate)
-    return out
-
-
-def _contact_preference_candidates(
-    *, contacts: list[str], pref_root: Path
-) -> list[Path]:
-    """Return user-level preference paths for `<platform>/<user_id>` contacts."""
-
-    out: list[Path] = []
-    seen: set[Path] = set()
-    for contact in contacts:
-        path = contact_preference_path(
-            pref_root=pref_root,
-            platform_contact=contact,
-        )
-        if path in seen:
-            continue
-        seen.add(path)
-        out.append(path)
-    return out
-
-
-def _load_preferences_prompt(
-    *,
-    in_channel: str,
-    contacts: list[str],
-    pref_root: Path,
-    out_channel: str | None = None,
-) -> str:
-    """Load root-level, routed-channel, and contact-level preferences.
-
-    Preference files are resolved under `pref_root` (normally
-    `<config_base>/preferences`).
-
-    Returns:
-        Empty string when no preference files match; otherwise a
-        `<Preferences>...</Preferences>` block with one section per loaded file.
-        Each section starts with its corresponding preference path. For
-        symlinks, the path header also shows the resolved absolute target path.
-    """
-
-    candidates = _channel_preference_candidates(
-        in_channel,
-        out_channel=out_channel,
-        pref_root=pref_root,
-    )
-    candidates.extend(
-        _contact_preference_candidates(contacts=contacts, pref_root=pref_root)
-    )
-
-    blocks: list[str] = []
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if not text:
-            continue
-        blocks.append(
-            "\n".join([f"Path: {_display_preference_path(path)}", text, "---"])
-        )
-
-    if not blocks:
-        return ""
-    comment = "**The following are your preferences, written in your first person.**"
-    return (
-        f"<Preferences>\n{comment}\n" + "\n".join(blocks).rstrip() + "\n</Preferences>"
-    )
-
-
-def _display_preference_path(path: Path) -> str:
-    """Return display text for preference path headers in system prompts.
-
-    Normal files are shown as-is. Symlinks show both the symlink path and the
-    resolved absolute target (`<path> -> <resolved_abs_target>`).
-    """
-
-    if not path.is_symlink():
-        return str(path)
-    return f"{path} -> {path.resolve()}"
-
-
-def _validate_referenced_memory_ids(
-    *,
-    memory_store: MemoryStore,
-    referenced_memory_ids: list[str],
-) -> list[str]:
-    """Validate referenced memory IDs emitted by `finish_action`.
-
-    Contract:
-        - Malformed ids still fail fast with `ModelRetry`.
-        - Well-formed but missing ids are dropped. This keeps `finish_action`
-          tolerant to stale references when records were deleted externally.
-    """
-
-    invalid_ids = [
-        mem_id for mem_id in referenced_memory_ids if not is_memory_record_id(mem_id)
-    ]
-    if invalid_ids:
-        raise ModelRetry(
-            "Invalid referenced_memory_ids: each id must be a valid MemoryRecord id. "
-            f"Invalid id(s): {invalid_ids}"
-        )
-
-    return [
-        mem_id
-        for mem_id in referenced_memory_ids
-        if memory_store.get_by_id(mem_id) is not None
-    ]
-
-
-def _append_explicit_parent_memory_ids(
-    *,
-    memory_store: MemoryStore,
-    referenced_memory_ids: list[str],
-    explicit_parent_memory_ids: Sequence[str],
-) -> list[str]:
-    """Return validated explicit parents appended to final run parents.
-
-    `finish_action` already validates model-produced `referenced_memory_ids`.
-    `agent_run` uses this helper after model execution so caller-supplied
-    explicit parents remain in the final persisted memory even when omitted
-    from the model output.
-    """
-    validated_explicit_parent_ids = _validate_referenced_memory_ids(
-        memory_store=memory_store,
-        referenced_memory_ids=dedupe_memory_ids(explicit_parent_memory_ids),
-    )
-    return dedupe_memory_ids(referenced_memory_ids + validated_explicit_parent_ids)
 
 
 def finish_action(
@@ -478,30 +254,21 @@ def finish_action(
             `<CompactedRules>`.
 
     Contract:
-        `ctx.deps.working_memory_created_at` reserves the final record
+        `ctx.deps.memory_run.working_memory_created_at` reserves the final record
         timestamp before model execution in `agent_run`; this tool must
         preserve that `created_at` so the `<System>` prompt and persisted
         memory record agree on the derived memory id.
     """
 
-    validated_ids = _validate_referenced_memory_ids(
+    return build_finish_action_record(
         memory_store=ctx.deps.memory_storage,
+        memory_run=ctx.deps.memory_run,
+        start_event=ctx.deps.start_event,
         referenced_memory_ids=referenced_memory_ids,
-    )
-    return MemoryRecord(
-        created_at=ctx.deps.working_memory_created_at,
-        in_channel=ctx.deps.start_event.in_channel,
-        out_channel=ctx.deps.start_event.out_channel,
-        contacts=ctx.deps.resolved_contact_ids,
-        parents=validated_ids,
-        input="",
-        output=raw_output,
-        compacted=[
-            f"<input>{raw_input}</input>",
-            f"<intents>{input_intents}</intents>",
-            *compacted_actions,
-            f"<output>{raw_output}</output>",
-        ],
+        raw_input=raw_input,
+        raw_output=raw_output,
+        input_intents=input_intents,
+        compacted_actions=compacted_actions,
     )
 
 
@@ -543,7 +310,7 @@ def preferences_system_prompt(ctx: RunContext[MyDeps]) -> str:
     `concat_skills_prompt` so preference guidance appears first.
     """
 
-    return _load_preferences_prompt(
+    return load_preferences_prompt(
         in_channel=ctx.deps.start_event.in_channel,
         contacts=ctx.deps.start_event.contacts,
         pref_root=ctx.deps.config.config_base / "preferences",
@@ -555,7 +322,7 @@ def preferences_system_prompt(ctx: RunContext[MyDeps]) -> str:
 def injected_memories_system_prompt(ctx: RunContext[MyDeps]) -> str:
     """Inject run-scoped memory context computed once in `agent_run`."""
 
-    return ctx.deps.injected_memories_prompt
+    return ctx.deps.memory_run.injected_memories_prompt
 
 
 @agent.system_prompt
@@ -600,156 +367,6 @@ def _strip_history(
         *msgs[1:-1],
     ]  # remove initial message and final finish message
     return msgs
-
-
-def _event_meta_prompt(event: Event) -> str:
-    """Return a prompt chunk with event routing metadata (excluding body text).
-
-    This keeps channel/routing context explicit for the model without duplicating
-    the potentially large free-form `Event.content` body.
-    """
-
-    meta_json = event.model_dump_json(exclude={"content"})
-    return f"<EventMeta>{meta_json}</EventMeta>\n"
-
-
-async def _system_runtime_prompt(deps: MyDeps) -> str:
-    """Return runtime metadata that should be explicit to the model.
-
-    `Agent config base` is resolved through the shell runtime path (same
-    transport as bash tools), not from Python process environment variables.
-    The reserved run memory id is derived from a `created_at` timestamp
-    captured before model execution so the prompt can name the final record
-    explicitly.
-    """
-
-    try:
-        runtime_config_base = await agent_config_base_value(
-            basic_os_helper=deps.basic_os_helper,
-            shell_manager=deps.shell_manager,
-        )
-    except Exception as exc:
-        runtime_config_base = (
-            f"<unresolved:{type(exc).__name__}:{str(exc).replace(chr(10), ' ')}>"
-        )
-
-    return (
-        "<System>\n"
-        f"Current time: {datetime.now()}\n"
-        "Current run memory id: "
-        f"{memory_record_id_from_created_at(deps.working_memory_created_at)}\n"
-        "This id is reserved for the memory record produced by this run.\n"
-        f"Agent config base (`{AGENT_CONFIG_BASE_EXPR}`): {runtime_config_base}\n"
-        "</System>\n"
-    )
-
-
-def _memories_system_prompt(memory_blocks: Sequence[str]) -> str:
-    """Serialize selected memory blocks into one `<Memories>` system prompt."""
-
-    if not memory_blocks:
-        return ""
-    return f"<Memories>{'\n'.join(memory_blocks)}</Memories>"
-
-
-def _select_auto_memory_records(
-    memory_store: MemoryStore,
-    *,
-    in_channel: str,
-    contacts: Sequence[str],
-) -> tuple[list[str], set[str], list[str]]:
-    """Merge channel/contact retrieval results for `agent_run`.
-
-    Scope-specific retrieval lives in the sibling `k.agent.memory.retrieval.*`
-    modules. This helper preserves the legacy cross-scope merge semantics:
-    compacted ids win over raw-pair ids after the channel/contact results are
-    combined, while `memory_parent_ids` remain the latest root ids per scope.
-    Returned selected ids are sorted lexicographically, which matches
-    `MemoryRecord.id_` time order.
-    """
-
-    channel_roots = latest_memory_roots_by_in_channel(
-        memory_store,
-        in_channel=in_channel,
-    )
-    contact_roots = latest_memory_roots_by_contact(
-        memory_store,
-        contacts=contacts,
-    )
-    channel_compacted_ids, channel_raw_pair_ids = select_memory_ids_by_in_channel(
-        memory_store,
-        in_channel=in_channel,
-        roots=channel_roots,
-    )
-    contact_compacted_ids, contact_raw_pair_ids = select_memory_ids_by_contact(
-        memory_store,
-        contacts=contacts,
-        roots=contact_roots,
-    )
-
-    compacted_ids = set(channel_compacted_ids) | set(contact_compacted_ids)
-    selected_raw_pair_ids = (
-        set(channel_raw_pair_ids) | set(contact_raw_pair_ids)
-    ) - compacted_ids
-    selected_ids = compacted_ids | selected_raw_pair_ids
-    logger.info(
-        "Injected memories counts (auto): "
-        "channel_compacted_selected=%d, channel_raw_pair_selected=%d, "
-        "contact_compacted_selected=%d, contact_raw_pair_selected=%d, "
-        "injected_compacted=%d, injected_raw_pair=%d, injected_total=%d",
-        len(channel_compacted_ids),
-        len(channel_raw_pair_ids),
-        len(contact_compacted_ids),
-        len(contact_raw_pair_ids),
-        len(compacted_ids),
-        len(selected_raw_pair_ids),
-        len(selected_ids),
-    )
-    return (
-        sorted(selected_ids),
-        compacted_ids,
-        dedupe_memory_ids(channel_roots + contact_roots),
-    )
-
-
-def _select_explicit_parent_memory_records(
-    memory_store: MemoryStore,
-    *,
-    parent_memory_ids: Sequence[str],
-    compacted_cap_num: int = 15,
-    raw_pair_level_num: int = 3,
-    raw_pair_cap_num: int = 15,
-) -> tuple[list[str], set[str], list[str]]:
-    """Resolve explicit `parent_memories` without truncating the roots.
-
-    Explicit parent roots are pinned in compacted form. If those roots already
-    fill or exceed the compacted cap, ancestor expansion stops entirely instead
-    of downgrading or dropping the roots themselves.
-    """
-
-    if compacted_cap_num < 0:
-        raise ValueError(
-            f"explicit_parent_compacted_cap_num must be >= 0; got {compacted_cap_num}"
-        )
-    if raw_pair_cap_num < 0:
-        raise ValueError(
-            f"explicit_parent_raw_pair_cap_num must be >= 0; got {raw_pair_cap_num}"
-        )
-
-    deduped_root_ids = dedupe_memory_ids(parent_memory_ids)
-    if not deduped_root_ids:
-        return [], set(), []
-
-    expand_ancestors = len(deduped_root_ids) < compacted_cap_num
-    return get_memory_ids_from_roots(
-        memory_store,
-        roots=deduped_root_ids,
-        compacted_level_num=0,
-        raw_pair_level_num=raw_pair_level_num if expand_ancestors else 0,
-        compacted_cap_num=max(compacted_cap_num, len(deduped_root_ids)),
-        raw_pair_cap_num=raw_pair_cap_num if expand_ancestors else 0,
-        cap_name_prefix="explicit_parent",
-    )
 
 
 async def agent_run(
@@ -810,64 +427,31 @@ async def agent_run(
       can emit near-limit warnings in `BashEvent.system_msg`.
     """
 
-    resolved_contact_ids = resolve_contact_unique_ids(
+    memory_run = prepare_memory_run_state(
+        memory_store,
         config_base=config.config_base,
-        platform_contacts=instruct.contacts,
+        instruct=instruct,
+        parent_memories=parent_memories,
     )
-    working_memory_created_at = datetime.now()
-    explicit_parent_memory_ids = dedupe_memory_ids(parent_memories or [])
-    selected_mem_ids, compacted_mem_ids, memory_parent_ids = (
-        _select_auto_memory_records(
-            memory_store,
-            in_channel=instruct.in_channel,
-            contacts=resolved_contact_ids,
-        )
-    )
-
-    if explicit_parent_memory_ids:
-        explicit_selected_ids, explicit_compacted_ids, explicit_root_ids = (
-            _select_explicit_parent_memory_records(
-                memory_store,
-                parent_memory_ids=explicit_parent_memory_ids,
-            )
-        )
-        selected_mem_ids = sorted(set(selected_mem_ids) | set(explicit_selected_ids))
-        compacted_mem_ids |= explicit_compacted_ids
-        memory_parent_ids = dedupe_memory_ids(explicit_root_ids + memory_parent_ids)
-        logger.info(
-            "Injected memories counts (explicit roots): "
-            "roots=%d, injected_compacted=%d, injected_raw_pair=%d, "
-            "injected_total=%d",
-            len(explicit_root_ids),
-            len(explicit_compacted_ids),
-            len(explicit_selected_ids) - len(explicit_compacted_ids),
-            len(explicit_selected_ids),
-        )
-
-    all_mem_rec = memory_store.get_by_ids(set(selected_mem_ids))
-    memory_blocks = [
-        x.dump_compated() if x.id_ in compacted_mem_ids else x.dump_raw_pair()
-        for x in all_mem_rec
-    ]
-    memory_prompt = _memories_system_prompt(memory_blocks)
 
     usage_limits = UsageLimits()
 
     async with MyDeps(
         config=config,
         memory_storage=memory_store,
-        memory_parents=memory_parent_ids,
+        memory_run=memory_run,
         start_event=instruct,
-        working_memory_created_at=working_memory_created_at,
-        resolved_contact_ids=resolved_contact_ids,
-        injected_memories_prompt=memory_prompt,
     ) as my_deps:
         res = await agent.run(
             model=model,
             deps=my_deps,
             user_prompt=(
-                await _system_runtime_prompt(my_deps),
-                _event_meta_prompt(instruct),
+                await system_runtime_prompt(
+                    basic_os_helper=my_deps.basic_os_helper,
+                    shell_manager=my_deps.shell_manager,
+                    working_memory_created_at=my_deps.memory_run.working_memory_created_at,
+                ),
+                event_meta_prompt(instruct),
                 instruct.content,
             ),
             message_history=message_history,
@@ -880,16 +464,13 @@ async def agent_run(
         )
     msgs: list[ModelRequest | ModelResponse] = res.new_messages()
     msgs = _strip_history(msgs, (instruct.content,))
-    memory_record = res.output
-    memory_record.parents = _append_explicit_parent_memory_ids(
+    return finalize_memory_record(
         memory_store=memory_store,
-        referenced_memory_ids=memory_record.parents,
-        explicit_parent_memory_ids=explicit_parent_memory_ids,
+        memory_run=memory_run,
+        memory_record=res.output,
+        instruct_content=instruct.content,
+        detailed_messages=msgs,
     )
-    memory_record.input = instruct.content
-    memory_record.detailed = msgs
-
-    return memory_record
 
 
 if __name__ == "__main__":
