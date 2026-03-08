@@ -17,5 +17,6 @@ services:
               capabilities: [gpu]
     volumes:
       - ../data/fs:/home/k
+      - ../data/crontabs:/var/spool/cron/crontabs
       - ../core:/core
       - ../collections:/collections
