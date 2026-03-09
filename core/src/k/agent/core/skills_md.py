@@ -1,16 +1,75 @@
-"""Skills prompt helpers.
+"""Skills prompt assembly and `skills:` URI helpers.
 
-The agent injects skills documentation (SKILLS.md) into the system prompt so
-the model can discover available workflows. This module keeps filesystem
-reading logic separate from the agent wiring.
+The agent injects skills documentation (`SKILLS.md`) into the system prompt so
+the model can discover available workflows. This module owns both filesystem
+discovery for prompt injection and the lightweight `skills:` URI scheme used
+to label embedded skill docs.
+
+Resolution rules:
+    - `skills:<relative-path>` resolves under `<config_base>/skills`.
+    - The `<relative-path>` portion must remain relative and must not traverse
+      outside the skills root.
+    - `skills://...` (authority/netloc) is intentionally unsupported.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from k.agent.channels import channel_root
-from k.agent.core.skills_uri import skills_root_from_config_base, skills_uri
+
+SKILLS_URI_SCHEME = "skills"
+
+
+def skills_root_from_config_base(config_base: str | Path) -> Path:
+    """Return the skills root under `config_base`."""
+
+    return Path(config_base).expanduser().resolve() / "skills"
+
+
+def skills_uri(relative_path: str | Path) -> str:
+    """Format a `skills:` URI for a path relative to the skills root."""
+
+    rel = Path(relative_path).as_posix().lstrip("/")
+    return f"{SKILLS_URI_SCHEME}:{rel}"
+
+
+def resolve_skills_uri(uri: str, *, skills_root: str | Path) -> Path:
+    """Resolve a `skills:` URI into an absolute path under `skills_root`.
+
+    This is purely a resolver; the returned path may or may not exist.
+
+    Raises:
+        ValueError: If the URI scheme is not `skills:`, if it uses an authority
+            component, if it's absolute, or if it attempts path traversal.
+    """
+
+    parsed = urlparse(uri)
+    if parsed.scheme != SKILLS_URI_SCHEME:
+        raise ValueError(f"Unsupported scheme for skills URI: {parsed.scheme!r}")
+    if parsed.netloc:
+        raise ValueError("skills URIs must not include an authority component")
+
+    rel_path = Path(unquote(parsed.path))
+    if rel_path.is_absolute():
+        raise ValueError("skills URIs must be relative paths")
+    if any(part == ".." for part in rel_path.parts):
+        raise ValueError("skills URIs must not contain '..' path traversal")
+
+    return Path(skills_root).expanduser().resolve() / rel_path
+
+
+def _format_skill_md_chunk(relative_path: str | Path, content: str) -> str:
+    """Wrap SKILLS.md content in the delimiter format expected by prompts."""
+
+    return "\n".join(
+        [
+            f"# ===== {skills_uri(relative_path)} =====",
+            content.rstrip(),
+            "",
+        ]
+    )
 
 
 def concat_skills_md(config_base: str | Path) -> str:
@@ -32,14 +91,10 @@ def concat_skills_md(config_base: str | Path) -> str:
         for md in sorted(
             group_root.glob("*/SKILLS.md"), key=lambda p: (p.parent.name, str(p))
         ):
-            content = md.read_text()
             chunks.append(
-                "\n".join(
-                    [
-                        f"# ===== {skills_uri(f'{group}/{md.parent.name}/SKILLS.md')} =====",
-                        content.rstrip(),
-                        "",
-                    ]
+                _format_skill_md_chunk(
+                    f"{group}/{md.parent.name}/SKILLS.md",
+                    md.read_text(),
                 )
             )
 
@@ -66,11 +121,7 @@ def maybe_load_channel_skill_md(
     if not md.exists():
         return None
 
-    content = md.read_text()
-    return "\n".join(
-        [
-            f"# ===== {skills_uri(f'{group}/{root}/SKILLS.md')} =====",
-            content.rstrip(),
-            "",
-        ]
+    return _format_skill_md_chunk(
+        f"{group}/{root}/SKILLS.md",
+        md.read_text(),
     )
