@@ -11,6 +11,9 @@ keyword-triggered batches of updates to :func:`k.agent.core.agent_run` as an
 
 Design notes / boundaries:
 - This is a polling (no webhook) starter intended for local/dev usage.
+- The CLI/function entrypoint shares `kapy`'s config-backed model loading and
+  Logfire setup by default; callers can still pass an explicit `Model`
+  instance when they need custom runtime behavior.
 - The forwarded `content` is a newline-delimited stream where each line is a
   Telegram update JSON object.
   - Only definite plain-text message updates are compacted to reduce token usage.

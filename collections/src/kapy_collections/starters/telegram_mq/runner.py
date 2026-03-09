@@ -1,23 +1,24 @@
 """AMQP-backed Telegram starter runner.
 
 This variant consumes Telegram-like updates from RabbitMQ and reuses the core
-Telegram dispatch pipeline.
+Telegram dispatch pipeline. String/omitted model inputs and Logfire setup are
+kept aligned with the installed `kapy` CLI so long-running starters inherit the
+same config-backed defaults.
 """
 
 import datetime
 import html
+import importlib
 import json
-import logging
 import os
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import aio_pika
 import anyio
 import anyio.to_thread as to_thread
-import logfire
 from k.agent.core import agent_run
+from k.agent.core.cli_runtime import configure_cli_logfire, resolve_cli_model
 from k.agent.memory.folder import FolderMemoryStore
 from k.config import Config
 
@@ -133,6 +134,8 @@ def _mq_to_update(mq_msg: dict[str, Any]) -> dict[str, Any]:
     dt_str = mq_msg.get("date")
     try:
         # Handle ISO format with potential Z or timezone offset
+        if not isinstance(dt_str, str):
+            raise ValueError("date must be an ISO-8601 string")
         dt = datetime.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
         ts = int(dt.timestamp())
     except Exception:
@@ -215,6 +218,8 @@ async def run_amqp_forever(
 ) -> None:
     """Run AMQP consumption once and propagate unexpected failures."""
 
+    aio_pika = importlib.import_module("aio_pika")
+
     if dispatch_recent_per_chat < 0:
         raise ValueError(
             f"dispatch_recent_per_chat must be >= 0; got {dispatch_recent_per_chat}"
@@ -293,99 +298,92 @@ async def run_amqp_forever(
         else:
             # Fallback to the provided queue name if no chat_ids specified
             queue = await channel.get_queue(queue_name)
-        async with anyio.create_task_group() as tg:
-            async with queue.iterator() as queue_iter:
-                async for message in queue_iter:
-                    async with message.process():
-                        try:
-                            body = json.loads(message.body.decode())
-                            # Convert to standard format
-                            update = _mq_to_update(body) if "chat_id" in body else body
-                        except Exception as e:
-                            print(f"Failed to parse message: {e}")
-                            continue
+        async with anyio.create_task_group() as tg, queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    try:
+                        body = json.loads(message.body.decode())
+                        # Convert to standard format
+                        update = _mq_to_update(body) if "chat_id" in body else body
+                    except Exception as e:
+                        print(f"Failed to parse message: {e}")
+                        continue
 
-                        unseen_updates = filter_unseen_updates(
-                            [update],
-                            last_processed_update_id=last_consumed_update_id,
-                        )
-                        unseen_updates, _ignored_forum_topic_created_updates = (
-                            filter_non_forum_topic_created_updates(unseen_updates)
-                        )
-                        if not unseen_updates:
-                            continue
+                    unseen_updates = filter_unseen_updates(
+                        [update],
+                        last_processed_update_id=last_consumed_update_id,
+                    )
+                    unseen_updates, _ignored_forum_topic_created_updates = (
+                        filter_non_forum_topic_created_updates(unseen_updates)
+                    )
+                    if not unseen_updates:
+                        continue
 
-                        accepted_updates: list[dict[str, Any]] = []
-                        latest_observed_update_id = last_consumed_update_id
-                        for unseen in unseen_updates:
-                            if bot_user_id is not None:
-                                from_user_id = _extract_update_from_user_id(unseen)
-                                if from_user_id == bot_user_id:
-                                    continue
-                            update_id = extract_update_id(unseen)
-                            if update_id is None:
+                    accepted_updates: list[dict[str, Any]] = []
+                    latest_observed_update_id = last_consumed_update_id
+                    for unseen in unseen_updates:
+                        if bot_user_id is not None:
+                            from_user_id = _extract_update_from_user_id(unseen)
+                            if from_user_id == bot_user_id:
                                 continue
-                            pending_updates_by_id.setdefault(update_id, unseen)
-                            accepted_updates.append(unseen)
-                            if (
-                                latest_observed_update_id is None
-                                or update_id > latest_observed_update_id
-                            ):
-                                latest_observed_update_id = update_id
+                        update_id = extract_update_id(unseen)
+                        if update_id is None:
+                            continue
+                        pending_updates_by_id.setdefault(update_id, unseen)
+                        accepted_updates.append(unseen)
+                        if (
+                            latest_observed_update_id is None
+                            or update_id > latest_observed_update_id
+                        ):
+                            latest_observed_update_id = update_id
 
-                        if latest_observed_update_id is not None:
-                            last_consumed_update_id = latest_observed_update_id
+                    if latest_observed_update_id is not None:
+                        last_consumed_update_id = latest_observed_update_id
 
-                        persisted = 0
-                        if updates_store_path is not None and accepted_updates:
-                            try:
-                                persisted = await to_thread.run_sync(
-                                    append_updates_jsonl,
-                                    updates_store_path,
-                                    list(accepted_updates),
-                                )
-                            except OSError as e:
-                                print(
-                                    "[yellow]telegram persist error[/yellow] "
-                                    + f"path={updates_store_path}: {type(e).__name__}: {e}"
-                                )
-
-                        # Check triggers for each keyword in the list (split by |)
-                        keywords = [k.strip() for k in keyword.split("|") if k.strip()]
-
-                        # We use a custom trigger check to support multiple keywords
-                        pending_updates_in_order = [
-                            pending_updates_by_id[update_id]
-                            for update_id in sorted(pending_updates_by_id)
-                        ]
-
-                        def get_triggered_keyword(
-                            updates: list[dict[str, Any]],
-                        ) -> str | None:
-                            for k in keywords:
-                                if dispatch_groups_for_batch(
-                                    updates,
-                                    keyword=k,
-                                    chat_ids=chat_ids,
-                                    bot_user_id=bot_user_id,
-                                    bot_username=bot_username,
-                                ):
-                                    return k
-                            return None
-
-                        triggered_keyword = get_triggered_keyword(
-                            pending_updates_in_order
-                        )
-
-                        grouped = None
-                        if triggered_keyword:
-                            grouped = dispatch_groups_for_batch(
-                                pending_updates_in_order,
-                                keyword=triggered_keyword,
-                                chat_ids=chat_ids,
-                                bot_user_id=bot_user_id,
-                                bot_username=bot_username,
+                    persisted = 0
+                    if updates_store_path is not None and accepted_updates:
+                        try:
+                            persisted = await to_thread.run_sync(
+                                append_updates_jsonl,
+                                updates_store_path,
+                                list(accepted_updates),
                             )
+                        except OSError as e:
+                            print(
+                                "[yellow]telegram persist error[/yellow] "
+                                + f"path={updates_store_path}: {type(e).__name__}: {e}"
+                            )
+
+                    # Check triggers for each keyword in the list (split by |)
+                    keywords = [k.strip() for k in keyword.split("|") if k.strip()]
+
+                    # We use a custom trigger check to support multiple keywords
+                    pending_updates_in_order = [
+                        pending_updates_by_id[update_id]
+                        for update_id in sorted(pending_updates_by_id)
+                    ]
+
+                    triggered_keyword: str | None = None
+                    for triggered_candidate in keywords:
+                        if dispatch_groups_for_batch(
+                            pending_updates_in_order,
+                            keyword=triggered_candidate,
+                            chat_ids=chat_ids,
+                            bot_user_id=bot_user_id,
+                            bot_username=bot_username,
+                        ):
+                            triggered_keyword = triggered_candidate
+                            break
+
+                    grouped = None
+                    if triggered_keyword:
+                        grouped = dispatch_groups_for_batch(
+                            pending_updates_in_order,
+                            keyword=triggered_keyword,
+                            chat_ids=chat_ids,
+                            bot_user_id=bot_user_id,
+                            bot_username=bot_username,
+                        )
 
                         if grouped:
                             # If chat_ids is provided, treat it as an exclusive filter for dispatching
@@ -541,7 +539,7 @@ async def run(
     amqp_url: str | None = None,
     queue_name: str = "telegram.messages.raw",
     keyword: str,
-    model: Any,
+    model: Any | None = None,
     chat_id: str = "",
     updates_store_path: str | Path | None = None,
     dispatch_recent_per_chat: int = 0,
@@ -552,6 +550,8 @@ async def run(
     Notes:
     - `updates_store_path` accepts either a `Path` or a string path and is
       normalized to a `Path` before being passed to lower-level helpers.
+    - `model=None` means "use the same config-backed model as `kapy`". Callers
+      may still pass an explicit `Model` instance to override that runtime.
     """
     if amqp_url is None:
         amqp_url = os.environ.get("AMQP_URL")
@@ -559,11 +559,10 @@ async def run(
         raise ValueError(
             "amqp_url is required (pass it directly or set AMQP_URL env var)"
         )
-    logfire.configure()
-    logfire.instrument_pydantic_ai()
-    logging.basicConfig(level=logging.INFO, handlers=[logfire.LogfireLoggingHandler()])
 
     config = Config()
+    configure_cli_logfire(config.config_base)
+    resolved_model = resolve_cli_model(config, model)
     try:
         tz = _parse_timezone(str(timezone))
     except ValueError as e:
@@ -594,7 +593,7 @@ async def run(
 
     await run_amqp_forever(
         config=config,
-        model=model,
+        model=resolved_model,
         token=token,
         amqp_url=amqp_url,
         queue_name=queue_name,

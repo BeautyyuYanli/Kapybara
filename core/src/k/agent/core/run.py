@@ -2,7 +2,10 @@
 
 `agent_run` and `MyDeps` live in `k.agent.core.agent` (per architecture).
 This module keeps small helpers that are useful for callers/tests plus the
-installed `kapy` console script.
+installed `kapy` console script. Shared CLI/starter runtime setup such as
+Logfire configuration and config-backed model loading lives in
+`k.agent.core.cli_runtime` so long-running starters can stay aligned with
+`kapy`.
 
 The CLI is one-shot only: callers must pass a prompt, foreground runs use
 `--wait`, and detached execution is the default otherwise. Stdout is reserved
@@ -28,18 +31,23 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
-import logfire
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import UserContent
 
 from k.agent.channels import channel_root
 from k.agent.core.agent import agent_run
+from k.agent.core.cli_runtime import (
+    agent_run_model_from_config as _agent_run_model_from_config,
+)
+from k.agent.core.cli_runtime import (
+    configure_cli_logfire as _configure_cli_logfire,
+)
 from k.agent.core.entities import Event
 from k.agent.memory.entities import memory_record_id_from_created_at
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.agent.memory.store import MemoryStore, coerce_record_id
-from k.config import Config, load_kapybara_toml_config
+from k.config import Config
 
 if TYPE_CHECKING:
     from pydantic_ai.models import Model
@@ -61,48 +69,6 @@ class DetachedCliRunMetadata(BaseModel):
     pid: int
     memory_id: str
     logfile: Path
-
-
-def _load_cli_logfire_token(config_base: str | Path) -> str | None:
-    """Best-effort lookup of `[logfire].token` from `<config_base>/config.toml`.
-
-    Logfire setup should not fail earlier than the main CLI config path. When
-    the TOML file is missing or invalid, keep the previous environment-driven
-    behavior here and let the later model-config load surface the real error.
-    """
-
-    try:
-        file_config = load_kapybara_toml_config(config_base)
-    except ValueError:
-        return None
-
-    if file_config.logfire is None:
-        return None
-    return file_config.logfire.token
-
-
-def _configure_cli_logfire(config_base: str | Path) -> None:
-    """Configure Logfire for CLI runs without requiring project credentials.
-
-    The default `logfire.configure()` behavior prompts for project setup when no
-    token or cached credentials are present. `kapy` is often used in ad-hoc or
-    automated shells, so only send telemetry when Logfire is already configured.
-    CLI stdout is machine-facing JSON, so disable Logfire console output
-    entirely. If `<config_base>/config.toml` declares `[logfire].token`,
-    prefer that token for `kapy` CLI runs.
-    """
-
-    token = _load_cli_logfire_token(config_base)
-    if token is None:
-        logfire.configure(send_to_logfire="if-token-present", console=False)
-    else:
-        logfire.configure(
-            send_to_logfire="if-token-present",
-            token=token,
-            console=False,
-        )
-    logfire.instrument_pydantic_ai()
-    logging.basicConfig(level=logging.INFO, handlers=[logfire.LogfireLoggingHandler()])
 
 
 def _extract_input_event_channel_root(instruct: Sequence[UserContent]) -> str | None:
@@ -272,28 +238,6 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     return parser.parse_args(_normalize_parent_memory_flag_values(argv))
-
-
-def _agent_run_model_from_config(config: Config) -> Model:
-    """Build the `agent_run` model from `<config_base>/config.toml`.
-
-    `kapy` uses `OpenAIChatModel`, so `model_name` must be an OpenAI model id
-    such as `gpt-5.2`. Optional TOML `openai_api_key` and `openai_base_url`
-    values override the default OpenAI provider resolution for CLI runs; when
-    omitted, the provider still falls back to environment/default behavior.
-    """
-
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
-
-    file_config = load_kapybara_toml_config(config.config_base)
-    return OpenAIChatModel(
-        file_config.agent_run.model_name,
-        provider=OpenAIProvider(
-            api_key=file_config.agent_run.openai_api_key,
-            base_url=file_config.agent_run.openai_base_url,
-        ),
-    )
 
 
 def _normalize_parent_memory_ids(parent_memories: list[str] | None) -> list[str]:

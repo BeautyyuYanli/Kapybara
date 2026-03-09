@@ -6,6 +6,8 @@ Event payload policy:
 - Non-text updates are forwarded in their original shape so media/callback
   payloads keep as much detail as possible.
 - `forum_topic_created` service updates are ignored.
+- String/omitted model inputs are resolved through the same config-backed
+  OpenAI loader that the installed `kapy` CLI uses.
 """
 
 from __future__ import annotations
@@ -19,11 +21,11 @@ from typing import Any
 import anyio
 import anyio.to_thread as to_thread
 from k.agent.core import Event, agent_run
+from k.agent.core.cli_runtime import resolve_cli_model
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.config import Config
 from pydantic_ai.models import Model
-from pydantic_ai.models.openrouter import OpenRouterModel
 from rich import print
 
 from .api import TelegramBotApi, TelegramBotApiError
@@ -214,7 +216,7 @@ async def run_agent_for_chat_batch(
     api: TelegramBotApi,
     chat_id: int | None,
     batch_updates: list[dict[str, Any]],
-    model: OpenRouterModel,
+    model: Model,
     config: Config,
     memory_store: FolderMemoryStore,
     append_lock: anyio.Lock,
@@ -416,7 +418,7 @@ def update_last_trigger_update_id_by_chat(
 async def _poll_and_run_forever(
     *,
     config: Config,
-    model: Model | str,
+    model: Model | str | None,
     token: str,
     timeout_seconds: int,
     keyword: str,
@@ -437,11 +439,8 @@ async def _poll_and_run_forever(
             f"dispatch_recent_per_chat must be >= 0; got {dispatch_recent_per_chat}"
         )
 
-    mem_store = FolderMemoryStore(
-        root=memory_root_from_config_base(config.config_base)
-    )
-    if isinstance(model, str):
-        model = OpenRouterModel(model)
+    mem_store = FolderMemoryStore(root=memory_root_from_config_base(config.config_base))
+    model = resolve_cli_model(config, model)
     api = TelegramBotApi(token=token)
     try:
         me = await api.get_me()

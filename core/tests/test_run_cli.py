@@ -8,6 +8,7 @@ import anyio
 import pytest
 from pydantic_ai.models.openai import OpenAIChatModel
 
+import k.agent.core.cli_runtime as cli_runtime_module
 import k.agent.core.run as run_module
 from k.agent.core.entities import Event
 from k.agent.memory.entities import MemoryRecord, memory_record_id_from_millis
@@ -65,14 +66,18 @@ def test_configure_cli_logfire_uses_token_optional_mode(
     def fake_basic_config(**kwargs: Any) -> None:
         captured["basic_config"] = kwargs
 
-    monkeypatch.setattr(run_module.logfire, "configure", fake_configure)
+    monkeypatch.setattr(cli_runtime_module.logfire, "configure", fake_configure)
     monkeypatch.setattr(
-        run_module.logfire,
+        cli_runtime_module.logfire,
         "instrument_pydantic_ai",
         fake_instrument_pydantic_ai,
     )
-    monkeypatch.setattr(run_module.logfire, "LogfireLoggingHandler", lambda: handler)
-    monkeypatch.setattr(run_module.logging, "basicConfig", fake_basic_config)
+    monkeypatch.setattr(
+        cli_runtime_module.logfire,
+        "LogfireLoggingHandler",
+        lambda: handler,
+    )
+    monkeypatch.setattr(cli_runtime_module.logging, "basicConfig", fake_basic_config)
 
     run_module._configure_cli_logfire(tmp_path / ".kapybara")
 
@@ -105,14 +110,18 @@ def test_configure_cli_logfire_uses_toml_token_when_present(
     def fake_basic_config(**kwargs: Any) -> None:
         captured["basic_config"] = kwargs
 
-    monkeypatch.setattr(run_module.logfire, "configure", fake_configure)
+    monkeypatch.setattr(cli_runtime_module.logfire, "configure", fake_configure)
     monkeypatch.setattr(
-        run_module.logfire,
+        cli_runtime_module.logfire,
         "instrument_pydantic_ai",
         fake_instrument_pydantic_ai,
     )
-    monkeypatch.setattr(run_module.logfire, "LogfireLoggingHandler", lambda: handler)
-    monkeypatch.setattr(run_module.logging, "basicConfig", fake_basic_config)
+    monkeypatch.setattr(
+        cli_runtime_module.logfire,
+        "LogfireLoggingHandler",
+        lambda: handler,
+    )
+    monkeypatch.setattr(cli_runtime_module.logging, "basicConfig", fake_basic_config)
 
     run_module._configure_cli_logfire(config_base)
 
@@ -189,6 +198,27 @@ def test_agent_run_model_from_config_uses_optional_openai_overrides(
 
     assert isinstance(model, OpenAIChatModel)
     assert model.model_name == "gpt-5.2"
+    assert str(model.client.base_url) == "https://gateway.example/v1/"
+    assert model.client.api_key == "toml-key"
+
+
+def test_agent_run_model_from_config_allows_model_name_override(
+    tmp_path: Path,
+) -> None:
+    config_base = tmp_path / ".kapybara"
+    _write_cli_config(
+        config_base,
+        openai_api_key="toml-key",
+        openai_base_url="https://gateway.example/v1",
+    )
+
+    model = cli_runtime_module.agent_run_model_from_config(
+        Config(config_base=config_base),
+        model_name="gpt-5.3-mini",
+    )
+
+    assert isinstance(model, OpenAIChatModel)
+    assert model.model_name == "gpt-5.3-mini"
     assert str(model.client.base_url) == "https://gateway.example/v1/"
     assert model.client.api_key == "toml-key"
 

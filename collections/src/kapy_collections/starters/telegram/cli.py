@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import logfire
-
 if TYPE_CHECKING:
     from pydantic_ai.models import Model
 
+from k.agent.core.cli_runtime import configure_cli_logfire, resolve_cli_model
 from k.config import Config
 
 from .compact import _expand_chat_id_watchlist
@@ -29,8 +27,11 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-name",
-        required=True,
-        help="PydanticAI model name passed to OpenRouterModel (required).",
+        default=None,
+        help=(
+            "Optional model id override. When omitted, load the same "
+            "`[agent_run]` model config that the installed `kapy` CLI uses."
+        ),
     )
     parser.add_argument(
         "--token",
@@ -84,7 +85,7 @@ async def run(
     *,
     token: str,
     keyword: str,
-    model: Model | str,
+    model: Model | str | None = None,
     chat_id: str = "",
     timezone: str = _DEFAULT_TIMEZONE,
     timeout_seconds: int = 60,
@@ -93,14 +94,13 @@ async def run(
 ) -> None:
     """Function entrypoint.
 
-    `model` is required so callers must make an explicit model choice.
+    `model=None` means "use the same config-backed model as `kapy`". Callers
+    may still pass an explicit `Model` instance to override that runtime.
     """
 
-    logfire.configure()
-    logfire.instrument_pydantic_ai()
-    logging.basicConfig(level=logging.INFO, handlers=[logfire.LogfireLoggingHandler()])
-
-    config = Config()  # type: ignore[call-arg]
+    config = Config()
+    configure_cli_logfire(config.config_base)
+    resolved_model = resolve_cli_model(config, model)
 
     try:
         tz = _parse_timezone(str(timezone))
@@ -128,7 +128,7 @@ async def run(
 
     await _poll_and_run_forever(
         config=config,
-        model=model,
+        model=resolved_model,
         token=token,
         timeout_seconds=timeout_seconds,
         keyword=keyword,
