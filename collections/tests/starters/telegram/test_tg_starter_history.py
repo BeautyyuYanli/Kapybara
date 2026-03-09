@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+
 from kapy_collections.starters.telegram import (
     append_updates_jsonl,
     load_last_trigger_update_id_by_chat,

@@ -2,10 +2,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from k.config import Config
+
 from kapy_collections.starters.telegram import cli as tg_cli
 from kapy_collections.starters.telegram_mq import runner as tg_mq_runner
-
-from k.config import Config
 
 
 @pytest.mark.anyio

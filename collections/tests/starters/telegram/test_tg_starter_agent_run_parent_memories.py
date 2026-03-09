@@ -4,13 +4,13 @@ from typing import Any
 
 import anyio
 import pytest
-from kapy_collections.starters.telegram import runner as tg_runner
-from kapy_collections.starters.telegram_mq import runner as tg_mq_runner
-
 from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.config import Config
+
+from kapy_collections.starters.telegram import runner as tg_runner
+from kapy_collections.starters.telegram_mq import runner as tg_mq_runner
 
 
 def _sample_batch() -> list[dict[str, Any]]:
