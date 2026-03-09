@@ -5,11 +5,12 @@ points that eventually call `k.agent.core.agent_run`:
 
 - Logfire setup that never prompts for project credentials in ad-hoc shells.
 - Model resolution from `<config_base>/config.toml` using the same optional
-  OpenAI provider overrides as the installed `kapy` CLI.
+  provider overrides as the installed `kapy` CLI.
 
 Callers may still pass an explicit `Model` instance when they need custom
 runtime behavior (for example a fallback model graph). String model ids are
-treated as config-backed overrides and still inherit the TOML OpenAI settings.
+treated as config-backed overrides and still inherit the TOML provider
+settings selected by `[agent_run].provider`.
 """
 
 from __future__ import annotations
@@ -75,33 +76,60 @@ def agent_run_model_from_config(
 ) -> Model:
     """Build the default `agent_run` model from `<config_base>/config.toml`.
 
-    `kapy` uses `OpenAIChatModel`, so the resolved model name must be an OpenAI
-    model id such as `gpt-5.2`. Optional TOML `openai_api_key` and
-    `openai_base_url` values override the default OpenAI provider resolution
-    for CLI-like runs; when omitted, the provider still falls back to the
-    environment/default client behavior.
+    `[agent_run].provider` selects the `pydantic-ai` model/provider family.
+    Supported providers are `openai`, `google`, and `anthropic` (with the TOML
+    aliases `gemini` -> `google` and `claude` -> `anthropic`). Provider-specific
+    `*_api_key` and `*_base_url` values override the default SDK/client
+    resolution for CLI-like runs; when omitted, each provider still falls back
+    to its environment/default client behavior.
 
     When `model_name` is provided, it overrides only the model id while keeping
     the same provider settings that `kapy` would load from the TOML file.
     """
 
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
-
     file_config = load_kapybara_toml_config(config.config_base)
+    agent_run_config = file_config.agent_run
     resolved_model_name = (
-        file_config.agent_run.model_name if model_name is None else model_name.strip()
+        agent_run_config.model_name if model_name is None else model_name.strip()
     )
     if not resolved_model_name:
         raise ValueError("model_name must not be empty")
 
-    return OpenAIChatModel(
-        resolved_model_name,
-        provider=OpenAIProvider(
-            api_key=file_config.agent_run.openai_api_key,
-            base_url=file_config.agent_run.openai_base_url,
-        ),
-    )
+    if agent_run_config.provider == "openai":
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        return OpenAIChatModel(
+            resolved_model_name,
+            provider=OpenAIProvider(
+                api_key=agent_run_config.openai_api_key,
+                base_url=agent_run_config.openai_base_url,
+            ),
+        )
+    if agent_run_config.provider == "google":
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.providers.google import GoogleProvider
+
+        return GoogleModel(
+            resolved_model_name,
+            provider=GoogleProvider(
+                api_key=agent_run_config.google_api_key,
+                base_url=agent_run_config.google_base_url,
+            ),
+        )
+    if agent_run_config.provider == "anthropic":
+        from pydantic_ai.models.anthropic import AnthropicModel
+        from pydantic_ai.providers.anthropic import AnthropicProvider
+
+        return AnthropicModel(
+            resolved_model_name,
+            provider=AnthropicProvider(
+                api_key=agent_run_config.anthropic_api_key,
+                base_url=agent_run_config.anthropic_base_url,
+            ),
+        )
+
+    raise ValueError(f"Unsupported agent_run provider: {agent_run_config.provider!r}")
 
 
 def resolve_cli_model(

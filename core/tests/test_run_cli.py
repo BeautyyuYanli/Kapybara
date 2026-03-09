@@ -6,6 +6,7 @@ from typing import Any
 
 import anyio
 import pytest
+from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel
 
 import k.agent.core.cli_runtime as cli_runtime_module
@@ -34,17 +35,32 @@ class _CapturedLogger:
 def _write_cli_config(
     config_base: Path,
     *,
+    provider: str | None = None,
     openai_api_key: str | None = None,
     openai_base_url: str | None = None,
+    google_api_key: str | None = None,
+    google_base_url: str | None = None,
+    anthropic_api_key: str | None = None,
+    anthropic_base_url: str | None = None,
     logfire_token: str | None = None,
 ) -> None:
     path = config_toml_path(config_base)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["[agent_run]", 'model_name = "gpt-5.2"']
+    if provider is not None:
+        lines.append(f'provider = "{provider}"')
     if openai_api_key is not None:
         lines.append(f'openai_api_key = "{openai_api_key}"')
     if openai_base_url is not None:
         lines.append(f'openai_base_url = "{openai_base_url}"')
+    if google_api_key is not None:
+        lines.append(f'google_api_key = "{google_api_key}"')
+    if google_base_url is not None:
+        lines.append(f'google_base_url = "{google_base_url}"')
+    if anthropic_api_key is not None:
+        lines.append(f'anthropic_api_key = "{anthropic_api_key}"')
+    if anthropic_base_url is not None:
+        lines.append(f'anthropic_base_url = "{anthropic_base_url}"')
     if logfire_token is not None:
         lines.extend(["", "[logfire]", f'token = "{logfire_token}"'])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -221,6 +237,52 @@ def test_agent_run_model_from_config_allows_model_name_override(
     assert model.model_name == "gpt-5.3-mini"
     assert str(model.client.base_url) == "https://gateway.example/v1/"
     assert model.client.api_key == "toml-key"
+
+
+def test_agent_run_model_from_config_builds_google_model_with_overrides(
+    tmp_path: Path,
+) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[agent_run]\n"
+        'provider = "gemini"\n'
+        'model_name = "gemini-3-flash-preview"\n'
+        'google_api_key = "google-key"\n'
+        'google_base_url = "https://gateway.example/google"\n',
+        encoding="utf-8",
+    )
+
+    model = run_module._agent_run_model_from_config(Config(config_base=config_base))
+
+    assert isinstance(model, GoogleModel)
+    assert model.model_name == "gemini-3-flash-preview"
+    assert model.base_url == "https://gateway.example/google"
+
+
+def test_agent_run_model_from_config_builds_anthropic_model_with_overrides(
+    tmp_path: Path,
+) -> None:
+    from pydantic_ai.models.anthropic import AnthropicModel
+
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[agent_run]\n"
+        'provider = "claude"\n'
+        'model_name = "claude-sonnet-4-6"\n'
+        'anthropic_api_key = "anthropic-key"\n'
+        'anthropic_base_url = "https://gateway.example/anthropic"\n',
+        encoding="utf-8",
+    )
+
+    model = run_module._agent_run_model_from_config(Config(config_base=config_base))
+
+    assert isinstance(model, AnthropicModel)
+    assert model.model_name == "claude-sonnet-4-6"
+    assert model.base_url == "https://gateway.example/anthropic/"
 
 
 @pytest.mark.anyio

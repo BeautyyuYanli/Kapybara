@@ -603,6 +603,7 @@ async def _poll_and_run_forever(
 
             # If chat_ids is provided, treat it as an exclusive filter for dispatching
             # to avoid duplicate processing in multi-instance setups.
+            dispatch_groups: dict[int | None, list[dict[str, Any]]]
             if chat_ids is not None:
                 dispatch_groups = {
                     cid: updates for cid, updates in grouped.items() if cid in chat_ids

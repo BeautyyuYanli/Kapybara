@@ -388,6 +388,7 @@ async def run_amqp_forever(
                         if grouped:
                             # If chat_ids is provided, treat it as an exclusive filter for dispatching
                             # to avoid duplicate processing in multi-instance setups.
+                            dispatch_groups: dict[int | None, list[dict[str, Any]]]
                             if chat_ids is not None:
                                 dispatch_groups = {
                                     cid: updates

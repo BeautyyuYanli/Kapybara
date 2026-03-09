@@ -37,18 +37,45 @@ def _normalize_optional_toml_string(value: str | None) -> str | None:
 class AgentRunCliConfig(BaseModel):
     """TOML-backed defaults for the installed `kapy` console script.
 
-    `model_name` is the OpenAI model id used to build the `model` argument
-    passed into `k.agent.core.agent.agent_run`.
-    `openai_api_key` and `openai_base_url`, when set, override the default
-    OpenAI provider credentials/endpoint for CLI runs. When omitted, provider
-    resolution falls back to the environment/default OpenAI client behavior.
+    `provider` selects which `pydantic-ai` model family to build for
+    `k.agent.core.agent.agent_run`. The default is `openai` for backward
+    compatibility; `gemini` and `claude` are accepted as aliases for the
+    underlying `google` and `anthropic` providers.
+
+    `model_name` is the provider-specific model id. Provider-specific `*_api_key`
+    and `*_base_url` fields override the default SDK/client resolution for that
+    provider only. When omitted, provider resolution falls back to the
+    environment/default behavior of the underlying `pydantic-ai` provider.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    provider: str = "openai"
     model_name: str
     openai_api_key: str | None = None
     openai_base_url: str | None = None
+    google_api_key: str | None = None
+    google_base_url: str | None = None
+    anthropic_api_key: str | None = None
+    anthropic_base_url: str | None = None
+
+    @field_validator("provider")
+    @classmethod
+    def _normalize_provider(cls, value: str) -> str:
+        """Normalize provider aliases and reject unsupported values."""
+
+        normalized = value.strip().lower()
+        if normalized == "gemini":
+            normalized = "google"
+        elif normalized == "claude":
+            normalized = "anthropic"
+
+        if normalized not in {"openai", "google", "anthropic"}:
+            raise ValueError(
+                "provider must be one of: openai, google, anthropic "
+                "(aliases: gemini -> google, claude -> anthropic)"
+            )
+        return normalized
 
     @field_validator("model_name")
     @classmethod
@@ -60,10 +87,17 @@ class AgentRunCliConfig(BaseModel):
             raise ValueError("model_name must not be empty")
         return normalized
 
-    @field_validator("openai_api_key", "openai_base_url")
+    @field_validator(
+        "openai_api_key",
+        "openai_base_url",
+        "google_api_key",
+        "google_base_url",
+        "anthropic_api_key",
+        "anthropic_base_url",
+    )
     @classmethod
-    def _normalize_optional_openai_setting(cls, value: str | None) -> str | None:
-        """Trim optional OpenAI settings and collapse blank strings to `None`."""
+    def _normalize_optional_provider_setting(cls, value: str | None) -> str | None:
+        """Trim optional provider settings and collapse blank strings to `None`."""
 
         return _normalize_optional_toml_string(value)
 
@@ -92,10 +126,11 @@ class KapybaraTomlConfig(BaseModel):
     """Contents of `<config_base>/config.toml`.
 
     This file stores persistent, user-editable defaults that should live with
-    the agent's filesystem state. `[agent_run]` carries required `kapy` model
-    defaults, while optional sections such as `[logfire]` configure ancillary
-    CLI integrations. Transport and path settings stay on `Config` so they can
-    still be controlled through `K_*` environment variables.
+    the agent's filesystem state. `[agent_run]` carries required `kapy`
+    model/provider defaults, while optional sections such as `[logfire]`
+    configure ancillary CLI integrations. Transport and path settings stay on
+    `Config` so they can still be controlled through `K_*` environment
+    variables.
     """
 
     model_config = ConfigDict(extra="forbid")

@@ -45,6 +45,7 @@ def test_load_kapybara_toml_config_reads_agent_run_model_name(tmp_path: Path) ->
 
     loaded = load_kapybara_toml_config(config_base)
 
+    assert loaded.agent_run.provider == "openai"
     assert loaded.agent_run.model_name == "gpt-5.2"
 
 
@@ -66,6 +67,42 @@ def test_load_kapybara_toml_config_reads_optional_openai_settings(
 
     assert loaded.agent_run.openai_api_key == "test-key"
     assert loaded.agent_run.openai_base_url == "https://gateway.example/v1"
+
+
+def test_load_kapybara_toml_config_reads_google_settings(tmp_path: Path) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[agent_run]\n"
+        'provider = "google"\n'
+        'model_name = "gemini-3-flash-preview"\n'
+        'google_api_key = "google-key"\n'
+        'google_base_url = "https://generativelanguage.googleapis.com"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_kapybara_toml_config(config_base)
+
+    assert loaded.agent_run.provider == "google"
+    assert loaded.agent_run.google_api_key == "google-key"
+    assert (
+        loaded.agent_run.google_base_url == "https://generativelanguage.googleapis.com"
+    )
+
+
+def test_load_kapybara_toml_config_normalizes_provider_aliases(tmp_path: Path) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '[agent_run]\nprovider = "claude"\nmodel_name = "claude-sonnet-4-6"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_kapybara_toml_config(config_base)
+
+    assert loaded.agent_run.provider == "anthropic"
 
 
 def test_load_kapybara_toml_config_reads_optional_logfire_settings(
@@ -109,6 +146,32 @@ def test_load_kapybara_toml_config_treats_blank_optional_openai_settings_as_none
     assert loaded.agent_run.openai_base_url is None
 
 
+def test_load_kapybara_toml_config_treats_blank_optional_provider_settings_as_none(
+    tmp_path: Path,
+) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[agent_run]\n"
+        'provider = "gemini"\n'
+        'model_name = "gemini-3-flash-preview"\n'
+        'google_api_key = "   "\n'
+        'google_base_url = "   "\n'
+        'anthropic_api_key = "   "\n'
+        'anthropic_base_url = "   "\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_kapybara_toml_config(config_base)
+
+    assert loaded.agent_run.provider == "google"
+    assert loaded.agent_run.google_api_key is None
+    assert loaded.agent_run.google_base_url is None
+    assert loaded.agent_run.anthropic_api_key is None
+    assert loaded.agent_run.anthropic_base_url is None
+
+
 def test_load_kapybara_toml_config_treats_blank_optional_logfire_token_as_none(
     tmp_path: Path,
 ) -> None:
@@ -133,6 +196,19 @@ def test_load_kapybara_toml_config_rejects_blank_model_name(tmp_path: Path) -> N
     path.write_text('[agent_run]\nmodel_name = "   "\n', encoding="utf-8")
 
     with pytest.raises(ValueError, match="model_name must not be empty"):
+        _ = load_kapybara_toml_config(config_base)
+
+
+def test_load_kapybara_toml_config_rejects_unknown_provider(tmp_path: Path) -> None:
+    config_base = tmp_path / ".kapybara"
+    path = config_toml_path(config_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '[agent_run]\nprovider = "bedrock"\nmodel_name = "x"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="provider must be one of"):
         _ = load_kapybara_toml_config(config_base)
 
 
