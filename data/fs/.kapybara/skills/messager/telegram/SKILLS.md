@@ -56,6 +56,7 @@ curl -sS -X POST "$BASE/sendMessage" \
 ## Telegra.ph handoff
 
 For long/structured content, use `skills:messager/telegraph/SKILLS.md`.
+**Note**: Telegra.ph requires **HTML**; Markdown is not supported.
 That skill creates the Telegra.ph page and prints the URL to stdout.
 
 After you capture the URL, send it back with `sendMessage`.

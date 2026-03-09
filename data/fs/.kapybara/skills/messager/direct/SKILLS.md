@@ -1,15 +1,15 @@
 ---
 name: messager/direct
-description: Simply print the response to stdout for direct channel.
+description: Include the response text in the finish_action raw_output field for direct channel.
 ---
 
 # messager/direct
 
 This skill is for responding to events coming from the `direct` channel.
-Since this is a local/direct execution, "sending" a message just means printing it to stdout.
+For direct execution, "sending" a message means including it in the final finish_action output.
 
 ## Usage
 
-```bash
-echo "Your message here"
-```
+For `direct` channel responses, do not use `echo` or any external tool.
+Instead, include the response text directly in the `raw_output` field when calling `finish_action`.
+

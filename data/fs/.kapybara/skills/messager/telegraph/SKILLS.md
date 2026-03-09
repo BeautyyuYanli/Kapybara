@@ -17,7 +17,7 @@ messaging skill can deliver the link.
 Env:
 - `TELEGRAPH_ACCESS_TOKEN` (required)
 
-## createTelegraph
+## createTelegraph (skills:messager/telegraph/SKILLS.md)
 
 ```bash
 URL=$(~/.kapybara/skills/messager/telegraph/create_telegraph "<h3>HTML content here</h3>" \

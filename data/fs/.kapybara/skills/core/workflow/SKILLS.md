@@ -27,6 +27,10 @@ A workflow consists of three types of nodes:
 - Dependencies are declared using `--parent-memory='<ID>'`.
 - Register dependent nodes sequentially: capture one node's `memory_id` from the kapy command JSON output before launching the next node that depends on it.
 
+### 4. Parallelism & ID Collision
+- Memory IDs are derived from millisecond-level timestamps.
+- When launching multiple independent nodes in parallel (e.g., from a Start Node), **wait at least 1ms** (e.g., `sleep 0.001`) between `kapy` calls to ensure each node receives a unique ID.
+
 ## Usage Patterns
 
 #### 1. Register the first intermediate step
