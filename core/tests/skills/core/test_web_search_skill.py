@@ -7,7 +7,13 @@ import pytest
 
 
 def _web_search_script_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
+    current = Path(__file__).resolve().parent
+    for candidate in (current, *current.parents):
+        if (candidate / "core").is_dir() and (candidate / "data").is_dir():
+            repo_root = candidate
+            break
+    else:
+        raise RuntimeError(f"Could not locate repository root from {__file__!r}")
     return (
         repo_root
         / "data"

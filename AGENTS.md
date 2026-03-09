@@ -48,4 +48,4 @@ In this section, “notes” means module/class/function docstrings plus any rel
 - **Code clarity**: add proper inline comments and docstrings where appropriate to explain non-obvious logic and public interfaces.
 - **Reuse**: when common logic exists, extract it into a helper utility function to avoid duplication.
 - **Testing**: add unit tests when you modify source code that should be tested.
-- **Before submit**: `cd core/` then run `pdm run fix`, `pdm run typecheck`, and `pdm run test`.
+- **Before submit**: `cd core/` or `cd collections/`, then run `pdm run fix`, `pdm run typecheck`, and `pdm run test`.
