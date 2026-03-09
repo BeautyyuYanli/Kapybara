@@ -31,7 +31,6 @@ Example (Telegram thread input):
 
 Let `root(channel)` be the first channel segment.
 
-- Context skill: `context/{root(in_channel)}`
 - Messager skill: `messager/{root(effective_out_channel)}`
   - `effective_out_channel = out_channel or in_channel`
 
@@ -39,7 +38,7 @@ This keeps routing explicit while reusing platform-level skills.
 
 ## Memory retrieval
 
-When retrieving memory for a channel prefix, filter by `MemoryRecord.in_channel`
+When retrieving memory for a channel prefix, filter by `MemoryRecord.in_channel` and `MemoryRecord.out_channel`
 using prefix matching.
 
 Example:
@@ -52,7 +51,7 @@ Example:
 
 ## Preference injection
 
-For an `in_channel`, inject preferences in this order:
+For an `in_channel`/`out_channel`, inject preferences in this order:
 
 Preference files are resolved from `~/.kapybara/preferences`.
 
@@ -72,10 +71,6 @@ Example for `telegram/chat/<chat_id>`:
 5. `telegram/chat/PREFERENCES.md`
 6. `telegram/chat/<chat_id>.md`
 7. `telegram/chat/<chat_id>/PREFERENCES.md`
-
-`contacts/<platform>/<user_id>.md`-based user preference filtering keeps the
-current behavior. For unique contact ids and symlink layout, see
-`docs/concept/contacts.md`.
 
 ## Required Fields
 
