@@ -62,7 +62,7 @@ Check status:
 
 ```bash
 docker compose ps
-docker compose logs -f basic-os
+docker compose logs -f
 ```
 
 Stop the stack:
