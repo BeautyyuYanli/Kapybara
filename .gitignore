@@ -7,11 +7,14 @@ core/.venv
 data/*
 !data/fs/
 data/fs/*
+!data/fs/.env.example
+!data/fs/start.example.sh
 
 
 !data/fs/.kapybara/
 data/fs/.kapybara/*
 !data/fs/.kapybara/.bashrc
+!data/fs/.kapybara/config.example.toml
 !data/fs/.kapybara/preferences/
 data/fs/.kapybara/preferences/*
 !data/fs/.kapybara/preferences/PREFERENCES.default.md
