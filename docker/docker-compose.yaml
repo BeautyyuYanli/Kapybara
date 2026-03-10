@@ -1,6 +1,6 @@
 services:
   basic-os:
-    image: ${IMAGE_NAME:-kapybara-basic-os:latest}
+    image: ${IMAGE_NAME:-ghcr.io/beautyyuyanli/kapybara:latest}
     build:
       context: ..
       dockerfile: docker/basic-os/Dockerfile
