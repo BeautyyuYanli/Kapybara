@@ -1,14 +1,15 @@
 # Copy this file to `config.toml` and set the provider/model pair you want the
-# installed `kapy` CLI to use by default.
+# installed `kapy` CLI to use by default. Google AI Studio with Gemini Flash is
+# the recommended default.
 [agent_run]
-provider = "openai"
-model_name = "gpt-5.2"
-openai_api_key = ""
-openai_base_url = ""
+provider = "google"
+model_name = "gemini-3-flash-preview"
+google_api_key = ""
+# google_base_url = "https://generativelanguage.googleapis.com"
 
 # Uncomment these if you use a different provider.
-# google_api_key = ""
-# google_base_url = "https://generativelanguage.googleapis.com"
+# openai_api_key = ""
+# openai_base_url = ""
 # anthropic_api_key = ""
 # anthropic_base_url = ""
 

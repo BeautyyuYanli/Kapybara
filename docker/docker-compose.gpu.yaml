@@ -1,0 +1,10 @@
+services:
+  basic-os:
+    # Enable this override only on hosts with NVIDIA Container Toolkit support.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

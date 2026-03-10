@@ -8,13 +8,6 @@ services:
       PUID: "${PUID:?set PUID (e.g. id -u)}"
       PGID: "${PGID:?set PGID (e.g. id -g)}"
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     volumes:
       - ../data/fs:/home/k
       # Bind the Debian crontab spool so root cron jobs remain visible through
