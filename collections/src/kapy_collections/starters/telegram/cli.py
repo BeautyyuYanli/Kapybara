@@ -65,7 +65,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dispatch-recent-per-chat",
         type=int,
-        default=0,
+        default=10,
         help=(
             "When > 0, cap each dispatched chat batch to the latest N updates. "
             "If --updates-store-path is set, dispatch prefers the latest N stored "
@@ -90,7 +90,7 @@ async def run(
     timezone: str = _DEFAULT_TIMEZONE,
     timeout_seconds: int = 60,
     updates_store_path: str = "",
-    dispatch_recent_per_chat: int = 0,
+    dispatch_recent_per_chat: int = 10,
 ) -> None:
     """Function entrypoint.
 

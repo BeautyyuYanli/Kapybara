@@ -8,6 +8,19 @@ from kapy_collections.starters.telegram import cli as tg_cli
 from kapy_collections.starters.telegram_mq import runner as tg_mq_runner
 
 
+def test_telegram_cli_parse_defaults_dispatch_recent_per_chat_to_ten() -> None:
+    args = tg_cli._parse_cli_args(
+        [
+            "--token",
+            "bot-token",
+            "--keyword",
+            "kapy",
+        ]
+    )
+
+    assert args.dispatch_recent_per_chat == 10
+
+
 @pytest.mark.anyio
 async def test_telegram_cli_run_uses_shared_kapy_runtime_helpers(
     monkeypatch: pytest.MonkeyPatch,
@@ -45,6 +58,7 @@ async def test_telegram_cli_run_uses_shared_kapy_runtime_helpers(
     assert captured["resolved_model_args"] == (config, None)
     assert captured["runner_kwargs"]["config"] == config
     assert captured["runner_kwargs"]["model"] == "resolved-model"
+    assert captured["runner_kwargs"]["dispatch_recent_per_chat"] == 10
 
 
 @pytest.mark.anyio
