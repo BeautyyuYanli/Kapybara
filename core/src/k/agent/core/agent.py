@@ -41,13 +41,12 @@ from pydantic_ai.models import KnownModelName, Model
 
 from k.agent.core.entities import Event, MemoryHint, finish_action, tool_exception_guard
 from k.agent.core.media_tools import (
-    ModelMediaPolicyResolver,
-    load_media_policy_resolver,
-    read_media_tool,
-)
-from k.agent.core.media_tools import (
     read_media as _read_media,
 )
+from k.agent.core.media_tools import (
+    read_media_tool,
+)
+from k.agent.core.multimodal import MediaPolicy, load_media_policy
 from k.agent.core.prompts import (
     SOP_prompt,
     bash_tool_prompt,
@@ -94,10 +93,9 @@ class MyDeps:
         continue working.
 
     Media compatibility:
-        `media_policy_resolver` selects the `read_media` compatibility policy
-        from the current run model. When `None`, it is loaded from
-        `config.media_policy_config_path` or falls back to the built-in OpenAI
-        policy.
+        `media_policy` is the explicit `read_media` compatibility policy loaded
+        from `config.multimodal`. When unset, it falls back to the built-in
+        `google latest` preset.
     """
 
     config: Config
@@ -111,16 +109,14 @@ class MyDeps:
     stuck_warning_limit: int = 3
     basic_os_helper: BasicOSHelper = field(init=False)
     shell_manager: ShellSessionManager = field(init=False)
-    media_policy_resolver: ModelMediaPolicyResolver | None = None
+    media_policy: MediaPolicy | None = None
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         self.basic_os_helper = BasicOSHelper(config=self.config)
         self.shell_manager = ShellSessionManager()
-        if self.media_policy_resolver is None:
-            self.media_policy_resolver = load_media_policy_resolver(
-                self.config.media_policy_config_path
-            )
+        if self.media_policy is None:
+            self.media_policy = load_media_policy(self.config.multimodal)
 
     async def __aenter__(self) -> MyDeps:
         return self

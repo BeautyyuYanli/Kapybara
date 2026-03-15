@@ -1,16 +1,21 @@
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pydantic_ai import BinaryContent
-from pydantic_ai.models.openrouter import OpenRouterModel
 
 from k.agent.core import media_tools
 from k.agent.core.agent import read_media
+from k.agent.core.multimodal import (
+    DEFAULT_MEDIA_POLICY_NAME,
+    PRESET_MEDIA_POLICIES,
+    MediaPolicy,
+    load_media_policy,
+)
+from k.config import Config, MultimodalConfig, MultimodalCustomPolicyConfig
 
 
 def _ffmpeg_generate_media(path: Path, *args: str) -> None:
@@ -78,7 +83,9 @@ async def test_read_media_expands_env_vars_for_local_paths(
 
 
 @pytest.mark.anyio
-async def test_read_media_converts_unsupported_image_to_webp(tmp_path: Path) -> None:
+async def test_read_media_defaults_to_google_policy_and_converts_image_to_jpeg(
+    tmp_path: Path,
+) -> None:
     bmp_path = tmp_path / "sample.bmp"
     _ffmpeg_generate_media(
         bmp_path, "-f", "lavfi", "-i", "color=c=green:s=3x3", "-frames:v", "1"
@@ -89,34 +96,33 @@ async def test_read_media_converts_unsupported_image_to_webp(tmp_path: Path) -> 
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "image/webp"
-    assert out[0].data[:4] == b"RIFF"
-    assert out[0].data[8:12] == b"WEBP"
+    assert out[0].media_type == "image/jpeg"
+    assert out[0].data[:2] == b"\xff\xd8"
 
 
 @pytest.mark.anyio
-async def test_read_media_converts_unsupported_audio_to_webm(
+async def test_read_media_defaults_to_google_policy_and_converts_audio_to_mp3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     src_path = tmp_path / "tone.unknown"
     src_path.write_bytes(b"not-a-real-audio-container")
 
-    async def fake_convert_audio_to_webm(
+    async def fake_convert_audio_to_mpeg(
         path: Path, dst_dir: Path
     ) -> media_tools.PreparedFile:
-        output = dst_dir / "tone.webm"
-        output.write_bytes(b"\x1aE\xdf\xa3fake-webm")
-        return media_tools.PreparedFile(path=output, media_type_hint="audio/webm")
+        output = dst_dir / "tone.mp3"
+        output.write_bytes(b"ID3fake-mp3")
+        return media_tools.PreparedFile(path=output, media_type_hint="audio/mpeg")
 
     original_detect = media_tools._detect_media_type
 
     def fake_detect_media_type(path: Path, hint: str | None = None) -> str:
         if path == src_path:
-            return "audio/ogg"
+            return "audio/webm"
         return original_detect(path, hint)
 
     monkeypatch.setattr(
-        media_tools, "_convert_audio_to_webm", fake_convert_audio_to_webm
+        media_tools, "_convert_audio_to_mpeg", fake_convert_audio_to_mpeg
     )
     monkeypatch.setattr(media_tools, "_detect_media_type", fake_detect_media_type)
 
@@ -125,8 +131,8 @@ async def test_read_media_converts_unsupported_audio_to_webm(
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "audio/webm"
-    assert out[0].data.startswith(b"\x1aE\xdf\xa3")
+    assert out[0].media_type == "audio/mpeg"
+    assert out[0].data.startswith(b"ID3")
 
 
 def test_assert_public_remote_target_rejects_loopback() -> None:
@@ -135,7 +141,9 @@ def test_assert_public_remote_target_rejects_loopback() -> None:
 
 
 @pytest.mark.anyio
-async def test_read_media_converts_animated_gif_to_webp(tmp_path: Path) -> None:
+async def test_read_media_converts_animated_gif_to_jpeg_under_google_default(
+    tmp_path: Path,
+) -> None:
     animated_gif = tmp_path / "animated.gif"
     _ffmpeg_generate_media(
         animated_gif,
@@ -152,9 +160,8 @@ async def test_read_media_converts_animated_gif_to_webp(tmp_path: Path) -> None:
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "image/webp"
-    assert out[0].data[:4] == b"RIFF"
-    assert out[0].data[8:12] == b"WEBP"
+    assert out[0].media_type == "image/jpeg"
+    assert out[0].data[:2] == b"\xff\xd8"
 
 
 @pytest.mark.anyio
@@ -166,7 +173,7 @@ async def test_read_media_rejects_unknown_binary_file(tmp_path: Path) -> None:
 
     assert (
         out
-        == "Unsupported media type for policy 'openai': application/octet-stream. Provide a directly supported MIME type or configure a conversion rule for it."
+        == "Unsupported media type for policy 'google latest': application/octet-stream. Provide a directly supported MIME type or configure a conversion rule for it."
     )
 
 
@@ -188,29 +195,14 @@ async def test_read_media_rejects_empty_strings() -> None:
 
 
 @pytest.mark.anyio
-async def test_read_media_tool_uses_policy_selected_from_current_model(
-    tmp_path: Path,
-) -> None:
+async def test_read_media_tool_uses_explicit_policy_from_deps(tmp_path: Path) -> None:
     png_path = tmp_path / "sample.png"
     _ffmpeg_generate_media(
         png_path, "-f", "lavfi", "-i", "color=c=purple:s=2x2", "-frames:v", "1"
     )
 
-    image_only_policy = media_tools.ModelMediaPolicy(
-        name="image-only",
-        supported_media_types=frozenset({"image/png"}),
-    )
-    resolver = media_tools.ModelMediaPolicyResolver(
-        policies={
-            "openai": media_tools.OPENAI_MEDIA_POLICY,
-            "image-only": image_only_policy,
-        },
-        default_policy_name="openai",
-        model_type_policy_map={OpenRouterModel: "image-only"},
-    )
     ctx = SimpleNamespace(
-        deps=SimpleNamespace(media_policy_resolver=resolver),
-        model=OpenRouterModel("custom/image-only"),
+        deps=SimpleNamespace(media_policy=PRESET_MEDIA_POLICIES["include image"]),
     )
 
     out = await media_tools.read_media_tool(ctx, [str(png_path)])
@@ -218,32 +210,40 @@ async def test_read_media_tool_uses_policy_selected_from_current_model(
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "image/png"
+    assert out[0].media_type == "image/jpeg"
 
 
-def test_load_media_policy_resolver_from_json_config(tmp_path: Path) -> None:
-    config_path = tmp_path / "media-policy.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "default_policy_name": "image-only",
-                "policies": {
-                    "image-only": {
-                        "supported_media_types": ["image/png"],
-                        "conversion_rules": [],
-                    }
-                },
-                "model_type_policy_map": {
-                    "pydantic_ai.models.openrouter.OpenRouterModel": "image-only"
-                },
-            }
-        ),
-        encoding="utf-8",
+def test_load_media_policy_defaults_to_google_latest() -> None:
+    policy = load_media_policy(None)
+
+    assert policy.name == DEFAULT_MEDIA_POLICY_NAME
+
+
+def test_load_media_policy_accepts_preset_name() -> None:
+    policy = load_media_policy(MultimodalConfig(policy="include image and audio"))
+
+    assert policy.supported_media_types == frozenset({"image/jpeg", "audio/mpeg"})
+
+
+def test_load_media_policy_accepts_embedded_custom_policy() -> None:
+    policy = load_media_policy(
+        MultimodalConfig(
+            policy=MultimodalCustomPolicyConfig(
+                name="png-only",
+                supported_media_types=["image/png"],
+            )
+        )
     )
 
-    resolver = media_tools.load_media_policy_resolver(config_path)
-    policy = resolver.resolve(OpenRouterModel("custom/image-only"))
-
-    assert policy.name == "image-only"
+    assert isinstance(policy, MediaPolicy)
+    assert policy.name == "png-only"
     assert policy.supported_media_types == frozenset({"image/png"})
-    assert "openai" in resolver.policies
+
+
+def test_config_supports_nested_multimodal_section() -> None:
+    config = Config(
+        fs_base=Path("/tmp/fs"),
+        multimodal={"policy": "include audio"},
+    )
+
+    assert config.multimodal.policy == "include audio"
