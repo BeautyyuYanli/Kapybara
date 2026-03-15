@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
 from pydantic_ai import BinaryContent
 from pydantic_ai.models.openrouter import OpenRouterModel
 
@@ -13,12 +13,24 @@ from k.agent.core import media_tools
 from k.agent.core.agent import read_media
 
 
+def _ffmpeg_generate_media(path: Path, *args: str) -> None:
+    """Create deterministic test media via ffmpeg so tests match runtime codecs."""
+
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", *args, str(path)],
+        check=True,
+        capture_output=True,
+    )
+
+
 @pytest.mark.anyio
 async def test_read_media_downloads_remote_media_to_binary_content(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     remote_file = tmp_path / "remote.jpg"
-    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(remote_file, format="JPEG")
+    _ffmpeg_generate_media(
+        remote_file, "-f", "lavfi", "-i", "color=c=red:s=2x2", "-frames:v", "1"
+    )
 
     async def fake_download(url: str, dst_dir: Path) -> media_tools.PreparedFile:
         copied = dst_dir / "downloaded.jpg"
@@ -51,7 +63,9 @@ async def test_read_media_expands_env_vars_for_local_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     image_path = tmp_path / "x.jpg"
-    Image.new("RGB", (2, 2), color=(0, 0, 255)).save(image_path, format="JPEG")
+    _ffmpeg_generate_media(
+        image_path, "-f", "lavfi", "-i", "color=c=blue:s=2x2", "-frames:v", "1"
+    )
     monkeypatch.setenv("K_TEST_MEDIA_DIR", str(tmp_path))
 
     out = await read_media(["$K_TEST_MEDIA_DIR/x.jpg"])
@@ -66,7 +80,9 @@ async def test_read_media_expands_env_vars_for_local_paths(
 @pytest.mark.anyio
 async def test_read_media_converts_unsupported_image_to_webp(tmp_path: Path) -> None:
     bmp_path = tmp_path / "sample.bmp"
-    Image.new("RGB", (3, 3), color=(0, 255, 0)).save(bmp_path, format="BMP")
+    _ffmpeg_generate_media(
+        bmp_path, "-f", "lavfi", "-i", "color=c=green:s=3x3", "-frames:v", "1"
+    )
 
     out = await read_media([str(bmp_path)])
 
@@ -119,6 +135,29 @@ def test_assert_public_remote_target_rejects_loopback() -> None:
 
 
 @pytest.mark.anyio
+async def test_read_media_converts_animated_gif_to_webp(tmp_path: Path) -> None:
+    animated_gif = tmp_path / "animated.gif"
+    _ffmpeg_generate_media(
+        animated_gif,
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=2x2:rate=2",
+        "-t",
+        "1.5",
+    )
+
+    out = await read_media([str(animated_gif)])
+
+    assert isinstance(out, list)
+    assert len(out) == 1
+    assert isinstance(out[0], BinaryContent)
+    assert out[0].media_type == "image/webp"
+    assert out[0].data[:4] == b"RIFF"
+    assert out[0].data[8:12] == b"WEBP"
+
+
+@pytest.mark.anyio
 async def test_read_media_rejects_unknown_binary_file(tmp_path: Path) -> None:
     unknown_path = tmp_path / "unknown"
     unknown_path.write_bytes(b"\x00\x01\x02\x03\x04")
@@ -153,7 +192,9 @@ async def test_read_media_tool_uses_policy_selected_from_current_model(
     tmp_path: Path,
 ) -> None:
     png_path = tmp_path / "sample.png"
-    Image.new("RGB", (2, 2), color=(123, 45, 67)).save(png_path, format="PNG")
+    _ffmpeg_generate_media(
+        png_path, "-f", "lavfi", "-i", "color=c=purple:s=2x2", "-frames:v", "1"
+    )
 
     image_only_policy = media_tools.ModelMediaPolicy(
         name="image-only",

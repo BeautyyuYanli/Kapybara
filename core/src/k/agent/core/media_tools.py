@@ -12,7 +12,7 @@ matches the previous OpenAI-oriented behavior:
 - images: PNG, JPEG, WEBP, or non-animated GIF
 - audio: MP3/MPEG, WAV, M4A/MP4, or WEBM
 - documents: PDF
-- decodable images -> WEBP
+- decodable images -> WEBP (via `ffmpeg`)
 - decodable audio -> WEBM (via `ffmpeg`)
 
 The plain `read_media(...)` helper keeps working for direct callers and uses the
@@ -36,13 +36,13 @@ import os
 import socket
 from dataclasses import dataclass
 from pathlib import Path
+from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
 import filetype
 import httpx
-from PIL import Image, ImageSequence, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from pydantic_ai import BinaryContent, MultiModalContent, RunContext
 from pydantic_ai.models.fallback import FallbackModel
@@ -50,10 +50,10 @@ from pydantic_ai.models.wrapper import WrapperModel
 
 from k.agent.core.entities import tool_exception_guard
 
-REMOTE_DOWNLOAD_LIMIT_BYTES = 50 * 1024 * 1024
-REMOTE_REDIRECT_LIMIT = 5
-REMOTE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
-REMOTE_USER_AGENT = "kapybara-read-media/1.0"
+REMOTE_DOWNLOAD_LIMIT_BYTES: int = 50 * 1024 * 1024
+REMOTE_REDIRECT_LIMIT: int = 5
+REMOTE_TIMEOUT: httpx.Timeout = httpx.Timeout(20.0, connect=5.0)
+REMOTE_USER_AGENT: str = "kapybara-read-media/1.0"
 
 
 @dataclass(slots=True)
@@ -62,6 +62,14 @@ class PreparedFile:
 
     path: Path
     media_type_hint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessResult:
+    """Captured subprocess result for ffmpeg/ffprobe helpers."""
+
+    stdout: bytes
+    stderr: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,7 +292,7 @@ def _normalize_media_type(media_type: str | None) -> str | None:
     if not media_type:
         return None
     normalized = media_type.split(";", 1)[0].strip().lower()
-    aliases = {
+    aliases: dict[str, str] = {
         "audio/mp3": "audio/mpeg",
         "audio/x-m4a": "audio/mp4",
         "audio/x-wav": "audio/wav",
@@ -352,27 +360,94 @@ def _detect_media_type(path: Path, hint: str | None = None) -> str:
     return "application/octet-stream"
 
 
-def _is_non_animated_gif(path: Path) -> bool:
+async def _run_media_process(*args: str) -> ProcessResult:
+    """Run one media command and return captured stdout/stderr.
+
+    The helpers in this module rely on the system `ffmpeg` / `ffprobe`
+    executables instead of Pillow so one codec/toolchain determines both media
+    probing and conversions.
+    """
+
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        return_code = process.returncode or 1
+        raise CalledProcessError(return_code, args, output=stdout, stderr=stderr)
+    return ProcessResult(stdout=stdout, stderr=stderr)
+
+
+async def _probe_video_packet_count(path: Path) -> int:
+    """Return the number of packets in the first video stream.
+
+    GIF animation detection is intentionally packet-count based so static GIFs
+    remain accepted under `static_only_media_types` while multi-frame GIFs are
+    rejected without decoding them via Pillow.
+    """
+
+    result = await _run_media_process(
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-count_packets",
+        "-show_entries",
+        "stream=nb_read_packets",
+        "-of",
+        "json",
+        os.fspath(path),
+    )
+    payload: dict[str, Any] = json.loads(result.stdout.decode("utf-8"))
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or not streams:
+        raise ValueError(f"Unsupported image file: {path}")
+
+    packet_value = streams[0].get("nb_read_packets")
+    if packet_value is None:
+        raise ValueError(f"Unsupported image file: {path}")
+
+    try:
+        return int(packet_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported image file: {path}") from exc
+
+
+async def _is_non_animated_gif(path: Path) -> bool:
     """Return whether the GIF is static enough for `static_only_media_types`."""
 
-    with Image.open(path) as image:
-        return getattr(image, "n_frames", 1) <= 1
+    return await _probe_video_packet_count(path) <= 1
 
 
-def _convert_image_to_webp(path: Path, dst_dir: Path) -> PreparedFile:
+async def _convert_image_to_webp(path: Path, dst_dir: Path) -> PreparedFile:
     """Convert any decodable image to WEBP.
 
-    Animated images are flattened to their first frame.
+    Animated images are flattened to their first frame so the historical
+    OpenAI-oriented policy keeps treating unsupported animated images as static
+    WEBP inputs after conversion.
     """
 
     output_path = dst_dir / f"{path.stem or 'image'}.webp"
     try:
-        with Image.open(path) as image:
-            if getattr(image, "is_animated", False):
-                image = next(ImageSequence.Iterator(image))
-            image.save(output_path, format="WEBP")
-    except (UnidentifiedImageError, OSError) as exc:
+        await _run_media_process(
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            os.fspath(path),
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libwebp",
+            os.fspath(output_path),
+        )
+    except CalledProcessError as exc:
         raise ValueError(f"Unsupported image file: {path}") from exc
+    if not output_path.exists():
+        raise ValueError(f"Unsupported image file: {path}")
     return PreparedFile(path=output_path, media_type_hint="image/webp")
 
 
@@ -380,23 +455,23 @@ async def _convert_audio_to_webm(path: Path, dst_dir: Path) -> PreparedFile:
     """Convert decodable audio to WEBM via `ffmpeg`."""
 
     output_path = dst_dir / f"{path.stem or 'audio'}.webm"
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-nostdin",
-        "-y",
-        "-i",
-        os.fspath(path),
-        "-vn",
-        "-acodec",
-        "libopus",
-        os.fspath(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _stdout, stderr = await process.communicate()
-    if process.returncode != 0 or not output_path.exists():
-        reason = stderr.decode("utf-8", errors="replace").strip()
-        raise ValueError(f"Failed to convert audio file {path}: {reason}")
+    try:
+        await _run_media_process(
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            os.fspath(path),
+            "-vn",
+            "-acodec",
+            "libopus",
+            os.fspath(output_path),
+        )
+    except CalledProcessError as exc:
+        reason = exc.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"Failed to convert audio file {path}: {reason}") from exc
+    if not output_path.exists():
+        raise ValueError(f"Failed to convert audio file {path}: missing output file")
     return PreparedFile(path=output_path, media_type_hint="audio/webm")
 
 
@@ -502,13 +577,13 @@ async def _apply_conversion_rule(
     """Apply one configured conversion rule."""
 
     if rule.converter == "image_to_webp":
-        return _convert_image_to_webp(prepared.path, dst_dir)
+        return await _convert_image_to_webp(prepared.path, dst_dir)
     if rule.converter == "audio_to_webm":
         return await _convert_audio_to_webm(prepared.path, dst_dir)
     raise ValueError(f"Unsupported media conversion rule: {rule.converter}")
 
 
-def _is_directly_supported(
+async def _is_directly_supported(
     prepared: PreparedFile, media_type: str, policy: ModelMediaPolicy
 ) -> bool:
     """Check direct support, including static-only formats like GIF."""
@@ -516,7 +591,7 @@ def _is_directly_supported(
     if media_type not in policy.supported_media_types:
         return False
     if media_type in policy.static_only_media_types:
-        return _is_non_animated_gif(prepared.path)
+        return await _is_non_animated_gif(prepared.path)
     return True
 
 
@@ -526,7 +601,7 @@ async def _normalize_media(
     """Keep supported files as-is and convert unsupported-but-decodable inputs."""
 
     media_type = _detect_media_type(prepared.path, prepared.media_type_hint)
-    if _is_directly_supported(prepared, media_type, policy):
+    if await _is_directly_supported(prepared, media_type, policy):
         return PreparedFile(path=prepared.path, media_type_hint=media_type)
 
     for rule in policy.conversion_rules:
