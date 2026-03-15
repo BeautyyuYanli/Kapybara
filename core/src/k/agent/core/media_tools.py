@@ -462,7 +462,13 @@ async def read_media(
     *,
     policy: MediaPolicy | None = None,
 ) -> list[MultiModalContent] | str:
-    """Direct-call helper using the built-in default multimodal preset."""
+    """
+    Read media files from URLs or local file paths.
+    Note: This tool does not support video files. For video content, use the `read-video` skill first.
+
+    Args:
+        media: A list of URLs and/or local file paths.
+    """
 
     return await _read_media_impl(
         media,
@@ -475,7 +481,13 @@ async def read_media_tool(
     ctx: RunContext[Any],
     media: list[str],
 ) -> list[MultiModalContent] | str:
-    """Agent tool adapter that reads the explicit multimodal policy from deps."""
+    """
+    Read media files from URLs or local file paths.
+    Note: This tool does not support video files. For video content, use the `read-video` skill first.
+
+    Args:
+        media: A list of URLs and/or local file paths.
+    """
 
     deps = getattr(ctx, "deps", None)
     policy = getattr(deps, "media_policy", None)

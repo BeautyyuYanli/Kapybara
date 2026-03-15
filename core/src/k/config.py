@@ -1,9 +1,11 @@
-"""Application settings loaded from TOML, environment, and init kwargs.
+"""Application settings loaded from env/init plus TOML-backed multimodal policy.
 
 `Config` is the single settings surface used across starters, runtime wiring,
-and helper utilities. Nested models are used for structured sections so
-`~/.kapybara/config.toml`, `K_...` environment overrides, and direct
-instantiation all share one schema.
+and helper utilities. Historical fields such as `fs_base` and `basic_os_*`
+keep their original `BaseSettings` source order: init kwargs first, then
+`K_...` environment variables. The shared `~/.kapybara/config.toml` file is
+only consulted for the nested `[multimodal]` section so multimodal policy can
+be configured without changing legacy settings behavior.
 """
 
 from pathlib import Path
@@ -45,8 +47,24 @@ def default_user_config_toml_path() -> Path:
     return Path("~/.kapybara/config.toml").expanduser()
 
 
+class MultimodalTomlConfigSettingsSource(TomlConfigSettingsSource):
+    """Expose only the `[multimodal]` TOML section as a settings source.
+
+    Restricting the TOML source to one nested field preserves the legacy source
+    ordering for all existing top-level settings while still allowing
+    multimodal presets and custom policies to live in the shared user config.
+    """
+
+    def __call__(self) -> dict[str, object]:
+        data = super().__call__()
+        multimodal = data.get("multimodal")
+        if multimodal is None:
+            return {}
+        return {"multimodal": multimodal}
+
+
 class Config(BaseSettings):
-    """Application settings with `~/.kapybara/config.toml` as the highest priority.
+    """Application settings with optional TOML-backed multimodal policy.
 
     Unknown TOML sections are ignored so the shared user config file can store
     settings for other entrypoints without breaking `Config`.
@@ -74,9 +92,9 @@ class Config(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Load the user TOML file before init kwargs or environment overrides."""
+        """Inject `[multimodal]` TOML data without changing legacy field priority."""
 
-        toml_settings = TomlConfigSettingsSource(
+        toml_settings = MultimodalTomlConfigSettingsSource(
             settings_cls,
             toml_file=default_user_config_toml_path(),
         )
