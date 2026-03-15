@@ -14,9 +14,8 @@ non-global/private destinations and validates every redirect target. Inputs that
 are not already compatible are converted when we can do so without inventing
 content:
 
-- decodable images -> PNG
-- decodable audio -> WAV (via `ffmpeg`)
-- text-like documents -> PDF
+- decodable images -> WEBP
+- decodable audio -> WEBM (via `ffmpeg`)
 
 Video files are intentionally rejected here. The agent should use the dedicated
 video workflow first because "convert video to something else" is not a safe
@@ -37,10 +36,11 @@ from urllib.parse import urljoin, urlparse
 
 import filetype
 import httpx
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageSequence, UnidentifiedImageError
 from pydantic_ai import BinaryContent, MultiModalContent
 
 from k.agent.core.entities import tool_exception_guard
+
 
 OPENAI_IMAGE_MEDIA_TYPES = {
     "image/gif",
@@ -58,17 +58,6 @@ OPENAI_DOCUMENT_MEDIA_TYPES = {"application/pdf"}
 OPENAI_MEDIA_TYPES = (
     OPENAI_IMAGE_MEDIA_TYPES | OPENAI_AUDIO_MEDIA_TYPES | OPENAI_DOCUMENT_MEDIA_TYPES
 )
-TEXTUAL_DOCUMENT_MEDIA_TYPES = {
-    "application/json",
-    "application/ld+json",
-    "application/rtf",
-    "application/xml",
-    "text/csv",
-    "text/html",
-    "text/markdown",
-    "text/plain",
-    "text/xml",
-}
 REMOTE_DOWNLOAD_LIMIT_BYTES = 50 * 1024 * 1024
 REMOTE_REDIRECT_LIMIT = 5
 REMOTE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
@@ -104,27 +93,6 @@ def _normalize_media_type(media_type: str | None) -> str | None:
     return aliases.get(normalized, normalized)
 
 
-def _looks_like_text(data: bytes) -> bool:
-    """Treat UTF-8 or mostly printable bytes as text-like content."""
-
-    if not data:
-        return True
-    if b"\x00" in data:
-        return False
-    try:
-        decoded = data.decode("utf-8")
-        control_chars = sum(
-            ord(char) < 32 and char not in "\t\n\r\f\b" for char in decoded
-        )
-        return control_chars == 0
-    except UnicodeDecodeError:
-        pass
-
-    printable = sum(byte in b"\t\n\r\f\b" or 32 <= byte <= 126 for byte in data[:2048])
-    sample_size = min(len(data), 2048)
-    return sample_size > 0 and printable / sample_size >= 0.95
-
-
 def _detect_media_type(path: Path, hint: str | None = None) -> str:
     """Infer the real media type from bytes first, then fall back to hints/name."""
 
@@ -143,10 +111,6 @@ def _detect_media_type(path: Path, hint: str | None = None) -> str:
     if normalized_guess:
         return normalized_guess
 
-    head = path.read_bytes()[:2048]
-    if _looks_like_text(head):
-        return "text/plain"
-
     return "application/octet-stream"
 
 
@@ -157,38 +121,36 @@ def _is_non_animated_gif(path: Path) -> bool:
         return getattr(image, "n_frames", 1) <= 1
 
 
-def _convert_image_to_png(path: Path, dst_dir: Path) -> PreparedFile:
-    """Convert any decodable image to PNG.
+def _convert_image_to_webp(path: Path, dst_dir: Path) -> PreparedFile:
+    """Convert any decodable image to WEBP.
 
-    Animated images are flattened to their first frame. That preserves visual
-    content while avoiding unsupported animated formats.
+    Animated images are flattened to their first frame.
     """
 
-    output_path = dst_dir / f"{path.stem or 'image'}.png"
+    output_path = dst_dir / f"{path.stem or 'image'}.webp"
     try:
         with Image.open(path) as image:
-            frame = image.convert("RGBA")
-            frame.save(output_path, format="PNG")
-    except UnidentifiedImageError as exc:
+            if getattr(image, "is_animated", False):
+                image = next(ImageSequence.Iterator(image))
+            image.save(output_path, format="WEBP")
+    except (UnidentifiedImageError, OSError) as exc:
         raise ValueError(f"Unsupported image file: {path}") from exc
-    return PreparedFile(path=output_path, media_type_hint="image/png")
+    return PreparedFile(path=output_path, media_type_hint="image/webp")
 
 
-async def _convert_audio_to_wav(path: Path, dst_dir: Path) -> PreparedFile:
-    """Convert decodable audio to WAV via `ffmpeg`.
+async def _convert_audio_to_webm(path: Path, dst_dir: Path) -> PreparedFile:
+    """Convert decodable audio to WEBM via `ffmpeg`."""
 
-    `ffmpeg` is used instead of a Python codec stack because the repo already
-    relies on the host runtime and this keeps support broad without pulling in
-    many optional decoder wheels.
-    """
-
-    output_path = dst_dir / f"{path.stem or 'audio'}.wav"
+    output_path = dst_dir / f"{path.stem or 'audio'}.webm"
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-nostdin",
         "-y",
         "-i",
         os.fspath(path),
+        "-vn",
+        "-acodec",
+        "libopus",
         os.fspath(output_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -197,107 +159,7 @@ async def _convert_audio_to_wav(path: Path, dst_dir: Path) -> PreparedFile:
     if process.returncode != 0 or not output_path.exists():
         reason = stderr.decode("utf-8", errors="replace").strip()
         raise ValueError(f"Failed to convert audio file {path}: {reason}")
-    return PreparedFile(path=output_path, media_type_hint="audio/wav")
-
-
-def _escape_pdf_text(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-
-
-def _build_text_pdf_bytes(text: str) -> bytes:
-    """Render plain text into a minimal PDF using the built-in Helvetica font."""
-
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    page_width = 612
-    page_height = 792
-    left_margin = 72
-    top_margin = 72
-    line_height = 14
-    lines_per_page = max(1, (page_height - 2 * top_margin) // line_height)
-    pages = [
-        lines[index : index + lines_per_page]
-        for index in range(0, max(len(lines), 1), lines_per_page)
-    ]
-    if not pages:
-        pages = [[]]
-
-    objects: list[bytes] = []
-
-    def add_object(payload: str | bytes) -> int:
-        index = len(objects) + 1
-        body = payload.encode("latin-1") if isinstance(payload, str) else payload
-        objects.append(f"{index} 0 obj\n".encode() + body + b"\nendobj\n")
-        return index
-
-    font_id = add_object("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-    page_ids: list[int] = []
-    content_ids: list[int] = []
-
-    for page_lines in pages:
-        content_lines = [
-            "BT",
-            "/F1 12 Tf",
-            f"{left_margin} {page_height - top_margin} Td",
-        ]
-        for idx, line in enumerate(page_lines):
-            if idx > 0:
-                content_lines.append(f"0 -{line_height} Td")
-            safe = _escape_pdf_text(
-                line.encode("latin-1", errors="replace").decode("latin-1")
-            )
-            content_lines.append(f"({safe}) Tj")
-        content_lines.append("ET")
-        stream = "\n".join(content_lines).encode("latin-1")
-        content_id = add_object(
-            b"<< /Length "
-            + str(len(stream)).encode()
-            + b" >>\nstream\n"
-            + stream
-            + b"\nendstream"
-        )
-        content_ids.append(content_id)
-        page_id = add_object("")
-        page_ids.append(page_id)
-
-    kids = " ".join(f"{page_id} 0 R" for page_id in page_ids)
-    pages_id = add_object(f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>")
-    catalog_id = add_object(f"<< /Type /Catalog /Pages {pages_id} 0 R >>")
-
-    for page_id, content_id in zip(page_ids, content_ids, strict=True):
-        objects[page_id - 1] = (
-            f"{page_id} 0 obj\n"
-            f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {page_width} {page_height}] "
-            f"/Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>\n"
-            "endobj\n"
-        ).encode("latin-1")
-
-    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
-    output = bytearray(header)
-    offsets = [0]
-    for obj in objects:
-        offsets.append(len(output))
-        output.extend(obj)
-    xref_offset = len(output)
-    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("latin-1"))
-    output.extend(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        output.extend(f"{offset:010d} 00000 n \n".encode("latin-1"))
-    output.extend(
-        (
-            f"trailer\n<< /Size {len(objects) + 1} /Root {catalog_id} 0 R >>\n"
-            f"startxref\n{xref_offset}\n%%EOF\n"
-        ).encode("latin-1")
-    )
-    return bytes(output)
-
-
-def _convert_text_to_pdf(path: Path, dst_dir: Path) -> PreparedFile:
-    """Convert text-like files into a simple PDF to match OpenAI document input."""
-
-    text = path.read_text(encoding="utf-8", errors="replace")
-    output_path = dst_dir / f"{path.stem or 'document'}.pdf"
-    output_path.write_bytes(_build_text_pdf_bytes(text))
-    return PreparedFile(path=output_path, media_type_hint="application/pdf")
+    return PreparedFile(path=output_path, media_type_hint="audio/webm")
 
 
 def _assert_public_remote_target(url: str) -> None:
@@ -408,24 +270,22 @@ async def _normalize_to_openai_media(
         return PreparedFile(path=prepared.path, media_type_hint=media_type)
     if media_type in OPENAI_IMAGE_MEDIA_TYPES:
         if media_type == "image/gif" and not _is_non_animated_gif(prepared.path):
-            return _convert_image_to_png(prepared.path, dst_dir)
+            return _convert_image_to_webp(prepared.path, dst_dir)
         return PreparedFile(path=prepared.path, media_type_hint=media_type)
 
     if media_type.startswith("image/"):
-        return _convert_image_to_png(prepared.path, dst_dir)
+        return _convert_image_to_webp(prepared.path, dst_dir)
     if media_type.startswith("audio/"):
-        return await _convert_audio_to_wav(prepared.path, dst_dir)
+        return await _convert_audio_to_webm(prepared.path, dst_dir)
     if media_type.startswith("video/"):
         raise ValueError(
             "Video files are not supported by read_media; use the `read-video` skill first."
         )
-    if media_type in TEXTUAL_DOCUMENT_MEDIA_TYPES or media_type.startswith("text/"):
-        return _convert_text_to_pdf(prepared.path, dst_dir)
 
     raise ValueError(
         "Unsupported media type for OpenAI multimodal input: "
-        f"{media_type}. Supported types are PDF, PNG, JPEG, WEBP, non-animated GIF, "
-        "and common audio inputs (MP3, WAV, M4A, WEBM)."
+        f"{media_type}. Only images, audio, and PDF documents are supported. "
+        "Unsupported image/audio formats will be converted to WEBP/WEBM automatically."
     )
 
 
