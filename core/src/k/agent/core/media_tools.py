@@ -305,12 +305,7 @@ async def read_media[DepsT](
     """Read media from URLs or local files and normalize it for OpenAI input.
 
     Args:
-        media: URLs or local file paths. URL inputs are downloaded to a temporary
-            file through the SSRF-safe fetch path before compatibility checks run.
-
-    Returns:
-        A list of `BinaryContent` values whose media types are already accepted
-        by the OpenAI multimodal API baseline.
+        media: URLs or local file paths to include as multimodal input.
     """
 
     results: list[MultiModalContent] = []
