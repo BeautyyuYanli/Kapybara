@@ -28,6 +28,7 @@ dedicated `read-video` workflow.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import ipaddress
 import json
 import mimetypes
@@ -44,6 +45,8 @@ import httpx
 from PIL import Image, ImageSequence, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from pydantic_ai import BinaryContent, MultiModalContent, RunContext
+from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.wrapper import WrapperModel
 
 from k.agent.core.entities import tool_exception_guard
 
@@ -92,53 +95,49 @@ class ModelMediaPolicy:
     static_only_media_types: frozenset[str] = frozenset()
 
 
-@dataclass(frozen=True, slots=True)
-class ModelReference:
-    """Normalized model identity used for policy lookup."""
-
-    provider: str | None = None
-    model_name: str | None = None
-    model_id: str | None = None
-
-
 @dataclass(slots=True)
 class ModelMediaPolicyResolver:
     """Resolve the active `ModelMediaPolicy` from the current run model.
 
-    Selection order is:
-    1. exact `model_id`
-    2. `model_name`
-    3. `provider`
-    4. `default_policy_name`
+    Resolution is based on the concrete model class instead of provider/name
+    strings. When multiple configured classes match (for example
+    `OpenRouterModel` also matching `OpenAIChatModel`), the nearest class in the
+    model's MRO wins.
 
-    The structure is intentionally data-driven so callers can build it from
-    JSON or inject it directly via agent deps.
+    Wrapper and fallback models are unwrapped before matching because media must
+    be normalized for the underlying provider-facing model, not the adapter.
     """
 
     policies: dict[str, ModelMediaPolicy]
     default_policy_name: str
-    model_id_policy_map: dict[str, str]
-    model_name_policy_map: dict[str, str]
-    provider_policy_map: dict[str, str]
+    model_type_policy_map: dict[type[object], str]
 
     def resolve(self, model: object | None = None) -> ModelMediaPolicy:
-        ref = _model_reference(model)
-        policy_name = None
-        if ref.model_id:
-            policy_name = self.model_id_policy_map.get(ref.model_id)
-        if policy_name is None and ref.model_name:
-            policy_name = self.model_name_policy_map.get(ref.model_name)
-        if policy_name is None and ref.provider:
-            policy_name = self.provider_policy_map.get(ref.provider)
-        if policy_name is None:
-            policy_name = self.default_policy_name
+        policy_name = self._resolve_policy_name(model)
 
         try:
             return self.policies[policy_name]
         except KeyError as exc:
             raise ValueError(
-                f"Unknown media policy '{policy_name}' selected for model {ref.model_id or ref.model_name or '<unknown>'}."
+                f"Unknown media policy '{policy_name}' selected for model {type(_unwrap_model_for_media_policy(model)).__name__}."
             ) from exc
+
+    def _resolve_policy_name(self, model: object | None) -> str:
+        candidate = _unwrap_model_for_media_policy(model)
+        if candidate is None:
+            return self.default_policy_name
+
+        candidate_type = type(candidate)
+        mro = candidate_type.mro()
+        best_match: tuple[int, str] | None = None
+        for model_type, policy_name in self.model_type_policy_map.items():
+            if not isinstance(candidate, model_type):
+                continue
+            distance = mro.index(model_type)
+            if best_match is None or distance < best_match[0]:
+                best_match = (distance, policy_name)
+
+        return best_match[1] if best_match is not None else self.default_policy_name
 
 
 class MediaConversionRuleConfig(BaseModel):
@@ -194,13 +193,14 @@ class ModelMediaPolicyResolverConfig(BaseModel):
 
     This is the bridge from file/env configuration into the runtime policy
     objects used by `read_media`.
+
+    `model_type_policy_map` keys are import paths to model classes, for example
+    `pydantic_ai.models.openrouter.OpenRouterModel`.
     """
 
     default_policy_name: str = "openai"
     policies: dict[str, ModelMediaPolicyConfig] = Field(default_factory=dict)
-    model_id_policy_map: dict[str, str] = Field(default_factory=dict)
-    model_name_policy_map: dict[str, str] = Field(default_factory=dict)
-    provider_policy_map: dict[str, str] = Field(default_factory=dict)
+    model_type_policy_map: dict[str, str] = Field(default_factory=dict)
 
     def to_runtime(self) -> ModelMediaPolicyResolver:
         return ModelMediaPolicyResolver(
@@ -209,11 +209,9 @@ class ModelMediaPolicyResolverConfig(BaseModel):
                 for name, policy in self.policies.items()
             },
             default_policy_name=self.default_policy_name,
-            model_id_policy_map=dict(self.model_id_policy_map),
-            model_name_policy_map=dict(self.model_name_policy_map),
-            provider_policy_map={
-                provider.lower(): policy_name
-                for provider, policy_name in self.provider_policy_map.items()
+            model_type_policy_map={
+                _load_model_type(model_type_path): policy_name
+                for model_type_path, policy_name in self.model_type_policy_map.items()
             },
         )
 
@@ -255,11 +253,7 @@ def default_media_policy_resolver() -> ModelMediaPolicyResolver:
     return ModelMediaPolicyResolver(
         policies={"openai": OPENAI_MEDIA_POLICY},
         default_policy_name="openai",
-        model_id_policy_map={},
-        model_name_policy_map={},
-        provider_policy_map={
-            "openai": "openai",
-        },
+        model_type_policy_map={},
     )
 
 
@@ -300,31 +294,41 @@ def _normalize_media_type(media_type: str | None) -> str | None:
     return aliases.get(normalized, normalized)
 
 
-def _model_reference(model: object | None) -> ModelReference:
-    """Normalize a model object/string into provider and model identifiers."""
+def _unwrap_model_for_media_policy(model: object | None) -> object | None:
+    """Return the concrete provider-facing model used for media normalization.
 
-    if model is None:
-        return ModelReference()
+    Wrapper models simply delegate requests, so their wrapped model determines
+    media compatibility. Fallback models normalize against the first configured
+    model because media preparation happens before provider failover.
+    """
 
-    if isinstance(model, str):
-        if ":" in model:
-            provider, model_name = model.split(":", 1)
-            return ModelReference(
-                provider=provider.lower(),
-                model_name=model_name,
-                model_id=f"{provider.lower()}:{model_name}",
-            )
-        return ModelReference(model_name=model, model_id=model)
+    current = model
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, WrapperModel):
+            current = current.wrapped
+            continue
+        if isinstance(current, FallbackModel):
+            current = current.models[0] if current.models else None
+            continue
+        return current
+    return current
 
-    provider = getattr(model, "system", None)
-    model_name = getattr(model, "model_name", None)
-    model_id = getattr(model, "model_id", None)
-    provider = provider.lower() if isinstance(provider, str) else None
-    return ModelReference(
-        provider=provider,
-        model_name=model_name if isinstance(model_name, str) else None,
-        model_id=model_id if isinstance(model_id, str) else None,
-    )
+
+def _load_model_type(import_path: str) -> type[object]:
+    """Load a model class from a fully qualified import path."""
+
+    module_name, separator, attr_name = import_path.rpartition(".")
+    if not separator:
+        raise ValueError(
+            f"Invalid model type path '{import_path}'. Expected 'module.ClassName'."
+        )
+
+    model_type = getattr(importlib.import_module(module_name), attr_name)
+    if not isinstance(model_type, type):
+        raise ValueError(f"Configured model type '{import_path}' is not a class.")
+    return model_type
 
 
 def _detect_media_type(path: Path, hint: str | None = None) -> str:
@@ -546,7 +550,9 @@ async def _normalize_media(
     )
 
 
-def _to_binary_content(prepared: PreparedFile, policy: ModelMediaPolicy) -> BinaryContent:
+def _to_binary_content(
+    prepared: PreparedFile, policy: ModelMediaPolicy
+) -> BinaryContent:
     """Read the normalized local file into `BinaryContent` with an explicit type."""
 
     media_type = _detect_media_type(prepared.path, prepared.media_type_hint)

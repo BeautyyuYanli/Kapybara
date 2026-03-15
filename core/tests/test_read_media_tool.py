@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 from pydantic_ai import BinaryContent
+from pydantic_ai.models.openrouter import OpenRouterModel
 
 from k.agent.core import media_tools
 from k.agent.core.agent import read_media
@@ -164,17 +165,11 @@ async def test_read_media_tool_uses_policy_selected_from_current_model(
             "image-only": image_only_policy,
         },
         default_policy_name="openai",
-        model_id_policy_map={"openrouter:custom/image-only": "image-only"},
-        model_name_policy_map={},
-        provider_policy_map={},
+        model_type_policy_map={OpenRouterModel: "image-only"},
     )
     ctx = SimpleNamespace(
         deps=SimpleNamespace(media_policy_resolver=resolver),
-        model=SimpleNamespace(
-            system="openrouter",
-            model_name="custom/image-only",
-            model_id="openrouter:custom/image-only",
-        ),
+        model=OpenRouterModel("custom/image-only"),
     )
 
     out = await media_tools.read_media_tool(ctx, [str(png_path)])
@@ -197,14 +192,16 @@ def test_load_media_policy_resolver_from_json_config(tmp_path: Path) -> None:
                         "conversion_rules": [],
                     }
                 },
-                "provider_policy_map": {"openrouter": "image-only"},
+                "model_type_policy_map": {
+                    "pydantic_ai.models.openrouter.OpenRouterModel": "image-only"
+                },
             }
         ),
         encoding="utf-8",
     )
 
     resolver = media_tools.load_media_policy_resolver(config_path)
-    policy = resolver.resolve("openrouter:custom/image-only")
+    policy = resolver.resolve(OpenRouterModel("custom/image-only"))
 
     assert policy.name == "image-only"
     assert policy.supported_media_types == frozenset({"image/png"})
