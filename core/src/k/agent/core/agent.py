@@ -27,6 +27,7 @@ from pydantic_ai import (
     Agent,
     ModelMessage,
     RunContext,
+    Tool,
     ToolOutput,
 )
 from pydantic_ai.messages import (
@@ -39,7 +40,14 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import KnownModelName, Model
 
 from k.agent.core.entities import Event, MemoryHint, finish_action, tool_exception_guard
-from k.agent.core.media_tools import read_media
+from k.agent.core.media_tools import (
+    ModelMediaPolicyResolver,
+    load_media_policy_resolver,
+    read_media_tool,
+)
+from k.agent.core.media_tools import (
+    read_media as _read_media,
+)
 from k.agent.core.prompts import (
     SOP_prompt,
     bash_tool_prompt,
@@ -84,6 +92,12 @@ class MyDeps:
         return a `BashEvent`). When it reaches zero, the tool response appends a
         system message reminding the agent to post a progress update, then
         continue working.
+
+    Media compatibility:
+        `media_policy_resolver` selects the `read_media` compatibility policy
+        from the current run model. When `None`, it is loaded from
+        `config.media_policy_config_path` or falls back to the built-in OpenAI
+        policy.
     """
 
     config: Config
@@ -97,11 +111,16 @@ class MyDeps:
     stuck_warning_limit: int = 3
     basic_os_helper: BasicOSHelper = field(init=False)
     shell_manager: ShellSessionManager = field(init=False)
+    media_policy_resolver: ModelMediaPolicyResolver | None = None
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         self.basic_os_helper = BasicOSHelper(config=self.config)
         self.shell_manager = ShellSessionManager()
+        if self.media_policy_resolver is None:
+            self.media_policy_resolver = load_media_policy_resolver(
+                self.config.media_policy_config_path
+            )
 
     async def __aenter__(self) -> MyDeps:
         return self
@@ -214,12 +233,16 @@ agent = Agent(
         bash_wait,
         bash_interrupt,
         edit_file,
-        read_media,
+        Tool(read_media_tool, name="read_media"),
         fork,
     ],
     deps_type=MyDeps,
     output_type=ToolOutput(finish_action, name="finish_action"),
 )
+
+# Keep the historical import surface for tests/helpers that call `read_media`
+# directly without going through the tool wrapper.
+read_media = _read_media
 
 
 @agent.system_prompt

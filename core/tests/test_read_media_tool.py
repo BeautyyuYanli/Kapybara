@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import wave
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -45,23 +46,24 @@ async def test_read_media_rejects_kind_prefixes() -> None:
 
 
 @pytest.mark.anyio
-async def test_read_media_expands_env_vars_for_local_paths_and_converts_text_to_pdf(
+async def test_read_media_expands_env_vars_for_local_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "x.txt").write_text("hello", encoding="utf-8")
+    image_path = tmp_path / "x.jpg"
+    Image.new("RGB", (2, 2), color=(0, 0, 255)).save(image_path, format="JPEG")
     monkeypatch.setenv("K_TEST_MEDIA_DIR", str(tmp_path))
 
-    out = await read_media(["$K_TEST_MEDIA_DIR/x.txt"])
+    out = await read_media(["$K_TEST_MEDIA_DIR/x.jpg"])
 
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "application/pdf"
-    assert out[0].data.startswith(b"%PDF-1.4")
+    assert out[0].media_type == "image/jpeg"
+    assert out[0].data == image_path.read_bytes()
 
 
 @pytest.mark.anyio
-async def test_read_media_converts_unsupported_image_to_png(tmp_path: Path) -> None:
+async def test_read_media_converts_unsupported_image_to_webp(tmp_path: Path) -> None:
     bmp_path = tmp_path / "sample.bmp"
     Image.new("RGB", (3, 3), color=(0, 255, 0)).save(bmp_path, format="BMP")
 
@@ -70,26 +72,44 @@ async def test_read_media_converts_unsupported_image_to_png(tmp_path: Path) -> N
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "image/png"
-    assert out[0].data.startswith(b"\x89PNG\r\n\x1a\n")
+    assert out[0].media_type == "image/webp"
+    assert out[0].data[:4] == b"RIFF"
+    assert out[0].data[8:12] == b"WEBP"
 
 
 @pytest.mark.anyio
-async def test_read_media_converts_unsupported_audio_to_wav(tmp_path: Path) -> None:
-    src_path = tmp_path / "tone.au"
-    with wave.open(str(src_path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(8000)
-        wav_file.writeframes(b"\x00\x00" * 800)
+async def test_read_media_converts_unsupported_audio_to_webm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src_path = tmp_path / "tone.unknown"
+    src_path.write_bytes(b"not-a-real-audio-container")
+
+    async def fake_convert_audio_to_webm(
+        path: Path, dst_dir: Path
+    ) -> media_tools.PreparedFile:
+        output = dst_dir / "tone.webm"
+        output.write_bytes(b"\x1aE\xdf\xa3fake-webm")
+        return media_tools.PreparedFile(path=output, media_type_hint="audio/webm")
+
+    original_detect = media_tools._detect_media_type
+
+    def fake_detect_media_type(path: Path, hint: str | None = None) -> str:
+        if path == src_path:
+            return "audio/ogg"
+        return original_detect(path, hint)
+
+    monkeypatch.setattr(
+        media_tools, "_convert_audio_to_webm", fake_convert_audio_to_webm
+    )
+    monkeypatch.setattr(media_tools, "_detect_media_type", fake_detect_media_type)
 
     out = await read_media([str(src_path)])
 
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "audio/wav"
-    assert out[0].data.startswith(b"RIFF")
+    assert out[0].media_type == "audio/webm"
+    assert out[0].data.startswith(b"\x1aE\xdf\xa3")
 
 
 def test_assert_public_remote_target_rejects_loopback() -> None:
@@ -106,7 +126,7 @@ async def test_read_media_rejects_unknown_binary_file(tmp_path: Path) -> None:
 
     assert (
         out
-        == "Unsupported media type for OpenAI multimodal input: application/octet-stream. Supported types are PDF, PNG, JPEG, WEBP, non-animated GIF, and common audio inputs (MP3, WAV, M4A, WEBM)."
+        == "Unsupported media type for policy 'openai': application/octet-stream. Provide a directly supported MIME type or configure a conversion rule for it."
     )
 
 
@@ -125,3 +145,67 @@ async def test_read_media_rejects_empty_strings() -> None:
     out = await read_media(["  "])
 
     assert out == "Invalid media spec: empty string"
+
+
+@pytest.mark.anyio
+async def test_read_media_tool_uses_policy_selected_from_current_model(
+    tmp_path: Path,
+) -> None:
+    png_path = tmp_path / "sample.png"
+    Image.new("RGB", (2, 2), color=(123, 45, 67)).save(png_path, format="PNG")
+
+    image_only_policy = media_tools.ModelMediaPolicy(
+        name="image-only",
+        supported_media_types=frozenset({"image/png"}),
+    )
+    resolver = media_tools.ModelMediaPolicyResolver(
+        policies={
+            "openai": media_tools.OPENAI_MEDIA_POLICY,
+            "image-only": image_only_policy,
+        },
+        default_policy_name="openai",
+        model_id_policy_map={"openrouter:custom/image-only": "image-only"},
+        model_name_policy_map={},
+        provider_policy_map={},
+    )
+    ctx = SimpleNamespace(
+        deps=SimpleNamespace(media_policy_resolver=resolver),
+        model=SimpleNamespace(
+            system="openrouter",
+            model_name="custom/image-only",
+            model_id="openrouter:custom/image-only",
+        ),
+    )
+
+    out = await media_tools.read_media_tool(ctx, [str(png_path)])
+
+    assert isinstance(out, list)
+    assert len(out) == 1
+    assert isinstance(out[0], BinaryContent)
+    assert out[0].media_type == "image/png"
+
+
+def test_load_media_policy_resolver_from_json_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "media-policy.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_policy_name": "image-only",
+                "policies": {
+                    "image-only": {
+                        "supported_media_types": ["image/png"],
+                        "conversion_rules": [],
+                    }
+                },
+                "provider_policy_map": {"openrouter": "image-only"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolver = media_tools.load_media_policy_resolver(config_path)
+    policy = resolver.resolve("openrouter:custom/image-only")
+
+    assert policy.name == "image-only"
+    assert policy.supported_media_types == frozenset({"image/png"})
+    assert "openai" in resolver.policies
