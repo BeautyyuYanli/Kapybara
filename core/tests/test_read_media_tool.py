@@ -10,12 +10,16 @@ from pydantic_ai import BinaryContent
 from k.agent.core import media_tools
 from k.agent.core.agent import read_media
 from k.agent.core.multimodal import (
-    DEFAULT_MEDIA_POLICY_NAME,
-    PRESET_MEDIA_POLICIES,
     MediaPolicy,
     load_media_policy,
 )
-from k.config import Config, MultimodalConfig, MultimodalCustomPolicyConfig
+from k.config import (
+    DEFAULT_MEDIA_POLICY_NAME,
+    Config,
+    MultimodalConfig,
+    MultimodalCustomPolicyConfig,
+    resolve_multimodal_policy_config,
+)
 
 
 def _ffmpeg_generate_media(path: Path, *args: str) -> None:
@@ -83,7 +87,7 @@ async def test_read_media_expands_env_vars_for_local_paths(
 
 
 @pytest.mark.anyio
-async def test_read_media_defaults_to_google_policy_and_converts_image_to_jpeg(
+async def test_read_media_defaults_to_google_policy_and_converts_image_to_webp(
     tmp_path: Path,
 ) -> None:
     bmp_path = tmp_path / "sample.bmp"
@@ -96,8 +100,8 @@ async def test_read_media_defaults_to_google_policy_and_converts_image_to_jpeg(
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "image/jpeg"
-    assert out[0].data[:2] == b"\xff\xd8"
+    assert out[0].media_type == "image/webp"
+    assert out[0].data[:4] == b"RIFF"
 
 
 @pytest.mark.anyio
@@ -141,7 +145,7 @@ def test_assert_public_remote_target_rejects_loopback() -> None:
 
 
 @pytest.mark.anyio
-async def test_read_media_converts_animated_gif_to_jpeg_under_google_default(
+async def test_read_media_converts_animated_gif_to_webp_under_google_default(
     tmp_path: Path,
 ) -> None:
     animated_gif = tmp_path / "animated.gif"
@@ -160,8 +164,8 @@ async def test_read_media_converts_animated_gif_to_jpeg_under_google_default(
     assert isinstance(out, list)
     assert len(out) == 1
     assert isinstance(out[0], BinaryContent)
-    assert out[0].media_type == "image/jpeg"
-    assert out[0].data[:2] == b"\xff\xd8"
+    assert out[0].media_type == "image/webp"
+    assert out[0].data[:4] == b"RIFF"
 
 
 @pytest.mark.anyio
@@ -202,7 +206,9 @@ async def test_read_media_tool_uses_explicit_policy_from_deps(tmp_path: Path) ->
     )
 
     ctx = SimpleNamespace(
-        deps=SimpleNamespace(media_policy=PRESET_MEDIA_POLICIES["include image"]),
+        deps=SimpleNamespace(
+            media_policy=load_media_policy(MultimodalConfig(policy="include image"))
+        ),
     )
 
     out = await media_tools.read_media_tool(ctx, [str(png_path)])
@@ -240,6 +246,24 @@ def test_load_media_policy_accepts_embedded_custom_policy() -> None:
     assert policy.supported_media_types == frozenset({"image/png"})
 
 
+def test_resolve_multimodal_policy_config_uses_config_presets() -> None:
+    policy = resolve_multimodal_policy_config(MultimodalConfig(policy="openai latest"))
+
+    assert policy.name == "openai latest"
+    assert [rule.converter for rule in policy.conversion_rules] == [
+        "image_to_webp",
+        "audio_to_webm",
+    ]
+
+
+def test_load_media_policy_uses_webp_capable_provider_presets() -> None:
+    google_policy = load_media_policy(MultimodalConfig(policy="google latest"))
+    anthropic_policy = load_media_policy(MultimodalConfig(policy="anthropic latest"))
+
+    assert google_policy.conversion_rules[0].converter == "image_to_webp"
+    assert anthropic_policy.conversion_rules[0].converter == "image_to_webp"
+
+
 def test_config_supports_nested_multimodal_section() -> None:
     config = Config(
         fs_base=Path("/tmp/fs"),
@@ -247,3 +271,11 @@ def test_config_supports_nested_multimodal_section() -> None:
     )
 
     assert config.multimodal.policy == "include audio"
+
+
+def test_config_rejects_unknown_multimodal_preset() -> None:
+    with pytest.raises(ValueError, match="Unknown multimodal policy preset"):
+        Config(
+            fs_base=Path("/tmp/fs"),
+            multimodal={"policy": "not a preset"},
+        )
