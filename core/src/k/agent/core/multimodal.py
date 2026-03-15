@@ -2,9 +2,9 @@
 
 This module owns the compatibility contract used by
 `k.agent.core.media_tools` and translates structured multimodal config from
-`k.config` into concrete runtime policies. Preset names and their config-backed
-definitions intentionally live in `k.config` so TOML/env validation stays out
-of agent runtime code.
+`k.multimodal_config` into concrete runtime policies. Preset resolution stays
+in the config layer so TOML/env validation happens before agent runtime code
+consumes a structured policy object.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from k.config import (
+from k.multimodal_config import (
     MultimodalConfig,
     MultimodalConversionRuleConfig,
     MultimodalCustomPolicyConfig,

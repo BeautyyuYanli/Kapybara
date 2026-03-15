@@ -279,3 +279,45 @@ def test_config_rejects_unknown_multimodal_preset() -> None:
             fs_base=Path("/tmp/fs"),
             multimodal={"policy": "not a preset"},
         )
+
+
+def test_config_prioritizes_user_toml_for_multimodal_preset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_dir = tmp_path / "home"
+    config_dir = home_dir / ".kapybara"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(
+        'fs_base = "/tmp/from-toml"\n[multimodal]\npolicy = "anthropic latest"\n'
+    )
+    monkeypatch.setenv("HOME", str(home_dir))
+
+    config = Config(
+        fs_base=Path("/tmp/from-init"),
+        multimodal={"policy": "include audio"},
+    )
+
+    assert config.fs_base == Path("/tmp/from-toml")
+    assert config.multimodal.policy == "anthropic latest"
+    assert (
+        resolve_multimodal_policy_config(config.multimodal).name == "anthropic latest"
+    )
+
+
+def test_config_loads_custom_multimodal_policy_from_user_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_dir = tmp_path / "home"
+    config_dir = home_dir / ".kapybara"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(
+        'fs_base = "/tmp/from-toml"\n[multimodal.policy]\nname = "png-only"\nsupported_media_types = ["image/png"]\n'
+    )
+    monkeypatch.setenv("HOME", str(home_dir))
+
+    config = Config()
+    policy = resolve_multimodal_policy_config(config.multimodal)
+
+    assert isinstance(config.multimodal.policy, MultimodalCustomPolicyConfig)
+    assert policy.name == "png-only"
+    assert policy.supported_media_types == ["image/png"]
