@@ -53,6 +53,19 @@ curl -sS -X POST "$BASE/sendMessage" \
   -d disable_web_page_preview=true | jq
 ```
 
+## At-mentions (@Mentions)
+
+In Telegram, the **default and mandatory** way to mention users (especially those without public usernames) is to use HTML-formatted User ID links. This ensures the mention works reliably and correctly links to the user's profile. Avoid using the native `@username` format.
+
+**Standard Format (HTML):**
+`<a href="tg://user?id=USER_ID">User Name</a>`
+
+Example:
+```bash
+MSG="Hello <a href=\"tg://user?id=567113516\">Yanli</a>!"
+# Then send with parse_mode=HTML
+```
+
 ## Telegra.ph handoff
 
 For long/structured content, use `skills:messager/telegraph/SKILLS.md`.
