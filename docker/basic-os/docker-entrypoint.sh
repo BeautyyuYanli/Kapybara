@@ -3,7 +3,9 @@ set -euo pipefail
 
 # This entrypoint aligns runtime identity with PUID/PGID (creating or updating
 # passwd/group records as needed) and then hands off to Supervisor, which keeps
-# long-running services (currently: sshd and cron) in the foreground. It also
+# long-running services (currently: sshd and cron) in the foreground. Runtime
+# passwd/group changes live in the container writable layer, so user/group setup
+# must stay idempotent across restarts of the same container. The script also
 # ensures SSH keys exist for both the SSH daemon (host keys) and the runtime
 # user (~/.ssh/id_ed25519), authorizes that user key for SSH login, and repairs
 # the Debian crontab spool when it is bind-mounted from the host so `crontab -l`
@@ -32,13 +34,28 @@ ensure_group_for_pgid() {
 }
 
 ensure_user_for_puid() {
-  local user_with_target_uid
+  local user_with_target_uid existing_k_uid
 
   user_with_target_uid="$(user_name_for_uid "${PUID}")"
+  existing_k_uid="$(id -u k 2>/dev/null || true)"
 
   if [[ -n "${user_with_target_uid}" ]]; then
-    echo "error: uid ${PUID} is already in use by user ${user_with_target_uid}." >&2
-    exit 1
+    # Container restarts keep passwd edits in the writable layer, so allow the
+    # requested uid when it is already assigned to the runtime user we manage.
+    if [[ "${user_with_target_uid}" != "k" ]]; then
+      echo "error: uid ${PUID} is already in use by user ${user_with_target_uid}." >&2
+      exit 1
+    fi
+  fi
+
+  if [[ -n "${existing_k_uid}" ]]; then
+    usermod \
+      --uid "${PUID}" \
+      --gid "${PGID}" \
+      --home "${WORKSPACE}" \
+      --shell /bin/bash \
+      "k"
+    return
   fi
 
   useradd \
