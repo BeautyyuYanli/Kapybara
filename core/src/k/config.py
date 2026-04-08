@@ -58,6 +58,7 @@ class AgentRunCliConfig(BaseModel):
     google_base_url: str | None = None
     anthropic_api_key: str | None = None
     anthropic_base_url: str | None = None
+    anthropic_default_headers: dict[str, str] | None = None
 
     @field_validator("provider")
     @classmethod

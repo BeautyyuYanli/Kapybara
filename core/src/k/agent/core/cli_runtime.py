@@ -118,15 +118,18 @@ def agent_run_model_from_config(
             ),
         )
     if agent_run_config.provider == "anthropic":
+        from anthropic import AsyncAnthropic
         from pydantic_ai.models.anthropic import AnthropicModel
         from pydantic_ai.providers.anthropic import AnthropicProvider
 
+        client = AsyncAnthropic(
+            api_key=agent_run_config.anthropic_api_key,
+            base_url=agent_run_config.anthropic_base_url,
+            default_headers=agent_run_config.anthropic_default_headers or {},
+        )
         return AnthropicModel(
             resolved_model_name,
-            provider=AnthropicProvider(
-                api_key=agent_run_config.anthropic_api_key,
-                base_url=agent_run_config.anthropic_base_url,
-            ),
+            provider=AnthropicProvider(anthropic_client=client),
         )
 
     raise ValueError(f"Unsupported agent_run provider: {agent_run_config.provider!r}")
