@@ -4,5 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .pdm-python
+.pdm-build/
+dist/
 *.egg-info/
 .env

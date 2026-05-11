@@ -1,0 +1,109 @@
+name: Release shell-session-manager
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "shell-session-manager/pyproject.toml"
+      - ".github/workflows/shell-session-manager-release.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  detect-version-change:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect package version change
+        id: version
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          path = Path("shell-session-manager/pyproject.toml")
+          current_version = tomllib.loads(path.read_text())["project"]["version"]
+
+          before_sha = os.environ.get("BEFORE_SHA", "")
+          zero_sha = "0" * 40
+          previous_version = None
+          if before_sha and before_sha != zero_sha:
+              try:
+                  previous_text = subprocess.check_output(
+                      ["git", "show", f"{before_sha}:{path.as_posix()}"],
+                      text=True,
+                  )
+              except subprocess.CalledProcessError:
+                  previous_text = ""
+              if previous_text:
+                  previous_version = tomllib.loads(previous_text)["project"]["version"]
+
+          changed = previous_version is None or previous_version != current_version
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={current_version}\n")
+              output.write(f"changed={str(changed).lower()}\n")
+          PY
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: detect-version-change
+    if: needs.detect-version-change.outputs.changed == 'true'
+    env:
+      PDM_VENV_IN_PROJECT: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Set up PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          version: "2.26.6"
+
+      - name: Install dependencies
+        working-directory: shell-session-manager
+        run: pdm install
+
+      - name: Check formatting
+        working-directory: shell-session-manager
+        run: pdm run ruff format --check .
+
+      - name: Lint
+        working-directory: shell-session-manager
+        run: pdm run ruff check .
+
+      - name: Typecheck
+        working-directory: shell-session-manager
+        run: pdm run typecheck
+
+      - name: Test
+        working-directory: shell-session-manager
+        run: pdm run test
+
+      - name: Build package
+        working-directory: shell-session-manager
+        run: pdm build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: shell-session-manager/dist/

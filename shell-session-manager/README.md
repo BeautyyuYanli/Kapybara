@@ -8,3 +8,44 @@ best-effort cleanup for long-lived command sessions.
 Command construction is intentionally out of scope: callers should pass the
 exact command string they want to execute, including any shell, SSH, PTY, or
 environment bootstrap wrappers.
+
+## Usage
+
+```python
+import anyio
+
+from shell_session_manager import ShellSession, ShellSessionOptions
+
+
+async def main() -> None:
+    async with ShellSession(
+        "python -u -c 'import sys; print(\"ready\"); line = sys.stdin.readline(); print(line.upper(), end=\"\")'",
+        options=ShellSessionOptions(timeout_seconds=1),
+    ) as session:
+        stdout, stderr, code = await session.next()
+        print(stdout.decode(), stderr.decode(), code)  # ready\n, "", None
+
+        stdout, stderr, code = await session.next(b"hello\n")
+        print(stdout.decode(), stderr.decode(), code)  # HELLO\n, "", 0
+
+
+anyio.run(main)
+```
+
+For multiple long-lived sessions, use `ShellSessionManager`:
+
+```python
+import anyio
+
+from shell_session_manager import ShellSessionManager
+
+
+async def main() -> None:
+    async with ShellSessionManager() as manager:
+        session_id = await manager.new_shell("python -c 'print(42)'")
+        stdout, stderr, returncode = await manager.next(session_id)
+        print(stdout.decode(), stderr.decode(), returncode)
+
+
+anyio.run(main)
+```
