@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from k.config import Config
 
 if TYPE_CHECKING:
-    from k.io_helpers.shell import ShellSessionManager
+    from shell_session_manager import ShellSessionManager
 
 DEFAULT_AGENT_CONFIG_BASE = "~/.kapybara"
 AGENT_CONFIG_BASE_EXPR = "$K_CONFIG_BASE"
@@ -147,7 +147,7 @@ class BasicOSHelper:
 
 
 async def main():
-    from k.io_helpers.shell import ShellSession, ShellSessionOptions
+    from shell_session_manager import ShellSession, ShellSessionOptions
 
     config = Config()
     basic_os_helper = BasicOSHelper(config=config)

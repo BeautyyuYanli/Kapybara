@@ -57,6 +57,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.usage import UsageLimits
+from shell_session_manager import ShellSessionManager
 
 from k.agent.core.entities import Event, tool_exception_guard
 from k.agent.core.media_tools import read_media
@@ -91,7 +92,6 @@ from k.agent.memory.entities import MemoryRecord
 from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.config import Config
-from k.io_helpers.shell import ShellSessionManager
 from k.runner_helpers.basic_os import BasicOSHelper
 
 

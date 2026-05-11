@@ -51,9 +51,11 @@ class MemoryStore(Protocol):
 
     def refresh(self) -> None:
         """Force a reload from disk (even if the underlying storage did not change)."""
+        ...
 
     def contains_id(self, id_: MemoryRecordId) -> bool:
         """Return whether `id_` exists, preferring metadata-only checks when possible."""
+        ...
 
     def get_latests(
         self,
@@ -73,24 +75,29 @@ class MemoryStore(Protocol):
             num: Optional maximum number of ids to return. `None` means no
                 limit.
         """
+        ...
 
     def get_by_id(self, id_: MemoryRecordId) -> MemoryRecord | None:
         """Return a record by id, or `None` if missing."""
+        ...
 
     def get_by_ids(
         self, ids: Set[MemoryRecordId], *, strict: bool = False
     ) -> list[MemoryRecord]:
         """Return records for `ids`, sorted by (`created_at`, store order)."""
+        ...
 
     def get_parents(
         self, record: MemoryRecordRef, *, strict: bool = False
     ) -> list[str]:
         """Return parent ids for `record` (in the same order as `record.parents`)."""
+        ...
 
     def get_children(
         self, record: MemoryRecordRef, *, strict: bool = False
     ) -> list[str]:
         """Return child ids for `record` (in the same order as `record.children`)."""
+        ...
 
     def get_ancestors(
         self,
@@ -106,6 +113,7 @@ class MemoryStore(Protocol):
         - `level=1`: return direct parent ids.
         - `level=None`: return all reachable ancestors.
         """
+        ...
 
     def get_between(
         self,
@@ -116,6 +124,8 @@ class MemoryStore(Protocol):
         include_end: bool = True,
     ) -> list[str]:
         """Return record ids whose `created_at` falls within the given range."""
+        ...
 
     def append(self, record: MemoryRecord) -> None:
         """Persist `record` and update parents' `children` links."""
+        ...

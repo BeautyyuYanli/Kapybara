@@ -14,13 +14,13 @@ from dataclasses import dataclass, field
 from typing import Any, Concatenate, Protocol
 
 from pydantic_ai import RunContext
-
-from k.io_helpers.shell import (
+from shell_session_manager import (
     NextResult,
     ShellSessionInfo,
     ShellSessionManager,
     ShellSessionOptions,
 )
+
 from k.runner_helpers.basic_os import (
     AGENT_CONFIG_BASE_EXPR,
     BasicOSHelper,
@@ -85,9 +85,10 @@ def _cl100k_base_token_len(text: str) -> int:
         import tiktoken
 
         _CL100K_BASE_ENCODING = tiktoken.get_encoding("cl100k_base")
+    encoding = _CL100K_BASE_ENCODING
 
     # `tiktoken` returns a list of token ids; its length is the token count.
-    return len(_CL100K_BASE_ENCODING.encode(text))
+    return len(encoding.encode(text))
 
 
 def _append_system_msg(existing: str | None, extra: str) -> str:

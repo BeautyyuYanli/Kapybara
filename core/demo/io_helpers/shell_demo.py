@@ -3,8 +3,7 @@ from __future__ import annotations
 import sys
 
 import anyio
-
-from k.io_helpers.shell import ShellSession, ShellSessionOptions
+from shell_session_manager import ShellSession, ShellSessionOptions
 
 
 async def main() -> None:

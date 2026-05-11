@@ -1,14 +1,14 @@
 import anyio
 import pytest
 
-from k.io_helpers.shell import ShellSessionManager, ShellSessionOptions
+from shell_session_manager import ShellSessionManager, ShellSessionOptions
 
 
 @pytest.mark.anyio
 async def test_shell_session_manager_new_shell_registers_and_next_prunes() -> None:
     manager = ShellSessionManager()
     session_id = await manager.new_shell(
-        'python -c \'import sys; print("OUT"); print("ERR", file=sys.stderr)\''
+        'python -c \'import sys, time; print("OUT", flush=True); print("ERR", file=sys.stderr, flush=True); time.sleep(0.1)\''
     )
 
     sessions = await manager.list_sessions()

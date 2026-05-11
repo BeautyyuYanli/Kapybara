@@ -7,9 +7,9 @@ from typing import cast
 
 import pytest
 from pydantic_ai import RunContext
+from shell_session_manager import ShellSessionOptions
 
 from k.agent.core.shell_tools import BashEvent, bash, bash_input, bash_wait, edit_file
-from k.io_helpers.shell import ShellSessionOptions
 
 
 @dataclass(slots=True)

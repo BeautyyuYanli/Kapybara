@@ -1,6 +1,6 @@
 import pytest
 
-from k.io_helpers.shell import ShellSession, ShellSessionOptions
+from shell_session_manager import ShellSession, ShellSessionOptions
 
 
 @pytest.mark.anyio

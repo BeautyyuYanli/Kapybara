@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from shell_session_manager import ShellSessionManager
+
 from k.agent.core.entities import Event
 from k.agent.memory.entities import memory_record_id_from_created_at
-from k.io_helpers.shell import ShellSessionManager
 from k.runner_helpers.basic_os import (
     AGENT_CONFIG_BASE_EXPR,
     BasicOSHelper,
