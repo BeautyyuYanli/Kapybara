@@ -5,10 +5,10 @@
 groups = ["default", "dev"]
 strategy = []
 lock_version = "4.5.0"
-content_hash = "sha256:174fd2a0c3a6a0ead30662c54dbb6844e6e1425eae5163e0011b14e5d5bba5f3"
+content_hash = "sha256:7d9f3dfbae409dc40aeb100e6dd17aa51c67986edf75479c11ffd93dab5557f0"
 
 [[metadata.targets]]
-requires_python = "==3.14.*"
+requires_python = ">=3.12"
 
 [[package]]
 name = "anyio"
@@ -16,6 +16,7 @@ version = "4.13.0"
 summary = ""
 dependencies = [
     "idna",
+    "typing-extensions; python_full_version < \"3.13\"",
 ]
 files = [
     {file = "anyio-4.13.0-py3-none-any.whl", hash = "sha256:08b310f9e24a9594186fd75b4f73f4a4152069e3853f1ed8bfbf58369f4ad708"},
@@ -143,4 +144,13 @@ files = [
     {file = "ruff-0.15.12-py3-none-win_amd64.whl", hash = "sha256:c87a162d61ab3adca47c03f7f717c68672edec7d1b5499e652331780fe74950d"},
     {file = "ruff-0.15.12-py3-none-win_arm64.whl", hash = "sha256:a538f7a82d061cee7be55542aca1d86d1393d55d81d4fcc314370f4340930d4f"},
     {file = "ruff-0.15.12.tar.gz", hash = "sha256:ecea26adb26b4232c0c2ca19ccbc0083a68344180bba2a600605538ce51a40a6"},
+]
+
+[[package]]
+name = "typing-extensions"
+version = "4.15.0"
+summary = ""
+files = [
+    {file = "typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"},
+    {file = "typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466"},
 ]

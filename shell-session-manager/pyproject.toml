@@ -4,13 +4,13 @@ build-backend = "pdm.backend"
 
 [project]
 name = "shell-session-manager"
-version = "1.0.0"
+version = "1.0.1"
 description = "Async subprocess session manager with incremental stdin/stdout/stderr support"
 authors = [
     {name = "Yanli 盐粒", email = "yanli@mail.one"},
 ]
 dependencies = ["anyio>=4.12.1"]
-requires-python = "==3.14.*"
+requires-python = ">=3.12"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

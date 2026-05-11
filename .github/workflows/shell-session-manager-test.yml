@@ -1,0 +1,62 @@
+name: Test shell-session-manager
+
+on:
+  push:
+    paths:
+      - "shell-session-manager/**"
+      - ".github/workflows/shell-session-manager-test.yml"
+  pull_request:
+    paths:
+      - "shell-session-manager/**"
+      - ".github/workflows/shell-session-manager-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    env:
+      PDM_VENV_IN_PROJECT: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          version: "2.26.6"
+
+      - name: Install dependencies
+        working-directory: shell-session-manager
+        run: pdm install
+
+      - name: Check formatting
+        working-directory: shell-session-manager
+        run: pdm run ruff format --check .
+
+      - name: Lint
+        working-directory: shell-session-manager
+        run: pdm run ruff check .
+
+      - name: Typecheck
+        working-directory: shell-session-manager
+        run: pdm run typecheck
+
+      - name: Test
+        working-directory: shell-session-manager
+        run: pdm run test
+
+      - name: Build package
+        working-directory: shell-session-manager
+        run: pdm build
