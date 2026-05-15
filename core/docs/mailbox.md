@@ -146,8 +146,8 @@ configured serializer.
 
 ## Channels and filtering
 
-Mailbox channels reuse the existing hierarchical channel conventions from the `k`
-package:
+Mailbox channels reuse the existing slash-separated channel validation
+conventions from the `k` package:
 
 - slash-separated hierarchy
 - no empty segments
@@ -161,14 +161,15 @@ Examples:
 `MessageFilter` supports:
 
 - `channel`
-- `channels`
-- `channel_match="subtree" | "exact"`
 - `consumed=None | False | True`
 - `since`
 - `until`
 - `producer`
 
-Default channel matching is subtree-based.
+Mailbox filtering treats `channel` as one exact identifier, not a subtree root.
+That means `telegram/chat/1` and `telegram/chat/1/thread/10` are distinct
+mailbox channels for query purposes even though both strings use slash-separated
+formatting.
 
 ## Read semantics
 
@@ -245,7 +246,7 @@ Compaction removes retained-out messages from:
 
 - message storage
 - timeline index
-- channel indexes
+- exact channel indexes (`mailbox:{namespace}:channel:{quote(channel)}`)
 - unconsumed index
 - consumed index
 - consumed-info hash

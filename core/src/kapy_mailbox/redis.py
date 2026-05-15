@@ -22,7 +22,7 @@ from urllib.parse import quote
 import uuid6
 from redis.asyncio import Redis
 
-from k.agent.channels import iter_channel_prefixes, validate_channel_path
+from k.agent.channels import validate_channel_path
 from kapy_mailbox.exceptions import (
     AutoCompactorClosedError,
     InvalidChannelError,
@@ -176,7 +176,12 @@ class _UUIDv7Factory:
 
 @dataclass(slots=True, frozen=True)
 class _MailboxKeys:
-    """Redis key layout for one mailbox namespace."""
+    """Redis key layout for one mailbox namespace.
+
+    Channel-filtered mailbox reads use one lexicographic zset per exact channel.
+    The physical key name is intentionally `channel:*`; the mailbox no longer
+    stores or reads tree-era `channel_exact:*` / `channel_prefix:*` indexes.
+    """
 
     namespace: str
 
@@ -204,35 +209,23 @@ class _MailboxKeys:
     def compact_lock(self) -> str:
         return f"mailbox:{self.namespace}:compact_lock"
 
-    def channel_exact(self, channel: str) -> str:
-        return f"mailbox:{self.namespace}:channel_exact:{quote(channel, safe='')}"
-
-    def channel_prefix(self, prefix: str) -> str:
-        return f"mailbox:{self.namespace}:channel_prefix:{quote(prefix, safe='')}"
+    def channel(self, channel: str) -> str:
+        return f"mailbox:{self.namespace}:channel:{quote(channel, safe='')}"
 
 
 @dataclass(slots=True)
 class _CandidateSource:
-    """Mutable cursor for one Redis lexicographic index scan."""
+    """Mutable cursor for one Redis lexicographic index scan.
+
+    Every mailbox read now scans exactly one Redis zset source: the global
+    timeline, one consume-state index, or one exact-channel timeline. The
+    cursor only needs to remember the last emitted id because single-source
+    reads no longer coordinate exhaustion across overlapping indexes.
+    """
 
     key: str
     after_id: str | None = None
     cursor: str | None = None
-    exhausted: bool = False
-
-
-@dataclass(slots=True)
-class _CandidateScanState:
-    """State for bounded multi-index mailbox scans.
-
-    Channel filters can require several Redis reads because multiple indexes may
-    overlap. The scan state keeps per-index cursors and a de-duplication set so
-    `get(limit=...)` stays bounded at the Redis range-read layer.
-    """
-
-    sources: list[_CandidateSource]
-    seen_ids: set[str]
-    pending_ids: list[str]
 
 
 class RedisMailbox:
@@ -286,7 +279,11 @@ class RedisMailbox:
         *,
         producer: str | None = None,
     ) -> list[Message]:
-        """Append several messages with one Redis transaction."""
+        """Append several messages with one Redis transaction.
+
+        Each stored message is indexed in the global timeline, its exact-channel
+        timeline, and the unconsumed index.
+        """
 
         normalized_items = list(items)
         if not normalized_items:
@@ -321,9 +318,7 @@ class RedisMailbox:
                 value=self._serializer.dump_message(message),
             )
             pipeline.zadd(self._keys.timeline, {message.id: 0.0})
-            pipeline.zadd(self._keys.channel_exact(message.channel), {message.id: 0.0})
-            for prefix in iter_channel_prefixes(message.channel):
-                pipeline.zadd(self._keys.channel_prefix(prefix), {message.id: 0.0})
+            pipeline.zadd(self._keys.channel(message.channel), {message.id: 0.0})
             pipeline.zadd(self._keys.unconsumed, {message.id: 0.0})
         await pipeline.execute()
         return messages
@@ -355,10 +350,9 @@ class RedisMailbox:
             return []
 
         message_filter = filter or MessageFilter()
-        scan_state = self._candidate_scan_state(
+        candidate_source = self._candidate_source(
             message_filter,
             after_id=normalized_after_id,
-            order=order,
         )
 
         matched: list[Message] = []
@@ -367,8 +361,8 @@ class RedisMailbox:
             if remaining == 0:
                 return matched
 
-            candidate_ids = await self._candidate_ids_page(
-                scan_state,
+            candidate_ids = await self._zset_ids_page(
+                candidate_source,
                 order=order,
                 limit=_query_page_size(remaining),
             )
@@ -454,8 +448,9 @@ class RedisMailbox:
         stop after the current delete batch when its Redis lock renewal fails.
         Manual callers should use the default behavior.
 
-        Compaction removes expired messages from the message hash, timeline,
-        channel indexes, consumed/unconsumed indexes, and consumed-info hash.
+        Compaction removes expired messages from the message hash, timeline, the
+        exact-channel timeline, consumed/unconsumed indexes, and consumed-info
+        hash.
         It also deletes the legacy watch wakeup stream left behind by pre-removal
         mailbox versions so upgraded namespaces do not retain unused stream data.
         Retention is driven by the mailbox policy: old unconsumed messages are
@@ -545,16 +540,13 @@ class RedisMailbox:
             ):
                 pipeline.hdel(self._keys.messages, message.id)
                 pipeline.zrem(self._keys.timeline, message.id)
-                pipeline.zrem(self._keys.channel_exact(message.channel), message.id)
-                prefixes = iter_channel_prefixes(message.channel)
-                for prefix in prefixes:
-                    pipeline.zrem(self._keys.channel_prefix(prefix), message.id)
+                pipeline.zrem(self._keys.channel(message.channel), message.id)
                 pipeline.zrem(self._keys.unconsumed, message.id)
                 pipeline.zrem(self._keys.consumed, message.id)
                 pipeline.hdel(self._keys.consumed_info, message.id)
 
                 deleted_messages += 1
-                index_entries_removed += 1 + 1 + len(prefixes) + 2
+                index_entries_removed += 4
                 if raw_consumed_info is not None:
                     consumed_info_removed += 1
 
@@ -581,87 +573,29 @@ class RedisMailbox:
 
         await self._redis.unlink(f"mailbox:{self._namespace}:events")
 
-    def _candidate_scan_state(
+    def _candidate_source(
         self,
         filter: MessageFilter,
         *,
         after_id: str | None,
-        order: MessageOrder,
-    ) -> _CandidateScanState:
-        _ = order
-        if filter.channels is None:
-            if filter.consumed is True:
-                return _CandidateScanState(
-                    sources=[_CandidateSource(self._keys.consumed, after_id=after_id)],
-                    seen_ids=set(),
-                    pending_ids=[],
-                )
-            if filter.consumed is False:
-                return _CandidateScanState(
-                    sources=[
-                        _CandidateSource(self._keys.unconsumed, after_id=after_id)
-                    ],
-                    seen_ids=set(),
-                    pending_ids=[],
-                )
-            return _CandidateScanState(
-                sources=[_CandidateSource(self._keys.timeline, after_id=after_id)],
-                seen_ids=set(),
-                pending_ids=[],
+    ) -> _CandidateSource:
+        """Choose the single Redis index scanned for a mailbox read.
+
+        Exact-channel filters always read from that channel timeline. Other
+        predicates are applied after loading the candidate messages so the
+        mailbox keeps one-source cursor semantics for `after_id`.
+        """
+
+        if filter.channel is not None:
+            return _CandidateSource(
+                self._keys.channel(filter.channel),
+                after_id=after_id,
             )
-
-        return _CandidateScanState(
-            sources=[
-                _CandidateSource(
-                    self._keys.channel_exact(channel)
-                    if filter.channel_match == "exact"
-                    else self._keys.channel_prefix(channel),
-                    after_id=after_id,
-                )
-                for channel in filter.iter_channels()
-            ],
-            seen_ids=set(),
-            pending_ids=[],
-        )
-
-    async def _candidate_ids_page(
-        self,
-        state: _CandidateScanState,
-        *,
-        order: MessageOrder,
-        limit: int,
-    ) -> list[str]:
-        emitted = state.pending_ids[:limit]
-        state.pending_ids = state.pending_ids[limit:]
-        remaining = limit - len(emitted)
-        if remaining == 0:
-            return emitted
-
-        collected_ids: list[str] = []
-        for source in state.sources:
-            if source.exhausted:
-                continue
-            page_ids = await self._zset_ids_page(
-                source,
-                order=order,
-                limit=remaining,
-            )
-            for message_id in page_ids:
-                if message_id in state.seen_ids:
-                    continue
-                state.seen_ids.add(message_id)
-                collected_ids.append(message_id)
-
-        if not collected_ids:
-            return emitted
-
-        merged = sorted(
-            [*emitted, *state.pending_ids, *collected_ids],
-            reverse=order == "newest_first",
-        )
-        returned = merged[:limit]
-        state.pending_ids = merged[limit:]
-        return returned
+        if filter.consumed is True:
+            return _CandidateSource(self._keys.consumed, after_id=after_id)
+        if filter.consumed is False:
+            return _CandidateSource(self._keys.unconsumed, after_id=after_id)
+        return _CandidateSource(self._keys.timeline, after_id=after_id)
 
     async def _load_messages(self, message_ids: list[str]) -> list[Message]:
         if not message_ids:
@@ -745,11 +679,8 @@ class RedisMailbox:
 
         message_ids = [_decode_text(value) for value in cast(list[str | bytes], values)]
         if not message_ids:
-            source.exhausted = True
             return []
         source.cursor = message_ids[-1]
-        if len(message_ids) < limit:
-            source.exhausted = True
         return message_ids
 
     async def _is_unconsumed(self, message_id: str) -> bool:

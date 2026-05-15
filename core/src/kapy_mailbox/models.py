@@ -13,14 +13,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from k.agent.channels import channel_has_prefix, validate_channel_path
+from k.agent.channels import validate_channel_path
 from kapy_mailbox.exceptions import InvalidMessageFilterError
 
 type JsonValue = (
     None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 )
 type MessageOrder = Literal["oldest_first", "newest_first"]
-type ChannelMatch = Literal["subtree", "exact"]
 type ProducerState = Literal[
     "registered",
     "running",
@@ -68,11 +67,9 @@ class MessageInput:
 class MessageFilter:
     """Composable message-selection predicates for mailbox queries.
 
-    Channel selection is expressed through `channel` and/or `channels`. The two
-    forms are merged, validated, and treated as a set of normalized channel
-    roots. By default `channel_match="subtree"`, so a filter for
-    `telegram/chat/1` matches that exact channel and everything below it;
-    `channel_match="exact"` restricts results to the exact channel ids.
+    `channel`, when provided, is one exact mailbox channel identifier validated
+    with the shared slash-separated path rules. Mailbox filtering treats the
+    full normalized string as an exact identifier rather than a subtree root.
 
     `consumed` controls consume-state selection: `None` means both consumed and
     unconsumed messages, `False` means only currently unconsumed messages, and
@@ -82,30 +79,17 @@ class MessageFilter:
     """
 
     channel: str | None = None
-    channels: frozenset[str] | None = None
-    channel_match: ChannelMatch = "subtree"
     consumed: bool | None = None
     since: datetime | None = None
     until: datetime | None = None
     producer: str | None = None
 
     def __post_init__(self) -> None:
-        normalized_channels: set[str] = set()
         if self.channel is not None:
-            normalized_channels.add(
-                self._normalize_channel(self.channel, field_name="channel")
-            )
-        if self.channels is not None:
-            if not self.channels:
-                raise InvalidMessageFilterError("channels must not be empty")
-            for index, value in enumerate(sorted(self.channels)):
-                normalized_channels.add(
-                    self._normalize_channel(value, field_name=f"channels[{index}]")
-                )
-
-        if self.channel_match not in {"subtree", "exact"}:
-            raise InvalidMessageFilterError(
-                f"Unsupported channel_match: {self.channel_match!r}"
+            object.__setattr__(
+                self,
+                "channel",
+                self._normalize_channel(self.channel, field_name="channel"),
             )
 
         if self.since is not None:
@@ -119,18 +103,6 @@ class MessageFilter:
         ):
             raise InvalidMessageFilterError("since must be <= until")
 
-        object.__setattr__(
-            self,
-            "channels",
-            None if not normalized_channels else frozenset(normalized_channels),
-        )
-        if self.channel is not None:
-            object.__setattr__(
-                self,
-                "channel",
-                self._normalize_channel(self.channel, field_name="channel"),
-            )
-
     @staticmethod
     def _normalize_channel(value: str, *, field_name: str) -> str:
         try:
@@ -138,26 +110,11 @@ class MessageFilter:
         except (TypeError, ValueError) as exc:
             raise InvalidMessageFilterError(str(exc)) from exc
 
-    def iter_channels(self) -> tuple[str, ...]:
-        """Return normalized channels as a stable tuple."""
-
-        if self.channels is None:
-            return ()
-        return tuple(sorted(self.channels))
-
     def matches(self, message: Message) -> bool:
         """Return whether a message matches this filter snapshot."""
 
-        if self.channels is not None:
-            if self.channel_match == "exact":
-                if message.channel not in self.channels:
-                    return False
-            else:
-                if not any(
-                    channel_has_prefix(channel=message.channel, prefix=channel)
-                    for channel in self.channels
-                ):
-                    return False
+        if self.channel is not None and message.channel != self.channel:
+            return False
 
         if self.consumed is not None:
             is_consumed = message.consumed_at is not None

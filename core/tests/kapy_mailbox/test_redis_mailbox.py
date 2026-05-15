@@ -111,31 +111,36 @@ async def test_put_many_preserves_order_and_get_uses_default_limit() -> None:
 
 
 @pytest.mark.anyio
-async def test_get_supports_subtree_exact_and_consumed_filters() -> None:
+async def test_get_supports_exact_channel_and_consumed_filters() -> None:
     mailbox, clock, redis = _make_mailbox()
 
     root = await mailbox.put("telegram/chat/1", {"kind": "root"})
+    clock.advance(milliseconds=1)
+    sibling = await mailbox.put("telegram/chat/1", {"kind": "sibling"})
     clock.advance(milliseconds=1)
     child = await mailbox.put("telegram/chat/1/thread/2", {"kind": "child"})
     clock.advance(milliseconds=1)
     other = await mailbox.put("telegram/chat/2", {"kind": "other"})
     _ = other
 
-    subtree = await mailbox.get(MessageFilter(channels=frozenset({"telegram/chat/1"})))
-    exact = await mailbox.get(
-        MessageFilter(
-            channels=frozenset({"telegram/chat/1"}),
-            channel_match="exact",
-        )
-    )
-    await mailbox.consume([child.id], consumer="agent")
+    exact = await mailbox.get(MessageFilter(channel="telegram/chat/1"))
+    await mailbox.consume([sibling.id, child.id], consumer="agent")
     unconsumed = await mailbox.get(MessageFilter(consumed=False), limit=None)
     consumed = await mailbox.get(MessageFilter(consumed=True), limit=None)
+    exact_unconsumed = await mailbox.get(
+        MessageFilter(channel="telegram/chat/1", consumed=False),
+        limit=None,
+    )
+    exact_consumed = await mailbox.get(
+        MessageFilter(channel="telegram/chat/1", consumed=True),
+        limit=None,
+    )
 
-    assert [message.id for message in subtree] == [root.id, child.id]
-    assert [message.id for message in exact] == [root.id]
+    assert [message.id for message in exact] == [root.id, sibling.id]
     assert [message.id for message in unconsumed] == [root.id, other.id]
-    assert [message.id for message in consumed] == [child.id]
+    assert [message.id for message in consumed] == [sibling.id, child.id]
+    assert [message.id for message in exact_unconsumed] == [root.id]
+    assert [message.id for message in exact_consumed] == [sibling.id]
     await redis.aclose()
 
 
@@ -177,36 +182,51 @@ async def test_consume_strict_raises_for_unknown_ids() -> None:
 
 
 @pytest.mark.anyio
-async def test_get_multi_channel_pagination_keeps_overflow_candidates() -> None:
+async def test_message_filter_supports_producer_since_until_and_exact_channel() -> None:
     mailbox, clock, redis = _make_mailbox()
 
-    for index in range(4):
-        await mailbox.put(
-            "telegram/chat/a",
-            {"index": index},
-            producer="drop",
-        )
-        clock.advance(milliseconds=1)
-    expected_ids: list[str] = []
-    for index in range(4):
-        message = await mailbox.put(
-            "telegram/chat/b",
-            {"index": index},
-            producer="keep",
-        )
-        expected_ids.append(message.id)
-        clock.advance(milliseconds=1)
+    early = await mailbox.put(
+        "telegram/chat/1",
+        {"index": 0},
+        producer="telegram",
+    )
+    clock.advance(seconds=1)
+    kept = await mailbox.put(
+        "telegram/chat/1",
+        {"index": 1},
+        producer="telegram",
+    )
+    clock.advance(seconds=1)
+    late = await mailbox.put(
+        "telegram/chat/1",
+        {"index": 2},
+        producer="telegram",
+    )
+    clock.advance(milliseconds=1)
+    wrong_channel = await mailbox.put(
+        "telegram/chat/1/thread/2",
+        {"index": 3},
+        producer="telegram",
+    )
+    clock.advance(milliseconds=1)
+    wrong_producer = await mailbox.put(
+        "telegram/chat/1",
+        {"index": 4},
+        producer="email",
+    )
+    _ = (early, late, wrong_channel, wrong_producer)
 
     messages = await mailbox.get(
         MessageFilter(
-            channels=frozenset({"telegram/chat/a", "telegram/chat/b"}),
-            producer="keep",
+            channel="telegram/chat/1",
+            producer="telegram",
+            since=kept.created_at,
+            until=kept.created_at,
         ),
-        limit=4,
-        order="oldest_first",
+        limit=None,
     )
 
-    assert [message.id for message in messages] == expected_ids
+    assert [message.id for message in messages] == [kept.id]
     await redis.aclose()
 
 
@@ -295,14 +315,53 @@ async def test_get_after_existing_id_keeps_pure_cursor_semantics_if_id_is_compac
 
     await redis.hdel(mailbox._keys.messages, first.id)
     await redis.zrem(mailbox._keys.timeline, first.id)
-    await redis.zrem(mailbox._keys.channel_exact(first.channel), first.id)
-    for prefix in mailbox_redis_module.iter_channel_prefixes(first.channel):
-        await redis.zrem(mailbox._keys.channel_prefix(prefix), first.id)
+    await redis.zrem(mailbox._keys.channel(first.channel), first.id)
     await redis.zrem(mailbox._keys.unconsumed, first.id)
 
     received = await mailbox.get(after_id=first.id, limit=10)
 
     assert [message.id for message in received] == [second.id, third.id]
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_put_creates_only_exact_channel_indexes() -> None:
+    mailbox, _, redis = _make_mailbox()
+    message = await mailbox.put("telegram/chat/1/thread/2", {"index": 1})
+
+    assert await redis.zrange(mailbox._keys.channel(message.channel), 0, -1) == [
+        message.id.encode()
+    ]
+    assert (
+        await redis.exists(
+            "mailbox:tests:channel_exact:telegram%2Fchat%2F1%2Fthread%2F2"
+        )
+        == 0
+    )
+    assert await redis.exists("mailbox:tests:channel_prefix:telegram") == 0
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_after_missing_id_keeps_pure_cursor_semantics_for_exact_channel_reads() -> (
+    None
+):
+    mailbox, clock, redis = _make_mailbox()
+    first = await mailbox.put("telegram/chat/1", {"index": 1})
+    clock.advance(milliseconds=1)
+    second = await mailbox.put("telegram/chat/2", {"index": 2})
+    clock.advance(milliseconds=1)
+    third = await mailbox.put("telegram/chat/1", {"index": 3})
+    missing_id = str(uuid6.UUID(int=uuid6.UUID(first.id).int + 1, version=7))
+    _ = second
+
+    received = await mailbox.get(
+        MessageFilter(channel="telegram/chat/1"),
+        after_id=missing_id,
+        limit=None,
+    )
+
+    assert [message.id for message in received] == [third.id]
     await redis.aclose()
 
 
@@ -354,6 +413,26 @@ async def test_compact_respects_keep_unconsumed_flag() -> None:
     _assert_compaction_result_public_shape(result)
     assert result.skipped_unconsumed == 1
     assert [message.id for message in remaining] == [old_unconsumed.id]
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_compact_removes_deleted_messages_from_exact_channel_indexes() -> None:
+    mailbox, clock, redis = _make_mailbox(
+        retention=RetentionPolicy(max_age=timedelta(days=1), keep_unconsumed=False)
+    )
+    expired = await mailbox.put("telegram/chat/1", {"index": 1})
+    clock.advance(days=2, milliseconds=1)
+    kept = await mailbox.put("telegram/chat/1", {"index": 2})
+
+    result = await mailbox.compact()
+    channel_ids = await redis.zrange(mailbox._keys.channel("telegram/chat/1"), 0, -1)
+
+    assert result.messages_deleted == 1
+    _assert_compaction_result_public_shape(result)
+    assert result.index_entries_removed == 4
+    assert channel_ids == [kept.id.encode()]
+    assert expired.id.encode() not in channel_ids
     await redis.aclose()
 
 
