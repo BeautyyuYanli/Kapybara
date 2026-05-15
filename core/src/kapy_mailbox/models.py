@@ -1,8 +1,8 @@
 """Shared value objects for the Redis-backed mailbox.
 
 These models hold user-facing mailbox contracts and lightweight lifecycle state.
-Validation stays close to the data shape so `RedisMailbox`, watchers, and
-supervisor helpers can share one set of invariants.
+Validation stays close to the data shape so `RedisMailbox` and supervisor
+helpers can share one set of invariants.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ class MessageInput:
 
 @dataclass(slots=True, frozen=True)
 class MessageFilter:
-    """Composable message-selection predicates shared by `get()` and `watch()`.
+    """Composable message-selection predicates for mailbox queries.
 
     Channel selection is expressed through `channel` and/or `channels`. The two
     forms are merged, validated, and treated as a set of normalized channel
@@ -211,32 +211,6 @@ class CompactionResult:
     index_entries_removed: int
     consumed_info_removed: int
     skipped_unconsumed: int
-    stream_entries_trimmed: int
-
-
-@dataclass(slots=True, frozen=True)
-class WatchAfter:
-    """Tagged watch start value that resumes strictly after a message id."""
-
-    message_id: str
-
-
-class WatchStart:
-    """Factory namespace for watcher start values.
-
-    The mailbox intentionally keeps the public surface small: callers use the
-    plain strings `"new"` and `"oldest"`, or `WatchStart.after(id)` for resume.
-    """
-
-    NEW: Literal["new"] = "new"
-    OLDEST: Literal["oldest"] = "oldest"
-
-    @staticmethod
-    def after(message_id: str) -> WatchAfter:
-        return WatchAfter(message_id=message_id)
-
-
-type WatchStartValue = Literal["new", "oldest"] | WatchAfter
 
 
 class CancellationToken:

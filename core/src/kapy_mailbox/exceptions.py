@@ -20,7 +20,7 @@ class InvalidMessageFilterError(MailboxError):
 
 
 class InvalidMessageWindowError(MailboxError):
-    """Raised when query or watch window parameters are invalid."""
+    """Raised when mailbox query window parameters are invalid."""
 
 
 class UnknownMessageError(MailboxError):
@@ -29,10 +29,6 @@ class UnknownMessageError(MailboxError):
     def __init__(self, message_ids: list[str]) -> None:
         self.message_ids = list(message_ids)
         super().__init__(f"Unknown message ids: {', '.join(self.message_ids)}")
-
-
-class WatchClosedError(MailboxError):
-    """Raised when a closed watcher is used again."""
 
 
 class ProducerAlreadyRegisteredError(MailboxError):

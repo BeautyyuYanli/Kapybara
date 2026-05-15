@@ -9,13 +9,12 @@ shared inbox, while one or more agent loops need to:
 
 - append messages
 - query recent or unconsumed history
-- wait for future messages
 - mark handled messages as consumed
 - compact old history on a retention policy
 
-The package is intentionally **not** a consumer-group queue or a general-purpose
-broker replacement. It is closer to a small event-log plus inbox abstraction with
-Redis-friendly read and recovery semantics.
+The package is intentionally **not** a consumer-group queue or a broker
+replacement. It is closer to a small event-log plus inbox abstraction with
+Redis-friendly query and recovery semantics.
 
 Current implementation package:
 
@@ -31,7 +30,6 @@ The mailbox implementation follows these principles:
    - it does not start background tasks by itself
 
 2. **Lifecycle objects are separate**
-   - watcher: `MailboxWatcher`
    - producer supervisor: `MailboxProducerSupervisor`
    - auto-compactor: `MailboxAutoCompactor`
 
@@ -39,24 +37,20 @@ The mailbox implementation follows these principles:
    - every stored message gets a mailbox-assigned UUIDv7 id
    - that id is both the public message id and the mailbox ordering cursor
 
-4. **Watcher semantics are arrival-based**
-   - watch observes message arrival
-   - it does not observe consume-state transitions
-   - therefore `watch(..., consumed=True)` is invalid
-
-5. **Resume cursors are pure cursors**
-   - `WatchStart.after(id)` only requires a syntactically valid UUIDv7 string
+4. **Incremental reads use pure cursors**
+   - `get(..., after_id=id)` only requires a syntactically valid UUIDv7 string
    - the referenced message does not need to exist in Redis
-   - there is no fallback or warning for missing/compacted ids
+   - there is no fallback for missing or compacted ids
+
+5. **Consume state is explicit**
+   - `consume()` updates consume metadata
+   - reads observe current consume state through `MessageFilter(consumed=...)`
 
 ## Public API surface
-
-The public surface is intentionally small.
 
 ### Main types
 
 - `RedisMailbox`
-- `MailboxWatcher`
 - `MailboxWriter`
 - `MailboxProducerSupervisor`
 - `MailboxAutoCompactor`
@@ -70,7 +64,6 @@ The public surface is intentionally small.
 - `CompactionResult`
 - `RetentionPolicy`
 - `RestartPolicy`
-- `WatchStart`
 
 ### Exceptions
 
@@ -79,31 +72,15 @@ The public surface is intentionally small.
 - `InvalidMessageFilterError`
 - `InvalidMessageWindowError`
 - `UnknownMessageError`
-- `WatchClosedError`
 - `ProducerAlreadyRegisteredError`
 - `ProducerSupervisorClosedError`
 - `AutoCompactorClosedError`
 
-## Dependencies
-
-Runtime dependencies used by the mailbox implementation:
-
-- `redis>=7.4.0`
-- `pydantic>=2.12.5`
-- `uuid6>=2025.0.1`
-
-Test dependency used by mailbox tests:
-
-- `fakeredis[lua]>=2.35.1`
-
 ## Quick start
 
-### Basic mailbox usage
-
 ```python
-from redis.asyncio import Redis
-
 from kapy_mailbox import MessageFilter, RedisMailbox
+from redis.asyncio import Redis
 
 redis = Redis.from_url("redis://localhost:6379")
 mailbox = RedisMailbox(redis, namespace="agent-main")
@@ -118,31 +95,39 @@ messages = await mailbox.get(
 await mailbox.consume([message.id for message in messages], consumer="agent-loop")
 ```
 
-### Watching future messages
+## Incremental polling
+
+`get()` supports resumable polling via `after_id`.
 
 ```python
-from kapy_mailbox import MessageFilter
-
-async with (await mailbox.watch(MessageFilter(consumed=False), start="new")) as watcher:
-    messages = await watcher.next()
+batch = await mailbox.get(after_id=last_seen_id, limit=50)
+if batch:
+    last_seen_id = batch[-1].id
 ```
 
-### Resuming from a saved cursor
+Common migration patterns from the removed watch API:
+
+- replay history: start with `after_id = None`
+- future-only polling: seed `after_id` from the current newest message before the
+  loop
 
 ```python
-from kapy_mailbox import MessageFilter, WatchStart
+# Replay from current history.
+after_id = None
 
-async with (
-    await mailbox.watch(
-        MessageFilter(consumed=False),
-        start=WatchStart.after(last_seen_id),
-    )
-) as watcher:
-    messages = await watcher.try_next()
+# Or skip backlog and only poll future arrivals.
+latest = await mailbox.get(limit=1, order="newest_first")
+after_id = latest[0].id if latest else None
+
+while True:
+    batch = await mailbox.get(after_id=after_id, limit=50)
+    if batch:
+        after_id = batch[-1].id
+        ...
 ```
 
-`last_seen_id` only needs to be a valid UUIDv7 string. It can refer to a message
-that no longer exists.
+`after_id` only needs to be a valid UUIDv7 string. It can refer to a message that
+no longer exists.
 
 ## Message model
 
@@ -156,8 +141,8 @@ that no longer exists.
 - `consumed_at: datetime | None`
 - `consumed_by: str | None`
 
-The payload boundary is JSON-compatible data validated and serialized by
-Pydantic-backed serializer logic.
+The payload boundary is JSON-compatible data validated and serialized by the
+configured serializer.
 
 ## Channels and filtering
 
@@ -185,35 +170,7 @@ Examples:
 
 Default channel matching is subtree-based.
 
-### Examples
-
-Recent messages in one subtree:
-
-```python
-messages = await mailbox.get(
-    MessageFilter(channel="telegram/chat/1"),
-    limit=20,
-    order="newest_first",
-)
-```
-
-Exact-channel only:
-
-```python
-messages = await mailbox.get(
-    MessageFilter(channel="telegram/chat/1", channel_match="exact"),
-)
-```
-
-All consumed messages:
-
-```python
-messages = await mailbox.get(MessageFilter(consumed=True))
-```
-
 ## Read semantics
-
-### `get()`
 
 Signature:
 
@@ -227,59 +184,6 @@ Important rules:
 - pass `limit=None` explicitly for an unbounded scan
 - `after_id` is a UUIDv7 ordering cursor
 - results are immutable snapshots
-
-### `WatchStart`
-
-Watcher start modes:
-
-- `"new"`
-  - start strictly after the mailbox latest id at watch-creation time
-- `"oldest"`
-  - replay historical matches first
-- `WatchStart.after(id)`
-  - pure UUIDv7 cursor semantics
-
-## Watcher behavior
-
-### `watch()` is async
-
-`RedisMailbox.watch(...)` is async because `start="new"` needs to anchor against
-Redis state before the watcher is returned.
-
-### `try_next()`
-
-- non-blocking
-- returns `[]` if no matching message is currently available
-- **does not** auto-retry connection failures
-
-### `next()`
-
-- blocks until at least one matching message is available
-- retries a small number of recoverable Redis connection failures
-- preserves the watcher cursor across retries
-
-Current default retry policy:
-
-- 3 retries
-- backoff: `0.1s`, `0.5s`, `1.0s`
-
-Retry is intended for recoverable Redis connection/timeout class failures, not for
-domain errors such as:
-
-- closed watcher use
-- invalid filter
-- invalid UUID window arguments
-
-### Unsupported watcher filter
-
-This is intentionally invalid:
-
-```python
-await mailbox.watch(MessageFilter(consumed=True), start="new")
-```
-
-Reason: watch observes **message arrival**, not later consume-state transitions.
-Callers that need consumed history should use `get(MessageFilter(consumed=True), ...)`.
 
 ## Consumption semantics
 
@@ -309,31 +213,17 @@ It exposes:
 - `put(...)`
 - `put_many(...)`
 
-It intentionally does not expose `get`, `watch`, `consume`, or `compact`.
+It intentionally does not expose `get`, `consume`, or `compact`.
 
 ## Producer supervision
 
 `MailboxProducerSupervisor` runs producers in restartable supervision loops.
-
-### Behavior
 
 - producers are registered by name
 - `start()` launches supervisor tasks
 - `stop()` prevents further restarts and waits for shutdown
 - producer return or exception is treated as a failure/restart condition
 - restart uses bounded exponential backoff
-
-Example:
-
-```python
-from kapy_mailbox import MailboxProducerSupervisor
-
-supervisor = MailboxProducerSupervisor(mailbox.writer())
-supervisor.register_producer("telegram", telegram_producer)
-
-async with supervisor:
-    ...
-```
 
 ## Retention and compaction
 
@@ -359,7 +249,6 @@ Compaction removes retained-out messages from:
 - unconsumed index
 - consumed index
 - consumed-info hash
-- aged event-stream entries
 
 ### Automatic compaction
 
@@ -376,41 +265,17 @@ Default settings:
 If lock renewal is lost, the current compaction round finishes only the current
 delete batch and then stops that round.
 
-Example:
-
-```python
-from datetime import timedelta
-from kapy_mailbox import MailboxAutoCompactor
-
-async with MailboxAutoCompactor(mailbox, interval=timedelta(minutes=1)):
-    ...
-```
-
 ## Concurrency model
-
-### Multiple mailbox instances
 
 Multiple `RedisMailbox` instances may point at the same Redis namespace.
 
 This is normal for:
 
-- multiple watchers
 - separate producer and consumer processes
-- separate UI / debug readers
+- separate UI or debug readers
+- horizontally scaled workers performing polling reads
 
-### Multiple watchers
-
-Multiple watchers on the same namespace are supported.
-
-They are independent read sessions:
-
-- each keeps its own `last_seen_id`
-- each keeps its own stream wakeup cursor
-- they do not claim messages exclusively
-
-This is broadcast-style observation, not consumer-group partitioning.
-
-## Redis client lifecycle and reconnect behavior
+## Redis client lifecycle and errors
 
 `RedisMailbox` does not own the Redis client lifecycle.
 
@@ -418,39 +283,13 @@ This is broadcast-style observation, not consumer-group partitioning.
 - caller closes it
 - mailbox methods surface Redis errors rather than silently swallowing them
 
-Reconnect behavior today:
-
-- ordinary Redis client commands rely on redis-py connection behavior
-- `MailboxWatcher.next()` adds mailbox-level retry for recoverable connection failures
-- `MailboxWatcher.try_next()` does not retry
-- if retries are exhausted, the last Redis error is raised to the caller
-
-## Main-flow validation
-
-The mailbox main flow was manually validated against a real Redis instance running
-in Docker, covering:
-
-- `put`
-- `put_many`
-- `writer.put`
-- `get`
-- `watch(start="new")`
-- `watch(start=WatchStart.after(...))`
-- `consume`
-- `compact`
-- `MailboxProducerSupervisor`
-- `MailboxAutoCompactor`
-
-This validation was done with a temporary Redis container rather than only fake
-Redis tests.
-
 ## Suggested usage boundaries
 
 Use this mailbox when you need:
 
 - agent inbox semantics
 - recent history lookups
-- Redis-backed watcher resume via UUIDv7 cursor
+- incremental polling via UUIDv7 cursor
 - explicit consume state
 - simple supervised producers
 

@@ -3,8 +3,8 @@
 This package implements the proposal in
 `.context/proposals/260515-1659-agent-mailbox-design.md` as a lightweight,
 Redis-client-compatible mailbox layer. `RedisMailbox` owns no Redis lifecycle or
-background tasks; watcher, producer supervision, and automatic compaction are
-separate objects.
+background tasks; producer supervision and automatic compaction are separate
+objects.
 """
 
 from kapy_mailbox.exceptions import (
@@ -16,7 +16,6 @@ from kapy_mailbox.exceptions import (
     ProducerAlreadyRegisteredError,
     ProducerSupervisorClosedError,
     UnknownMessageError,
-    WatchClosedError,
 )
 from kapy_mailbox.models import (
     CancellationToken,
@@ -29,13 +28,10 @@ from kapy_mailbox.models import (
     ProducerStatus,
     RestartPolicy,
     RetentionPolicy,
-    WatchAfter,
-    WatchStart,
 )
 from kapy_mailbox.redis import (
     MailboxAutoCompactor,
     MailboxProducerSupervisor,
-    MailboxWatcher,
     MailboxWriter,
     RedisMailbox,
 )
@@ -52,7 +48,6 @@ __all__ = [
     "JSONMessageSerializer",
     "MailboxAutoCompactor",
     "MailboxProducerSupervisor",
-    "MailboxWatcher",
     "MailboxWriter",
     "Message",
     "MessageFilter",
@@ -67,7 +62,4 @@ __all__ = [
     "RestartPolicy",
     "RetentionPolicy",
     "UnknownMessageError",
-    "WatchAfter",
-    "WatchClosedError",
-    "WatchStart",
 ]

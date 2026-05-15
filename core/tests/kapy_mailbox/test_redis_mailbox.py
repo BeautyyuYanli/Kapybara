@@ -8,11 +8,10 @@ from typing import Any
 import fakeredis.aioredis
 import pytest
 import uuid6
-from redis.exceptions import ConnectionError as RedisConnectionError
 
+import kapy_mailbox
 import kapy_mailbox.redis as mailbox_redis_module
 from kapy_mailbox import (
-    InvalidMessageFilterError,
     InvalidMessageWindowError,
     MailboxAutoCompactor,
     MailboxProducerSupervisor,
@@ -21,7 +20,6 @@ from kapy_mailbox import (
     RedisMailbox,
     RestartPolicy,
     RetentionPolicy,
-    WatchStart,
 )
 from kapy_mailbox.exceptions import PayloadSerializationError, UnknownMessageError
 
@@ -47,25 +45,11 @@ class _ObservedRedis:
     record_hmget: bool = False
     raise_on_renew_eval: bool = False
     hmget_lengths: list[int] = field(default_factory=list)
-    hmget_failures: list[Exception] = field(default_factory=list)
-    xread_failures: list[Exception] = field(default_factory=list)
 
     async def hmget(self, name: str, keys: list[str]):
-        if self.hmget_failures:
-            raise self.hmget_failures.pop(0)
         if self.record_hmget:
             self.hmget_lengths.append(len(keys))
         return await self.inner.hmget(name, keys)
-
-    async def xread(
-        self,
-        streams: dict[str, str],
-        count: int | None = None,
-        block: int | None = None,
-    ):
-        if self.xread_failures:
-            raise self.xread_failures.pop(0)
-        return await self.inner.xread(streams, count=count, block=block)
 
     async def eval(self, script: str, numkeys: int, *keys_and_args: object):
         if (
@@ -92,6 +76,10 @@ def _make_mailbox(
     redis = _ObservedRedis(raw_redis, record_hmget=observe_reads)
     mailbox = RedisMailbox(redis, namespace="tests", clock=clock, retention=retention)
     return mailbox, clock, redis
+
+
+def _assert_compaction_result_public_shape(result: object) -> None:
+    assert not hasattr(result, "stream_entries_trimmed")
 
 
 @pytest.mark.anyio
@@ -231,188 +219,71 @@ async def test_put_rejects_non_json_payloads_by_default() -> None:
     await redis.aclose()
 
 
-@pytest.mark.anyio
-async def test_watch_oldest_drains_history_then_waits_for_future_message() -> None:
-    mailbox, clock, redis = _make_mailbox()
-    first = await mailbox.put("telegram/chat/1", {"index": 1})
-    clock.advance(milliseconds=1)
-    second = await mailbox.put("telegram/chat/1", {"index": 2})
-
-    async with await mailbox.watch(
-        MessageFilter(channels=frozenset({"telegram/chat/1"})),
-        start="oldest",
-        batch_size=2,
-    ) as watcher:
-        history = await watcher.try_next()
-        assert [message.id for message in history] == [first.id, second.id]
-        assert await watcher.try_next() == []
-
-        async def _publish() -> None:
-            await asyncio.sleep(0.01)
-            clock.advance(milliseconds=1)
-            await mailbox.put("telegram/chat/1", {"index": 3})
-
-        task = asyncio.create_task(_publish())
-        live_batch = await asyncio.wait_for(watcher.next(), timeout=1)
-        await task
-        assert [message.payload["index"] for message in live_batch] == [3]
-    await redis.aclose()
+def test_public_mailbox_api_removes_watch_surface() -> None:
+    assert not hasattr(RedisMailbox, "watch")
+    assert not hasattr(kapy_mailbox, "MailboxWatcher")
+    assert not hasattr(kapy_mailbox, "WatchAfter")
+    assert not hasattr(kapy_mailbox, "WatchStart")
+    assert not hasattr(kapy_mailbox, "WatchClosedError")
 
 
 @pytest.mark.anyio
-async def test_watch_new_anchors_at_creation_not_first_read() -> None:
-    mailbox, clock, redis = _make_mailbox()
-
-    watcher = await mailbox.watch(start="new")
-    clock.advance(milliseconds=1)
-    created = await mailbox.put("telegram/chat/1", {"index": 1})
-
-    received = await watcher.try_next()
-
-    assert [message.id for message in received] == [created.id]
-    await watcher.close()
-    await redis.aclose()
-
-
-@pytest.mark.anyio
-async def test_next_retries_recoverable_query_failure_and_preserves_cursor() -> None:
-    mailbox, clock, redis = _make_mailbox()
-    first = await mailbox.put("telegram/chat/1", {"index": 1})
-    clock.advance(milliseconds=1)
-    await mailbox.put("telegram/chat/1", {"index": 2})
-    redis.hmget_failures.append(RedisConnectionError("temporary read failure"))
-
-    watcher = await mailbox.watch(start="oldest")
-    received = await watcher.next()
-
-    assert [message.id for message in received] == [first.id]
-    await watcher.close()
-    await redis.aclose()
-
-
-@pytest.mark.anyio
-async def test_next_retries_recoverable_blocking_read_failure_then_succeeds() -> None:
-    mailbox, clock, redis = _make_mailbox()
-    redis.xread_failures.append(RedisConnectionError("temporary xread failure"))
-    watcher = await mailbox.watch(start="new")
-
-    async def _publish() -> None:
-        await asyncio.sleep(0.2)
-        clock.advance(milliseconds=1)
-        await mailbox.put("telegram/chat/1", {"index": 1})
-
-    task = asyncio.create_task(_publish())
-    received = await asyncio.wait_for(watcher.next(), timeout=2)
-    await task
-
-    assert [message.payload["index"] for message in received] == [1]
-    await watcher.close()
-    await redis.aclose()
-
-
-@pytest.mark.anyio
-async def test_next_exhausts_retries_and_raises_last_connection_error() -> None:
+async def test_put_does_not_create_legacy_watch_event_stream() -> None:
     mailbox, _, redis = _make_mailbox()
+
     await mailbox.put("telegram/chat/1", {"index": 1})
-    redis.hmget_failures.extend(
-        [RedisConnectionError(f"failure-{index}") for index in range(4)]
-    )
-    watcher = await mailbox.watch(start="oldest")
 
-    with pytest.raises(RedisConnectionError, match="failure-3"):
-        await watcher.next()
-
-    await watcher.close()
+    assert await redis.exists("mailbox:tests:events") == 0
     await redis.aclose()
 
 
 @pytest.mark.anyio
-async def test_try_next_does_not_retry_recoverable_connection_error() -> None:
+async def test_compact_deletes_legacy_watch_event_stream_even_without_messages() -> (
+    None
+):
     mailbox, _, redis = _make_mailbox()
-    await mailbox.put("telegram/chat/1", {"index": 1})
-    redis.hmget_failures.append(RedisConnectionError("try-next failure"))
-    watcher = await mailbox.watch(start="oldest")
+    legacy_events_key = "mailbox:tests:events"
 
-    with pytest.raises(RedisConnectionError, match="try-next failure"):
-        await watcher.try_next()
+    await redis.xadd(legacy_events_key, {"message_id": "legacy"})
 
-    assert len(redis.hmget_failures) == 0
-    await watcher.close()
+    result = await mailbox.compact()
+
+    assert result.messages_deleted == 0
+    _assert_compaction_result_public_shape(result)
+    assert await redis.exists(legacy_events_key) == 0
     await redis.aclose()
 
 
 @pytest.mark.anyio
-async def test_watch_rejects_consumed_true_filter() -> None:
-    mailbox, _, redis = _make_mailbox()
-
-    with pytest.raises(InvalidMessageFilterError):
-        await mailbox.watch(
-            MessageFilter(consumed=True),
-        )
-
-    await redis.aclose()
-
-
-@pytest.mark.anyio
-async def test_watch_after_missing_id_uses_pure_cursor_semantics() -> None:
+async def test_get_after_missing_id_uses_pure_cursor_semantics() -> None:
     mailbox, clock, redis = _make_mailbox()
     first = await mailbox.put("telegram/chat/1", {"index": 1})
     clock.advance(milliseconds=1)
     second = await mailbox.put("telegram/chat/1", {"index": 2})
     missing_id = str(uuid6.UUID(int=uuid6.UUID(first.id).int + 1, version=7))
-    assert missing_id not in {first.id, second.id}
 
-    watcher = await mailbox.watch(start=WatchStart.after(missing_id))
-    received = await watcher.try_next()
-    await watcher.close()
+    received = await mailbox.get(after_id=missing_id, limit=None)
 
     assert [message.id for message in received] == [second.id]
 
     later_cursor = str(uuid6.UUID(int=uuid6.UUID(second.id).int + 1, version=7))
-    watcher_after_created = await mailbox.watch(start=WatchStart.after(second.id))
-    watcher_after_future = await mailbox.watch(start=WatchStart.after(later_cursor))
-
-    received_after_created = await watcher_after_created.try_next()
-    received_after_future = await watcher_after_future.try_next()
-
-    assert received_after_created == []
-    assert received_after_future == []
-    await watcher_after_created.close()
-    await watcher_after_future.close()
+    assert await mailbox.get(after_id=second.id, limit=None) == []
+    assert await mailbox.get(after_id=later_cursor, limit=None) == []
     await redis.aclose()
 
 
 @pytest.mark.anyio
-async def test_watch_after_missing_id_logs_no_warning_with_pure_cursor_semantics(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    mailbox, clock, redis = _make_mailbox()
-    first = await mailbox.put("telegram/chat/1", {"index": 1})
-    clock.advance(milliseconds=1)
-    second = await mailbox.put("telegram/chat/1", {"index": 2})
-    missing_id = str(uuid6.UUID(int=uuid6.UUID(first.id).int + 1, version=7))
-    caplog.set_level("WARNING")
-
-    watcher = await mailbox.watch(start=WatchStart.after(missing_id))
-    received = await watcher.try_next()
-
-    assert [message.id for message in received] == [second.id]
-    assert caplog.text == ""
-    await watcher.close()
-    await redis.aclose()
-
-
-@pytest.mark.anyio
-async def test_watch_after_invalid_uuid_raises_window_error() -> None:
+async def test_get_after_invalid_uuid_raises_window_error() -> None:
     mailbox, _, redis = _make_mailbox()
 
     with pytest.raises(InvalidMessageWindowError):
-        await mailbox.watch(start=WatchStart.after("not-a-uuid"))
+        await mailbox.get(after_id="not-a-uuid")
+
     await redis.aclose()
 
 
 @pytest.mark.anyio
-async def test_watch_after_existing_id_keeps_resume_cursor_even_if_id_is_compacted() -> (
+async def test_get_after_existing_id_keeps_pure_cursor_semantics_if_id_is_compacted() -> (
     None
 ):
     mailbox, clock, redis = _make_mailbox()
@@ -422,8 +293,6 @@ async def test_watch_after_existing_id_keeps_resume_cursor_even_if_id_is_compact
     clock.advance(milliseconds=1)
     third = await mailbox.put("telegram/chat/1", {"index": 3})
 
-    watcher = await mailbox.watch(start=WatchStart.after(first.id), batch_size=10)
-
     await redis.hdel(mailbox._keys.messages, first.id)
     await redis.zrem(mailbox._keys.timeline, first.id)
     await redis.zrem(mailbox._keys.channel_exact(first.channel), first.id)
@@ -431,10 +300,9 @@ async def test_watch_after_existing_id_keeps_resume_cursor_even_if_id_is_compact
         await redis.zrem(mailbox._keys.channel_prefix(prefix), first.id)
     await redis.zrem(mailbox._keys.unconsumed, first.id)
 
-    received = await watcher.try_next()
+    received = await mailbox.get(after_id=first.id, limit=10)
 
     assert [message.id for message in received] == [second.id, third.id]
-    await watcher.close()
     await redis.aclose()
 
 
@@ -483,6 +351,7 @@ async def test_compact_respects_keep_unconsumed_flag() -> None:
     remaining = await mailbox.get(limit=None)
 
     assert result.messages_deleted == 1
+    _assert_compaction_result_public_shape(result)
     assert result.skipped_unconsumed == 1
     assert [message.id for message in remaining] == [old_unconsumed.id]
     await redis.aclose()
@@ -575,13 +444,13 @@ async def test_compact_stops_after_batch_boundary_when_should_continue_turns_fal
     remaining = await mailbox.get(limit=None)
 
     assert result.messages_deleted == 1
+    _assert_compaction_result_public_shape(result)
     assert len(remaining) == 3
     await redis.aclose()
 
 
 @pytest.mark.anyio
 async def test_auto_compactor_lock_renewal_exception_sets_lock_lost_and_logs(
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     mailbox, _, redis = _make_mailbox()

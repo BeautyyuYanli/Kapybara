@@ -2,15 +2,14 @@
 
 The core `RedisMailbox` is intentionally a thin API wrapper around an injected
 `redis.asyncio.Redis` client. It does not own the Redis connection, does not
-close it, and does not start background tasks. Watchers, producer supervision,
-and periodic compaction are separate lifecycle objects so callers can compose
-them explicitly.
+close it, and does not start background tasks. Producer supervision and
+periodic compaction are separate lifecycle objects so callers can compose them
+explicitly.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import random
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
@@ -22,19 +21,15 @@ from urllib.parse import quote
 
 import uuid6
 from redis.asyncio import Redis
-from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from k.agent.channels import iter_channel_prefixes, validate_channel_path
 from kapy_mailbox.exceptions import (
     AutoCompactorClosedError,
     InvalidChannelError,
-    InvalidMessageFilterError,
     InvalidMessageWindowError,
     ProducerAlreadyRegisteredError,
     ProducerSupervisorClosedError,
     UnknownMessageError,
-    WatchClosedError,
 )
 from kapy_mailbox.models import (
     CancellationToken,
@@ -49,20 +44,15 @@ from kapy_mailbox.models import (
     ProducerStatus,
     RestartPolicy,
     RetentionPolicy,
-    WatchAfter,
-    WatchStartValue,
     _ProducerRuntime,
 )
 from kapy_mailbox.serialization import JSONMessageSerializer, MessageSerializer
-
-logger = getLogger(__name__)
 
 DEFAULT_COMPACT_INTERVAL = timedelta(minutes=15)
 DEFAULT_COMPACT_LOCK_TTL = timedelta(minutes=5)
 DEFAULT_COMPACT_LOCK_RENEW_INTERVAL = timedelta(seconds=60)
 DEFAULT_QUERY_PAGE_SIZE = 100
 DEFAULT_COMPACT_BATCH_SIZE = 100
-WATCHER_RETRY_DELAYS_SECONDS = (0.1, 0.5, 1.0)
 
 _CONSUME_MESSAGES_SCRIPT = """
 local messages_key = KEYS[1]
@@ -211,10 +201,6 @@ class _MailboxKeys:
         return f"mailbox:{self.namespace}:consumed_info"
 
     @property
-    def events(self) -> str:
-        return f"mailbox:{self.namespace}:events"
-
-    @property
     def compact_lock(self) -> str:
         return f"mailbox:{self.namespace}:compact_lock"
 
@@ -252,8 +238,8 @@ class _CandidateScanState:
 class RedisMailbox:
     """Lightweight Redis-backed mailbox API wrapper.
 
-    This object is safe to share across concurrent producers, watchers, and
-    consumers as long as the injected Redis client supports concurrent async I/O.
+    This object is safe to share across concurrent producers and consumers as
+    long as the injected Redis client supports concurrent async I/O.
     It does not own the Redis client lifecycle and intentionally starts no
     background tasks on its own.
     """
@@ -339,10 +325,6 @@ class RedisMailbox:
             for prefix in iter_channel_prefixes(message.channel):
                 pipeline.zadd(self._keys.channel_prefix(prefix), {message.id: 0.0})
             pipeline.zadd(self._keys.unconsumed, {message.id: 0.0})
-            pipeline.xadd(
-                self._keys.events,
-                {"message_id": message.id, "channel": message.channel},
-            )
         await pipeline.execute()
         return messages
 
@@ -358,9 +340,10 @@ class RedisMailbox:
 
         The default `limit=100` is a safety window: callers must pass
         `limit=None` explicitly to request an unbounded scan. `after_id` resumes
-        strictly after a UUIDv7 cursor, and `order` chooses oldest-first or
-        newest-first lexicographic UUID order. The returned messages are loaded as
-        immutable snapshots, so mutating them does not affect Redis state.
+        strictly after a UUIDv7 cursor without requiring that cursor to still
+        exist in Redis, and `order` chooses oldest-first or newest-first
+        lexicographic UUID order. The returned messages are loaded as immutable
+        snapshots, so mutating them does not affect Redis state.
         """
 
         normalized_after_id = self._normalize_after_id(after_id)
@@ -399,60 +382,6 @@ class RedisMailbox:
                 matched.append(message)
                 if limit is not None and len(matched) >= limit:
                     return matched
-
-    async def watch(
-        self,
-        filter: MessageFilter | None = None,
-        *,
-        start: WatchStartValue = "new",
-        batch_size: int = 1,
-    ) -> MailboxWatcher:
-        """Create an independent watcher session.
-
-        This method is async so it can resolve its starting cursor before the
-        watcher is returned. `start="new"` therefore anchors against mailbox
-        state at watch-creation time instead of first read, which avoids races
-        with concurrent puts.
-
-        `start="new"` begins strictly after the mailbox's current latest id.
-        `start="oldest"` replays matching historical messages first. A
-        `WatchStart.after(id)` resume cursor must be a valid UUIDv7 string, but
-        it otherwise uses pure cursor semantics: the id does not need to exist in
-        Redis, belong to this namespace, or still be present after compaction.
-
-        Live watch observes message arrival rather than later consume-state
-        transitions. Because the mailbox does not publish consume-transition
-        events, `MessageFilter(consumed=True)` is rejected for `watch()` and must
-        be expressed through `get(...)` instead.
-        """
-
-        resolved_filter = filter or MessageFilter()
-        if resolved_filter.consumed is True:
-            raise InvalidMessageFilterError(
-                "watch() does not support MessageFilter(consumed=True); use get() for consumed history"
-            )
-
-        initial_stream_anchor = await self._latest_stream_id()
-        resolved_last_seen_id: str | None = None
-
-        if start == "oldest":
-            resolved_last_seen_id = None
-        elif start == "new":
-            initial_message_anchor = await self._latest_message_id()
-            resolved_last_seen_id = initial_message_anchor
-        elif isinstance(start, WatchAfter):
-            normalized_id = _normalize_uuid7(start.message_id)
-            resolved_last_seen_id = normalized_id
-        else:
-            raise InvalidMessageWindowError(f"Unsupported watch start: {start!r}")
-
-        return MailboxWatcher(
-            self,
-            filter=resolved_filter,
-            batch_size=batch_size,
-            initial_stream_anchor=initial_stream_anchor,
-            initial_last_seen_id=resolved_last_seen_id,
-        )
 
     async def consume(
         self,
@@ -526,33 +455,33 @@ class RedisMailbox:
         Manual callers should use the default behavior.
 
         Compaction removes expired messages from the message hash, timeline,
-        channel indexes, consumed/unconsumed indexes, consumed-info hash, and the
-        wakeup stream's age-based retention window. Retention is driven by the
-        mailbox policy: old unconsumed messages are deleted too unless
+        channel indexes, consumed/unconsumed indexes, and consumed-info hash.
+        It also deletes the legacy watch wakeup stream left behind by pre-removal
+        mailbox versions so upgraded namespaces do not retain unused stream data.
+        Retention is driven by the mailbox policy: old unconsumed messages are
+        deleted too unless
         `RetentionPolicy.keep_unconsumed` is enabled, in which case those entries
         are counted as skipped and left in place.
         """
 
+        await self._delete_legacy_events_stream()
+
         timeline_ids = await self._zset_ids(self._keys.timeline, order="oldest_first")
         if not timeline_ids:
-            stream_entries_trimmed = await self._trim_events_for_age()
             return CompactionResult(
                 messages_deleted=0,
                 index_entries_removed=0,
                 consumed_info_removed=0,
                 skipped_unconsumed=0,
-                stream_entries_trimmed=stream_entries_trimmed,
             )
 
         timeline_messages = await self._load_messages(timeline_ids)
         if not timeline_messages:
-            stream_entries_trimmed = await self._trim_events_for_age()
             return CompactionResult(
                 messages_deleted=0,
                 index_entries_removed=0,
                 consumed_info_removed=0,
                 skipped_unconsumed=0,
-                stream_entries_trimmed=stream_entries_trimmed,
             )
 
         cutoff: datetime | None = None
@@ -583,13 +512,11 @@ class RedisMailbox:
                 remaining_count_excess -= 1
 
         if not messages_to_delete:
-            stream_entries_trimmed = await self._trim_events_for_age()
             return CompactionResult(
                 messages_deleted=0,
                 index_entries_removed=0,
                 consumed_info_removed=0,
                 skipped_unconsumed=skipped_unconsumed,
-                stream_entries_trimmed=stream_entries_trimmed,
             )
 
         delete_ids = [message.id for message in messages_to_delete]
@@ -636,25 +563,23 @@ class RedisMailbox:
             if _should_continue is not None and not _should_continue():
                 break
 
-        stream_entries_trimmed = await self._trim_events_for_age()
         return CompactionResult(
             messages_deleted=deleted_messages,
             index_entries_removed=index_entries_removed,
             consumed_info_removed=consumed_info_removed,
             skipped_unconsumed=skipped_unconsumed,
-            stream_entries_trimmed=stream_entries_trimmed,
         )
 
-    async def _trim_events_for_age(self) -> int:
-        if self._retention.max_age is None:
-            return 0
-        cutoff = _normalize_datetime(self._clock.now()) - self._retention.max_age
-        trimmed = await self._redis.xtrim(
-            self._keys.events,
-            minid=f"{int(cutoff.timestamp() * 1000)}-0",
-            approximate=True,
-        )
-        return int(trimmed)
+    async def _delete_legacy_events_stream(self) -> None:
+        """Delete the removed watch stream key if an upgraded namespace still has it.
+
+        Watch support is gone from the public API, but older deployments may have
+        already created `mailbox:{namespace}:events` or may still be writing to it
+        during a rolling rollout. Deleting the key on every compaction keeps that
+        legacy storage bounded without reviving any watch behavior.
+        """
+
+        await self._redis.unlink(f"mailbox:{self._namespace}:events")
 
     def _candidate_scan_state(
         self,
@@ -835,41 +760,6 @@ class RedisMailbox:
             )
         ) is not None
 
-    async def _latest_message_id(self) -> str | None:
-        values = await self._redis.zrevrangebylex(
-            self._keys.timeline,
-            max="+",
-            min="-",
-            start=0,
-            num=1,
-        )
-        if not values:
-            return None
-        return _decode_text(cast(str | bytes, values[0]))
-
-    async def _latest_stream_id(self) -> str:
-        entries = _coerce_stream_entries(
-            await self._redis.xrevrange(self._keys.events, count=1)
-        )
-        if not entries:
-            return "0-0"
-        return entries[0][0]
-
-    async def _wait_for_event(self, stream_id: str) -> str:
-        entries = _coerce_xread(
-            await self._redis.xread(
-                {self._keys.events: stream_id},
-                count=1,
-                block=0,
-            )
-        )
-        if not entries:
-            return stream_id
-        _, stream_entries = entries[0]
-        if not stream_entries:
-            return stream_id
-        return stream_entries[-1][0]
-
     def _normalize_channel(self, channel: str, *, field_name: str) -> str:
         try:
             return validate_channel_path(channel, field_name=field_name)
@@ -885,7 +775,7 @@ class RedisMailbox:
 class MailboxWriter:
     """Write-only mailbox facade for producers.
 
-    Producers only need append access. Hiding query/watch/consume keeps their
+    Producers only need append access. Hiding query/consume keeps their
     dependency surface narrow and makes producer supervision easier to reason
     about.
     """
@@ -909,139 +799,6 @@ class MailboxWriter:
         producer: str | None = None,
     ) -> list[Message]:
         return await self._mailbox.put_many(items, producer=producer)
-
-
-class MailboxWatcher:
-    """Independent watch session over a mailbox.
-
-    A watcher tracks its own message cursor and Redis stream wakeup cursor. It is
-    safe to create many watchers from the same mailbox because each watcher keeps
-    isolated read state and can be closed without affecting the mailbox.
-    """
-
-    def __init__(
-        self,
-        mailbox: RedisMailbox,
-        *,
-        filter: MessageFilter,
-        batch_size: int,
-        initial_stream_anchor: str = "0-0",
-        initial_last_seen_id: str | None = None,
-    ) -> None:
-        if batch_size <= 0:
-            raise InvalidMessageWindowError("batch_size must be > 0")
-        self._mailbox = mailbox
-        self._filter = filter
-        self._batch_size = batch_size
-        self._initial_stream_anchor = initial_stream_anchor
-        self._initial_last_seen_id = initial_last_seen_id
-        self._initialized = False
-        self._closed = False
-        self._last_seen_id: str | None = None
-        self._stream_cursor = "0-0"
-        self._wait_task: asyncio.Task[str] | None = None
-
-    async def __aenter__(self) -> MailboxWatcher:
-        await self._initialize()
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        await self.close()
-
-    def __aiter__(self) -> MailboxWatcher:
-        return self
-
-    async def __anext__(self) -> list[Message]:
-        try:
-            return await self.next()
-        except WatchClosedError as exc:
-            raise StopAsyncIteration from exc
-
-    async def try_next(self) -> list[Message]:
-        """Return the next matching batch without waiting for future messages."""
-
-        self._ensure_open()
-        await self._initialize()
-        messages = await self._mailbox.get(
-            self._filter,
-            after_id=self._last_seen_id,
-            limit=self._batch_size,
-            order="oldest_first",
-        )
-        if not messages:
-            return []
-
-        self._last_seen_id = messages[-1].id
-        return messages
-
-    async def next(self) -> list[Message]:
-        """Block until at least one matching message is available.
-
-        `next()` retries a small number of recoverable Redis connection failures
-        from the blocking watch path and the immediate follow-up reads while
-        preserving the watcher's current cursor. Non-connection domain errors such
-        as invalid filters or closed-watcher misuse are surfaced immediately.
-        """
-
-        self._ensure_open()
-        await self._initialize()
-        retry_index = 0
-        while True:
-            try:
-                messages = await self.try_next()
-                if messages:
-                    return messages
-                await self._block_for_wakeup()
-                retry_index = 0
-            except asyncio.CancelledError:
-                raise
-            except WatchClosedError:
-                raise
-            except Exception as exc:
-                if not _is_recoverable_watcher_error(exc):
-                    raise
-                if retry_index >= len(WATCHER_RETRY_DELAYS_SECONDS):
-                    raise
-                delay = WATCHER_RETRY_DELAYS_SECONDS[retry_index]
-                retry_index += 1
-                await asyncio.sleep(delay)
-
-    async def close(self) -> None:
-        """Close the watcher and cancel any pending blocking read."""
-
-        if self._closed:
-            return
-        self._closed = True
-        if self._wait_task is not None:
-            self._wait_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._wait_task
-            self._wait_task = None
-
-    async def _initialize(self) -> None:
-        if self._initialized:
-            return
-        self._stream_cursor = self._initial_stream_anchor
-        self._last_seen_id = self._initial_last_seen_id
-        self._initialized = True
-
-    async def _block_for_wakeup(self) -> None:
-        self._ensure_open()
-        self._wait_task = asyncio.create_task(
-            self._mailbox._wait_for_event(self._stream_cursor)
-        )
-        try:
-            self._stream_cursor = await self._wait_task
-        except asyncio.CancelledError:
-            if self._closed:
-                raise WatchClosedError("watcher is closed") from None
-            raise
-        finally:
-            self._wait_task = None
-
-    def _ensure_open(self) -> None:
-        if self._closed:
-            raise WatchClosedError("watcher is closed")
 
 
 class MailboxProducerSupervisor:
@@ -1396,12 +1153,6 @@ def _as_bool(value: object) -> bool:
     return bool(value)
 
 
-def _is_recoverable_watcher_error(exc: Exception) -> bool:
-    """Return whether `MailboxWatcher.next()` should retry an exception."""
-
-    return isinstance(exc, (RedisConnectionError, RedisTimeoutError))
-
-
 def _query_page_size(remaining: int | None) -> int:
     if remaining is None:
         return DEFAULT_QUERY_PAGE_SIZE
@@ -1410,39 +1161,3 @@ def _query_page_size(remaining: int | None) -> int:
 
 def _decode_string_list(value: object) -> list[str]:
     return [_decode_text(cast(str | bytes, item)) for item in cast(list[object], value)]
-
-
-def _coerce_stream_entries(value: object) -> list[tuple[str, dict[str, str]]]:
-    entries: list[tuple[str, dict[str, str]]] = []
-    for raw_entry in cast(list[object], value):
-        raw_id, raw_fields = cast(tuple[object, object], raw_entry)
-        entries.append(
-            (
-                _decode_text(cast(str | bytes, raw_id)),
-                _coerce_stream_fields(raw_fields),
-            )
-        )
-    return entries
-
-
-def _coerce_xread(value: object) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
-    streams: list[tuple[str, list[tuple[str, dict[str, str]]]]] = []
-    for raw_stream in cast(list[object], value):
-        raw_name, raw_entries = cast(tuple[object, object], raw_stream)
-        streams.append(
-            (
-                _decode_text(cast(str | bytes, raw_name)),
-                _coerce_stream_entries(raw_entries),
-            )
-        )
-    return streams
-
-
-def _coerce_stream_fields(value: object) -> dict[str, str]:
-    raw_fields = cast(dict[object, object], value)
-    return {
-        _decode_text(cast(str | bytes, key)): _decode_text(
-            cast(str | bytes, field_value)
-        )
-        for key, field_value in raw_fields.items()
-    }
