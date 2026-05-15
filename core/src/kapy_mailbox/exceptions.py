@@ -35,6 +35,10 @@ class ProducerAlreadyRegisteredError(MailboxError):
     """Raised when the same producer name is registered twice."""
 
 
+class NamespaceNotAllowedError(MailboxError):
+    """Raised when a writer is asked to target a disallowed namespace."""
+
+
 class ProducerSupervisorClosedError(MailboxError):
     """Raised when a stopped supervisor is used again."""
 

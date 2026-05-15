@@ -5,6 +5,10 @@ The core `RedisMailbox` is intentionally a thin API wrapper around an injected
 close it, and does not start background tasks. Producer supervision and
 periodic compaction are separate lifecycle objects so callers can compose them
 explicitly.
+
+`RedisMailbox` remains a single-namespace read/consume/compact API. Its
+write-only `MailboxWriter` facade can route writes to another namespace while
+keeping the same serializer, clock, and per-namespace Redis transaction shape.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from kapy_mailbox.exceptions import (
     AutoCompactorClosedError,
     InvalidChannelError,
     InvalidMessageWindowError,
+    NamespaceNotAllowedError,
     ProducerAlreadyRegisteredError,
     ProducerSupervisorClosedError,
     UnknownMessageError,
@@ -234,7 +239,9 @@ class RedisMailbox:
     This object is safe to share across concurrent producers and consumers as
     long as the injected Redis client supports concurrent async I/O.
     It does not own the Redis client lifecycle and intentionally starts no
-    background tasks on its own.
+    background tasks on its own. Reads, consume operations, and compaction stay
+    scoped to the namespace chosen at construction time even if a derived
+    `MailboxWriter` is later used to append into other namespaces.
     """
 
     def __init__(
@@ -254,10 +261,25 @@ class RedisMailbox:
         self._uuid_factory = _UUIDv7Factory(clock=self._clock)
         self._retention = retention or RetentionPolicy()
 
-    def writer(self) -> MailboxWriter:
-        """Return a write-only facade for supervised producers."""
+    def writer(
+        self,
+        *,
+        allowed_namespaces: Iterable[str] | None = None,
+    ) -> MailboxWriter:
+        """Return a write-only facade for supervised producers.
 
-        return MailboxWriter(self)
+        The returned writer uses this mailbox namespace as its default target.
+        Passing `allowed_namespaces` restricts which target namespaces the
+        writer may append into; `None` allows any namespace. When an allow-list
+        is configured, later writer calls that target any other namespace raise
+        `NamespaceNotAllowedError` before any Redis mutation is attempted.
+        """
+
+        return MailboxWriter(
+            self,
+            default_namespace=self._namespace,
+            allowed_namespaces=allowed_namespaces,
+        )
 
     async def put(
         self,
@@ -285,6 +307,27 @@ class RedisMailbox:
         timeline, and the unconsumed index.
         """
 
+        return await self._put_many_in_namespace(
+            items,
+            producer=producer,
+            namespace=self._namespace,
+        )
+
+    async def _put_many_in_namespace(
+        self,
+        items: Iterable[MessageInput],
+        *,
+        producer: str | None = None,
+        namespace: str,
+    ) -> list[Message]:
+        """Append several messages into one target namespace.
+
+        This is the shared write path for namespace-scoped mailbox APIs and the
+        write-only `MailboxWriter` facade. One call only ever targets a single
+        namespace, so Redis mutations remain atomic within that namespace and do
+        not add any cross-namespace transaction semantics.
+        """
+
         normalized_items = list(items)
         if not normalized_items:
             return []
@@ -310,16 +353,17 @@ class RedisMailbox:
                 )
             )
 
+        keys = _MailboxKeys(namespace)
         pipeline = self._redis.pipeline(transaction=True)
         for message in messages:
             pipeline.hset(
-                self._keys.messages,
+                keys.messages,
                 key=message.id,
                 value=self._serializer.dump_message(message),
             )
-            pipeline.zadd(self._keys.timeline, {message.id: 0.0})
-            pipeline.zadd(self._keys.channel(message.channel), {message.id: 0.0})
-            pipeline.zadd(self._keys.unconsumed, {message.id: 0.0})
+            pipeline.zadd(keys.timeline, {message.id: 0.0})
+            pipeline.zadd(keys.channel(message.channel), {message.id: 0.0})
+            pipeline.zadd(keys.unconsumed, {message.id: 0.0})
         await pipeline.execute()
         return messages
 
@@ -708,11 +752,33 @@ class MailboxWriter:
 
     Producers only need append access. Hiding query/consume keeps their
     dependency surface narrow and makes producer supervision easier to reason
-    about.
+    about. The writer remembers one default namespace for compatibility, while
+    allowing callers to opt into another target namespace per write.
     """
 
-    def __init__(self, mailbox: RedisMailbox) -> None:
+    def __init__(
+        self,
+        mailbox: RedisMailbox,
+        *,
+        default_namespace: str,
+        allowed_namespaces: Iterable[str] | None = None,
+    ) -> None:
         self._mailbox = mailbox
+        self._default_namespace = default_namespace
+        self._allowed_namespaces = (
+            None if allowed_namespaces is None else frozenset(allowed_namespaces)
+        )
+
+    def _resolve_namespace(self, namespace: str | None) -> str:
+        target_namespace = self._default_namespace if namespace is None else namespace
+        if (
+            self._allowed_namespaces is not None
+            and target_namespace not in self._allowed_namespaces
+        ):
+            raise NamespaceNotAllowedError(
+                f"Writer cannot write to namespace {target_namespace!r}"
+            )
+        return target_namespace
 
     async def put(
         self,
@@ -720,16 +786,45 @@ class MailboxWriter:
         payload: JsonValue,
         *,
         producer: str | None = None,
+        namespace: str | None = None,
     ) -> Message:
-        return await self._mailbox.put(channel, payload, producer=producer)
+        """Append one message to the default or explicitly selected namespace.
+
+        `producer` labels who emitted the message, while `namespace` chooses
+        which mailbox keyspace receives it. When this writer was created with
+        `allowed_namespaces=None`, any namespace is accepted. Otherwise,
+        targeting a namespace outside the configured allow-list raises
+        `NamespaceNotAllowedError` and performs no Redis write.
+        """
+
+        target_namespace = self._resolve_namespace(namespace)
+        messages = await self._mailbox._put_many_in_namespace(
+            [MessageInput(channel=channel, payload=payload, producer=producer)],
+            namespace=target_namespace,
+        )
+        return messages[0]
 
     async def put_many(
         self,
         items: Iterable[MessageInput],
         *,
         producer: str | None = None,
+        namespace: str | None = None,
     ) -> list[Message]:
-        return await self._mailbox.put_many(items, producer=producer)
+        """Append several messages to one target namespace.
+
+        `producer` remains a write-time label fallback for items that do not set
+        `MessageInput.producer`. `namespace` selects the mailbox namespace to
+        append into; omitting it preserves the writer's default namespace. When
+        this writer has an allow-list, any target namespace outside that list
+        raises `NamespaceNotAllowedError` before Redis is mutated.
+        """
+
+        return await self._mailbox._put_many_in_namespace(
+            items,
+            producer=producer,
+            namespace=self._resolve_namespace(namespace),
+        )
 
 
 class MailboxProducerSupervisor:

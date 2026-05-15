@@ -17,6 +17,7 @@ from kapy_mailbox import (
     MailboxProducerSupervisor,
     MessageFilter,
     MessageInput,
+    NamespaceNotAllowedError,
     RedisMailbox,
     RestartPolicy,
     RetentionPolicy,
@@ -68,14 +69,23 @@ class _ObservedRedis:
 
 def _make_mailbox(
     *,
+    namespace: str = "tests",
     retention: RetentionPolicy | None = None,
     observe_reads: bool = False,
+    clock: _ManualClock | None = None,
+    redis: _ObservedRedis | None = None,
 ) -> tuple[RedisMailbox, _ManualClock, _ObservedRedis]:
-    clock = _ManualClock(datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC))
-    raw_redis = fakeredis.aioredis.FakeRedis()
-    redis = _ObservedRedis(raw_redis, record_hmget=observe_reads)
-    mailbox = RedisMailbox(redis, namespace="tests", clock=clock, retention=retention)
-    return mailbox, clock, redis
+    mailbox_clock = clock or _ManualClock(datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC))
+    observed_redis = redis or _ObservedRedis(fakeredis.aioredis.FakeRedis())
+    if observe_reads:
+        observed_redis.record_hmget = True
+    mailbox = RedisMailbox(
+        observed_redis,
+        namespace=namespace,
+        clock=mailbox_clock,
+        retention=retention,
+    )
+    return mailbox, mailbox_clock, observed_redis
 
 
 def _assert_compaction_result_public_shape(result: object) -> None:
@@ -236,6 +246,125 @@ async def test_put_rejects_non_json_payloads_by_default() -> None:
 
     with pytest.raises(PayloadSerializationError):
         await mailbox.put("telegram/chat/1", object())  # type: ignore[arg-type]
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_put_uses_default_namespace_when_none_is_passed() -> None:
+    mailbox, clock, redis = _make_mailbox(namespace="default")
+    other_mailbox, _, _ = _make_mailbox(namespace="other", clock=clock, redis=redis)
+    writer = mailbox.writer()
+
+    message = await writer.put(
+        "telegram/chat/1",
+        {"index": 1},
+        producer="telegram",
+    )
+
+    assert [stored.id for stored in await mailbox.get(limit=None)] == [message.id]
+    assert await other_mailbox.get(limit=None) == []
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_put_can_target_another_namespace() -> None:
+    mailbox, clock, redis = _make_mailbox(namespace="default")
+    other_mailbox, _, _ = _make_mailbox(namespace="other", clock=clock, redis=redis)
+    writer = mailbox.writer()
+
+    message = await writer.put(
+        "telegram/chat/1",
+        {"index": 1},
+        producer="telegram",
+        namespace="other",
+    )
+
+    assert await mailbox.get(limit=None) == []
+    assert [stored.id for stored in await other_mailbox.get(limit=None)] == [message.id]
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_put_many_can_target_another_namespace() -> None:
+    mailbox, clock, redis = _make_mailbox(namespace="default")
+    other_mailbox, _, _ = _make_mailbox(namespace="other", clock=clock, redis=redis)
+
+    messages = await mailbox.writer().put_many(
+        [
+            MessageInput(channel="telegram/chat/1", payload={"index": 0}),
+            MessageInput(
+                channel="telegram/chat/1",
+                payload={"index": 1},
+                producer="email",
+            ),
+            MessageInput(channel="telegram/chat/2", payload={"index": 2}),
+        ],
+        producer="telegram",
+        namespace="other",
+    )
+
+    other_messages = await other_mailbox.get(limit=None)
+
+    assert await mailbox.get(limit=None) == []
+    assert [message.payload["index"] for message in messages] == [0, 1, 2]
+    assert [message.producer for message in messages] == [
+        "telegram",
+        "email",
+        "telegram",
+    ]
+    assert [message.id for message in other_messages] == [
+        message.id for message in messages
+    ]
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_allows_explicitly_listed_non_default_namespace() -> None:
+    mailbox, clock, redis = _make_mailbox(namespace="default")
+    other_mailbox, _, _ = _make_mailbox(namespace="other", clock=clock, redis=redis)
+    writer = mailbox.writer(allowed_namespaces={"default", "other"})
+
+    message = await writer.put(
+        "telegram/chat/1",
+        {"index": 1},
+        producer="telegram",
+        namespace="other",
+    )
+
+    assert await mailbox.get(limit=None) == []
+    assert [stored.id for stored in await other_mailbox.get(limit=None)] == [message.id]
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_rejects_disallowed_namespace_before_writing() -> None:
+    mailbox, clock, redis = _make_mailbox(namespace="default")
+    other_mailbox, _, _ = _make_mailbox(namespace="other", clock=clock, redis=redis)
+    writer = mailbox.writer(allowed_namespaces={"default"})
+
+    with pytest.raises(NamespaceNotAllowedError):
+        await writer.put(
+            "telegram/chat/1",
+            {"index": 1},
+            producer="telegram",
+            namespace="other",
+        )
+
+    assert await mailbox.get(limit=None) == []
+    assert await other_mailbox.get(limit=None) == []
+    assert await redis.exists("mailbox:other:messages") == 0
+    assert await redis.exists("mailbox:other:timeline") == 0
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_remains_write_only() -> None:
+    mailbox, _, redis = _make_mailbox()
+    writer = mailbox.writer()
+
+    assert not hasattr(writer, "get")
+    assert not hasattr(writer, "consume")
+    assert not hasattr(writer, "compact")
     await redis.aclose()
 
 
@@ -437,6 +566,35 @@ async def test_compact_removes_deleted_messages_from_exact_channel_indexes() -> 
 
 
 @pytest.mark.anyio
+async def test_compact_only_affects_the_mailbox_namespace_it_runs_on() -> None:
+    mailbox, clock, redis = _make_mailbox(
+        namespace="default",
+        retention=RetentionPolicy(max_age=timedelta(days=1), keep_unconsumed=False),
+    )
+    other_mailbox, _, _ = _make_mailbox(namespace="other", clock=clock, redis=redis)
+    writer = mailbox.writer()
+
+    default_message = await writer.put("telegram/chat/1", {"index": 1}, producer="demo")
+    await writer.put(
+        "telegram/chat/1",
+        {"index": 2},
+        producer="demo",
+        namespace="other",
+    )
+    clock.advance(days=2)
+
+    result = await mailbox.compact()
+
+    assert result.messages_deleted == 1
+    assert [message.id for message in await mailbox.get(limit=None)] == []
+    assert [message.producer for message in await other_mailbox.get(limit=None)] == [
+        "demo"
+    ]
+    assert await redis.hexists(mailbox._keys.messages, default_message.id) == 0
+    await redis.aclose()
+
+
+@pytest.mark.anyio
 async def test_compaction_lock_scripts_execute_real_lua() -> None:
     mailbox, _, redis = _make_mailbox()
     lock_key = mailbox._keys.compact_lock
@@ -582,6 +740,62 @@ async def test_producer_supervisor_restarts_failed_producer_and_stops_cleanly() 
     status_after_stop = supervisor.status("demo")
 
     assert len(attempts) >= 2
+    assert status_before_stop.restart_count >= 1
+    assert status_before_stop.state in {"running", "backoff", "stopping"}
+    assert status_after_stop.state == "stopped"
+    await redis.aclose()
+
+
+@pytest.mark.anyio
+async def test_producer_supervisor_writer_can_route_to_multiple_namespaces() -> None:
+    mailbox, clock, redis = _make_mailbox(namespace="default")
+    other_mailbox, _, _ = _make_mailbox(namespace="other", clock=clock, redis=redis)
+    supervisor = MailboxProducerSupervisor(
+        mailbox.writer(),
+        restart_policy=RestartPolicy(
+            initial_delay_seconds=0.01,
+            max_delay_seconds=0.02,
+            multiplier=1.0,
+            jitter_ratio=0.0,
+        ),
+    )
+    attempts: list[int] = []
+
+    async def producer(writer: Any, token: Any) -> None:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise RuntimeError("boom")
+        await writer.put("telegram/chat/1", {"namespace": "default"}, producer="demo")
+        await writer.put(
+            "telegram/chat/1",
+            {"namespace": "other"},
+            producer="demo",
+            namespace="other",
+        )
+        await token.wait_cancelled()
+
+    supervisor.register_producer("demo", producer)
+    await supervisor.start()
+
+    for _ in range(100):
+        if (
+            len(await mailbox.get(limit=None)) == 1
+            and len(await other_mailbox.get(limit=None)) == 1
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    status_before_stop = supervisor.status("demo")
+    await supervisor.stop(timeout=0.5)
+    status_after_stop = supervisor.status("demo")
+
+    assert len(attempts) >= 2
+    assert [
+        message.payload["namespace"] for message in await mailbox.get(limit=None)
+    ] == ["default"]
+    assert [
+        message.payload["namespace"] for message in await other_mailbox.get(limit=None)
+    ] == ["other"]
     assert status_before_stop.restart_count >= 1
     assert status_before_stop.state in {"running", "backoff", "stopping"}
     assert status_after_stop.state == "stopped"
