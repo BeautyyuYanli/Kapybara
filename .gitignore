@@ -1,4 +1,5 @@
 .ck/
+.context/
 *.pyc
 *.jsonl
 .venv
