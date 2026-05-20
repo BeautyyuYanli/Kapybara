@@ -30,6 +30,12 @@ Memory retrieval boundaries:
     Preference discovery lives in `k.agent.core.preference_injection`.
     Runtime prompt builders live in `k.agent.core.runtime_prompting`.
     This module only wires those collaborators into the runtime entrypoint.
+
+Tool retry policy:
+    Local and OpenAI-compatible models can emit malformed tool arguments during
+    otherwise recoverable turns. The core agent intentionally grants normal
+    tools and `finish_action` output validation a small retry budget so
+    transient malformed arguments can be corrected by the model.
 """
 
 from __future__ import annotations
@@ -93,6 +99,9 @@ from k.agent.memory.folder import FolderMemoryStore
 from k.agent.memory.paths import memory_root_from_config_base
 from k.config import Config
 from k.runner_helpers.basic_os import BasicOSHelper
+
+_MAX_TOOL_RETRIES = 3
+_OUTPUT_RETRIES = 3
 
 
 @dataclass(slots=True)
@@ -289,6 +298,8 @@ agent = cast(
         ],
         deps_type=MyDeps,
         output_type=ToolOutput(finish_action, name="finish_action"),
+        retries=_MAX_TOOL_RETRIES,
+        output_retries=_OUTPUT_RETRIES,
     ),
 )
 

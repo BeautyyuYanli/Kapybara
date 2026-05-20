@@ -10,7 +10,7 @@ import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from k.agent.contacts import resolve_contact_unique_ids
-from k.agent.core.agent import agent, agent_run
+from k.agent.core.agent import _MAX_TOOL_RETRIES, _OUTPUT_RETRIES, agent, agent_run
 from k.agent.core.entities import Event
 from k.agent.memory.entities import MemoryRecord, memory_record_id_from_created_at
 from k.agent.memory.folder import FolderMemoryStore
@@ -36,6 +36,14 @@ class _FakeRunResult:
 
     def new_messages(self) -> list[ModelRequest | ModelResponse]:
         return list(self._messages)
+
+
+def test_core_agent_retry_budgets_are_relaxed() -> None:
+    # pydantic-ai stores constructor retry budgets on private attrs; this guards
+    # the core wiring that prevents transient malformed tool/output arguments
+    # from failing after the previous single retry.
+    assert agent._max_tool_retries == _MAX_TOOL_RETRIES
+    assert agent._max_result_retries == _OUTPUT_RETRIES
 
 
 @pytest.mark.anyio
