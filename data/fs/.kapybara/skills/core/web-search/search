@@ -1,22 +1,13 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["httpx", "pydantic", "uvloop"]
+# dependencies = ["httpx", "pydantic", "uvloop", "PyYAML"]
 # ///
 
-"""Run one or more Jina web searches and persist full results under `/tmp`.
+"""Run one or more Exa web searches and persist full results under `/tmp`.
 
-This script is intentionally optimized for tool UX:
-- Caller must provide a unique `--out-dir` under `/tmp` for each invocation.
-- Full per-query JSON results are always written to files under `/tmp`.
-- Stdout includes run metadata and all result rows; no separate run manifest file is created.
-- Multiple queries are processed concurrently.
-
-Per Jina Search Foundation docs, `s.jina.ai` responses contain top-level
-metadata (`code`/`status`/etc.) and result objects under `data`.
-Each result can include `title`, `description`, `url`, and `content`.
-We preserve those stable fields, write full text content to per-result files,
-and keep a concise JSON payload for downstream tooling.
+- search focuses on highlights (max 4000 chars) as requested by owner.
+- Caller must provide a unique `--out-dir` under `/tmp`.
 """
 
 import argparse
@@ -27,135 +18,101 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Coroutine, TypeVar
+from typing import Any, TypeVar
 
 import httpx
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict
 
 
 MAX_SNIPPET_CHARS = 280
 MAX_STDOUT_FIELD_CHARS = 120
-MAX_STDOUT_DESCRIPTION_CHARS = 220
-DEFAULT_CONCURRENCY = 32
-REQUEST_TIMEOUT_SECONDS = 30.0
+MAX_STDOUT_DESCRIPTION_CHARS = 400
+DEFAULT_CONCURRENCY = 16
+REQUEST_TIMEOUT_SECONDS = 60.0
 TMP_ROOT = Path("/tmp").resolve()
-UPSTREAM_META_KEYS = ("code", "status", "name", "message", "readableMessage")
 T = TypeVar("T")
 
 
 class SearchJob(BaseModel):
-    """One search execution request and its output target."""
-
-    model_config = ConfigDict(frozen=True)
-
     query: str
     out_path: Path
 
 
-class JinaSearchItem(BaseModel):
-    """Subset of one Jina Search result item used by this skill."""
-
+class ExaResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
-
     title: str | None = None
     url: str | None = None
-    description: str | None = None
-    content: str | None = None
+    highlights: list[str] | None = None
+    score: float | None = None
+    id: str | None = None
+    publishedDate: str | None = None
+    author: str | None = None
 
 
-class JinaSearchPayload(BaseModel):
-    """Validated shape of the upstream Jina Search JSON object."""
-
+class ExaSearchPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
-
-    code: int | None = None
-    status: int | None = None
-    name: str | None = None
-    message: str | None = None
-    readableMessage: str | None = None
-    data: list[JinaSearchItem] | JinaSearchItem | None = None
+    results: list[ExaResult]
 
 
 class CompactSearchResult(BaseModel):
-    """Compact searchable output row persisted in per-query JSON."""
-
     model_config = ConfigDict(extra="forbid")
-
     title: str
     url: str
     description: str
-    snippet: str | None = None
-    full_text_path: str | None = None
+    highlights: list[str] | None = None
 
 
 class SearchOutputPayload(BaseModel):
-    """Per-query persisted JSON output contract."""
-
     model_config = ConfigDict(extra="forbid")
-
     query: str
     generated_at: str
     output_path: str
-    full_text_dir: str
     result_count: int
     results: list[CompactSearchResult]
-    upstream: dict[str, int | float | str] | None = None
     error: str | None = None
-    raw_preview: str | None = None
 
 
 class SearchSummaryRow(BaseModel):
-    """Compact per-query row returned in stdout."""
-
     model_config = ConfigDict(extra="forbid")
-
     query: str
     result_count: int
     output_path: str
     results: list[dict[str, str]] | None = None
     error: str | None = None
-    upstream: dict[str, int | float | str] | None = None
 
 
 def _normalize_whitespace(value: str) -> str:
-    """Collapse all whitespace into single spaces."""
     return " ".join(value.split())
 
 
 def _as_clean_string(value: object) -> str:
-    """Return a stripped string when value is a string; otherwise empty."""
     if isinstance(value, str):
         return value.strip()
     return ""
 
 
 def _truncate(text: str, max_chars: int) -> str:
-    """Trim text to max_chars while preserving readability."""
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3].rstrip() + "..."
 
 
 def _utc_now_iso() -> str:
-    """Return a UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _write_text_file(path: Path, content: str) -> None:
-    """Write text content, creating parent directories when needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         f.write(content)
 
 
 def _dump_model(payload: BaseModel | dict[str, Any]) -> str:
-    """Serialize a pydantic model (or plain dict) as pretty JSON text."""
     data = payload.model_dump(exclude_none=True) if isinstance(payload, BaseModel) else payload
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
 def _assert_tmp_path(path: Path, label: str) -> None:
-    """Ensure the given path resolves under `/tmp`."""
     resolved = path.resolve()
     try:
         resolved.relative_to(TMP_ROOT)
@@ -164,344 +121,184 @@ def _assert_tmp_path(path: Path, label: str) -> None:
 
 
 def _build_jobs(queries: list[str], out_dir: str) -> list[SearchJob]:
-    """Build per-query output targets from a unique `/tmp` directory."""
     base_dir = Path(out_dir).expanduser().resolve()
     _assert_tmp_path(base_dir, "Output directory")
     if base_dir.exists():
-        raise ValueError(
-            f"Output directory already exists: {base_dir}. "
-            "Use a unique --out-dir path to avoid concurrent run conflicts."
-        )
+        raise ValueError(f"Output directory already exists: {base_dir}")
     base_dir.mkdir(parents=True, exist_ok=False)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     jobs: list[SearchJob] = []
     for index, query in enumerate(queries):
         digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:8]
-        out_path = base_dir / f"web_search_{run_id}_{index:03d}_{digest}.json"
+        out_path = base_dir / f"web_search_{run_id}_{index:03d}_{digest}.md"
         jobs.append(SearchJob(query=query, out_path=out_path))
     return jobs
 
 
-def _validate_output_targets(jobs: list[SearchJob]) -> None:
-    """Fail fast when any output target already exists or collides."""
-    seen_out_paths: set[Path] = set()
-    seen_full_text_dirs: set[Path] = set()
-    for job in jobs:
-        if job.out_path in seen_out_paths:
-            raise ValueError(f"Duplicate output file path planned: {job.out_path}")
-        seen_out_paths.add(job.out_path)
-
-        full_text_dir = _full_text_dir_from_output(str(job.out_path)).resolve()
-        if full_text_dir in seen_full_text_dirs:
-            raise ValueError(f"Duplicate full-text directory planned: {full_text_dir}")
-        seen_full_text_dirs.add(full_text_dir)
-
-        if job.out_path.exists():
-            raise ValueError(f"Output file already exists: {job.out_path}")
-        if full_text_dir.exists():
-            raise ValueError(f"Full-text output directory already exists: {full_text_dir}")
-
-
-def _full_text_dir_from_output(out_path: str) -> Path:
-    """Return the per-run directory used for full-text result files."""
-    resolved_out_path = Path(out_path).resolve()
-    return resolved_out_path.parent / f"{resolved_out_path.name}.full_text"
-
-
-def _dump_full_text(full_text: str, full_text_dir: Path, result_index: int) -> Path:
-    """Persist one result's full text and return the file path."""
-    full_text_dir.mkdir(parents=True, exist_ok=True)
-    result_path = full_text_dir / f"result_{result_index:03d}.txt"
-    with result_path.open("w", encoding="utf-8") as f:
-        f.write(full_text)
-        if not full_text.endswith("\n"):
-            f.write("\n")
-    return result_path
-
-
-def _extract_search_items(payload: JinaSearchPayload) -> list[JinaSearchItem]:
-    """Extract validated result objects from upstream payload."""
-    if isinstance(payload.data, list):
-        return payload.data
-    if isinstance(payload.data, JinaSearchItem):
-        return [payload.data]
-    return []
-
-
-def _extract_upstream_meta(payload: JinaSearchPayload) -> dict[str, int | float | str]:
-    """Keep stable top-level metadata from the upstream response."""
-    meta: dict[str, int | float | str] = {}
-    for key in UPSTREAM_META_KEYS:
-        value = getattr(payload, key, None)
-        if isinstance(value, (str, int, float)):
-            meta[key] = value
-    return meta
-
-
-def _compact_result(
-    item: JinaSearchItem, full_text_dir: Path, result_index: int
-) -> CompactSearchResult | None:
-    """Reduce one documented search result and persist its full text."""
-    title = _as_clean_string(item.title)
-    url = _as_clean_string(item.url)
-    description = _as_clean_string(item.description)
-    full_text = _as_clean_string(item.content)
-    snippet = _truncate(_normalize_whitespace(full_text), MAX_SNIPPET_CHARS) if full_text else ""
-
-    if not description and snippet:
-        description = snippet
-        snippet = ""
-
-    if not any((title, url, description, full_text)):
-        return None
-
-    compact = CompactSearchResult(
-        title=title,
-        url=url,
-        description=description,
-        snippet=snippet or None,
-    )
-    if full_text:
-        full_text_path = _dump_full_text(full_text, full_text_dir, result_index)
-        compact.full_text_path = str(full_text_path)
-    return compact
-
-
 def _format_search_output(raw_output: str, query: str, out_path: str) -> str:
-    """Convert documented upstream payload into compact JSON records."""
     resolved_out_path = str(Path(out_path).resolve())
-    full_text_dir = _full_text_dir_from_output(out_path)
     generated_at = _utc_now_iso()
 
     try:
         payload = json.loads(raw_output)
-    except json.JSONDecodeError:
+        validated_payload = ExaSearchPayload.model_validate(payload)
+    except Exception as exc:
         fallback = SearchOutputPayload(
             query=query,
             generated_at=generated_at,
             output_path=resolved_out_path,
-            full_text_dir=str(full_text_dir),
             result_count=0,
             results=[],
-            error="Search response was not valid JSON.",
-            raw_preview=_truncate(_normalize_whitespace(raw_output), MAX_SNIPPET_CHARS),
-        )
-        return _dump_model(fallback)
-
-    if not isinstance(payload, dict):
-        fallback = SearchOutputPayload(
-            query=query,
-            generated_at=generated_at,
-            output_path=resolved_out_path,
-            full_text_dir=str(full_text_dir),
-            result_count=0,
-            results=[],
-            error="Search response JSON root was not an object.",
-            raw_preview=_truncate(_normalize_whitespace(raw_output), MAX_SNIPPET_CHARS),
-        )
-        return _dump_model(fallback)
-
-    try:
-        validated_payload = JinaSearchPayload.model_validate(payload)
-    except ValidationError:
-        fallback = SearchOutputPayload(
-            query=query,
-            generated_at=generated_at,
-            output_path=resolved_out_path,
-            full_text_dir=str(full_text_dir),
-            result_count=0,
-            results=[],
-            error="Search response JSON object did not match expected schema.",
-            raw_preview=_truncate(_normalize_whitespace(raw_output), MAX_SNIPPET_CHARS),
+            error=f"Invalid response: {exc}",
         )
         return _dump_model(fallback)
 
     compact_results: list[CompactSearchResult] = []
-    for result_index, item in enumerate(_extract_search_items(validated_payload)):
-        compact = _compact_result(item, full_text_dir, result_index)
-        if compact:
-            compact_results.append(compact)
+    for item in validated_payload.results:
+        title = _as_clean_string(item.title) or "No Title"
+        url = _as_clean_string(item.url) or ""
+        highlights = item.highlights
+        
+        description = _truncate(_normalize_whitespace(" ".join(highlights)), MAX_STDOUT_DESCRIPTION_CHARS) if highlights else ""
+
+        compact = CompactSearchResult(
+            title=title,
+            url=url,
+            description=description,
+            highlights=highlights or None,
+        )
+        compact_results.append(compact)
 
     output = SearchOutputPayload(
         query=query,
         generated_at=generated_at,
         output_path=resolved_out_path,
-        full_text_dir=str(full_text_dir),
         result_count=len(compact_results),
         results=compact_results,
     )
-    upstream_meta = _extract_upstream_meta(validated_payload)
-    if upstream_meta:
-        output.upstream = upstream_meta
-    if not compact_results and validated_payload.message is not None:
-        output.error = _as_clean_string(validated_payload.message) or "Search API returned no result data."
     return _dump_model(output)
-
-
-def _format_search_exception(query: str, out_path: Path, error: Exception) -> str:
-    """Build a stable error payload when request execution fails."""
-    payload = SearchOutputPayload(
-        query=query,
-        generated_at=_utc_now_iso(),
-        output_path=str(out_path.resolve()),
-        full_text_dir=str(_full_text_dir_from_output(str(out_path))),
-        result_count=0,
-        results=[],
-        error=f"Search request failed: {error}",
-    )
-    return _dump_model(payload)
-
-
-def _stdout_result_item(value: dict[str, object]) -> dict[str, str]:
-    """Extract one stdout-safe result item with bounded field lengths."""
-    return {
-        "title": _truncate(_as_clean_string(value.get("title")), MAX_STDOUT_FIELD_CHARS),
-        "url": _truncate(_as_clean_string(value.get("url")), MAX_STDOUT_FIELD_CHARS),
-        "description": _truncate(
-            _as_clean_string(value.get("description")),
-            MAX_STDOUT_DESCRIPTION_CHARS,
-        ),
-    }
-
-
-def _summary_row(payload: SearchOutputPayload) -> SearchSummaryRow:
-    """Convert one query output into stdout-friendly full result rows."""
-    row = SearchSummaryRow(
-        query=_truncate(_as_clean_string(payload.query), MAX_STDOUT_FIELD_CHARS),
-        result_count=len(payload.results),
-        output_path=_as_clean_string(payload.output_path),
-    )
-
-    stdout_results = [
-        _stdout_result_item(item.model_dump(exclude_none=True))
-        for item in payload.results
-    ]
-    if stdout_results:
-        row.results = stdout_results
-
-    error = _as_clean_string(payload.error)
-    if error:
-        row.error = _truncate(error, MAX_STDOUT_FIELD_CHARS)
-
-    if payload.upstream is not None:
-        compact_upstream = {
-            key: payload.upstream[key]
-            for key in ("code", "status", "name")
-            if key in payload.upstream and isinstance(payload.upstream[key], (str, int, float))
-        }
-        if compact_upstream:
-            row.upstream = compact_upstream
-
-    return row
 
 
 async def _run_search_job(
     client: httpx.AsyncClient,
     job: SearchJob,
-    jina_key: str,
+    exa_key: str,
 ) -> SearchSummaryRow:
-    """Execute one query, persist full output, and return summary metadata."""
     headers = {
-        "Authorization": f"Bearer {jina_key}",
-        "Accept": "application/json",
+        "x-api-key": exa_key,
+        "Content-Type": "application/json",
     }
-    request_body = {"q": job.query}
+    # Per owner instructions: search only return highlights, max char = 4000
+    request_body = {
+        "query": job.query,
+        "type": "auto",
+        "num_results": 10,
+        "contents": {
+            "highlights": {"max_characters": 4000}
+        }
+    }
 
     try:
         response = await client.post(
-            "https://s.jina.ai/",
+            "https://api.exa.ai/search",
             json=request_body,
             headers=headers,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        output = _format_search_output(response.text, job.query, str(job.out_path))
+        payload = ExaSearchPayload.model_validate(response.json())
+        
+        md_content = []
+        compact_results = []
+        for res in payload.results:
+            # Metadata as YAML header
+            meta = {
+                "title": res.title or "No Title",
+                "url": res.url or "",
+                "publishedDate": res.publishedDate or "",
+                "author": res.author or "",
+                "score": res.score or 0.0,
+                "id": res.id or "",
+            }
+            import yaml
+            # Clean meta of None/empty if desired, but owner said YAML header
+            yaml_header = "---\n" + yaml.dump(meta, allow_unicode=True, default_flow_style=False) + "---\n"
+            
+            highlights_text = "\n\n".join(res.highlights) if res.highlights else ""
+            md_content.append(yaml_header + highlights_text)
+            
+            # For summary
+            compact_results.append(CompactSearchResult(
+                title=res.title or "No Title",
+                url=res.url or "",
+                description=_truncate(_normalize_whitespace(" ".join(res.highlights or [])), MAX_STDOUT_DESCRIPTION_CHARS),
+                highlights=res.highlights,
+            ))
+            
+        full_md = "\n\n---\n\n".join(md_content)
+        _write_text_file(job.out_path, full_md)
+        
+        error = None
+        result_count = len(compact_results)
+
     except Exception as exc:
-        output = _format_search_exception(job.query, job.out_path, exc)
+        error = str(exc)
+        result_count = 0
+        compact_results = []
+        _write_text_file(job.out_path, f"Error: {error}")
 
-    _write_text_file(job.out_path, output)
-    parsed = SearchOutputPayload.model_validate_json(output)
-    return _summary_row(parsed)
+    summary = SearchSummaryRow(
+        query=_truncate(job.query, MAX_STDOUT_FIELD_CHARS),
+        result_count=result_count,
+        output_path=str(job.out_path.resolve()),
+        error=error,
+    )
+    if compact_results:
+        summary.results = []
+        for r in compact_results[:5]: # Limit results in stdout
+            row = {
+                "title": _truncate(r.title, MAX_STDOUT_FIELD_CHARS),
+                "url": _truncate(r.url, MAX_STDOUT_FIELD_CHARS),
+                "description": _truncate(r.description, MAX_STDOUT_DESCRIPTION_CHARS),
+            }
+            summary.results.append(row)
+    return summary
 
 
-async def _run_search_jobs(
-    jobs: list[SearchJob],
-    jina_key: str,
-) -> list[SearchSummaryRow]:
-    """Run all jobs concurrently with fixed internal concurrency control."""
+async def _run_search_jobs(jobs: list[SearchJob], exa_key: str) -> list[SearchSummaryRow]:
     semaphore = asyncio.Semaphore(DEFAULT_CONCURRENCY)
-
     async with httpx.AsyncClient() as client:
         async def bounded(job: SearchJob) -> SearchSummaryRow:
             async with semaphore:
-                return await _run_search_job(client, job, jina_key)
-
-        tasks = [asyncio.create_task(bounded(job)) for job in jobs]
-        return await asyncio.gather(*tasks)
-
-
-def _stdout_summary(rows: list[SearchSummaryRow]) -> str:
-    """Format stdout payload with all query rows and no external manifest dependency."""
-    summary: dict[str, object] = {
-        "generated_at": _utc_now_iso(),
-        "total_queries": len(rows),
-        "results": [item.model_dump(exclude_none=True) for item in rows],
-    }
-    return json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    """Create CLI parser for single and batch query modes."""
-    parser = argparse.ArgumentParser(
-        description="Web search via Jina AI Search",
-        allow_abbrev=False,
-    )
-    parser.add_argument("queries", nargs="+", help="One or more search queries")
-    parser.add_argument(
-        "--out-dir",
-        required=True,
-        help="Unique output directory under /tmp (must not exist before running)",
-    )
-    return parser
-
-
-def _run_with_uvloop(task: Coroutine[Any, Any, T]) -> T:
-    """Run one coroutine with uvloop as the event loop implementation."""
-    try:
-        import uvloop
-    except Exception as exc:  # pragma: no cover - runtime environment issue
-        raise RuntimeError("uvloop is required but could not be imported.") from exc
-    uvloop.install()
-    return asyncio.run(task)
+                return await _run_search_job(client, job, exa_key)
+        return await asyncio.gather(*(bounded(job) for job in jobs))
 
 
 def main() -> None:
-    parser = _build_parser()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("queries", nargs="+")
+    parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
 
-    jina_key = os.environ.get("JINA_AI_KEY")
-    if not jina_key:
-        print("Error: JINA_AI_KEY environment variable not set.", file=sys.stderr)
+    exa_key = os.environ.get("EXA_API_KEY")
+    if not exa_key:
+        print("Error: EXA_API_KEY not set", file=sys.stderr)
         sys.exit(1)
 
     try:
         jobs = _build_jobs(args.queries, args.out_dir)
-        _validate_output_targets(jobs)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        rows = _run_with_uvloop(
-            _run_search_jobs(
-                jobs=jobs,
-                jina_key=jina_key,
-            )
-        )
-        sys.stdout.write(_stdout_summary(rows))
+        import uvloop
+        uvloop.install()
+        rows = asyncio.run(_run_search_jobs(jobs, exa_key))
+        summary = {
+            "generated_at": _utc_now_iso(),
+            "total_queries": len(rows),
+            "results": [r.model_dump(exclude_none=True) for r in rows],
+        }
+        sys.stdout.write(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     except Exception as exc:
-        print(f"Error during search: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 

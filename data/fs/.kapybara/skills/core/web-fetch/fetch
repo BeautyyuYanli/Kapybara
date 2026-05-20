@@ -1,18 +1,13 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["httpx", "pydantic", "uvloop"]
+# dependencies = ["httpx", "pydantic", "uvloop", "PyYAML"]
 # ///
 
-"""Fetch one or more URLs via Jina Reader and persist full output under `/tmp`.
+"""Fetch one or more URLs via Exa API and persist full output under `/tmp`.
 
-This script keeps stdout compact for better tool UX while writing complete
-results to files:
-- Caller must provide a unique `--out-dir` under `/tmp` for each invocation.
-- URL bodies are written to per-item text files.
-- Run metadata is printed to stdout; no separate run manifest file is written.
-- Multiple URLs are fetched concurrently via `httpx.AsyncClient`.
-- Async execution runs on `uvloop` for lower scheduling overhead.
+- fetch focuses on fulltext (markdown) without max character limits.
+- Caller must provide a unique `--out-dir` under `/tmp`.
 """
 
 import argparse
@@ -22,51 +17,47 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Coroutine, TypeVar
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict
 
 
 TMP_ROOT = Path("/tmp").resolve()
-DEFAULT_CONCURRENCY = 32
-REQUEST_TIMEOUT_SECONDS = 60.0
+DEFAULT_CONCURRENCY = 16
+REQUEST_TIMEOUT_SECONDS = 90.0
 T = TypeVar("T")
 
 
-class FetchResult(BaseModel):
-    """Normalized fetch outcome for one URL request."""
+class ExaContentResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    url: str | None = None
+    title: str | None = None
+    text: str | None = None
+    id: str | None = None
+    author: str | None = None
+    publishedDate: str | None = None
+    favicon: str | None = None
+    image: str | None = None
 
-    model_config = ConfigDict(extra="forbid")
 
-    url: str
-    ok: bool
-    content: str
-    http_status: int | None
-    error: str | None
-    used_browser: bool
+class ExaContentsPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    results: list[ExaContentResult]
 
 
 class FetchManifestRow(BaseModel):
-    """One row in persisted manifest for a fetched URL."""
-
     model_config = ConfigDict(extra="forbid")
-
     index: int
     url: str
     status: str
-    http_status: int | None = None
     chars: int
-    used_browser: bool = False
     error: str | None = None
-    content_path: str | None = None
+    markdown_path: str | None = None
 
 
 class FetchManifest(BaseModel):
-    """Run metadata structure emitted to stdout for one fetch run."""
-
     model_config = ConfigDict(extra="forbid")
-
     generated_at: str
     output_dir: str
     content_dir: str
@@ -77,25 +68,21 @@ class FetchManifest(BaseModel):
 
 
 def _utc_now_iso() -> str:
-    """Return a UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _dump_model(payload: BaseModel | dict[str, object]) -> str:
-    """Serialize a pydantic model (or plain dict) as pretty JSON text."""
     data = payload.model_dump(exclude_none=True) if isinstance(payload, BaseModel) else payload
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
 def _write_text_file(path: Path, content: str) -> None:
-    """Write text content to disk, creating parent directories."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         f.write(content)
 
 
 def _assert_tmp_path(path: Path, label: str) -> None:
-    """Ensure a filesystem path resolves inside `/tmp`."""
     resolved = path.resolve()
     try:
         resolved.relative_to(TMP_ROOT)
@@ -104,197 +91,105 @@ def _assert_tmp_path(path: Path, label: str) -> None:
 
 
 def _prepare_output_dir(out_dir: str) -> Path:
-    """Validate and create a unique output directory under `/tmp`."""
     output_dir = Path(out_dir).expanduser().resolve()
     _assert_tmp_path(output_dir, "Output directory")
     if output_dir.exists():
-        raise ValueError(
-            f"Output directory already exists: {output_dir}. "
-            "Use a unique --out-dir path to avoid concurrent run conflicts."
-        )
+        raise ValueError(f"Output directory already exists: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=False)
     return output_dir
 
 
 def _content_dir_from_output_dir(output_dir: Path) -> Path:
-    """Return the per-run content directory under the unique output directory."""
     return output_dir / "contents"
 
 
-async def _fetch_url(
-    client: httpx.AsyncClient,
-    target: str,
-    jina_key: str,
-    use_browser: bool = True,
-) -> FetchResult:
-    """Fetch one URL, retrying once without browser mode when non-200."""
-    url = f"https://r.jina.ai/{target}"
+async def _fetch_urls(urls: list[str], exa_key: str) -> list[ExaContentResult]:
     headers = {
-        "Authorization": f"Bearer {jina_key}",
-        "Accept": "text/plain",
+        "x-api-key": exa_key,
+        "Content-Type": "application/json",
     }
-    if use_browser:
-        headers["X-Experimental"] = "browser"
-
-    try:
-        response = await client.get(
-            url,
+    # Per owner instructions: fetch only return content (text/markdown), no max char limit.
+    # Exa's "text" field returns markdown-formatted content by default now.
+    request_body = {
+        "urls": urls,
+        "text": True
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.exa.ai/contents",
+            json=request_body,
             headers=headers,
             timeout=REQUEST_TIMEOUT_SECONDS,
-            follow_redirects=True,
         )
-        if response.status_code == 200:
-            return FetchResult(
-                url=target,
-                ok=True,
-                content=response.text,
-                http_status=200,
-                error=None,
-                used_browser=use_browser,
-            )
-        if use_browser:
-            return await _fetch_url(
-                client=client,
-                target=target,
-                jina_key=jina_key,
-                use_browser=False,
-            )
-        return FetchResult(
-            url=target,
-            ok=False,
-            content="",
-            http_status=response.status_code,
-            error=f"HTTP {response.status_code}",
-            used_browser=False,
-        )
-    except Exception as exc:
-        return FetchResult(
-            url=target,
-            ok=False,
-            content="",
-            http_status=None,
-            error=str(exc),
-            used_browser=use_browser,
-        )
-
-
-async def _fetch_urls(
-    urls: list[str],
-    jina_key: str,
-) -> list[FetchResult]:
-    """Fetch all URLs concurrently with fixed internal concurrency control."""
-    semaphore = asyncio.Semaphore(DEFAULT_CONCURRENCY)
-    async with httpx.AsyncClient() as client:
-        async def bounded(target: str) -> FetchResult:
-            async with semaphore:
-                return await _fetch_url(client, target, jina_key, use_browser=True)
-
-        tasks = [asyncio.create_task(bounded(url)) for url in urls]
-        return await asyncio.gather(*tasks)
-
-
-def _content_path(content_dir: Path, index: int) -> Path:
-    """Return the file path used for one URL content body."""
-    return content_dir / f"item_{index:03d}.txt"
-
-
-def _stdout_summary(manifest: FetchManifest | dict[str, object]) -> str:
-    """Render full run metadata to stdout without external manifest files."""
-    manifest_obj = (
-        manifest
-        if isinstance(manifest, FetchManifest)
-        else FetchManifest.model_validate(manifest)
-    )
-    return _dump_model(manifest_obj)
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    """Create CLI parser for fetch batch mode."""
-    parser = argparse.ArgumentParser(
-        description="Fetch one or more URLs via Jina Reader",
-        allow_abbrev=False,
-    )
-    parser.add_argument("urls", nargs="+", help="URLs to fetch")
-    parser.add_argument(
-        "--out-dir",
-        required=True,
-        help="Unique output directory under /tmp (must not exist before running)",
-    )
-    return parser
-
-
-def _run_with_uvloop(task: Coroutine[Any, Any, T]) -> T:
-    """Run one coroutine with uvloop as the event loop implementation."""
-    try:
-        import uvloop
-    except Exception as exc:  # pragma: no cover - runtime environment issue
-        raise RuntimeError("uvloop is required but could not be imported.") from exc
-    uvloop.install()
-    return asyncio.run(task)
-
-
-async def _async_main(args: argparse.Namespace, jina_key: str) -> FetchManifest:
-    """Execute fetch workflow and return manifest payload."""
-    output_dir = _prepare_output_dir(args.out_dir)
-    content_dir = _content_dir_from_output_dir(output_dir)
-    content_dir.mkdir(parents=True, exist_ok=True)
-
-    results = await _fetch_urls(
-        urls=args.urls,
-        jina_key=jina_key,
-    )
-
-    manifest_rows: list[FetchManifestRow] = []
-    ok_count = 0
-    for index, result in enumerate(results):
-        row = FetchManifestRow(
-            index=index,
-            url=result.url,
-            status="ok" if result.ok else "error",
-            http_status=result.http_status,
-            chars=len(result.content),
-            used_browser=result.used_browser,
-            error=result.error,
-        )
-        if result.ok:
-            ok_count += 1
-            body_path = _content_path(content_dir, index)
-            _write_text_file(
-                body_path,
-                result.content if result.content.endswith("\n") else f"{result.content}\n",
-            )
-            row.content_path = str(body_path.resolve())
-        manifest_rows.append(row)
-
-    manifest_payload = FetchManifest(
-        generated_at=_utc_now_iso(),
-        output_dir=str(output_dir.resolve()),
-        content_dir=str(content_dir.resolve()),
-        total_urls=len(args.urls),
-        ok_count=ok_count,
-        error_count=len(args.urls) - ok_count,
-        results=manifest_rows,
-    )
-    return manifest_payload
+        response.raise_for_status()
+        payload = ExaContentsPayload.model_validate(response.json())
+        return payload.results
 
 
 def main() -> None:
-    parser = _build_parser()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("urls", nargs="+")
+    parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
 
-    jina_key = os.environ.get("JINA_AI_KEY")
-    if not jina_key:
-        print("Error: JINA_AI_KEY environment variable not set.", file=sys.stderr)
+    exa_key = os.environ.get("EXA_API_KEY")
+    if not exa_key:
+        print("Error: EXA_API_KEY not set", file=sys.stderr)
         sys.exit(1)
 
     try:
-        manifest = _run_with_uvloop(_async_main(args, jina_key))
-        sys.stdout.write(_stdout_summary(manifest))
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        output_dir = _prepare_output_dir(args.out_dir)
+        content_dir = _content_dir_from_output_dir(output_dir)
+        content_dir.mkdir(parents=True, exist_ok=True)
+
+        import uvloop
+        uvloop.install()
+        results = asyncio.run(_fetch_urls(args.urls, exa_key))
+
+        manifest_rows: list[FetchManifestRow] = []
+        ok_count = 0
+        for index, result in enumerate(results):
+            url = result.url or f"Unknown URL {index}"
+            # The "text" field from Exa is already in markdown format per changelog 2025-06-23.
+            markdown = result.text or ""
+
+            # Metadata as YAML header
+            import yaml
+            meta = {
+                "title": result.title or "No Title",
+                "url": url,
+                "publishedDate": result.publishedDate or "",
+                "author": result.author or "",
+                "id": result.id or "",
+            }
+            yaml_header = "---\n" + yaml.dump(meta, allow_unicode=True, default_flow_style=False) + "---\n"
+            full_content = yaml_header + markdown
+
+            row = FetchManifestRow(
+                index=index,
+                url=url,
+                status="ok" if markdown else "error",
+                chars=len(full_content),
+            )
+            if markdown:
+                ok_count += 1
+                md_path = content_dir / f"item_{index:03d}.md"
+                _write_text_file(md_path, full_content)
+                row.markdown_path = str(md_path.resolve())
+            manifest_rows.append(row)
+
+        manifest = FetchManifest(
+            generated_at=_utc_now_iso(),
+            output_dir=str(output_dir.resolve()),
+            content_dir=str(content_dir.resolve()),
+            total_urls=len(args.urls),
+            ok_count=ok_count,
+            error_count=len(args.urls) - ok_count,
+            results=manifest_rows,
+        )
+        sys.stdout.write(_dump_model(manifest))
     except Exception as exc:
-        print(f"Error during fetch: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
