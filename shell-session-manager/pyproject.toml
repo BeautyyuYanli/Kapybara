@@ -9,11 +9,23 @@ description = "Async subprocess session manager with incremental stdin/stdout/st
 authors = [
     {name = "Yanli 盐粒", email = "yanli@mail.one"},
 ]
-dependencies = ["anyio>=4.12.1"]
+dependencies = [
+    "aiosqlite>=0.21.0",
+    "anyio>=4.12.1",
+    "fastapi>=0.116.1",
+    "httpx>=0.28.1",
+    "pydantic>=2.12.5",
+    "sqlmodel>=0.0.24",
+    "typer>=0.16.1",
+    "uvicorn>=0.35.0",
+]
 requires-python = ">=3.12"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+
+[project.scripts]
+shellctl = "shell_session_manager.shellctl.server:main"
 
 [dependency-groups]
 dev = [
