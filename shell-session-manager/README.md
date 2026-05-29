@@ -49,3 +49,16 @@ async def main() -> None:
 
 anyio.run(main)
 ```
+
+## shellctl server
+
+Run the HTTP API locally with:
+
+```bash
+pdm run shellctl serve --listen 127.0.0.1:8765
+```
+
+Pass `--auth-token your-token` when you want bearer auth enforced. `shellctl
+serve` also reads `SHELLCTL_AUTH_TOKEN`, so you can export the token instead of
+passing the flag. Leave the flag/env var unset or empty to start without
+requiring an Authorization header.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import sqlite3
 import subprocess
@@ -23,6 +24,7 @@ from shell_session_manager.shellctl.server import (
     create_app,
 )
 from shell_session_manager.shellctl.shared import (
+    DEFAULT_AUTH_TOKEN_ENV,
     InputJobRequest,
     JobStatusName,
     JobStatusView,
@@ -33,6 +35,8 @@ from shell_session_manager.shellctl.shared import (
     job_pane_target,
     job_session_name,
 )
+
+server_cli_module = importlib.import_module("shell_session_manager.shellctl.server.cli")
 
 
 class FakeTmuxController:
@@ -85,15 +89,41 @@ class FakeTmuxController:
         self.pipe_active.pop(job_id, None)
 
 
-async def _create_service(tmp_path: Path) -> tuple[ShellctlService, FakeTmuxController]:
+async def _create_service(
+    tmp_path: Path, *, auth_token: str | None = None
+) -> tuple[ShellctlService, FakeTmuxController]:
     fake_tmux = FakeTmuxController()
     service = ShellctlService(
-        ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run"),
+        ShellctlConfig(
+            auth_token=auth_token,
+            state_dir=tmp_path / "state",
+            runtime_dir=tmp_path / "run",
+        ),
         tmux=fake_tmux,
     )
     await service.initialize_database()
     service._ensure_dir(service.config.jobs_dir)
     return service, fake_tmux
+
+
+def _capture_serve_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, object], CliRunner]:
+    captured: dict[str, object] = {}
+
+    def fake_create_app(config: ShellctlConfig):
+        captured["config"] = config
+        return object()
+
+    def fake_run(app: object, *, host: str, port: int, log_level: str) -> None:
+        captured["app"] = app
+        captured["host"] = host
+        captured["port"] = port
+        captured["log_level"] = log_level
+
+    monkeypatch.setattr(server_cli_module, "create_app", fake_create_app)
+    monkeypatch.setattr(server_cli_module.uvicorn, "run", fake_run)
+    return captured, CliRunner()
 
 
 async def _seed_job(
@@ -789,11 +819,23 @@ async def test_allocate_job_dir_retries_on_atomic_mkdir_collision(
 
 
 @pytest.mark.anyio
+async def test_service_initialize_allows_missing_auth_token(tmp_path: Path) -> None:
+    service = ShellctlService(
+        ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run"),
+        tmux=FakeTmuxController(),
+    )
+
+    await service.initialize()
+
+    assert service.config.runner_path.exists()
+    await service.shutdown()
+
+
+@pytest.mark.anyio
 async def test_http_routes_inject_shellctl_service_dependency(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("SHELLCTL_AUTH_TOKEN", "route-token")
-    service, _fake_tmux = await _create_service(tmp_path)
+    service, _fake_tmux = await _create_service(tmp_path, auth_token="route-token")
     app = create_app(service.config, service=service)
     transport = httpx.ASGITransport(app=app)
 
@@ -813,6 +855,223 @@ async def test_http_routes_inject_shellctl_service_dependency(
     assert authenticated.status_code == 200
     assert authenticated.json() == {"jobs": []}
     await service.shutdown()
+
+
+@pytest.mark.anyio
+async def test_http_routes_enforce_auth_from_environment_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DEFAULT_AUTH_TOKEN_ENV, "route-token")
+    service, _fake_tmux = await _create_service(tmp_path)
+    app = create_app(service.config, service=service)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://shellctl.test"
+    ) as client:
+        unauthenticated = await client.get("/v1/jobs")
+        authenticated = await client.get(
+            "/v1/jobs", headers={"Authorization": "Bearer route-token"}
+        )
+
+    assert unauthenticated.status_code == 401
+    assert authenticated.status_code == 200
+    await service.shutdown()
+
+
+@pytest.mark.anyio
+async def test_create_app_without_explicit_config_reads_auth_token_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def noop_initialize(self: ShellctlService) -> None:
+        return None
+
+    monkeypatch.setenv(DEFAULT_AUTH_TOKEN_ENV, "route-token")
+    monkeypatch.setattr(ShellctlService, "initialize", noop_initialize)
+    monkeypatch.setattr(ShellctlService, "start_background_gc", lambda self: None)
+    monkeypatch.setattr(
+        ShellctlService, "start_background_pipe_monitor", lambda self: None
+    )
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://shellctl.test"
+    ) as client:
+        response = await client.get("/v1/jobs")
+
+    assert app.state.shellctl_service.config.auth_token == "route-token"
+    assert response.status_code == 401
+    await app.state.shellctl_service.shutdown()
+
+
+@pytest.mark.anyio
+async def test_http_routes_skip_auth_when_token_missing(tmp_path: Path) -> None:
+    service, _fake_tmux = await _create_service(tmp_path)
+    app = create_app(service.config, service=service)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://shellctl.test"
+    ) as client:
+        response = await client.get("/v1/jobs")
+
+    assert response.status_code == 200
+    assert response.json() == {"jobs": []}
+    await service.shutdown()
+
+
+@pytest.mark.anyio
+async def test_http_routes_skip_auth_when_token_is_empty(tmp_path: Path) -> None:
+    service, _fake_tmux = await _create_service(tmp_path, auth_token="")
+    app = create_app(service.config, service=service)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://shellctl.test"
+    ) as client:
+        response = await client.get("/v1/jobs")
+
+    assert response.status_code == 200
+    assert response.json() == {"jobs": []}
+    await service.shutdown()
+
+
+def test_shellctl_config_reads_auth_token_from_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DEFAULT_AUTH_TOKEN_ENV, "env-token")
+
+    config = ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run")
+
+    assert config.auth_token == "env-token"
+
+
+def test_shellctl_config_treats_empty_environment_auth_token_as_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DEFAULT_AUTH_TOKEN_ENV, "")
+
+    config = ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run")
+
+    assert config.auth_token is None
+
+
+def test_serve_cli_passes_direct_auth_token_to_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, runner = _capture_serve_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--listen",
+            "0.0.0.0:9999",
+            "--auth-token",
+            "direct-token",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 9999
+    assert captured["log_level"] == "info"
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.auth_token == "direct-token"
+
+
+def test_serve_cli_prefers_explicit_auth_token_over_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DEFAULT_AUTH_TOKEN_ENV, "env-token")
+    captured, runner = _capture_serve_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--auth-token",
+            "direct-token",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.auth_token == "direct-token"
+
+
+def test_serve_cli_treats_empty_auth_token_as_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, runner = _capture_serve_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--auth-token",
+            "",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.auth_token is None
+
+
+def test_serve_cli_explicit_empty_auth_token_beats_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DEFAULT_AUTH_TOKEN_ENV, "env-token")
+    captured, runner = _capture_serve_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--auth-token",
+            "",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.auth_token is None
+
+
+def test_serve_cli_reads_auth_token_from_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DEFAULT_AUTH_TOKEN_ENV, "env-token")
+    captured, runner = _capture_serve_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.auth_token == "env-token"
 
 
 def test_runner_exit_cli_accepts_runner_option_contract(tmp_path: Path) -> None:

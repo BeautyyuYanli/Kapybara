@@ -26,7 +26,15 @@ cli = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 @cli.command("serve")
 def serve_command(
     listen: str = "127.0.0.1:8765",
-    auth_token_env: str = DEFAULT_AUTH_TOKEN_ENV,
+    auth_token: str | None = typer.Option(
+        None,
+        "--auth-token",
+        envvar=DEFAULT_AUTH_TOKEN_ENV,
+        help=(
+            "Bearer token value. You can also set SHELLCTL_AUTH_TOKEN. "
+            "Leave it unset or empty to disable HTTP bearer auth."
+        ),
+    ),
     state_dir: Path | None = None,
     runtime_dir: Path | None = None,
     gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS,
@@ -37,7 +45,7 @@ def serve_command(
     host, port = _parse_listen(listen)
     config = ShellctlConfig(
         listen=listen,
-        auth_token_env=auth_token_env,
+        auth_token=auth_token,
         state_dir=state_dir or default_state_dir(),
         runtime_dir=runtime_dir,
         gc_interval_seconds=gc_interval_seconds,
