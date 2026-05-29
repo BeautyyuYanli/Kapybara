@@ -88,7 +88,10 @@ def create_app(
     def verify_auth(
         authorization: Annotated[str | None, Header()] = None,
     ) -> None:
-        expected = f"Bearer {resolved_config.auth_token}"
+        token = resolved_config.auth_token
+        if token is None:
+            return
+        expected = f"Bearer {token}"
         if authorization != expected:
             raise ShellctlServerError(
                 401, "unauthorized", "Missing or invalid bearer token"

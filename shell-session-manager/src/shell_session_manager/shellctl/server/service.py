@@ -31,6 +31,7 @@ from shell_session_manager.shellctl.server.tmux import (
     TmuxControllerProtocol,
 )
 from shell_session_manager.shellctl.shared import (
+    DEFAULT_AUTH_TOKEN_ENV,
     DeleteJobResponse,
     InputJobRequest,
     JobInfo,
@@ -97,9 +98,12 @@ class ShellctlService:
             await connection.run_sync(SQLModel.metadata.create_all)
 
     async def initialize(self) -> None:
-        """Prepare directories, database, runner script, and tmux state."""
+        """Prepare directories, database, runner script, and tmux state.
 
-        _ = self.config.auth_token
+        Auth is configured at the API layer, so service startup must also work
+        when `shellctl serve` is intentionally running without a bearer token.
+        """
+
         await self.initialize_database()
         self._ensure_dir(cast(Path, self.config.runtime_dir))
         self._ensure_dir(self.config.jobs_dir)
@@ -966,7 +970,7 @@ class ShellctlService:
     def _runner_script_source(self) -> str:
         tmux_socket = shlex.quote(str(self.config.tmux_socket))
         state_dir = shlex.quote(str(self.config.state_dir))
-        auth_env = shlex.quote(self.config.auth_token_env)
+        auth_env = shlex.quote(DEFAULT_AUTH_TOKEN_ENV)
         shellctl_command = " ".join(
             shlex.quote(part) for part in self.config.shellctl_command
         )

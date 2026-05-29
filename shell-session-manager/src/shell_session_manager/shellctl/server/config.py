@@ -34,10 +34,14 @@ class ShellctlConfig:
     `shellctl_command` deliberately defaults to `python -m ...server` so the
     tmux-side commands stay pinned to the same interpreter environment that
     launched the API server.
+
+    Bearer auth is opt-in: if the explicit `auth_token` and the fallback
+    `SHELLCTL_AUTH_TOKEN` environment variable are both missing or empty,
+    `shellctl serve` accepts requests without checking an Authorization header.
     """
 
     listen: str = "127.0.0.1:8765"
-    auth_token_env: str = DEFAULT_AUTH_TOKEN_ENV
+    auth_token: str | None = None
     state_dir: Path = field(default_factory=default_state_dir)
     runtime_dir: Path | None = None
     gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
@@ -67,6 +71,12 @@ class ShellctlConfig:
     def __post_init__(self) -> None:
         if self.runtime_dir is None:
             object.__setattr__(self, "runtime_dir", default_runtime_dir(self.state_dir))
+        token = self.auth_token
+        if token is None:
+            token = os.environ.get(DEFAULT_AUTH_TOKEN_ENV)
+        if not token:
+            token = None
+        object.__setattr__(self, "auth_token", token)
 
     @property
     def jobs_dir(self) -> Path:
@@ -89,15 +99,6 @@ class ShellctlConfig:
     def runner_path(self) -> Path:
         runtime_dir = cast(Path, self.runtime_dir)
         return runtime_dir / "bin" / "shellctl-runner"
-
-    @property
-    def auth_token(self) -> str:
-        token = os.environ.get(self.auth_token_env)
-        if not token:
-            raise RuntimeError(
-                f"Missing bearer token in environment variable {self.auth_token_env}"
-            )
-        return token
 
 
 __all__ = ["ShellctlConfig"]
