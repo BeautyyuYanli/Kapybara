@@ -4,7 +4,7 @@ build-backend = "pdm.backend"
 
 [project]
 name = "shell-session-manager"
-version = "2.1.0"
+version = "2.1.1"
 description = "Async subprocess session manager with incremental stdin/stdout/stderr support"
 authors = [
     {name = "Yanli 盐粒", email = "yanli@mail.one"},
