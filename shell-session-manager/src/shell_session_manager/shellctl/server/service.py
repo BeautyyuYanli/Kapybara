@@ -23,6 +23,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
 
+from shell_session_manager.shellctl.server.artifacts import (
+    RUNNER_ENDED_AT_FILENAME,
+    RUNNER_EXIT_CODE_FILENAME,
+    pipe_drained_path,
+    pipe_failed_path,
+    runner_ended_at_path,
+    runner_exit_code_path,
+)
 from shell_session_manager.shellctl.server.config import ShellctlConfig
 from shell_session_manager.shellctl.server.db import JobRow, configure_sqlite_engine
 from shell_session_manager.shellctl.server.errors import ShellctlServerError
@@ -540,9 +548,12 @@ class ShellctlService:
     async def record_runner_exit(
         self, job_id: str, exit_code: int, ended_at: str
     ) -> None:
-        """Persist the runner's exit fact into SQLite.
+        """Persist a drained normal-exit fact into SQLite.
 
-        This is the source-of-truth replacement for the old `exit.json`. The
+        The usual caller is the tmux pipe finalizer after `sanitize-pty` has
+        reached EOF and flushed `output.log`. `_materialize_status_view()` may
+        also call this as a recovery path when `.pipe-drained` plus the normal
+        exit metadata files exist but SQLite is still non-terminal. The
         statement always records `exit_code` and `ended_at`, but it only changes
         `status` to `exited` when the current row is still non-terminal.
         """
@@ -660,6 +671,13 @@ class ShellctlService:
         - terminal SQLite status wins and is preserved
         - if SQLite already has an `exit_code` on a non-terminal row, materialize
           `exited`
+        - if normal-exit metadata and `.pipe-drained` already exist, recover the
+          drained normal exit immediately even when the finalizer has not yet
+          committed SQLite state
+        - if normal-exit metadata exists and neither `.pipe-drained` nor
+          `.pipe-failed` exists, keep the non-terminal row instead of guessing
+          `lost` while the pipe finalizer is still responsible for the eventual
+          `runner-exit` commit
         - if a live tmux session exists but the output pipe is known-dead,
           conditionally materialize `failed(reason=pipe_failed)`
         - if no live session exists and the row is not protected by the local
@@ -693,6 +711,10 @@ class ShellctlService:
                 target=JobStatusName.EXITED,
                 ended_at=row.ended_at or format_timestamp(),
             )
+        elif (drained_exit := self._drained_normal_exit_metadata(job_id)) is not None:
+            exit_code, ended_at = drained_exit
+            await self.record_runner_exit(job_id, exit_code, ended_at)
+            row = await self._get_job_row(job_id)
         elif session_exists:
             if pipe_active is False:
                 if (
@@ -728,7 +750,9 @@ class ShellctlService:
                     require_exit_code_null=True,
                 )
         else:
-            if not (
+            if self._normal_exit_commit_pending(job_id):
+                pass
+            elif not (
                 status in {JobStatusName.CREATED, JobStatusName.STARTING}
                 and job_id in self._starting_jobs
             ):
@@ -911,6 +935,36 @@ class ShellctlService:
     def _artifact_dir(self, job_id: str) -> Path:
         return self.config.jobs_dir / job_id
 
+    def _normal_exit_commit_pending(self, job_id: str) -> bool:
+        """Check whether a normal exit is still waiting for pipe drain + commit."""
+
+        job_dir = self._artifact_dir(job_id)
+        return (
+            runner_exit_code_path(job_dir).exists()
+            and runner_ended_at_path(job_dir).exists()
+            and not pipe_drained_path(job_dir).exists()
+            and not pipe_failed_path(job_dir).exists()
+        )
+
+    def _drained_normal_exit_metadata(self, job_id: str) -> tuple[int, str] | None:
+        """Read drained normal-exit metadata after successful sanitize drain."""
+
+        job_dir = self._artifact_dir(job_id)
+        drained_path = pipe_drained_path(job_dir)
+        exit_code_path = runner_exit_code_path(job_dir)
+        ended_at_path = runner_ended_at_path(job_dir)
+        if (
+            not drained_path.exists()
+            or not exit_code_path.exists()
+            or not ended_at_path.exists()
+        ):
+            return None
+        raw_exit_code = exit_code_path.read_text(encoding="utf-8").strip()
+        raw_ended_at = ended_at_path.read_text(encoding="utf-8").strip()
+        if not raw_exit_code or not raw_ended_at:
+            return None
+        return int(raw_exit_code), raw_ended_at
+
     def _allocate_job_dir(self) -> tuple[str, Path]:
         """Atomically allocate a unique artifact directory for a new job.
 
@@ -968,12 +1022,7 @@ class ShellctlService:
         self.config.runner_path.chmod(mode | stat.S_IXUSR)
 
     def _runner_script_source(self) -> str:
-        tmux_socket = shlex.quote(str(self.config.tmux_socket))
-        state_dir = shlex.quote(str(self.config.state_dir))
         auth_env = shlex.quote(DEFAULT_AUTH_TOKEN_ENV)
-        shellctl_command = " ".join(
-            shlex.quote(part) for part in self.config.shellctl_command
-        )
         return f"""#!/usr/bin/env bash
 set -uo pipefail
 
@@ -982,6 +1031,16 @@ JOB_ID="$2"
 CWD="$3"
 SCRIPT_PATH="$JOB_DIR/script"
 START_GATE="$JOB_DIR/start-gate"
+RUNNER_EXIT_CODE_PATH="$JOB_DIR/{RUNNER_EXIT_CODE_FILENAME}"
+RUNNER_ENDED_AT_PATH="$JOB_DIR/{RUNNER_ENDED_AT_FILENAME}"
+
+write_atomic() {{
+  local dest="$1"
+  local value="$2"
+  local tmp="${{dest}}.tmp.$$"
+  printf '%s\n' "$value" > "$tmp"
+  mv "$tmp" "$dest"
+}}
 
 while [ ! -e "$START_GATE" ]; do
   sleep 0.05
@@ -1013,8 +1072,9 @@ print(datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z'
 PY
 )"
 
-{shellctl_command} runner-exit --state-dir {state_dir} --job-id "$JOB_ID" --exit-code "$EXIT_CODE" --ended-at "$ENDED_AT"
-env -u TMUX tmux -S {tmux_socket} kill-session -t "shellctl-job-$JOB_ID" >/dev/null 2>&1 || true
+write_atomic "$RUNNER_EXIT_CODE_PATH" "$EXIT_CODE"
+write_atomic "$RUNNER_ENDED_AT_PATH" "$ENDED_AT"
+
 exit "$EXIT_CODE"
 """
 

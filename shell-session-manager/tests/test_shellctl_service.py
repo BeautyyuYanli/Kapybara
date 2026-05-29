@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +25,13 @@ from shell_session_manager.shellctl.server import (
     cli,
     create_app,
 )
+from shell_session_manager.shellctl.server.artifacts import (
+    PIPE_DRAINED_FILENAME,
+    PIPE_FAILED_FILENAME,
+    RUNNER_ENDED_AT_FILENAME,
+    RUNNER_EXIT_CODE_FILENAME,
+)
+from shell_session_manager.shellctl.server.tmux import TmuxController
 from shell_session_manager.shellctl.shared import (
     DEFAULT_AUTH_TOKEN_ENV,
     InputJobRequest,
@@ -104,6 +113,62 @@ async def _create_service(
     await service.initialize_database()
     service._ensure_dir(service.config.jobs_dir)
     return service, fake_tmux
+
+
+async def _create_real_service(
+    tmp_path: Path,
+    *,
+    shellctl_command: tuple[str, ...] | None = None,
+) -> ShellctlService:
+    config = ShellctlConfig(
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "run",
+        shellctl_command=shellctl_command
+        or ShellctlConfig(
+            state_dir=tmp_path / "default-state",
+            runtime_dir=tmp_path / "default-run",
+        ).shellctl_command,
+    )
+    service = ShellctlService(config)
+    await service.initialize()
+    return service
+
+
+def _write_delayed_sanitize_wrapper(
+    tmp_path: Path,
+    *,
+    delay_seconds: float,
+    sanitize_exit_code: int | None = None,
+) -> tuple[str, ...]:
+    wrapper_path = tmp_path / "delayed-sanitize-wrapper.py"
+    wrapper_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "import subprocess",
+                "import sys",
+                "import time",
+                "from pathlib import Path",
+                "",
+                f"REAL = [{sys.executable!r}, '-m', 'shell_session_manager.shellctl.server']",
+                "args = sys.argv[1:]",
+                "if args[:1] == ['sanitize-pty'] and '--ready-file' in args:",
+                "    ready_file = Path(args[args.index('--ready-file') + 1])",
+                "    ready_file.touch()",
+                f"    time.sleep({delay_seconds!r})",
+                (
+                    f"    raise SystemExit({sanitize_exit_code!r})"
+                    if sanitize_exit_code is not None
+                    else ""
+                ),
+                "raise SystemExit(subprocess.run(REAL + args, check=False).returncode)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return (sys.executable, str(wrapper_path))
 
 
 def _capture_serve_config(
@@ -322,6 +387,174 @@ async def test_run_job_happy_path_persists_running_row_and_artifacts(
         offset=0,
     )
     await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_run_job_returns_flushed_output_on_first_terminal_result(
+    tmp_path: Path,
+) -> None:
+    shellctl_command = _write_delayed_sanitize_wrapper(tmp_path, delay_seconds=0.2)
+    service = await _create_real_service(
+        tmp_path,
+        shellctl_command=shellctl_command,
+    )
+
+    try:
+        result = await service.run_job(
+            RunJobRequest(
+                script="printf 'delayed-flush\\n'\n",
+                cwd=str(tmp_path),
+                terminal=TerminalSize(),
+                timeout=3,
+                output_limit=8192,
+                idle_flush_seconds=1,
+            )
+        )
+
+        reread = await service.wait_job(
+            result.job_id,
+            WaitJobRequest(
+                offset=0,
+                timeout=0.001,
+                output_limit=8192,
+                idle_flush_seconds=0.01,
+            ),
+        )
+
+        assert result.done is True
+        assert result.status is JobStatusName.EXITED
+        assert result.exit_code == 0
+        assert result.output == "delayed-flush\n"
+        assert reread.output == "delayed-flush\n"
+        assert reread.offset == result.offset
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_sanitize_failure_does_not_commit_normal_exit(
+    tmp_path: Path,
+) -> None:
+    shellctl_command = _write_delayed_sanitize_wrapper(
+        tmp_path,
+        delay_seconds=0.2,
+        sanitize_exit_code=7,
+    )
+    service = await _create_real_service(
+        tmp_path,
+        shellctl_command=shellctl_command,
+    )
+
+    try:
+        result = await service.run_job(
+            RunJobRequest(
+                script="printf 'missing-output\\n'\n",
+                cwd=str(tmp_path),
+                terminal=TerminalSize(),
+                timeout=3,
+                output_limit=8192,
+                idle_flush_seconds=1,
+            )
+        )
+
+        reread = await service.wait_job(
+            result.job_id,
+            WaitJobRequest(
+                offset=0,
+                timeout=0.001,
+                output_limit=8192,
+                idle_flush_seconds=0.01,
+            ),
+        )
+        job_dir = service.config.jobs_dir / result.job_id
+
+        assert result.done is True
+        assert result.status is not JobStatusName.EXITED
+        assert result.exit_code is None
+        assert result.output == ""
+        assert reread.output == ""
+        assert not (job_dir / PIPE_DRAINED_FILENAME).exists()
+        assert (job_dir / PIPE_FAILED_FILENAME).exists()
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required")
+async def test_uv_quiet_shebang_returns_output_in_first_terminal_result(
+    tmp_path: Path,
+) -> None:
+    service = await _create_real_service(tmp_path)
+
+    try:
+        result = await service.run_job(
+            RunJobRequest(
+                script=(
+                    "#!/usr/bin/env -S uv run --script --quiet\n"
+                    "# /// script\n"
+                    '# requires-python = ">=3.12"\n'
+                    "# dependencies = []\n"
+                    "# ///\n"
+                    'print("hello")\n'
+                ),
+                cwd=str(tmp_path),
+                terminal=TerminalSize(),
+                timeout=10,
+                output_limit=8192,
+                idle_flush_seconds=1,
+            )
+        )
+
+        assert result.done is True
+        assert result.status is JobStatusName.EXITED
+        assert result.exit_code == 0
+        assert result.output == "hello\n"
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+@pytest.mark.parametrize(
+    ("script", "expected_output"),
+    [
+        ("printf 'no-shebang\\n'\n", "no-shebang\n"),
+        ("#!/bin/sh\nprintf 'sh-shebang\\n'\n", "sh-shebang\n"),
+        (
+            "#!/usr/bin/env bash\nprintf 'bash-shebang\\n'\n",
+            "bash-shebang\n",
+        ),
+    ],
+)
+async def test_existing_script_modes_still_return_output(
+    tmp_path: Path,
+    script: str,
+    expected_output: str,
+) -> None:
+    service = await _create_real_service(tmp_path)
+
+    try:
+        result = await service.run_job(
+            RunJobRequest(
+                script=script,
+                cwd=str(tmp_path),
+                terminal=TerminalSize(),
+                timeout=5,
+                output_limit=8192,
+                idle_flush_seconds=1,
+            )
+        )
+
+        assert result.done is True
+        assert result.status is JobStatusName.EXITED
+        assert result.exit_code == 0
+        assert result.output == expected_output
+    finally:
+        await service.shutdown()
 
 
 @pytest.mark.anyio
@@ -554,6 +787,32 @@ async def test_session_disappearing_between_probes_materializes_lost_not_pipe_fa
 
     assert view.status is JobStatusName.LOST
     assert row.reason == "tmux_session_missing"
+    await service.shutdown()
+
+
+@pytest.mark.anyio
+async def test_drained_uncommitted_normal_exit_self_commits_to_exited(
+    tmp_path: Path,
+) -> None:
+    service, _fake_tmux = await _create_service(tmp_path)
+    job_id = "05211530-k7p"
+    await _seed_job(service, job_id=job_id, status=JobStatusName.RUNNING)
+    job_dir = service.config.jobs_dir / job_id
+    (job_dir / RUNNER_EXIT_CODE_FILENAME).write_text("0\n", encoding="utf-8")
+    (job_dir / RUNNER_ENDED_AT_FILENAME).write_text(
+        "2026-05-21T15:30:20Z\n", encoding="utf-8"
+    )
+    (job_dir / PIPE_DRAINED_FILENAME).touch()
+
+    view = await service.get_job_status(job_id)
+    row = await service._get_job_row(job_id)
+
+    assert view.status is JobStatusName.EXITED
+    assert view.done is True
+    assert view.exit_code == 0
+    assert row.status == JobStatusName.EXITED.value
+    assert row.exit_code == 0
+    assert row.ended_at == "2026-05-21T15:30:20Z"
     await service.shutdown()
 
 
@@ -1072,6 +1331,44 @@ def test_serve_cli_reads_auth_token_from_environment(
     config = captured["config"]
     assert isinstance(config, ShellctlConfig)
     assert config.auth_token == "env-token"
+
+
+def test_runner_script_records_completion_metadata_without_direct_runner_exit(
+    tmp_path: Path,
+) -> None:
+    service = ShellctlService(
+        ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run"),
+        tmux=FakeTmuxController(),
+    )
+    source = service._runner_script_source()
+
+    assert RUNNER_EXIT_CODE_FILENAME in source
+    assert RUNNER_ENDED_AT_FILENAME in source
+    assert "write_atomic" in source
+    assert 'mv "$tmp" "$dest"' in source
+    assert re.search(r"\brunner-exit\s+--state-dir\b", source) is None
+    anyio.run(service.shutdown)
+
+
+def test_pipe_command_finalizer_commits_runner_exit_after_drain(tmp_path: Path) -> None:
+    controller = TmuxController(
+        ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run")
+    )
+    source = controller._pipe_command_source(
+        job_id="05211530-k7p",
+        job_dir=tmp_path / "state" / "jobs" / "05211530-k7p",
+        ready_file=tmp_path / "state" / "jobs" / "05211530-k7p" / ".pipe-ready",
+    )
+
+    assert "sanitize-pty" in source
+    assert PIPE_DRAINED_FILENAME in source
+    assert PIPE_FAILED_FILENAME in source
+    assert RUNNER_EXIT_CODE_FILENAME in source
+    assert RUNNER_ENDED_AT_FILENAME in source
+    assert re.search(r"\brunner-exit\b", source) is not None
+    assert 'if [ "$sanitize_status" -eq 0 ]' in source
+    assert source.index("sanitize-pty") < source.index(PIPE_DRAINED_FILENAME)
+    assert source.index(PIPE_DRAINED_FILENAME) < source.index("runner-exit")
 
 
 def test_runner_exit_cli_accepts_runner_option_contract(tmp_path: Path) -> None:

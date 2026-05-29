@@ -16,6 +16,12 @@ from typing import Protocol, cast
 
 import anyio
 
+from shell_session_manager.shellctl.server.artifacts import (
+    pipe_drained_path,
+    pipe_failed_path,
+    runner_ended_at_path,
+    runner_exit_code_path,
+)
 from shell_session_manager.shellctl.server.config import ShellctlConfig
 from shell_session_manager.shellctl.server.errors import ShellctlServerError
 from shell_session_manager.shellctl.shared import (
@@ -148,16 +154,10 @@ class TmuxController:
     async def enable_output_pipe(
         self, *, job_id: str, job_dir: Path, ready_file: Path
     ) -> None:
-        sanitize_command = self._shell_join(
-            (
-                *self._config.shellctl_command,
-                "sanitize-pty",
-                "--ready-file",
-                str(ready_file),
-            )
-        )
-        output_command = (
-            f"{sanitize_command} >> {shlex.quote(str(job_dir / 'output.log'))}"
+        output_command = self._pipe_command_source(
+            job_id=job_id,
+            job_dir=job_dir,
+            ready_file=ready_file,
         )
         result = await self._run_tmux(
             "pipe-pane",
@@ -174,6 +174,55 @@ class TmuxController:
                 result.stderr.decode("utf-8", errors="replace").strip()
                 or f"Failed to attach output pipe for {job_id}",
             )
+
+    def _pipe_command_source(
+        self, *, job_id: str, job_dir: Path, ready_file: Path
+    ) -> str:
+        """Build the tmux `pipe-pane` command that drains and finalizes output.
+
+        For normal exits, the runner now records completion metadata into job
+        artifacts and the pipe finalizer commits `runner-exit` only after
+        `sanitize-pty` reaches EOF and flushes `output.log` successfully.
+        """
+
+        sanitize_command = self._shell_join(
+            (
+                *self._config.shellctl_command,
+                "sanitize-pty",
+                "--ready-file",
+                str(ready_file),
+            )
+        )
+        runner_exit_command = self._shell_join(
+            (
+                *self._config.shellctl_command,
+                "runner-exit",
+                "--state-dir",
+                str(self._config.state_dir),
+                "--job-id",
+                job_id,
+            )
+        )
+        output_path = shlex.quote(str(job_dir / "output.log"))
+        drained_path = shlex.quote(str(pipe_drained_path(job_dir)))
+        failed_path = shlex.quote(str(pipe_failed_path(job_dir)))
+        exit_code_path = shlex.quote(str(runner_exit_code_path(job_dir)))
+        ended_at_path = shlex.quote(str(runner_ended_at_path(job_dir)))
+        return " ; ".join(
+            [
+                f"{sanitize_command} >> {output_path}",
+                "sanitize_status=$?",
+                (
+                    'if [ "$sanitize_status" -eq 0 ]; then '
+                    f": > {drained_path}; "
+                    f"if [ -s {exit_code_path} ] && [ -s {ended_at_path} ]; then "
+                    f'{runner_exit_command} --exit-code "$(cat {exit_code_path})" '
+                    f'--ended-at "$(cat {ended_at_path})"; fi; '
+                    f"else : > {failed_path}; fi"
+                ),
+                'exit "$sanitize_status"',
+            ]
+        )
 
     async def send_input(self, *, job_id: str, text: str) -> None:
         buffer_name = f"shellctl-in-{job_id}"
@@ -286,6 +335,7 @@ def _tmux_target_missing(stderr: str) -> bool:
         or "can't find session" in normalized
         or "no server running" in normalized
         or "failed to connect" in normalized
+        or "server exited unexpectedly" in normalized
     )
 
 
