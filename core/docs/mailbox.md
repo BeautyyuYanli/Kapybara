@@ -2,58 +2,57 @@
 
 ## Overview
 
-`kapy_mailbox` provides a Redis-backed mailbox layer for agent-style runtimes.
+`kapy_mailbox` provides a PostgreSQL-oriented mailbox layer split into three
+public surfaces:
 
-It is designed for workloads where multiple external producers feed messages into a
-shared inbox, while one or more agent loops need to:
+- `PostgresMailboxWriter`: write-only, producer-facing, namespace-explicit
+- `PostgresMailboxInbox`: read/consume only, bound to one namespace
+- `PostgresMailboxMaintenance`: manual and automatic compaction for explicit
+  namespaces
 
-- append messages
-- query recent or unconsumed history
-- mark handled messages as consumed
-- compact old history on a retention policy
+The package is intentionally **not** a broker, consumer-group queue, or
+exactly-once delivery system. It is a mailbox/event-log abstraction with UUIDv7
+ordering, exact-channel filtering, explicit consume state, and retention-based
+cleanup.
 
-The package is intentionally **not** a consumer-group queue or a broker
-replacement. It is closer to a small event-log plus inbox abstraction with
-Redis-friendly query and recovery semantics.
-
-Current implementation package:
-
-- `core/src/kapy_mailbox/`
+The runtime components do not own database lifecycles. For production use,
+`kapy_mailbox` ships `SQLModelPostgresMailboxStorage`, which uses SQLModel table
+definitions on top of SQLAlchemy's async engine with the `psycopg` async
+PostgreSQL driver. Advanced callers may still inject a custom adapter that
+implements the `PostgresMailboxStorage` protocol.
 
 ## Design goals
 
-The mailbox implementation follows these principles:
+1. **Writer, inbox, and maintenance are different objects**
+   - producers do not derive a writer from a namespace-bound inbox
+   - consumers do not receive write methods
+   - destructive maintenance does not live on inbox objects
 
-1. **RedisMailbox is lightweight**
-   - it wraps an injected `redis.asyncio.Redis` client
-   - it does not own the Redis connection lifecycle
-   - it does not start background tasks by itself
-
-2. **Lifecycle objects are separate**
-   - producer supervisor: `MailboxProducerSupervisor`
-   - auto-compactor: `MailboxAutoCompactor`
-
-3. **Ordering uses UUIDv7**
+2. **Ordering uses UUIDv7**
    - every stored message gets a mailbox-assigned UUIDv7 id
    - that id is both the public message id and the mailbox ordering cursor
 
-4. **Incremental reads use pure cursors**
+3. **Incremental reads use pure cursors**
    - `get(..., after_id=id)` only requires a syntactically valid UUIDv7 string
-   - the referenced message does not need to exist in Redis
-   - there is no fallback for missing or compacted ids
+   - the referenced message does not need to still exist in storage
 
-5. **Consume state is explicit**
+4. **Consume state is explicit**
    - `consume()` updates consume metadata
    - reads observe current consume state through `MessageFilter(consumed=...)`
+
+5. **Automatic compaction is explicit**
+   - callers pass the namespace list themselves
+   - retention policy is provided per namespace
+   - there is no automatic namespace discovery
 
 ## Public API surface
 
 ### Main types
 
-- `RedisMailbox`
-- `MailboxWriter`
+- `PostgresMailboxWriter`
+- `PostgresMailboxInbox`
+- `PostgresMailboxMaintenance`
 - `MailboxProducerSupervisor`
-- `MailboxAutoCompactor`
 
 ### Models
 
@@ -72,62 +71,116 @@ The mailbox implementation follows these principles:
 - `InvalidMessageFilterError`
 - `InvalidMessageWindowError`
 - `UnknownMessageError`
+- `NamespaceNotAllowedError`
 - `ProducerAlreadyRegisteredError`
 - `ProducerSupervisorClosedError`
-- `AutoCompactorClosedError`
 
 ## Quick start
 
 ```python
-from kapy_mailbox import MessageFilter, RedisMailbox
-from redis.asyncio import Redis
-
-redis = Redis.from_url("redis://localhost:6379")
-mailbox = RedisMailbox(redis, namespace="agent-main")
-
-await mailbox.put("telegram/chat/1", {"text": "hello"}, producer="telegram")
-
-messages = await mailbox.get(
-    MessageFilter(consumed=False),
-    order="oldest_first",
+from kapy_mailbox import (
+    MessageFilter,
+    PostgresMailboxInbox,
+    PostgresMailboxMaintenance,
+    PostgresMailboxWriter,
+    RetentionPolicy,
+    SQLModelPostgresMailboxStorage,
 )
 
-await mailbox.consume([message.id for message in messages], consumer="agent-loop")
+storage = SQLModelPostgresMailboxStorage.from_dsn(
+    "postgresql://user:password@localhost:5432/kapybara"
+)
+await storage.create_schema()
+
+writer = PostgresMailboxWriter(storage)
+inbox = PostgresMailboxInbox(storage, namespace="agent-main")
+maintenance = PostgresMailboxMaintenance(storage)
+
+await writer.put(
+    namespace="agent-main",
+    channel="telegram/chat/1",
+    payload={"text": "hello"},
+    producer="telegram",
+)
+
+messages = await inbox.get(MessageFilter(consumed=False), order="oldest_first")
+await inbox.consume([message.id for message in messages], consumer="agent-loop")
+
+await maintenance.compact(
+    namespace="agent-main",
+    retention=RetentionPolicy(max_age=timedelta(days=3)),
+)
+
+await storage.dispose()
 ```
 
-## Incremental polling
+## Schema setup
 
-`get()` supports resumable polling via `after_id`.
+`SQLModelPostgresMailboxStorage.create_schema()` creates the tables and indexes
+used by the mailbox:
+
+- `mailbox_messages`
+- `mailbox_compaction_locks`
+
+The timestamp columns used for message ordering and compaction leases are created
+as timezone-aware PostgreSQL timestamps so the mailbox's UTC datetime semantics
+round-trip correctly through the database.
+
+Applications should run it during installation, migration, or startup before
+serving mailbox traffic. The adapter does not auto-create schema during normal
+writer/inbox/maintenance operations.
+
+## Writer semantics
+
+`PostgresMailboxWriter` is namespace-agnostic and write-only.
 
 ```python
-batch = await mailbox.get(after_id=last_seen_id, limit=50)
-if batch:
-    last_seen_id = batch[-1].id
+await writer.put(
+    namespace="agent-a",
+    channel="telegram/chat/1",
+    payload={"text": "hello"},
+    producer="telegram",
+)
 ```
-
-Common migration patterns from the removed watch API:
-
-- replay history: start with `after_id = None`
-- future-only polling: seed `after_id` from the current newest message before the
-  loop
 
 ```python
-# Replay from current history.
-after_id = None
-
-# Or skip backlog and only poll future arrivals.
-latest = await mailbox.get(limit=1, order="newest_first")
-after_id = latest[0].id if latest else None
-
-while True:
-    batch = await mailbox.get(after_id=after_id, limit=50)
-    if batch:
-        after_id = batch[-1].id
-        ...
+await writer.put_many(
+    namespace="agent-b",
+    items=[
+        MessageInput(channel="telegram/chat/1", payload={"text": "a"}),
+        MessageInput(channel="telegram/chat/2", payload={"text": "b"}),
+    ],
+    producer="telegram",
+)
 ```
 
-`after_id` only needs to be a valid UUIDv7 string. It can refer to a message that
-no longer exists.
+Important rules:
+
+- `namespace` is required on every write
+- one `put_many(...)` call targets exactly one namespace
+- `allowed_namespaces=None` allows any namespace
+- when an allow-list is configured, disallowed targets raise
+  `NamespaceNotAllowedError` before any storage mutation
+- the writer intentionally does not expose `get`, `consume`, or `compact`
+
+## Inbox semantics
+
+`PostgresMailboxInbox` is bound to one namespace.
+
+```python
+inbox = PostgresMailboxInbox(storage, namespace="agent-a")
+messages = await inbox.get(MessageFilter(consumed=False), after_id=cursor, limit=50)
+result = await inbox.consume([message.id for message in messages], consumer="agent")
+```
+
+Important rules:
+
+- default `limit=100`
+- pass `limit=None` explicitly for an unbounded scan
+- `after_id` is a UUIDv7 ordering cursor
+- `channel` filtering is exact, not prefix-based
+- `strict=True` on `consume()` raises `UnknownMessageError` for missing ids
+- inboxes do not expose `put`, `put_many`, `writer`, or `compact`
 
 ## Message model
 
@@ -146,8 +199,7 @@ configured serializer.
 
 ## Channels and filtering
 
-Mailbox channels reuse the existing slash-separated channel validation
-conventions from the `k` package:
+Mailbox channels reuse the existing slash-separated channel validation rules:
 
 - slash-separated hierarchy
 - no empty segments
@@ -166,123 +218,78 @@ Examples:
 - `until`
 - `producer`
 
-Mailbox filtering treats `channel` as one exact identifier, not a subtree root.
-That means `telegram/chat/1` and `telegram/chat/1/thread/10` are distinct
-mailbox channels for query purposes even though both strings use slash-separated
-formatting.
-
-## Read semantics
-
-Signature:
-
-```python
-await mailbox.get(filter=None, after_id=None, limit=100, order="oldest_first")
-```
-
-Important rules:
-
-- default `limit=100`
-- pass `limit=None` explicitly for an unbounded scan
-- `after_id` is a UUIDv7 ordering cursor
-- results are immutable snapshots
-
-## Consumption semantics
-
-`consume()` is explicit and idempotent.
-
-```python
-result = await mailbox.consume(ids, consumer="agent-loop", strict=False)
-```
-
-The returned `ConsumeResult` classifies ids into:
-
-- `consumed`
-- `already_consumed`
-- `not_found`
-
-With `strict=True`, unknown ids raise `UnknownMessageError` instead of being left
-in `not_found`.
-
-`consume()` does **not** delete messages.
-
-## Producer-facing writer
-
-`MailboxWriter` is a write-only facade intended for supervised producers.
-
-It exposes:
-
-- `put(...)`
-- `put_many(...)`
-
-It intentionally does not expose `get`, `consume`, or `compact`.
+Filtering treats `channel` as one exact identifier, not a subtree root.
 
 ## Producer supervision
 
-`MailboxProducerSupervisor` runs producers in restartable supervision loops.
-
-- producers are registered by name
-- `start()` launches supervisor tasks
-- `stop()` prevents further restarts and waits for shutdown
-- producer return or exception is treated as a failure/restart condition
-- restart uses bounded exponential backoff
-
-## Retention and compaction
-
-Retention policy defaults:
-
-- `max_messages=None`
-- `max_age=timedelta(days=3)`
-- `keep_unconsumed=False`
-
-This means old unconsumed messages may be compacted unless explicitly protected.
-
-### Manual compaction
+`MailboxProducerSupervisor` still supervises long-running producers, but it now
+accepts a `PostgresMailboxWriter` directly.
 
 ```python
-result = await mailbox.compact()
+writer = PostgresMailboxWriter(storage)
+supervisor = MailboxProducerSupervisor(writer)
 ```
 
-Compaction removes retained-out messages from:
+Producer return or exception is treated as a failure/restart condition, and
+restart uses bounded exponential backoff.
 
-- message storage
-- timeline index
-- exact channel indexes (`mailbox:{namespace}:channel:{quote(channel)}`)
-- unconsumed index
-- consumed index
-- consumed-info hash
+## Manual compaction
 
-### Automatic compaction
+Compaction is owned by `PostgresMailboxMaintenance`.
 
-`MailboxAutoCompactor` periodically calls `mailbox.compact()`.
+```python
+result = await maintenance.compact(
+    namespace="agent-a",
+    retention=RetentionPolicy(max_age=timedelta(days=3)),
+)
+```
 
-Default settings:
+Compaction only affects the explicit namespace passed to the call.
 
-- interval: 15 minutes
-- jitter: ±10%
-- optional Redis lock enabled
-- lock TTL: 5 minutes
-- lock renew interval: 60 seconds
+## Automatic compaction
 
-If lock renewal is lost, the current compaction round finishes only the current
-delete batch and then stops that round.
+Automatic compaction has two public entry points and no standalone
+`MailboxAutoCompactor` object.
 
-## Concurrency model
+### Context-managed background timer
 
-Multiple `RedisMailbox` instances may point at the same Redis namespace.
+```python
+retention_policies = {
+    "agent-a": RetentionPolicy(max_age=timedelta(days=3)),
+    "agent-b": RetentionPolicy(max_messages=1000),
+}
 
-This is normal for:
+async with maintenance.auto_compacting(
+    namespaces=["agent-a", "agent-b"],
+    retention_provider=lambda namespace: retention_policies.get(namespace),
+    interval=timedelta(minutes=15),
+):
+    await run_application_until_shutdown()
+```
 
-- separate producer and consumer processes
-- separate UI or debug readers
-- horizontally scaled workers performing polling reads
+Entering the context starts one background timer task. Exiting the context is
+the only public stop signal.
 
-## Redis client lifecycle and errors
+### Blocking forever runner
 
-`RedisMailbox` does not own the Redis client lifecycle.
+```python
+await maintenance.run_auto_compact_forever(
+    namespaces=["agent-a", "agent-b"],
+    retention_provider=lambda namespace: retention_policies.get(namespace),
+    interval=timedelta(minutes=15),
+)
+```
 
-- caller creates the `redis.asyncio.Redis` client
-- caller closes it
-- mailbox methods surface Redis errors rather than silently swallowing them
+This blocks in the current task until that task is cancelled.
+
+### Automatic compaction rules
+
+- only the explicit `namespaces=[...]` list is iterated
+- the retention provider is queried for each namespace on each tick
+- provider returning `None` skips that namespace
+- a lock conflict or failure in one namespace does not stop others
+- no cross-namespace compact operation exists; each namespace is compacted
+  independently
 
 ## Suggested usage boundaries
 
@@ -293,9 +300,11 @@ Use this mailbox when you need:
 - incremental polling via UUIDv7 cursor
 - explicit consume state
 - simple supervised producers
+- retention-based cleanup over explicit namespace lists
 
 Do not treat it as:
 
 - a consumer-group queue
 - a distributed exactly-once system
 - a replacement for Kafka/RabbitMQ-style broker semantics
+- a cross-namespace read or consume API

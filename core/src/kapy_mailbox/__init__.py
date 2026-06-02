@@ -1,14 +1,15 @@
-"""Redis-backed agent mailbox primitives.
+"""PostgreSQL-backed agent mailbox primitives.
 
 This package implements the proposal in
-`.context/proposals/260515-1659-agent-mailbox-design.md` as a lightweight,
-Redis-client-compatible mailbox layer. `RedisMailbox` owns no Redis lifecycle or
-background tasks; producer supervision and automatic compaction are separate
-objects.
+`.context/proposals/260521-0207-split-mailbox-read-write.md` as a split mailbox
+layer with separate writer, inbox, and maintenance APIs. Mailbox components own
+no database lifecycle; producer supervision is separate, and automatic
+compaction is exposed through explicit context-managed or blocking entry points.
+`SQLModelPostgresMailboxStorage` is the bundled production adapter for
+SQLModel-backed PostgreSQL persistence over psycopg's async driver.
 """
 
 from kapy_mailbox.exceptions import (
-    AutoCompactorClosedError,
     InvalidChannelError,
     InvalidMessageFilterError,
     InvalidMessageWindowError,
@@ -30,16 +31,18 @@ from kapy_mailbox.models import (
     RestartPolicy,
     RetentionPolicy,
 )
-from kapy_mailbox.redis import (
-    MailboxAutoCompactor,
+from kapy_mailbox.postgres import (
     MailboxProducerSupervisor,
-    MailboxWriter,
-    RedisMailbox,
+    NamespaceRetentionProvider,
+    PostgresMailboxInbox,
+    PostgresMailboxMaintenance,
+    PostgresMailboxStorage,
+    PostgresMailboxWriter,
+    SQLModelPostgresMailboxStorage,
 )
 from kapy_mailbox.serialization import JSONMessageSerializer, MessageSerializer
 
 __all__ = [
-    "AutoCompactorClosedError",
     "CancellationToken",
     "CompactionResult",
     "ConsumeResult",
@@ -47,21 +50,24 @@ __all__ = [
     "InvalidMessageFilterError",
     "InvalidMessageWindowError",
     "JSONMessageSerializer",
-    "MailboxAutoCompactor",
     "MailboxProducerSupervisor",
-    "MailboxWriter",
     "Message",
     "MessageFilter",
     "MessageInput",
     "MessageSerializer",
     "NamespaceNotAllowedError",
+    "NamespaceRetentionProvider",
     "PayloadSerializationError",
+    "PostgresMailboxInbox",
+    "PostgresMailboxMaintenance",
+    "PostgresMailboxStorage",
+    "PostgresMailboxWriter",
     "ProducerAlreadyRegisteredError",
     "ProducerHandle",
     "ProducerStatus",
     "ProducerSupervisorClosedError",
-    "RedisMailbox",
     "RestartPolicy",
     "RetentionPolicy",
+    "SQLModelPostgresMailboxStorage",
     "UnknownMessageError",
 ]

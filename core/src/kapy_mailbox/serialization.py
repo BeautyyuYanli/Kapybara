@@ -2,8 +2,8 @@
 
 The default serializer uses Pydantic v2 as the storage boundary validator.
 Payloads must validate as `JsonValue`, and stored mailbox records are encoded as
-Pydantic models so Redis data stays JSON-inspectable without hand-written schema
-parsing.
+Pydantic models so PostgreSQL text/json columns stay JSON-inspectable without
+hand-written schema parsing.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _normalize_datetime(value: datetime) -> datetime:
 
 
 class _StoredMessageModel(BaseModel):
-    """Serialized mailbox message record stored in Redis."""
+    """Serialized mailbox message record stored in mailbox persistence."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -37,7 +37,7 @@ class _StoredMessageModel(BaseModel):
 
 
 class _ConsumedInfoModel(BaseModel):
-    """Serialized consume-state side record stored in Redis."""
+    """Serialized consume-state side record stored in mailbox persistence."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -49,7 +49,7 @@ _JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
 
 
 class MessageSerializer(Protocol):
-    """Encodes payloads and stored message records for Redis persistence."""
+    """Encodes payloads and stored message records for mailbox persistence."""
 
     def normalize_payload(self, payload: JsonValue) -> JsonValue:
         """Validate and deep-copy a payload into a JSON-compatible value."""
@@ -57,7 +57,7 @@ class MessageSerializer(Protocol):
         ...
 
     def dump_message(self, message: Message) -> str:
-        """Serialize a message record for the Redis message hash."""
+        """Serialize a message record for durable mailbox storage."""
 
         ...
 

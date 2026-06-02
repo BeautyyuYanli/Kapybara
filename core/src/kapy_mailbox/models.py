@@ -1,8 +1,8 @@
-"""Shared value objects for the Redis-backed mailbox.
+"""Shared value objects for the PostgreSQL mailbox.
 
 These models hold user-facing mailbox contracts and lightweight lifecycle state.
-Validation stays close to the data shape so `RedisMailbox` and supervisor
-helpers can share one set of invariants.
+Validation stays close to the data shape so the split writer/inbox/maintenance
+APIs and producer supervisor can share one set of invariants.
 """
 
 from __future__ import annotations

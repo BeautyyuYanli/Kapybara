@@ -1,4 +1,4 @@
-"""Domain exceptions for the Redis-backed mailbox."""
+"""Domain exceptions for the PostgreSQL mailbox."""
 
 from __future__ import annotations
 
@@ -41,7 +41,3 @@ class NamespaceNotAllowedError(MailboxError):
 
 class ProducerSupervisorClosedError(MailboxError):
     """Raised when a stopped supervisor is used again."""
-
-
-class AutoCompactorClosedError(MailboxError):
-    """Raised when a stopped auto-compactor is used again."""
