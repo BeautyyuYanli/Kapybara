@@ -512,11 +512,28 @@ async def test_send_input_reaches_real_job_stdin_after_env_bootstrap(
             ),
         )
 
+        output_after_input = result.output
+        final = result
+        if not final.done:
+            # `send_input()` shares wait semantics with `wait_job()`: it may
+            # return after the post-input output flushes but before tmux exit
+            # artifacts have materialized into a terminal DB status on slower CI.
+            final = await service.wait_job(
+                initial.job_id,
+                WaitJobRequest(
+                    offset=result.offset,
+                    timeout=5,
+                    output_limit=8192,
+                    idle_flush_seconds=0.01,
+                ),
+            )
+            output_after_input += final.output
+
         assert ready_window.done is False
-        assert result.done is True
-        assert result.status is JobStatusName.EXITED
-        assert result.exit_code == 0
-        assert result.output.endswith("got:hello from stdin\n")
+        assert final.done is True
+        assert final.status is JobStatusName.EXITED
+        assert final.exit_code == 0
+        assert output_after_input.endswith("got:hello from stdin\n")
     finally:
         await service.shutdown()
 
