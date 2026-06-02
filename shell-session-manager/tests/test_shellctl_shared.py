@@ -4,9 +4,13 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from shell_session_manager.shellctl.shared import (
     JOB_ID_ALPHABET,
     PtySanitizer,
+    RunJobRequest,
     generate_job_id,
     read_output_window,
     sanitize_pty_output,
@@ -112,3 +116,19 @@ def test_sanitize_pty_stream_flushes_incrementally() -> None:
 
     assert stdout.getvalue() == b"ready\nnext\n"
     assert stdout.flush_count >= 2
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({"": "x"}, "non-empty"),
+        ({"A=B": "x"}, "must not contain '='"),
+        ({"A\x00B": "x"}, "must not contain NUL"),
+        ({"A": "x\x00y"}, "must not contain NUL"),
+    ],
+)
+def test_run_job_request_rejects_invalid_env_entries(
+    env: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        RunJobRequest(script="printf ready\n", env=env)

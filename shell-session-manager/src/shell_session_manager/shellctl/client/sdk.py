@@ -96,14 +96,20 @@ class ShellctlClient:
         script: str,
         *,
         cwd: str | None = None,
+        env: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         terminal: TerminalSize | None = None,
     ) -> JobResult:
-        """Create a new job and wait for initial output or completion."""
+        """Create a new job and wait for initial output or completion.
+
+        `cwd` and `env` preset the script's working directory and environment
+        overlay on the server side.
+        """
 
         payload = RunJobRequest(
             script=script,
             cwd=cwd,
+            env=env,
             terminal=terminal,
             timeout=timeout,
             output_limit=self.output_limit,

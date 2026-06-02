@@ -39,7 +39,12 @@ async def test_shellctl_client_run_injects_headers_and_instance_defaults(
         idle_flush_seconds=0.25,
         transport=transport,
     ) as client:
-        await client.run("printf ready\\n", cwd="/tmp", timeout=12)
+        await client.run(
+            "printf ready\\n",
+            cwd="/tmp",
+            env={"HELLO": "world"},
+            timeout=12,
+        )
 
     assert captured["method"] == "POST"
     assert captured["path"] == "/v1/jobs/run"
@@ -47,6 +52,7 @@ async def test_shellctl_client_run_injects_headers_and_instance_defaults(
     assert captured["json"] == {
         "script": "printf ready\\n",
         "cwd": "/tmp",
+        "env": {"HELLO": "world"},
         "timeout": 12.0,
         "output_limit": 4096,
         "idle_flush_seconds": 0.25,

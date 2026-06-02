@@ -9,6 +9,7 @@ This module owns the long-lived job lifecycle rules: artifact creation,
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import shutil
 import stat
@@ -24,8 +25,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlmodel import SQLModel
 
 from shell_session_manager.shellctl.server.artifacts import (
+    JOB_ENV_FILENAME,
     RUNNER_ENDED_AT_FILENAME,
     RUNNER_EXIT_CODE_FILENAME,
+    job_env_path,
     pipe_drained_path,
     pipe_failed_path,
     runner_ended_at_path,
@@ -148,7 +151,8 @@ class ShellctlService:
         """Create a tmux-backed job and wait for its initial result window.
 
         Side effects:
-        - allocates `jobs/<job_id>/` and writes `script` / `output.log`
+        - allocates `jobs/<job_id>/` and writes `script`, `.job-env.json`, and
+          `output.log`
         - inserts a `jobs` row into SQLite, then conditionally transitions it
           through `created -> starting -> running`
         - creates a dedicated tmux session, installs `pipe-pane`, waits for the
@@ -168,6 +172,7 @@ class ShellctlService:
         """
 
         cwd = self._resolve_cwd(request.cwd)
+        env = self._resolve_env(request.env)
         terminal = request.terminal or TerminalSize(
             cols=self.config.default_terminal_cols,
             rows=self.config.default_terminal_rows,
@@ -183,6 +188,10 @@ class ShellctlService:
                 script_path = candidate_job_dir / "script"
                 output_path = candidate_job_dir / "output.log"
                 script_path.write_text(request.script, encoding="utf-8")
+                job_env_path(candidate_job_dir).write_text(
+                    json.dumps(env, ensure_ascii=False),
+                    encoding="utf-8",
+                )
                 output_path.touch()
                 row = JobRow(
                     job_id=candidate_job_id,
@@ -1000,6 +1009,17 @@ class ShellctlService:
             )
         return cwd
 
+    def _resolve_env(self, raw_env: dict[str, str] | None) -> dict[str, str]:
+        """Return a detached environment overlay for the generated runner.
+
+        `RunJobRequest` validates names/values before the service sees them.
+        The overlay augments the runner's inherited environment after shellctl
+        scrubs its own control variables, so explicit request values can be used
+        without replacing ambient entries like `PATH`.
+        """
+
+        return dict(raw_env or {})
+
     def _validate_offset(self, output_path: Path, offset: int) -> None:
         size = output_path.stat().st_size if output_path.exists() else 0
         if offset > size:
@@ -1022,7 +1042,59 @@ class ShellctlService:
         self.config.runner_path.chmod(mode | stat.S_IXUSR)
 
     def _runner_script_source(self) -> str:
+        """Build the bash runner installed into the shellctl runtime directory.
+
+        The wrapper still handles gate waiting and exit metadata in bash, but it
+        delegates launch setup to Python so per-job env overlays can be loaded
+        from JSON without shell-escaping arbitrary values into `export`
+        statements. The Python helper then `exec`s the target process instead of
+        waiting on it, which keeps `SIGINT` behavior identical to running the
+        script directly in the tmux pane. The bootstrap uses `python -c ...`
+        instead of a stdin-fed heredoc so the exec'd job still inherits the tmux
+        pane's PTY on fd 0 and can receive later `send_input()` data.
+        """
+
         auth_env = shlex.quote(DEFAULT_AUTH_TOKEN_ENV)
+        bootstrap_source = shlex.quote(
+            """
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+script_path = Path(sys.argv[1])
+cwd = sys.argv[2]
+env_path = Path(sys.argv[3])
+
+env = os.environ.copy()
+if env_path.exists():
+    env.update(json.loads(env_path.read_text(encoding="utf-8")))
+
+try:
+    os.chdir(cwd)
+except OSError:
+    raise SystemExit(111)
+
+with script_path.open("r", encoding="utf-8") as handle:
+    first_line = handle.readline()
+
+if first_line.startswith("#!"):
+    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
+    argv = [str(script_path)]
+else:
+    argv = ["sh", str(script_path)]
+
+try:
+    os.execvpe(argv[0], argv, env)
+except FileNotFoundError as exc:
+    print(f"{argv[0]}: {exc.strerror}", file=sys.stderr)
+    raise SystemExit(127) from exc
+except OSError as exc:
+    print(f"{argv[0]}: {exc.strerror}", file=sys.stderr)
+    raise SystemExit(126) from exc
+            """.strip()
+        )
         return f"""#!/usr/bin/env bash
 set -uo pipefail
 
@@ -1030,6 +1102,7 @@ JOB_DIR="$1"
 JOB_ID="$2"
 CWD="$3"
 SCRIPT_PATH="$JOB_DIR/script"
+ENV_PATH="$JOB_DIR/{JOB_ENV_FILENAME}"
 START_GATE="$JOB_DIR/start-gate"
 RUNNER_EXIT_CODE_PATH="$JOB_DIR/{RUNNER_EXIT_CODE_FILENAME}"
 RUNNER_ENDED_AT_PATH="$JOB_DIR/{RUNNER_ENDED_AT_FILENAME}"
@@ -1053,18 +1126,8 @@ unset SHELLCTL_TMUX_SOCKET
 unset SHELLCTL_RUNNER
 unset {auth_env}
 
-if cd "$CWD"; then
-  if IFS= read -r FIRST_LINE < "$SCRIPT_PATH" && [[ "$FIRST_LINE" == '#!'* ]]; then
-    chmod +x "$SCRIPT_PATH"
-    "$SCRIPT_PATH"
-    EXIT_CODE=$?
-  else
-    sh "$SCRIPT_PATH"
-    EXIT_CODE=$?
-  fi
-else
-  EXIT_CODE=111
-fi
+{shlex.quote(sys.executable)} -c {bootstrap_source} "$SCRIPT_PATH" "$CWD" "$ENV_PATH"
+EXIT_CODE=$?
 
 ENDED_AT="$({shlex.quote(sys.executable)} - <<'PY'
 from datetime import UTC, datetime

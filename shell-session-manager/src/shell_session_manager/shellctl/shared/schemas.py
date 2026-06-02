@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from shell_session_manager.shellctl.shared.constants import (
     DEFAULT_HEALTH_STATUS,
@@ -128,10 +128,16 @@ class ErrorResponse(ShellctlModel):
 
 
 class RunJobRequest(ShellctlModel):
-    """HTTP request body for `POST /v1/jobs/run`."""
+    """HTTP request body for `POST /v1/jobs/run`.
+
+    `env` augments the runner's inherited process environment instead of
+    replacing it, so callers can preset script-local variables without losing
+    ambient values such as `PATH`.
+    """
 
     script: str
     cwd: str | None = None
+    env: dict[str, str] | None = None
     terminal: TerminalSize | None = None
     timeout: float = Field(
         default=DEFAULT_TIMEOUT_SECONDS, gt=0, le=MAX_WAIT_TIMEOUT_SECONDS
@@ -140,6 +146,30 @@ class RunJobRequest(ShellctlModel):
         default=DEFAULT_OUTPUT_LIMIT_BYTES, ge=1, le=MAX_OUTPUT_LIMIT_BYTES
     )
     idle_flush_seconds: float = Field(default=DEFAULT_IDLE_FLUSH_SECONDS, ge=0, le=30)
+
+    @field_validator("env")
+    @classmethod
+    def _validate_env(cls, env: dict[str, str] | None) -> dict[str, str] | None:
+        """Reject env entries that cannot be represented in `execve`.
+
+        shellctl applies `env` as a process environment overlay, so validation
+        follows the low-level `NAME=value` constraints instead of shell variable
+        naming rules: names must be non-empty and cannot contain `=` or NUL,
+        while values cannot contain NUL.
+        """
+
+        if env is None:
+            return None
+        for name, value in env.items():
+            if not name:
+                raise ValueError("env names must be non-empty")
+            if "=" in name:
+                raise ValueError(f"env name must not contain '=': {name!r}")
+            if "\x00" in name:
+                raise ValueError(f"env name must not contain NUL: {name!r}")
+            if "\x00" in value:
+                raise ValueError(f"env value must not contain NUL: {name!r}")
+        return env
 
 
 class WaitJobRequest(ShellctlModel):

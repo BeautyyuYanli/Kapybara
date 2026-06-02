@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import re
 import shutil
@@ -26,10 +27,12 @@ from shell_session_manager.shellctl.server import (
     create_app,
 )
 from shell_session_manager.shellctl.server.artifacts import (
+    JOB_ENV_FILENAME,
     PIPE_DRAINED_FILENAME,
     PIPE_FAILED_FILENAME,
     RUNNER_ENDED_AT_FILENAME,
     RUNNER_EXIT_CODE_FILENAME,
+    job_env_path,
 )
 from shell_session_manager.shellctl.server.tmux import TmuxController
 from shell_session_manager.shellctl.shared import (
@@ -352,6 +355,7 @@ async def test_run_job_happy_path_persists_running_row_and_artifacts(
         RunJobRequest(
             script="printf ready\n",
             cwd=str(tmp_path),
+            env={"HELLO": "world", "UNICODE": "盐粒"},
             terminal=TerminalSize(cols=100, rows=40),
             timeout=0.01,
             output_limit=8192,
@@ -372,6 +376,10 @@ async def test_run_job_happy_path_persists_running_row_and_artifacts(
     assert row.output_path == f"jobs/{result.job_id}/output.log"
     assert row.started_at is not None
     assert (job_dir / "script").exists()
+    assert json.loads(job_env_path(job_dir).read_text(encoding="utf-8")) == {
+        "HELLO": "world",
+        "UNICODE": "盐粒",
+    }
     assert (job_dir / "output.log").exists()
     assert (job_dir / "start-gate").exists()
     assert job_session_name(result.job_id) in fake_tmux.sessions
@@ -387,6 +395,188 @@ async def test_run_job_happy_path_persists_running_row_and_artifacts(
         offset=0,
     )
     await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_run_job_env_overlay_is_visible_without_replacing_inherited_env(
+    tmp_path: Path,
+) -> None:
+    service = await _create_real_service(tmp_path)
+
+    try:
+        result = await service.run_job(
+            RunJobRequest(
+                script=(
+                    "python3 - <<'PY'\n"
+                    "import os\n"
+                    "print(os.environ['SHELLCTL_PRESET'])\n"
+                    "print('PATH' in os.environ)\n"
+                    "PY\n"
+                ),
+                cwd=str(tmp_path),
+                env={"SHELLCTL_PRESET": "from-client"},
+                terminal=TerminalSize(),
+                timeout=5,
+                output_limit=8192,
+                idle_flush_seconds=1,
+            )
+        )
+
+        assert result.done is True
+        assert result.status is JobStatusName.EXITED
+        assert result.exit_code == 0
+        assert result.output == "from-client\nTrue\n"
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_run_job_env_overlay_overrides_inherited_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SHELLCTL_PRESET", "parent")
+    service = await _create_real_service(tmp_path)
+
+    try:
+        result = await service.run_job(
+            RunJobRequest(
+                script=(
+                    "python3 - <<'PY'\n"
+                    "import os\n"
+                    "print(os.environ['SHELLCTL_PRESET'])\n"
+                    "PY\n"
+                ),
+                cwd=str(tmp_path),
+                env={"SHELLCTL_PRESET": "from-client"},
+                terminal=TerminalSize(),
+                timeout=5,
+                output_limit=8192,
+                idle_flush_seconds=1,
+            )
+        )
+
+        assert result.done is True
+        assert result.status is JobStatusName.EXITED
+        assert result.exit_code == 0
+        assert result.output == "from-client\n"
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_send_input_reaches_real_job_stdin_after_env_bootstrap(
+    tmp_path: Path,
+) -> None:
+    service = await _create_real_service(tmp_path)
+
+    try:
+        initial = await service.run_job(
+            RunJobRequest(
+                script=(
+                    "printf 'ready\\n'\n"
+                    "IFS= read -r line\n"
+                    "printf 'got:%s\\n' \"$line\"\n"
+                ),
+                cwd=str(tmp_path),
+                terminal=TerminalSize(),
+                timeout=5,
+                output_limit=8192,
+                idle_flush_seconds=0.01,
+            )
+        )
+
+        ready_window = initial
+        if ready_window.output == "":
+            ready_window = await service.wait_job(
+                initial.job_id,
+                WaitJobRequest(
+                    offset=initial.offset,
+                    timeout=1,
+                    output_limit=8192,
+                    idle_flush_seconds=0.01,
+                ),
+            )
+
+        result = await service.send_input(
+            initial.job_id,
+            InputJobRequest(
+                text="hello from stdin\n",
+                offset=ready_window.offset,
+                timeout=1,
+                output_limit=8192,
+                idle_flush_seconds=0.01,
+            ),
+        )
+
+        assert ready_window.done is False
+        assert result.done is True
+        assert result.status is JobStatusName.EXITED
+        assert result.exit_code == 0
+        assert result.output.endswith("got:hello from stdin\n")
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+async def test_terminated_job_does_not_emit_python_wrapper_traceback(
+    tmp_path: Path,
+) -> None:
+    service = await _create_real_service(tmp_path)
+
+    try:
+        initial = await service.run_job(
+            RunJobRequest(
+                script=(
+                    "trap 'exit 130' INT\n"
+                    "printf 'ready\\n'\n"
+                    "while :; do sleep 1; done\n"
+                ),
+                cwd=str(tmp_path),
+                terminal=TerminalSize(),
+                timeout=5,
+                output_limit=8192,
+                idle_flush_seconds=0.01,
+            )
+        )
+
+        ready_window = initial
+        if ready_window.output == "":
+            ready_window = await service.wait_job(
+                initial.job_id,
+                WaitJobRequest(
+                    offset=initial.offset,
+                    timeout=1,
+                    output_limit=8192,
+                    idle_flush_seconds=0.01,
+                ),
+            )
+        assert ready_window.done is False
+
+        terminated = await service.terminate_job(
+            initial.job_id,
+            TerminateJobRequest(grace_seconds=0.2),
+        )
+        final = await service.wait_job(
+            initial.job_id,
+            WaitJobRequest(
+                offset=ready_window.offset,
+                timeout=1,
+                output_limit=8192,
+                idle_flush_seconds=0.01,
+            ),
+        )
+
+        assert terminated.status is JobStatusName.TERMINATED
+        assert final.done is True
+        assert "KeyboardInterrupt" not in final.output
+        assert "Traceback (most recent call last)" not in final.output
+    finally:
+        await service.shutdown()
 
 
 @pytest.mark.anyio
@@ -1342,6 +1532,7 @@ def test_runner_script_records_completion_metadata_without_direct_runner_exit(
     )
     source = service._runner_script_source()
 
+    assert JOB_ENV_FILENAME in source
     assert RUNNER_EXIT_CODE_FILENAME in source
     assert RUNNER_ENDED_AT_FILENAME in source
     assert "write_atomic" in source
