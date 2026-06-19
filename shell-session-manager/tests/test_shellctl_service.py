@@ -15,6 +15,8 @@ from pathlib import Path
 import anyio
 import httpx
 import pytest
+from typer.testing import CliRunner
+
 import shell_session_manager.shellctl.server.service as server_service_module
 import shell_session_manager.shellctl.shared as shared_module
 from shell_session_manager.shellctl.server import (
@@ -48,7 +50,6 @@ from shell_session_manager.shellctl.shared import (
     job_pane_target,
     job_session_name,
 )
-from typer.testing import CliRunner
 
 server_cli_module = importlib.import_module("shell_session_manager.shellctl.server.cli")
 
