@@ -1,8 +1,13 @@
-"""Typer CLI entrypoints for shellctl server package."""
+"""Typer CLI entrypoints for the shellctl server package.
+
+The server CLI only exposes commands that need the FastAPI/SQLite runtime.
+The PTY sanitizer now lives in `shell_session_manager.shellctl.sanitize_pty`
+as a separate lightweight module so tmux pipes do not have a second, heavier
+entry path to maintain.
+"""
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import anyio
@@ -17,7 +22,6 @@ from shell_session_manager.shellctl.shared import (
     DEFAULT_GC_FINISHED_JOB_RETENTION_SECONDS,
     DEFAULT_GC_INTERVAL_SECONDS,
     default_state_dir,
-    sanitize_pty_stream,
 )
 
 cli = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
@@ -52,17 +56,6 @@ def serve_command(
         gc_finished_job_retention_seconds=gc_finished_job_retention_seconds,
     )
     uvicorn.run(create_app(config), host=host, port=port, log_level="info")
-
-
-@cli.command("sanitize-pty")
-def sanitize_pty_command(
-    ready_file: Path | None = typer.Option(None, "--ready-file"),
-) -> None:
-    """Read raw PTY bytes from stdin and write sanitized UTF-8 text to stdout."""
-
-    if ready_file is not None:
-        ready_file.touch()
-    sanitize_pty_stream(sys.stdin.buffer, sys.stdout.buffer)
 
 
 @cli.command("runner-exit")
@@ -107,6 +100,5 @@ __all__ = [
     "cli",
     "main",
     "runner_exit_command",
-    "sanitize_pty_command",
     "serve_command",
 ]

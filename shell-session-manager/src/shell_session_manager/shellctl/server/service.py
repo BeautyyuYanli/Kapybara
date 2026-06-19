@@ -30,6 +30,7 @@ from shell_session_manager.shellctl.server.artifacts import (
     RUNNER_EXIT_CODE_FILENAME,
     job_env_path,
     pipe_drained_path,
+    pipe_error_log_path,
     pipe_failed_path,
     runner_ended_at_path,
     runner_exit_code_path,
@@ -559,10 +560,10 @@ class ShellctlService:
     ) -> None:
         """Persist a drained normal-exit fact into SQLite.
 
-        The usual caller is the tmux pipe finalizer after `sanitize-pty` has
-        reached EOF and flushed `output.log`. `_materialize_status_view()` may
-        also call this as a recovery path when `.pipe-drained` plus the normal
-        exit metadata files exist but SQLite is still non-terminal. The
+        The usual caller is the tmux pipe finalizer after the lightweight PTY
+        sanitizer reaches EOF and flushes `output.log`. `_materialize_status_view()`
+        may also call this as a recovery path when `.pipe-drained` plus the
+        normal exit metadata files exist but SQLite is still non-terminal. The
         statement always records `exit_code` and `ended_at`, but it only changes
         `status` to `exited` when the current row is still non-terminal.
         """
@@ -635,13 +636,17 @@ class ShellctlService:
     async def _wait_for_output_pipe_ready(
         self, *, job_id: str, ready_file: Path
     ) -> None:
-        """Confirm the sanitize/output pipeline is live before opening start-gate."""
+        """Confirm the sanitize/output pipeline is live before opening start-gate.
 
-        deadline = anyio.current_time() + max(
-            self.config.poll_interval_seconds * 10,
-            self.config.pipe_monitor_interval_seconds,
-        )
+        Timeout failures include the ready-file path, current `#{pane_pipe}`
+        state, and a summary of `pipe-error.log` so operators can tell the
+        difference between slow startup, tmux pipe loss, and sanitizer crashes.
+        """
+
+        started_at = anyio.current_time()
+        deadline = started_at + self.config.pipe_ready_timeout_seconds
         while True:
+            waited_seconds = anyio.current_time() - started_at
             if ready_file.exists():
                 pipe_state = await self._tmux.is_output_pipe_active(job_id=job_id)
                 if pipe_state is True:
@@ -650,22 +655,86 @@ class ShellctlService:
                     raise ShellctlServerError(
                         500,
                         "pipe_failed",
-                        f"Output pipe never became ready for {job_id}",
+                        self._pipe_ready_failure_message(
+                            job_id=job_id,
+                            ready_file=ready_file,
+                            waited_seconds=waited_seconds,
+                            pipe_state=pipe_state,
+                            cause="tmux pane disappeared after the ready-file handshake",
+                        ),
                     )
             else:
                 if not await self._tmux.session_exists(job_session_name(job_id)):
+                    pipe_state = await self._tmux.is_output_pipe_active(job_id=job_id)
                     raise ShellctlServerError(
                         500,
                         "pipe_failed",
-                        f"Output pipe never became ready for {job_id}",
+                        self._pipe_ready_failure_message(
+                            job_id=job_id,
+                            ready_file=ready_file,
+                            waited_seconds=waited_seconds,
+                            pipe_state=pipe_state,
+                            cause="tmux session exited before the ready-file handshake",
+                        ),
                     )
             if anyio.current_time() >= deadline:
+                pipe_state = await self._tmux.is_output_pipe_active(job_id=job_id)
                 raise ShellctlServerError(
                     500,
                     "pipe_failed",
-                    f"Output pipe never became ready for {job_id}",
+                    self._pipe_ready_failure_message(
+                        job_id=job_id,
+                        ready_file=ready_file,
+                        waited_seconds=waited_seconds,
+                        pipe_state=pipe_state,
+                        cause="timed out waiting for the sanitize/output pipeline handshake",
+                    ),
                 )
             await anyio.sleep(self.config.poll_interval_seconds)
+
+    def _pipe_ready_failure_message(
+        self,
+        *,
+        job_id: str,
+        ready_file: Path,
+        waited_seconds: float,
+        pipe_state: bool | None,
+        cause: str,
+    ) -> str:
+        """Build a startup error message with enough pipe diagnostics to debug."""
+
+        return (
+            f"Output pipe never became ready for {job_id}: {cause}; "
+            f"waited {waited_seconds:.3f}s; "
+            f"ready-file={ready_file}; "
+            f"tmux #{{pane_pipe}}={self._format_pane_pipe_state(pipe_state)}; "
+            f"pipe-error.log={self._pipe_error_log_summary(ready_file.parent)}"
+        )
+
+    def _format_pane_pipe_state(self, pipe_state: bool | None) -> str:
+        if pipe_state is True:
+            return "1"
+        if pipe_state is False:
+            return "0"
+        return "pane-missing"
+
+    def _pipe_error_log_summary(self, job_dir: Path) -> str:
+        """Summarize sanitizer stderr without flooding API error responses."""
+
+        error_log = pipe_error_log_path(job_dir)
+        if not error_log.exists():
+            return f"{error_log} missing"
+        stderr_text = error_log.read_text(encoding="utf-8", errors="replace").strip()
+        if not stderr_text:
+            return f"{error_log} empty"
+        summary = " | ".join(
+            line.strip() for line in stderr_text.splitlines() if line.strip()
+        )
+        if not summary:
+            return f"{error_log} contains only whitespace"
+        if len(summary) > 240:
+            summary = f"{summary[:237]}..."
+        return f"{error_log}: {summary}"
 
     async def _materialize_status_view(
         self,

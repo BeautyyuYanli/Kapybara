@@ -18,6 +18,7 @@ import anyio
 
 from shell_session_manager.shellctl.server.artifacts import (
     pipe_drained_path,
+    pipe_error_log_path,
     pipe_failed_path,
     runner_ended_at_path,
     runner_exit_code_path,
@@ -182,13 +183,14 @@ class TmuxController:
 
         For normal exits, the runner now records completion metadata into job
         artifacts and the pipe finalizer commits `runner-exit` only after
-        `sanitize-pty` reaches EOF and flushes `output.log` successfully.
+        the lightweight sanitizer reaches EOF and flushes `output.log`
+        successfully. Sanitizer stderr is captured into `pipe-error.log` so
+        startup timeouts can distinguish slow imports from subprocess crashes.
         """
 
         sanitize_command = self._shell_join(
             (
-                *self._config.shellctl_command,
-                "sanitize-pty",
+                *self._config.sanitize_pty_command,
                 "--ready-file",
                 str(ready_file),
             )
@@ -205,12 +207,13 @@ class TmuxController:
         )
         output_path = shlex.quote(str(job_dir / "output.log"))
         drained_path = shlex.quote(str(pipe_drained_path(job_dir)))
+        error_log_path = shlex.quote(str(pipe_error_log_path(job_dir)))
         failed_path = shlex.quote(str(pipe_failed_path(job_dir)))
         exit_code_path = shlex.quote(str(runner_exit_code_path(job_dir)))
         ended_at_path = shlex.quote(str(runner_ended_at_path(job_dir)))
         return " ; ".join(
             [
-                f"{sanitize_command} >> {output_path}",
+                f"{sanitize_command} >> {output_path} 2> {error_log_path}",
                 "sanitize_status=$?",
                 (
                     'if [ "$sanitize_status" -eq 0 ]; then '

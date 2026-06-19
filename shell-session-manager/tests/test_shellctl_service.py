@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import os
@@ -14,8 +15,6 @@ from pathlib import Path
 import anyio
 import httpx
 import pytest
-from typer.testing import CliRunner
-
 import shell_session_manager.shellctl.server.service as server_service_module
 import shell_session_manager.shellctl.shared as shared_module
 from shell_session_manager.shellctl.server import (
@@ -29,10 +28,12 @@ from shell_session_manager.shellctl.server import (
 from shell_session_manager.shellctl.server.artifacts import (
     JOB_ENV_FILENAME,
     PIPE_DRAINED_FILENAME,
+    PIPE_ERROR_LOG_FILENAME,
     PIPE_FAILED_FILENAME,
     RUNNER_ENDED_AT_FILENAME,
     RUNNER_EXIT_CODE_FILENAME,
     job_env_path,
+    pipe_error_log_path,
 )
 from shell_session_manager.shellctl.server.tmux import TmuxController
 from shell_session_manager.shellctl.shared import (
@@ -47,6 +48,7 @@ from shell_session_manager.shellctl.shared import (
     job_pane_target,
     job_session_name,
 )
+from typer.testing import CliRunner
 
 server_cli_module = importlib.import_module("shell_session_manager.shellctl.server.cli")
 
@@ -57,6 +59,8 @@ class FakeTmuxController:
         self.pipe_active: dict[str, bool | None] = {}
         self.cleaned: list[str] = []
         self.touch_ready_on_enable = True
+        self.pipe_active_on_enable: bool | None = True
+        self.pipe_error_log_text: str | None = None
         self.on_send_interrupt: Callable[[str], Awaitable[None]] | None = None
         self.on_send_input: Callable[[str, str], Awaitable[None]] | None = None
 
@@ -82,8 +86,12 @@ class FakeTmuxController:
     async def enable_output_pipe(
         self, *, job_id: str, job_dir: Path, ready_file: Path
     ) -> None:
-        del job_dir
-        self.pipe_active[job_id] = True
+        self.pipe_active[job_id] = self.pipe_active_on_enable
+        if self.pipe_error_log_text is not None:
+            pipe_error_log_path(job_dir).write_text(
+                self.pipe_error_log_text,
+                encoding="utf-8",
+            )
         if self.touch_ready_on_enable:
             ready_file.touch()
 
@@ -122,15 +130,17 @@ async def _create_real_service(
     tmp_path: Path,
     *,
     shellctl_command: tuple[str, ...] | None = None,
+    sanitize_pty_command: tuple[str, ...] | None = None,
 ) -> ShellctlService:
+    defaults = ShellctlConfig(
+        state_dir=tmp_path / "default-state",
+        runtime_dir=tmp_path / "default-run",
+    )
     config = ShellctlConfig(
         state_dir=tmp_path / "state",
         runtime_dir=tmp_path / "run",
-        shellctl_command=shellctl_command
-        or ShellctlConfig(
-            state_dir=tmp_path / "default-state",
-            runtime_dir=tmp_path / "default-run",
-        ).shellctl_command,
+        shellctl_command=shellctl_command or defaults.shellctl_command,
+        sanitize_pty_command=sanitize_pty_command or defaults.sanitize_pty_command,
     )
     service = ShellctlService(config)
     await service.initialize()
@@ -154,9 +164,12 @@ def _write_delayed_sanitize_wrapper(
                 "import time",
                 "from pathlib import Path",
                 "",
-                f"REAL = [{sys.executable!r}, '-m', 'shell_session_manager.shellctl.server']",
+                (
+                    f"REAL = [{sys.executable!r}, '-m', "
+                    "'shell_session_manager.shellctl.sanitize_pty']"
+                ),
                 "args = sys.argv[1:]",
-                "if args[:1] == ['sanitize-pty'] and '--ready-file' in args:",
+                "if '--ready-file' in args:",
                 "    ready_file = Path(args[args.index('--ready-file') + 1])",
                 "    ready_file.touch()",
                 f"    time.sleep({delay_seconds!r})",
@@ -318,6 +331,12 @@ async def test_run_job_does_not_materialize_fresh_row_to_lost_during_startup_win
     await service.initialize_database()
     service._ensure_dir(service.config.jobs_dir)
     fake_tmux.touch_ready_on_enable = False
+    service.config = ShellctlConfig(
+        state_dir=service.config.state_dir,
+        runtime_dir=service.config.runtime_dir,
+        poll_interval_seconds=0.001,
+        pipe_ready_timeout_seconds=0.01,
+    )
 
     await service.run_job(
         RunJobRequest(
@@ -601,10 +620,10 @@ async def test_terminated_job_does_not_emit_python_wrapper_traceback(
 async def test_run_job_returns_flushed_output_on_first_terminal_result(
     tmp_path: Path,
 ) -> None:
-    shellctl_command = _write_delayed_sanitize_wrapper(tmp_path, delay_seconds=0.2)
+    sanitize_pty_command = _write_delayed_sanitize_wrapper(tmp_path, delay_seconds=0.2)
     service = await _create_real_service(
         tmp_path,
-        shellctl_command=shellctl_command,
+        sanitize_pty_command=sanitize_pty_command,
     )
 
     try:
@@ -644,14 +663,14 @@ async def test_run_job_returns_flushed_output_on_first_terminal_result(
 async def test_sanitize_failure_does_not_commit_normal_exit(
     tmp_path: Path,
 ) -> None:
-    shellctl_command = _write_delayed_sanitize_wrapper(
+    sanitize_pty_command = _write_delayed_sanitize_wrapper(
         tmp_path,
         delay_seconds=0.2,
         sanitize_exit_code=7,
     )
     service = await _create_real_service(
         tmp_path,
-        shellctl_command=shellctl_command,
+        sanitize_pty_command=sanitize_pty_command,
     )
 
     try:
@@ -1206,6 +1225,7 @@ async def test_run_job_keeps_start_gate_closed_when_pipe_never_becomes_ready(
         runtime_dir=service.config.runtime_dir,
         poll_interval_seconds=0.001,
         pipe_monitor_interval_seconds=0.01,
+        pipe_ready_timeout_seconds=0.01,
     )
 
     result = await service.run_job(
@@ -1222,6 +1242,43 @@ async def test_run_job_keeps_start_gate_closed_when_pipe_never_becomes_ready(
     assert result.status is JobStatusName.FAILED
     assert result.done is True
     assert not (service.config.jobs_dir / result.job_id / "start-gate").exists()
+    await service.shutdown()
+
+
+@pytest.mark.anyio
+async def test_run_job_pipe_ready_timeout_records_diagnostics(tmp_path: Path) -> None:
+    service, fake_tmux = await _create_service(tmp_path)
+    fake_tmux.touch_ready_on_enable = False
+    fake_tmux.pipe_active_on_enable = False
+    fake_tmux.pipe_error_log_text = "Traceback: sanitizer crashed\nsecond line\n"
+    service.config = ShellctlConfig(
+        state_dir=service.config.state_dir,
+        runtime_dir=service.config.runtime_dir,
+        poll_interval_seconds=0.001,
+        pipe_ready_timeout_seconds=0.01,
+    )
+
+    result = await service.run_job(
+        RunJobRequest(
+            script="printf ready\n",
+            cwd=str(tmp_path),
+            terminal=TerminalSize(),
+            timeout=0.05,
+            output_limit=8192,
+            idle_flush_seconds=0.01,
+        )
+    )
+
+    row = await service._get_job_row(result.job_id)
+    ready_file = service.config.jobs_dir / result.job_id / ".pipe-ready"
+
+    assert result.status is JobStatusName.FAILED
+    assert row.message is not None
+    assert "waited " in row.message
+    assert str(ready_file) in row.message
+    assert "tmux #{pane_pipe}=0" in row.message
+    assert PIPE_ERROR_LOG_FILENAME in row.message
+    assert "Traceback: sanitizer crashed | second line" in row.message
     await service.shutdown()
 
 
@@ -1558,6 +1615,19 @@ def test_runner_script_records_completion_metadata_without_direct_runner_exit(
     anyio.run(service.shutdown)
 
 
+def test_shellctl_config_defaults_to_lightweight_sanitize_entrypoint(
+    tmp_path: Path,
+) -> None:
+    config = ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run")
+
+    assert config.pipe_ready_timeout_seconds == 10.0
+    assert config.sanitize_pty_command == (
+        sys.executable,
+        "-m",
+        "shell_session_manager.shellctl.sanitize_pty",
+    )
+
+
 def test_pipe_command_finalizer_commits_runner_exit_after_drain(tmp_path: Path) -> None:
     controller = TmuxController(
         ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run")
@@ -1568,15 +1638,86 @@ def test_pipe_command_finalizer_commits_runner_exit_after_drain(tmp_path: Path) 
         ready_file=tmp_path / "state" / "jobs" / "05211530-k7p" / ".pipe-ready",
     )
 
-    assert "sanitize-pty" in source
+    assert "shell_session_manager.shellctl.sanitize_pty" in source
+    assert "shell_session_manager.shellctl.server sanitize-pty" not in source
     assert PIPE_DRAINED_FILENAME in source
+    assert PIPE_ERROR_LOG_FILENAME in source
     assert PIPE_FAILED_FILENAME in source
     assert RUNNER_EXIT_CODE_FILENAME in source
     assert RUNNER_ENDED_AT_FILENAME in source
     assert re.search(r"\brunner-exit\b", source) is not None
     assert 'if [ "$sanitize_status" -eq 0 ]' in source
-    assert source.index("sanitize-pty") < source.index(PIPE_DRAINED_FILENAME)
+    assert "2>" in source
+    assert source.index("shell_session_manager.shellctl.sanitize_pty") < source.index(
+        PIPE_DRAINED_FILENAME
+    )
     assert source.index(PIPE_DRAINED_FILENAME) < source.index("runner-exit")
+
+
+def test_sanitize_pty_module_uses_lightweight_imports_only() -> None:
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "shell_session_manager"
+        / "shellctl"
+        / "sanitize_pty.py"
+    )
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.add(node.module)
+
+    assert imports == {
+        "argparse",
+        "pathlib",
+        "sys",
+        "shell_session_manager.shellctl.shared.sanitize",
+    }
+
+
+def test_python_m_sanitize_pty_module_touches_ready_file_and_sanitizes_output(
+    tmp_path: Path,
+) -> None:
+    package_root = Path(__file__).resolve().parents[1]
+    src_path = package_root / "src"
+    env = dict(os.environ)
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{src_path}{os.pathsep}{current_pythonpath}"
+        if current_pythonpath
+        else str(src_path)
+    )
+    ready_file = tmp_path / "ready"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "shell_session_manager.shellctl.sanitize_pty",
+            "--ready-file",
+            str(ready_file),
+        ],
+        input=b"before\rafter\n",
+        capture_output=True,
+        check=False,
+        cwd=package_root,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert ready_file.exists()
+    assert result.stdout.decode("utf-8") == "after\n"
+
+
+def test_server_cli_no_longer_exposes_sanitize_pty_command() -> None:
+    result = CliRunner().invoke(cli, ["sanitize-pty"])
+
+    assert result.exit_code != 0
+    assert "No such command 'sanitize-pty'" in result.output
 
 
 def test_runner_exit_cli_accepts_runner_option_contract(tmp_path: Path) -> None:
@@ -1634,5 +1775,5 @@ def test_python_m_shellctl_server_module_entrypoint_shows_cli_help() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "sanitize-pty" in result.stdout
+    assert "sanitize-pty" not in result.stdout
     assert "runner-exit" in result.stdout

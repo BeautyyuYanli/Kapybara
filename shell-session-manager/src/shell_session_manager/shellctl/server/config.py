@@ -32,8 +32,10 @@ class ShellctlConfig:
     """Runtime configuration for the shellctl service and CLI.
 
     `shellctl_command` deliberately defaults to `python -m ...server` so the
-    tmux-side commands stay pinned to the same interpreter environment that
-    launched the API server.
+    tmux-side `runner-exit` callback stays pinned to the same interpreter
+    environment that launched the API server. `sanitize_pty_command` uses the
+    same interpreter but points at a lightweight module so the pipe ready-file
+    handshake does not pay FastAPI/SQLAlchemy import costs.
 
     Bearer auth is opt-in: if the explicit `auth_token` and the fallback
     `SHELLCTL_AUTH_TOKEN` environment variable are both missing or empty,
@@ -59,12 +61,20 @@ class ShellctlConfig:
     default_terminate_grace_seconds: float = DEFAULT_TERMINATE_GRACE_SECONDS
     poll_interval_seconds: float = 0.05
     pipe_monitor_interval_seconds: float = 1.0
+    pipe_ready_timeout_seconds: float = 10.0
     sqlite_busy_timeout_ms: int = 5000
     shellctl_command: tuple[str, ...] = field(
         default_factory=lambda: (
             sys.executable,
             "-m",
             "shell_session_manager.shellctl.server",
+        )
+    )
+    sanitize_pty_command: tuple[str, ...] = field(
+        default_factory=lambda: (
+            sys.executable,
+            "-m",
+            "shell_session_manager.shellctl.sanitize_pty",
         )
     )
 

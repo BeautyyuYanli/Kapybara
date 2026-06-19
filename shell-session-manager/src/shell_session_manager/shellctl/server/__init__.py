@@ -11,7 +11,6 @@ from shell_session_manager.shellctl.server.cli import (
     cli,
     main,
     runner_exit_command,
-    sanitize_pty_command,
     serve_command,
 )
 from shell_session_manager.shellctl.server.config import ShellctlConfig
@@ -28,6 +27,5 @@ __all__ = [
     "create_app",
     "main",
     "runner_exit_command",
-    "sanitize_pty_command",
     "serve_command",
 ]
