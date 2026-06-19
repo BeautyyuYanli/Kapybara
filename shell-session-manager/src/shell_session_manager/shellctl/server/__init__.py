@@ -2,8 +2,9 @@
 
 The original monolithic `shellctl.server` module is now organized as a package
 with smaller files for configuration, SQLite models, tmux control, lifecycle
-service logic, FastAPI wiring, and CLI commands. This `__init__` keeps the
-common public-ish imports stable without re-exporting unrelated internals.
+service logic, HTTP/gRPC transport wiring, and CLI commands. This `__init__`
+keeps the common public-ish imports stable without re-exporting unrelated
+internals.
 """
 
 from shell_session_manager.shellctl.server.api import create_app
@@ -17,16 +18,22 @@ from shell_session_manager.shellctl.server.cli import (
 from shell_session_manager.shellctl.server.config import ShellctlConfig
 from shell_session_manager.shellctl.server.db import JobRow
 from shell_session_manager.shellctl.server.errors import ShellctlServerError
+from shell_session_manager.shellctl.server.grpc import (
+    ShellctlGrpcService,
+    run_grpc_server,
+)
 from shell_session_manager.shellctl.server.service import ShellctlService
 
 __all__ = [
     "JobRow",
     "ShellctlConfig",
+    "ShellctlGrpcService",
     "ShellctlServerError",
     "ShellctlService",
     "cli",
     "create_app",
     "main",
+    "run_grpc_server",
     "runner_exit_command",
     "sanitize_pty_command",
     "serve_command",

@@ -1,26 +1,30 @@
-"""FastAPI wiring for shellctl server endpoints."""
+"""FastAPI wiring for the shellctl HTTP transport.
+
+This module keeps HTTP-specific concerns such as route registration and FastAPI
+lifespan management. Auth checks, error encoding, and endpoint delegation are
+shared with the gRPC transport through dedicated helper modules.
+"""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Annotated, cast
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 
+from shell_session_manager.shellctl.server.auth import AuthVerifier
 from shell_session_manager.shellctl.server.config import ShellctlConfig
+from shell_session_manager.shellctl.server.error_codec import ErrorCodec
 from shell_session_manager.shellctl.server.errors import ShellctlServerError
 from shell_session_manager.shellctl.server.service import ShellctlService
+from shell_session_manager.shellctl.server.transport import ShellctlEndpointController
 from shell_session_manager.shellctl.shared import (
-    DEFAULT_HEALTH_STATUS,
     DEFAULT_LIST_LIMIT,
-    DEFAULT_OUTPUT_LIMIT_BYTES,
     DEFAULT_TERMINATE_GRACE_SECONDS,
     MAX_LIST_LIMIT,
     MAX_OUTPUT_LIMIT_BYTES,
     DeleteJobResponse,
-    ErrorDetail,
-    ErrorResponse,
     HealthResponse,
     InputJobRequest,
     JobResult,
@@ -42,6 +46,9 @@ def create_app(
 
     resolved_config = config or ShellctlConfig()
     resolved_service = service or ShellctlService(resolved_config)
+    controller = ShellctlEndpointController(resolved_service)
+    auth_verifier = AuthVerifier.from_config(resolved_config)
+    error_codec = ErrorCodec()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -63,43 +70,27 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
-            content=ErrorResponse(
-                error=ErrorDetail(code=exc.code, message=exc.message)
-            ).model_dump(mode="json"),
+            content=error_codec.to_http_content(exc),
         )
 
     @app.exception_handler(RuntimeError)
     async def handle_runtime_error(
         _request: Request, exc: RuntimeError
     ) -> JSONResponse:
+        normalized = error_codec.normalize_exception(exc)
         return JSONResponse(
-            status_code=500,
-            content=ErrorResponse(
-                error=ErrorDetail(
-                    code="internal_error",
-                    message=str(exc) or "internal server error",
-                )
-            ).model_dump(mode="json"),
+            status_code=normalized.status_code,
+            content=error_codec.to_http_content(normalized),
         )
-
-    def get_service() -> ShellctlService:
-        return cast(ShellctlService, app.state.shellctl_service)
 
     def verify_auth(
         authorization: Annotated[str | None, Header()] = None,
     ) -> None:
-        token = resolved_config.auth_token
-        if token is None:
-            return
-        expected = f"Bearer {token}"
-        if authorization != expected:
-            raise ShellctlServerError(
-                401, "unauthorized", "Missing or invalid bearer token"
-            )
+        auth_verifier.verify_authorization_header(authorization)
 
     @app.get("/healthz", response_model=HealthResponse)
     async def healthz() -> HealthResponse:
-        return HealthResponse(status=DEFAULT_HEALTH_STATUS)
+        return await controller.health()
 
     @app.post(
         "/v1/jobs/run",
@@ -108,9 +99,8 @@ def create_app(
     )
     async def run_job(
         payload: RunJobRequest,
-        svc: ShellctlService = Depends(get_service),
     ) -> JobResult:
-        return await svc.run_job(payload)
+        return await controller.run_job(payload)
 
     @app.post(
         "/v1/jobs/{job_id}/wait",
@@ -120,9 +110,8 @@ def create_app(
     async def wait_job(
         job_id: str,
         payload: WaitJobRequest,
-        svc: ShellctlService = Depends(get_service),
     ) -> JobResult:
-        return await svc.wait_job(job_id, payload)
+        return await controller.wait_job(job_id, payload)
 
     @app.get(
         "/v1/jobs/{job_id}/log/tail",
@@ -133,10 +122,9 @@ def create_app(
         job_id: str,
         output_limit: Annotated[
             int, Query(ge=1, le=MAX_OUTPUT_LIMIT_BYTES)
-        ] = DEFAULT_OUTPUT_LIMIT_BYTES,
-        svc: ShellctlService = Depends(get_service),
+        ] = resolved_config.default_output_limit_bytes,
     ) -> JobResult:
-        return await svc.tail_job(job_id, output_limit=output_limit)
+        return await controller.tail_job(job_id, output_limit=output_limit)
 
     @app.get(
         "/v1/jobs/{job_id}",
@@ -145,9 +133,8 @@ def create_app(
     )
     async def job_status(
         job_id: str,
-        svc: ShellctlService = Depends(get_service),
     ) -> JobStatusView:
-        return await svc.get_job_status(job_id)
+        return await controller.get_job_status(job_id)
 
     @app.get(
         "/v1/jobs",
@@ -157,9 +144,8 @@ def create_app(
     async def list_jobs(
         status: Annotated[JobStatusName | None, Query()] = None,
         limit: Annotated[int, Query(ge=1, le=MAX_LIST_LIMIT)] = DEFAULT_LIST_LIMIT,
-        svc: ShellctlService = Depends(get_service),
     ) -> ListJobsResponse:
-        return await svc.list_jobs(status=status, limit=limit)
+        return await controller.list_jobs(status=status, limit=limit)
 
     @app.post(
         "/v1/jobs/{job_id}/input",
@@ -169,9 +155,8 @@ def create_app(
     async def input_job(
         job_id: str,
         payload: InputJobRequest,
-        svc: ShellctlService = Depends(get_service),
     ) -> JobResult:
-        return await svc.send_input(job_id, payload)
+        return await controller.send_input(job_id, payload)
 
     @app.post(
         "/v1/jobs/{job_id}/terminate",
@@ -181,9 +166,8 @@ def create_app(
     async def terminate_job(
         job_id: str,
         payload: TerminateJobRequest,
-        svc: ShellctlService = Depends(get_service),
     ) -> JobStatusView:
-        return await svc.terminate_job(job_id, payload)
+        return await controller.terminate_job(job_id, payload)
 
     @app.delete(
         "/v1/jobs/{job_id}",
@@ -194,9 +178,12 @@ def create_app(
         job_id: str,
         force: bool = False,
         grace_seconds: float = DEFAULT_TERMINATE_GRACE_SECONDS,
-        svc: ShellctlService = Depends(get_service),
     ) -> DeleteJobResponse:
-        return await svc.delete_job(job_id, force=force, grace_seconds=grace_seconds)
+        return await controller.delete_job(
+            job_id,
+            force=force,
+            grace_seconds=grace_seconds,
+        )
 
     return app
 

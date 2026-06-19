@@ -1,50 +1,51 @@
-"""Async HTTP client for the shellctl server API.
+"""Public async SDK façade for shellctl transports.
 
-The SDK keeps transport-level knobs (`output_limit`, `idle_flush_seconds`, and
- bearer token handling) on the client instance so individual method calls stay
- close to the proposal's high-level workflow.
+`ShellctlClient` keeps the stable high-level workflow API while delegating wire
+details to transport implementations. The primary constructor now selects the
+transport from the endpoint URL scheme: `http://` / `https://` use the HTTP
+transport, and `grpc://` / `grpcs://` use the grpclib transport.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+from grpclib.client import Channel
 
+from shell_session_manager.shellctl.client.common import (
+    ShellctlClientDefaults,
+    ShellctlClientError,
+    ShellctlTransportProtocol,
+    resolve_auth_token,
+)
+from shell_session_manager.shellctl.client.grpc import GrpcShellctlTransport
+from shell_session_manager.shellctl.client.http import HttpShellctlTransport
 from shell_session_manager.shellctl.shared import (
-    DEFAULT_AUTH_TOKEN_ENV,
     DEFAULT_IDLE_FLUSH_SECONDS,
     DEFAULT_LIST_LIMIT,
     DEFAULT_OUTPUT_LIMIT_BYTES,
     DEFAULT_TERMINATE_GRACE_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     DeleteJobResponse,
+    InputJobRequest,
     JobInfo,
     JobResult,
     JobStatusView,
-    ListJobsResponse,
     RunJobRequest,
     TerminalSize,
+    TerminateJobRequest,
+    WaitJobRequest,
 )
 
 
-class ShellctlClientError(RuntimeError):
-    """Raised when the shellctl server returns an error response."""
-
-    def __init__(self, status_code: int, code: str, message: str) -> None:
-        super().__init__(f"{code} ({status_code}): {message}")
-        self.status_code = status_code
-        self.code = code
-        self.message = message
-
-
 class ShellctlClient:
-    """Thin async SDK for the shellctl HTTP API.
+    """Thin async SDK façade for the shellctl HTTP and gRPC APIs.
 
-    The client owns a reusable `httpx.AsyncClient` unless one is injected via the
-    `client` argument. Callers can therefore either keep one instance for a full
-    workflow or treat it as an async context manager.
+    The client keeps request defaults (`output_limit`, `idle_flush_seconds`, and
+    bearer token handling) on the façade so HTTP and gRPC calls behave the same
+    from the caller's perspective.
     """
 
     def __init__(
@@ -56,21 +57,27 @@ class ShellctlClient:
         token: str | None = None,
         client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        ssl: object | None = None,
+        _transport_impl: ShellctlTransportProtocol | None = None,
+        _defaults: ShellctlClientDefaults | None = None,
+        _channel: Channel | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.output_limit = output_limit
-        self.idle_flush_seconds = idle_flush_seconds
-        self.token = (
-            token if token is not None else os.environ.get(DEFAULT_AUTH_TOKEN_ENV)
+        defaults = _defaults or ShellctlClientDefaults(
+            output_limit=output_limit,
+            idle_flush_seconds=idle_flush_seconds,
+            token=resolve_auth_token(token),
         )
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
-            base_url=self.base_url,
-            follow_redirects=True,
-            timeout=httpx.Timeout(
-                DEFAULT_TIMEOUT_SECONDS, connect=DEFAULT_TIMEOUT_SECONDS
-            ),
+        self.output_limit = defaults.output_limit
+        self.idle_flush_seconds = defaults.idle_flush_seconds
+        self.token = defaults.token
+        self._transport = _transport_impl or self._build_transport(
+            self.base_url,
+            defaults=defaults,
+            client=client,
             transport=transport,
+            ssl=ssl,
+            channel=_channel,
         )
 
     async def __aenter__(self) -> ShellctlClient:
@@ -80,16 +87,15 @@ class ShellctlClient:
         await self.close()
 
     async def close(self) -> None:
-        """Close the underlying HTTP client if this SDK instance owns it."""
+        """Close the underlying transport resources if this SDK owns them."""
 
-        if self._owns_client:
-            await self._client.aclose()
+        await self._transport.close()
 
     async def healthz(self) -> dict[str, Any]:
         """Call the public health endpoint without requiring auth."""
 
-        response = await self._client.get("/healthz")
-        return self._decode_response(response)
+        response = await self._transport.healthz()
+        return response.model_dump(mode="json")
 
     async def run(
         self,
@@ -106,7 +112,7 @@ class ShellctlClient:
         overlay on the server side.
         """
 
-        payload = RunJobRequest(
+        request = RunJobRequest(
             script=script,
             cwd=cwd,
             env=env,
@@ -115,12 +121,7 @@ class ShellctlClient:
             output_limit=self.output_limit,
             idle_flush_seconds=self.idle_flush_seconds,
         )
-        response = await self._client.post(
-            "/v1/jobs/run",
-            json=payload.model_dump(mode="json", exclude_none=True),
-            headers=self._auth_headers(),
-        )
-        return JobResult.model_validate(self._decode_response(response))
+        return await self._transport.run(request)
 
     async def wait(
         self,
@@ -131,26 +132,20 @@ class ShellctlClient:
     ) -> JobResult:
         """Wait for incremental output, completion, truncation, or timeout."""
 
-        response = await self._client.post(
-            f"/v1/jobs/{job_id}/wait",
-            json={
-                "offset": offset,
-                "timeout": timeout,
-                "output_limit": self.output_limit,
-                "idle_flush_seconds": self.idle_flush_seconds,
-            },
-            headers=self._auth_headers(),
+        return await self._transport.wait(
+            job_id,
+            WaitJobRequest(
+                offset=offset,
+                timeout=timeout,
+                output_limit=self.output_limit,
+                idle_flush_seconds=self.idle_flush_seconds,
+            ),
         )
-        return JobResult.model_validate(self._decode_response(response))
 
     async def status(self, job_id: str) -> JobStatusView:
         """Fetch the materialized status view for one job."""
 
-        response = await self._client.get(
-            f"/v1/jobs/{job_id}",
-            headers=self._auth_headers(),
-        )
-        return JobStatusView.model_validate(self._decode_response(response))
+        return await self._transport.status(job_id)
 
     async def list_jobs(
         self,
@@ -160,15 +155,7 @@ class ShellctlClient:
     ) -> list[JobInfo]:
         """List recent jobs, optionally filtered by lifecycle status."""
 
-        params: dict[str, Any] = {"limit": limit}
-        if status is not None:
-            params["status"] = status
-        response = await self._client.get(
-            "/v1/jobs",
-            params=params,
-            headers=self._auth_headers(),
-        )
-        payload = ListJobsResponse.model_validate(self._decode_response(response))
+        payload = await self._transport.list_jobs(status=status, limit=limit)
         return payload.jobs
 
     async def input(
@@ -181,28 +168,21 @@ class ShellctlClient:
     ) -> JobResult:
         """Send text input to a running job and then wait like `wait()`."""
 
-        response = await self._client.post(
-            f"/v1/jobs/{job_id}/input",
-            json={
-                "text": text,
-                "offset": offset,
-                "timeout": timeout,
-                "output_limit": self.output_limit,
-                "idle_flush_seconds": self.idle_flush_seconds,
-            },
-            headers=self._auth_headers(),
+        return await self._transport.input(
+            job_id,
+            InputJobRequest(
+                text=text,
+                offset=offset,
+                timeout=timeout,
+                output_limit=self.output_limit,
+                idle_flush_seconds=self.idle_flush_seconds,
+            ),
         )
-        return JobResult.model_validate(self._decode_response(response))
 
     async def tail(self, job_id: str) -> JobResult:
         """Fetch an immediate UTF-8-safe tail snapshot for a job."""
 
-        response = await self._client.get(
-            f"/v1/jobs/{job_id}/log/tail",
-            params={"output_limit": self.output_limit},
-            headers=self._auth_headers(),
-        )
-        return JobResult.model_validate(self._decode_response(response))
+        return await self._transport.tail(job_id, output_limit=self.output_limit)
 
     async def terminate(
         self,
@@ -211,12 +191,10 @@ class ShellctlClient:
     ) -> JobStatusView:
         """Terminate a job, returning the resulting materialized status view."""
 
-        response = await self._client.post(
-            f"/v1/jobs/{job_id}/terminate",
-            json={"grace_seconds": grace_seconds},
-            headers=self._auth_headers(),
+        return await self._transport.terminate(
+            job_id,
+            TerminateJobRequest(grace_seconds=grace_seconds),
         )
-        return JobStatusView.model_validate(self._decode_response(response))
 
     async def delete(
         self,
@@ -227,44 +205,83 @@ class ShellctlClient:
     ) -> DeleteJobResponse:
         """Delete job artifacts, optionally terminating the job first."""
 
-        params: dict[str, Any] = {"force": str(force).lower()}
-        if grace_seconds is not None:
-            params["grace_seconds"] = grace_seconds
-        response = await self._client.delete(
-            f"/v1/jobs/{job_id}",
-            params=params,
-            headers=self._auth_headers(),
+        return await self._transport.delete(
+            job_id,
+            force=force,
+            grace_seconds=grace_seconds,
         )
-        return DeleteJobResponse.model_validate(self._decode_response(response))
 
-    def _auth_headers(self) -> dict[str, str]:
-        if not self.token:
-            return {}
-        return {"Authorization": f"Bearer {self.token}"}
+    @staticmethod
+    def _build_transport(
+        base_url: str,
+        *,
+        defaults: ShellctlClientDefaults,
+        client: httpx.AsyncClient | None,
+        transport: httpx.AsyncBaseTransport | None,
+        ssl: object | None,
+        channel: Channel | None,
+    ) -> ShellctlTransportProtocol:
+        """Create the transport selected by the endpoint URL scheme.
 
-    def _decode_response(self, response: httpx.Response) -> dict[str, Any]:
-        try:
-            payload = response.json()
-        except ValueError as exc:  # pragma: no cover - network/proxy corruption
-            raise ShellctlClientError(
-                response.status_code, "invalid_json", response.text
-            ) from exc
+        HTTP endpoint URLs preserve the existing `httpx` injection hooks.
+        gRPC endpoints intentionally use only `grpc://host:port` or
+        `grpcs://host:port`; callers should not attach HTTP-only test transports
+        to those schemes.
+        """
 
-        if response.is_error:
-            error = payload.get("error") if isinstance(payload, dict) else None
-            if isinstance(error, dict):
-                code = str(error.get("code", "request_failed"))
-                message = str(error.get("message", response.text))
-            else:
-                code = "request_failed"
-                message = response.text
-            raise ShellctlClientError(response.status_code, code, message)
+        endpoint = urlsplit(base_url)
+        scheme = endpoint.scheme.lower()
 
-        if not isinstance(payload, dict):
-            raise ShellctlClientError(
-                response.status_code, "invalid_payload", response.text
+        if scheme in {"http", "https"}:
+            if channel is not None:
+                raise ValueError(
+                    "channel is only supported for grpc:// or grpcs:// endpoints"
+                )
+            if ssl is not None:
+                raise ValueError(
+                    "ssl is only supported for grpc:// or grpcs:// endpoints"
+                )
+            return HttpShellctlTransport(
+                base_url,
+                defaults=defaults,
+                client=client,
+                transport=transport,
             )
-        return payload
+
+        if scheme in {"grpc", "grpcs"}:
+            if client is not None or transport is not None:
+                raise ValueError(
+                    "client and transport are only supported for http:// or https:// endpoints"
+                )
+            if endpoint.hostname is None or endpoint.port is None:
+                raise ValueError(
+                    "gRPC endpoints must use grpc://host:port or grpcs://host:port"
+                )
+            if endpoint.path not in ("", "/") or endpoint.query or endpoint.fragment:
+                raise ValueError(
+                    "gRPC endpoints do not support path, query, or fragment components"
+                )
+            if scheme == "grpc" and ssl not in (None, False):
+                raise ValueError("use grpcs:// to enable TLS for gRPC endpoints")
+            if scheme == "grpcs" and ssl is False:
+                raise ValueError(
+                    "grpcs:// endpoints require TLS; omit ssl or pass TLS settings"
+                )
+            return GrpcShellctlTransport(
+                host=endpoint.hostname,
+                port=endpoint.port,
+                defaults=defaults,
+                ssl=True if scheme == "grpcs" and ssl is None else ssl,
+                channel=channel,
+            )
+
+        if "://" not in base_url:
+            raise ValueError(
+                "shellctl endpoint must include a scheme such as http:// or grpc://"
+            )
+        raise ValueError(
+            f"unsupported shellctl endpoint scheme: {scheme!r}; use http://, https://, grpc://, or grpcs://"
+        )
 
 
 __all__ = ["ShellctlClient", "ShellctlClientError"]

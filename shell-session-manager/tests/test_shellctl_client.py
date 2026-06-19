@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+import shell_session_manager.shellctl.client.sdk as client_sdk_module
 from shell_session_manager.shellctl.client import ShellctlClient, ShellctlClientError
 
 
@@ -106,3 +107,72 @@ async def test_shellctl_client_raises_structured_errors() -> None:
     ) as client:
         with pytest.raises(ShellctlClientError, match="job_not_running"):
             await client.input("job-1", "ls\n", offset=0)
+
+
+def test_shellctl_client_https_url_selects_http_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeHttpTransport:
+        def __init__(
+            self,
+            base_url: str,
+            *,
+            defaults: object,
+            client: object,
+            transport: object,
+        ) -> None:
+            captured["base_url"] = base_url
+            captured["defaults"] = defaults
+            captured["client"] = client
+            captured["transport"] = transport
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(client_sdk_module, "HttpShellctlTransport", FakeHttpTransport)
+
+    client = ShellctlClient("https://shellctl.test:8443", token="secret")
+
+    assert captured["base_url"] == "https://shellctl.test:8443"
+    assert client.base_url == "https://shellctl.test:8443"
+
+
+def test_shellctl_client_grpcs_url_selects_grpc_transport_and_enables_tls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeGrpcTransport:
+        def __init__(
+            self,
+            *,
+            host: str,
+            port: int,
+            defaults: object,
+            ssl: object | None = None,
+            channel: object | None = None,
+        ) -> None:
+            captured["host"] = host
+            captured["port"] = port
+            captured["defaults"] = defaults
+            captured["ssl"] = ssl
+            captured["channel"] = channel
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(client_sdk_module, "GrpcShellctlTransport", FakeGrpcTransport)
+
+    client = ShellctlClient("grpcs://grpc.test:8766", token="secret")
+
+    assert captured["host"] == "grpc.test"
+    assert captured["port"] == 8766
+    assert captured["ssl"] is True
+    assert client.base_url == "grpcs://grpc.test:8766"
+
+
+def test_shellctl_client_rejects_unsupported_endpoint_scheme() -> None:
+    with pytest.raises(ValueError, match="unsupported shellctl endpoint scheme"):
+        ShellctlClient("ftp://shellctl.test:21")

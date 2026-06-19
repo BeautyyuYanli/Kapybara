@@ -13,8 +13,10 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "anyio>=4.12.1",
     "fastapi>=0.116.1",
+    "grpclib[protobuf]>=0.4.8",
     "httpx>=0.28.1",
     "pydantic>=2.12.5",
+    "protobuf>=6,<7",
     "sqlmodel>=0.0.24",
     "typer>=0.16.1",
     "uvicorn>=0.35.0",
@@ -29,6 +31,7 @@ shellctl = "shell_session_manager.shellctl.server:main"
 
 [dependency-groups]
 dev = [
+    "grpcio-tools>=1.74,<2",
     "pytest>=9.0.2",
     "ruff>=0.15.0",
     "basedpyright>=1.34.0",
@@ -45,13 +48,17 @@ extend-exclude = [".venv", ".pdm-build"]
 select = ["E", "F", "I", "B", "UP", "N", "SIM", "PIE", "RUF"]
 ignore = ["N818", "E501", "SIM108", "SIM103", "B008"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/shell_session_manager/shellctl/proto/v1/shellctl_grpc.py" = ["N802"]
+"src/shell_session_manager/shellctl/server/grpc.py" = ["N802"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 line-ending = "lf"
 
 [tool.basedpyright]
-exclude = ["tests", ".venv", ".pdm-build"]
+exclude = ["tests", ".venv", ".pdm-build", "src/shell_session_manager/shellctl/proto"]
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
@@ -60,6 +67,7 @@ venv = ".venv"
 distribution = true
 
 [tool.pdm.scripts]
+proto = "python -m grpc_tools.protoc -I src --python_out=src --grpclib_python_out=src src/shell_session_manager/shellctl/proto/v1/shellctl.proto"
 lint = "ruff check . --fix"
 format = "ruff format ."
 fix = {composite = ["format", "lint"]}

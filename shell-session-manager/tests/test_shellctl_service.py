@@ -10,6 +10,7 @@ import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
 
 import anyio
 import httpx
@@ -194,6 +195,23 @@ def _capture_serve_config(
     return captured, CliRunner()
 
 
+def _capture_serve_grpc_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, object], CliRunner]:
+    captured: dict[str, object] = {}
+
+    async def fake_run_grpc_server(config: ShellctlConfig) -> None:
+        captured["config"] = config
+
+    def fake_anyio_run(func: object, config: ShellctlConfig) -> None:
+        captured["runner"] = func
+        captured["config"] = config
+
+    monkeypatch.setattr(server_cli_module, "run_grpc_server", fake_run_grpc_server)
+    monkeypatch.setattr(server_cli_module.anyio, "run", fake_anyio_run)
+    return captured, CliRunner()
+
+
 async def _seed_job(
     service: ShellctlService,
     *,
@@ -283,6 +301,32 @@ class InsertConflictService(RecordingService):
             self.failed_insert_job_ids.append(row.job_id)
             return False
         return await super()._insert_job_row(row)
+
+
+class ErrorRaisingHttpService:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    async def initialize(self) -> None:
+        return None
+
+    def start_background_gc(self) -> None:
+        return None
+
+    def start_background_pipe_monitor(self) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def list_jobs(
+        self,
+        *,
+        status: JobStatusName | None = None,
+        limit: int,
+    ) -> object:
+        del status, limit
+        raise self.exc
 
 
 @pytest.mark.anyio
@@ -1404,6 +1448,47 @@ async def test_http_routes_skip_auth_when_token_is_empty(tmp_path: Path) -> None
     await service.shutdown()
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("exc", "expected_status", "expected_body"),
+    [
+        (
+            ShellctlServerError(404, "job_not_found", "Unknown job id: missing"),
+            404,
+            {"error": {"code": "job_not_found", "message": "Unknown job id: missing"}},
+        ),
+        (
+            ShellctlServerError(409, "job_not_running", "already done"),
+            409,
+            {"error": {"code": "job_not_running", "message": "already done"}},
+        ),
+        (
+            RuntimeError("boom"),
+            500,
+            {"error": {"code": "internal_error", "message": "boom"}},
+        ),
+    ],
+)
+async def test_http_routes_preserve_shellctl_error_envelope_after_error_codec_refactor(
+    exc: Exception,
+    expected_status: int,
+    expected_body: dict[str, object],
+) -> None:
+    service = ErrorRaisingHttpService(exc)
+    app = create_app(
+        ShellctlConfig(auth_token=None), service=cast(ShellctlService, service)
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://shellctl.test"
+    ) as client:
+        response = await client.get("/v1/jobs")
+
+    assert response.status_code == expected_status
+    assert response.json() == expected_body
+
+
 def test_shellctl_config_reads_auth_token_from_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1540,6 +1625,77 @@ def test_serve_cli_reads_auth_token_from_environment(
     assert config.auth_token == "env-token"
 
 
+def test_serve_cli_defaults_http_listen_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, runner = _capture_serve_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8765
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.listen == "127.0.0.1:8765"
+
+
+def test_serve_grpc_cli_passes_auth_token_to_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, runner = _capture_serve_grpc_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--transport",
+            "grpc",
+            "--listen",
+            "127.0.0.1:9998",
+            "--auth-token",
+            "grpc-token",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.listen == "127.0.0.1:9998"
+    assert config.auth_token == "grpc-token"
+
+
+def test_serve_cli_uses_grpc_default_listen_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, runner = _capture_serve_grpc_config(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--transport",
+            "grpc",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.listen == "127.0.0.1:8766"
+
+
 def test_runner_script_records_completion_metadata_without_direct_runner_exit(
     tmp_path: Path,
 ) -> None:
@@ -1634,5 +1790,6 @@ def test_python_m_shellctl_server_module_entrypoint_shows_cli_help() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+    assert "serve" in result.stdout
     assert "sanitize-pty" in result.stdout
     assert "runner-exit" in result.stdout

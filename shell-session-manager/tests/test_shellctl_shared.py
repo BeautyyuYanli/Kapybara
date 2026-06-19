@@ -7,8 +7,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from shell_session_manager.shellctl.proto.v1 import shellctl_pb2 as pb
 from shell_session_manager.shellctl.shared import (
+    DEFAULT_LIST_LIMIT,
+    DEFAULT_TERMINATE_GRACE_SECONDS,
     JOB_ID_ALPHABET,
+    MAX_LIST_LIMIT,
+    MAX_OUTPUT_LIMIT_BYTES,
+    JobInfo,
+    JobStatusName,
+    JobStatusView,
     PtySanitizer,
     RunJobRequest,
     generate_job_id,
@@ -16,6 +24,9 @@ from shell_session_manager.shellctl.shared import (
     sanitize_pty_output,
     sanitize_pty_stream,
     tail_output_window,
+)
+from shell_session_manager.shellctl.shared import (
+    protobuf as proto_codec,
 )
 
 
@@ -132,3 +143,108 @@ def test_run_job_request_rejects_invalid_env_entries(
 ) -> None:
     with pytest.raises(ValidationError, match=message):
         RunJobRequest(script="printf ready\n", env=env)
+
+
+def test_protobuf_job_status_round_trip() -> None:
+    status = proto_codec.job_status_from_protobuf(
+        proto_codec.job_status_to_protobuf(JobStatusName.RUNNING)
+    )
+
+    assert status is JobStatusName.RUNNING
+
+
+def test_protobuf_optional_fields_round_trip() -> None:
+    view = JobStatusView(
+        job_id="job-1",
+        status=JobStatusName.EXITED,
+        done=True,
+        exit_code=7,
+        created_at="2026-05-21T15:30:12Z",
+        started_at="2026-05-21T15:30:13Z",
+        ended_at="2026-05-21T15:30:14Z",
+        offset=9,
+    )
+    info = JobInfo(
+        job_id="job-1",
+        status=JobStatusName.EXITED,
+        created_at="2026-05-21T15:30:12Z",
+        started_at="2026-05-21T15:30:13Z",
+        ended_at="2026-05-21T15:30:14Z",
+    )
+
+    encoded_view = proto_codec.job_status_view_to_protobuf(view)
+    encoded_info = proto_codec.job_info_to_protobuf(info)
+
+    assert encoded_view.HasField("exit_code")
+    assert encoded_view.HasField("started_at")
+    assert encoded_view.HasField("ended_at")
+    assert encoded_info.HasField("started_at")
+    assert encoded_info.HasField("ended_at")
+    assert proto_codec.job_status_view_from_protobuf(encoded_view) == view
+    assert proto_codec.job_info_from_protobuf(encoded_info) == info
+
+
+def test_protobuf_run_request_preserves_explicit_empty_optional_string() -> None:
+    message = pb.RunJobRequest(script="printf ready\n")
+    message.cwd = ""
+
+    decoded = proto_codec.run_job_request_from_protobuf(message)
+
+    assert decoded.cwd == ""
+
+
+def test_protobuf_run_request_keeps_env_validation_in_pydantic() -> None:
+    message = pb.RunJobRequest(script="printf ready\n")
+    message.env[""] = "bad"
+
+    with pytest.raises(ValidationError, match="non-empty"):
+        proto_codec.run_job_request_from_protobuf(message)
+
+
+def test_protobuf_list_jobs_request_uses_unspecified_as_none_filter() -> None:
+    status, limit = proto_codec.list_jobs_request_from_protobuf(
+        pb.ListJobsRequest(status=pb.JOB_STATUS_UNSPECIFIED)
+    )
+
+    assert status is None
+    assert limit == DEFAULT_LIST_LIMIT
+
+
+def test_protobuf_list_jobs_request_rejects_out_of_range_limit() -> None:
+    with pytest.raises(ValueError, match="limit"):
+        proto_codec.list_jobs_request_from_protobuf(
+            pb.ListJobsRequest(status=pb.JOB_STATUS_UNSPECIFIED, limit=0)
+        )
+
+    with pytest.raises(ValueError, match="limit"):
+        proto_codec.list_jobs_request_from_protobuf(
+            pb.ListJobsRequest(
+                status=pb.JOB_STATUS_UNSPECIFIED,
+                limit=MAX_LIST_LIMIT + 1,
+            )
+        )
+
+
+def test_protobuf_tail_job_request_rejects_out_of_range_output_limit() -> None:
+    with pytest.raises(ValueError, match="output_limit"):
+        proto_codec.tail_job_request_from_protobuf(
+            pb.TailJobRequest(job_id="job-1", output_limit=0)
+        )
+
+    with pytest.raises(ValueError, match="output_limit"):
+        proto_codec.tail_job_request_from_protobuf(
+            pb.TailJobRequest(
+                job_id="job-1",
+                output_limit=MAX_OUTPUT_LIMIT_BYTES + 1,
+            )
+        )
+
+
+def test_protobuf_delete_request_uses_default_grace_when_absent() -> None:
+    job_id, force, grace_seconds = proto_codec.delete_job_request_from_protobuf(
+        pb.DeleteJobRequest(job_id="job-1", force=True)
+    )
+
+    assert job_id == "job-1"
+    assert force is True
+    assert grace_seconds == DEFAULT_TERMINATE_GRACE_SECONDS

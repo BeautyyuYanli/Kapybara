@@ -55,10 +55,32 @@ anyio.run(main)
 Run the HTTP API locally with:
 
 ```bash
-pdm run shellctl serve --listen 127.0.0.1:8765
+pdm run shellctl serve --transport http --listen 127.0.0.1:8765
 ```
 
 Pass `--auth-token your-token` when you want bearer auth enforced. `shellctl
 serve` also reads `SHELLCTL_AUTH_TOKEN`, so you can export the token instead of
 passing the flag. Leave the flag/env var unset or empty to start without
 requiring an Authorization header.
+
+Run the gRPC transport locally with:
+
+```bash
+pdm run shellctl serve --transport grpc --listen 127.0.0.1:8766
+```
+
+The same bearer token contract applies to gRPC metadata via the
+`authorization: Bearer <token>` metadata key.
+
+The URL-scheme constructor is the primary client entrypoint:
+
+```python
+from shell_session_manager.shellctl import ShellctlClient
+
+
+async with ShellctlClient("grpc://127.0.0.1:8766", token="secret") as client:
+    print(await client.healthz())
+```
+
+`http://` and `https://` select the HTTP transport, while `grpc://` and
+`grpcs://` select the gRPC transport.

@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package shellctl.v1;
+
+service Shellctl {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc RunJob(RunJobRequest) returns (JobResult);
+  rpc WaitJob(WaitJobRequest) returns (JobResult);
+  rpc TailJob(TailJobRequest) returns (JobResult);
+  rpc GetJobStatus(GetJobStatusRequest) returns (JobStatusView);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc SendInput(InputJobRequest) returns (JobResult);
+  rpc TerminateJob(TerminateJobRequest) returns (JobStatusView);
+  rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_CREATED = 1;
+  JOB_STATUS_STARTING = 2;
+  JOB_STATUS_RUNNING = 3;
+  JOB_STATUS_EXITED = 4;
+  JOB_STATUS_TERMINATED = 5;
+  JOB_STATUS_FAILED = 6;
+  JOB_STATUS_LOST = 7;
+}
+
+message TerminalSize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message RunJobRequest {
+  string script = 1;
+  optional string cwd = 2;
+  map<string, string> env = 3;
+  optional TerminalSize terminal = 4;
+  optional double timeout = 5;
+  optional uint32 output_limit = 6;
+  optional double idle_flush_seconds = 7;
+}
+
+message WaitJobRequest {
+  string job_id = 1;
+  uint64 offset = 2;
+  optional double timeout = 3;
+  optional uint32 output_limit = 4;
+  optional double idle_flush_seconds = 5;
+}
+
+message TailJobRequest {
+  string job_id = 1;
+  optional uint32 output_limit = 2;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+
+message ListJobsRequest {
+  JobStatus status = 1;
+  optional uint32 limit = 2;
+}
+
+message InputJobRequest {
+  string job_id = 1;
+  string text = 2;
+  uint64 offset = 3;
+  optional double timeout = 4;
+  optional uint32 output_limit = 5;
+  optional double idle_flush_seconds = 6;
+}
+
+message TerminateJobRequest {
+  string job_id = 1;
+  optional double grace_seconds = 2;
+}
+
+message DeleteJobRequest {
+  string job_id = 1;
+  bool force = 2;
+  optional double grace_seconds = 3;
+}
+
+message JobResult {
+  string job_id = 1;
+  bool done = 2;
+  JobStatus status = 3;
+  optional int32 exit_code = 4;
+  string output_path = 5;
+  string output = 6;
+  uint64 offset = 7;
+  bool truncated = 8;
+}
+
+message JobStatusView {
+  string job_id = 1;
+  JobStatus status = 2;
+  bool done = 3;
+  optional int32 exit_code = 4;
+  string created_at = 5;
+  optional string started_at = 6;
+  optional string ended_at = 7;
+  uint64 offset = 8;
+}
+
+message JobInfo {
+  string job_id = 1;
+  JobStatus status = 2;
+  string created_at = 3;
+  optional string started_at = 4;
+  optional string ended_at = 5;
+}
+
+message ListJobsResponse {
+  repeated JobInfo jobs = 1;
+}
+
+message DeleteJobResponse {
+  string job_id = 1;
+  bool deleted = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}
