@@ -176,7 +176,7 @@ class WaitJobRequest(ShellctlModel):
     """HTTP request body for `POST /v1/jobs/{job_id}/wait`."""
 
     timeout: float = Field(
-        default=DEFAULT_TIMEOUT_SECONDS, gt=0, le=MAX_WAIT_TIMEOUT_SECONDS
+        default=DEFAULT_TIMEOUT_SECONDS, ge=0, le=MAX_WAIT_TIMEOUT_SECONDS
     )
     offset: int = Field(ge=0)
     output_limit: int = Field(
