@@ -2,7 +2,9 @@
 
 The SDK keeps transport-level knobs (`output_limit`, `idle_flush_seconds`, and
  bearer token handling) on the client instance so individual method calls stay
- close to the proposal's high-level workflow.
+ close to the proposal's high-level workflow. Blocking shell operations reuse
+ the shared client, but they override the HTTP read timeout per request so the
+ transport does not fail before the server-side shell wait timeout does.
 """
 
 from __future__ import annotations
@@ -44,7 +46,8 @@ class ShellctlClient:
 
     The client owns a reusable `httpx.AsyncClient` unless one is injected via the
     `client` argument. Callers can therefore either keep one instance for a full
-    workflow or treat it as an async context manager.
+    workflow or treat it as an async context manager. Injected clients keep their
+    original lifecycle; `close()` only closes clients that this SDK created.
     """
 
     def __init__(
@@ -56,10 +59,12 @@ class ShellctlClient:
         token: str | None = None,
         client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        request_timeout_grace_seconds: float = 10.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.output_limit = output_limit
         self.idle_flush_seconds = idle_flush_seconds
+        self.request_timeout_grace_seconds = request_timeout_grace_seconds
         self.token = (
             token if token is not None else os.environ.get(DEFAULT_AUTH_TOKEN_ENV)
         )
@@ -84,6 +89,21 @@ class ShellctlClient:
 
         if self._owns_client:
             await self._client.aclose()
+
+    def _wait_request_timeout(self, timeout: float) -> httpx.Timeout:
+        """Return a request timeout for blocking shell calls.
+
+        The shellctl server enforces the payload timeout, while the SDK keeps a
+        small HTTP read-timeout grace so the transport can wait slightly longer
+        for that response without loosening connect/write/pool timeouts.
+        """
+
+        return httpx.Timeout(
+            connect=DEFAULT_TIMEOUT_SECONDS,
+            read=timeout + self.request_timeout_grace_seconds,
+            write=DEFAULT_TIMEOUT_SECONDS,
+            pool=DEFAULT_TIMEOUT_SECONDS,
+        )
 
     async def healthz(self) -> dict[str, Any]:
         """Call the public health endpoint without requiring auth."""
@@ -119,6 +139,7 @@ class ShellctlClient:
             "/v1/jobs/run",
             json=payload.model_dump(mode="json", exclude_none=True),
             headers=self._auth_headers(),
+            timeout=self._wait_request_timeout(timeout),
         )
         return JobResult.model_validate(self._decode_response(response))
 
@@ -140,6 +161,7 @@ class ShellctlClient:
                 "idle_flush_seconds": self.idle_flush_seconds,
             },
             headers=self._auth_headers(),
+            timeout=self._wait_request_timeout(timeout),
         )
         return JobResult.model_validate(self._decode_response(response))
 
@@ -191,6 +213,7 @@ class ShellctlClient:
                 "idle_flush_seconds": self.idle_flush_seconds,
             },
             headers=self._auth_headers(),
+            timeout=self._wait_request_timeout(timeout),
         )
         return JobResult.model_validate(self._decode_response(response))
 
