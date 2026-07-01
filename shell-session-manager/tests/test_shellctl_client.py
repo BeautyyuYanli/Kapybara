@@ -7,6 +7,7 @@ import pytest
 
 from shell_session_manager.shellctl.client import ShellctlClient, ShellctlClientError
 from shell_session_manager.shellctl.client import sdk as shellctl_sdk
+from shell_session_manager.shellctl.shared import DEFAULT_TERMINATE_GRACE_SECONDS
 
 
 @pytest.mark.anyio
@@ -144,23 +145,7 @@ async def test_shellctl_client_blocking_calls_use_grace_read_timeout(
             lambda result: (result.status, result.offset) == ("running", 99),
         ),
         (
-            lambda client: client.terminate("job-1", grace_seconds=7.0),
-            "POST",
-            "/v1/jobs/job-1/terminate",
-            {
-                "job_id": "job-1",
-                "status": "running",
-                "done": False,
-                "exit_code": None,
-                "created_at": "2026-01-01T00:00:00Z",
-                "started_at": "2026-01-01T00:00:01Z",
-                "ended_at": None,
-                "offset": 99,
-            },
-            lambda result: (result.status, result.offset) == ("running", 99),
-        ),
-        (
-            lambda client: client.delete("job-1", force=True, grace_seconds=3.5),
+            lambda client: client.delete("job-1", force=False),
             "DELETE",
             "/v1/jobs/job-1",
             {"job_id": "job-1", "deleted": True},
@@ -196,6 +181,92 @@ async def test_shellctl_client_control_calls_use_default_timeout(
         result = await call(client)
 
     assert assert_result(result)
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_terminate_uses_grace_read_timeout() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/jobs/job-1/terminate"
+        assert json.loads(request.content.decode("utf-8")) == {"grace_seconds": 7.0}
+        assert request.extensions["timeout"] == {
+            "connect": 30.0,
+            "read": 17.0,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "job_id": "job-1",
+                "status": "terminated",
+                "done": True,
+                "exit_code": 130,
+                "created_at": "2026-01-01T00:00:00Z",
+                "started_at": "2026-01-01T00:00:01Z",
+                "ended_at": "2026-01-01T00:00:08Z",
+                "offset": 99,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient(
+        "http://127.0.0.1:8765",
+        token="secret",
+        transport=transport,
+    ) as client:
+        result = await client.terminate("job-1", grace_seconds=7.0)
+
+    assert (result.status, result.exit_code) == ("terminated", 130)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("kwargs", "expected_params", "expected_read_timeout"),
+    [
+        (
+            {"force": True, "grace_seconds": 3.5},
+            {"force": "true", "grace_seconds": "3.5"},
+            13.5,
+        ),
+        (
+            {"force": True},
+            {"force": "true"},
+            DEFAULT_TERMINATE_GRACE_SECONDS + 10.0,
+        ),
+        (
+            {"force": True, "grace_seconds": 0.0},
+            {"force": "true", "grace_seconds": "0.0"},
+            10.0,
+        ),
+    ],
+)
+async def test_shellctl_client_forced_delete_uses_terminate_grace_timeout(
+    kwargs: dict[str, object],
+    expected_params: dict[str, str],
+    expected_read_timeout: float,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.url.path == "/v1/jobs/job-1"
+        assert dict(request.url.params) == expected_params
+        assert request.extensions["timeout"] == {
+            "connect": 30.0,
+            "read": expected_read_timeout,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+        return httpx.Response(200, json={"job_id": "job-1", "deleted": True})
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient(
+        "http://127.0.0.1:8765",
+        token="secret",
+        transport=transport,
+    ) as client:
+        result = await client.delete("job-1", **kwargs)
+
+    assert (result.job_id, result.deleted) == ("job-1", True)
 
 
 @pytest.mark.anyio

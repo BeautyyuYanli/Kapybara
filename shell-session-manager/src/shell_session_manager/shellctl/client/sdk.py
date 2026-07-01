@@ -4,7 +4,8 @@ The SDK keeps transport-level knobs (`output_limit`, `idle_flush_seconds`, and
  bearer token handling) on the client instance so individual method calls stay
  close to the proposal's high-level workflow. Blocking shell operations reuse
  the shared client, but they override the HTTP read timeout per request so the
- transport does not fail before the server-side shell wait timeout does.
+ transport does not fail before the server-side shell wait timeout or
+ terminate-grace budget does.
 """
 
 from __future__ import annotations
@@ -104,6 +105,21 @@ class ShellctlClient:
             write=DEFAULT_TIMEOUT_SECONDS,
             pool=DEFAULT_TIMEOUT_SECONDS,
         )
+
+    def _terminate_request_timeout(
+        self, grace_seconds: float | None = None
+    ) -> httpx.Timeout:
+        """Return a request timeout for terminate-style calls.
+
+        `terminate()` and forced `delete()` block until the server finishes the
+        terminate grace window, so their HTTP read timeout must cover that
+        business wait budget even when the request relies on the API default.
+        """
+
+        effective_grace_seconds = (
+            DEFAULT_TERMINATE_GRACE_SECONDS if grace_seconds is None else grace_seconds
+        )
+        return self._wait_request_timeout(effective_grace_seconds)
 
     async def healthz(self) -> dict[str, Any]:
         """Call the public health endpoint without requiring auth."""
@@ -232,12 +248,13 @@ class ShellctlClient:
         job_id: str,
         grace_seconds: float = DEFAULT_TERMINATE_GRACE_SECONDS,
     ) -> JobStatusView:
-        """Terminate a job, returning the resulting materialized status view."""
+        """Terminate a job, waiting long enough for the grace window to finish."""
 
         response = await self._client.post(
             f"/v1/jobs/{job_id}/terminate",
             json={"grace_seconds": grace_seconds},
             headers=self._auth_headers(),
+            timeout=self._terminate_request_timeout(grace_seconds),
         )
         return JobStatusView.model_validate(self._decode_response(response))
 
@@ -248,15 +265,20 @@ class ShellctlClient:
         force: bool = False,
         grace_seconds: float | None = None,
     ) -> DeleteJobResponse:
-        """Delete job artifacts, optionally terminating the job first."""
+        """Delete job artifacts, optionally waiting for forced termination first."""
 
         params: dict[str, Any] = {"force": str(force).lower()}
         if grace_seconds is not None:
             params["grace_seconds"] = grace_seconds
+        request_kwargs: dict[str, Any] = {
+            "params": params,
+            "headers": self._auth_headers(),
+        }
+        if force:
+            request_kwargs["timeout"] = self._terminate_request_timeout(grace_seconds)
         response = await self._client.delete(
             f"/v1/jobs/{job_id}",
-            params=params,
-            headers=self._auth_headers(),
+            **request_kwargs,
         )
         return DeleteJobResponse.model_validate(self._decode_response(response))
 
