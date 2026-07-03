@@ -1481,6 +1481,7 @@ def test_serve_cli_passes_direct_auth_token_to_config(
     result = runner.invoke(
         cli,
         [
+            "serve",
             "--listen",
             "0.0.0.0:9999",
             "--auth-token",
@@ -1508,6 +1509,7 @@ def test_serve_cli_prefers_explicit_auth_token_over_environment(
     result = runner.invoke(
         cli,
         [
+            "serve",
             "--auth-token",
             "direct-token",
             "--state-dir",
@@ -1529,6 +1531,7 @@ def test_serve_cli_treats_empty_auth_token_as_disabled(
     result = runner.invoke(
         cli,
         [
+            "serve",
             "--auth-token",
             "",
             "--state-dir",
@@ -1551,6 +1554,7 @@ def test_serve_cli_explicit_empty_auth_token_beats_environment(
     result = runner.invoke(
         cli,
         [
+            "serve",
             "--auth-token",
             "",
             "--state-dir",
@@ -1573,6 +1577,7 @@ def test_serve_cli_reads_auth_token_from_environment(
     result = runner.invoke(
         cli,
         [
+            "serve",
             "--state-dir",
             str(tmp_path / "state"),
         ],
