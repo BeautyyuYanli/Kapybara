@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     )
     from shell_session_manager.shellctl.shared import (
         DEFAULT_AUTH_TOKEN_ENV,
+        DEFAULT_BASE_URL,
+        DEFAULT_BASE_URL_ENV,
         DEFAULT_GC_FINISHED_JOB_RETENTION_SECONDS,
         DEFAULT_GC_INTERVAL_SECONDS,
         DEFAULT_IDLE_FLUSH_SECONDS,
@@ -46,6 +48,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_AUTH_TOKEN_ENV",
+    "DEFAULT_BASE_URL",
+    "DEFAULT_BASE_URL_ENV",
     "DEFAULT_GC_FINISHED_JOB_RETENTION_SECONDS",
     "DEFAULT_GC_INTERVAL_SECONDS",
     "DEFAULT_IDLE_FLUSH_SECONDS",
@@ -78,6 +82,8 @@ _EXPORTS = {
     "ShellctlClient": "shell_session_manager.shellctl.client",
     "ShellctlClientError": "shell_session_manager.shellctl.client",
     "DEFAULT_AUTH_TOKEN_ENV": "shell_session_manager.shellctl.shared",
+    "DEFAULT_BASE_URL": "shell_session_manager.shellctl.shared",
+    "DEFAULT_BASE_URL_ENV": "shell_session_manager.shellctl.shared",
     "DEFAULT_GC_FINISHED_JOB_RETENTION_SECONDS": "shell_session_manager.shellctl.shared",
     "DEFAULT_GC_INTERVAL_SECONDS": "shell_session_manager.shellctl.shared",
     "DEFAULT_IDLE_FLUSH_SECONDS": "shell_session_manager.shellctl.shared",

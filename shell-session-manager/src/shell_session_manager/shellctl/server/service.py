@@ -2,10 +2,10 @@
 
 This module owns the long-lived job lifecycle rules: artifact creation,
 SQLite compare-and-swap transitions, tmux reconciliation, runner exit
-materialization, and GC. API and CLI controllers should call into
+materialization, and GC. API and local server entrypoints should call into
 `ShellctlService` rather than duplicating lifecycle logic, choosing either the
 lightweight `prepare_runtime()` bootstrap or the full `initialize()` startup
-depending on whether they need one-shot commands or long-running maintenance.
+depending on whether they need bounded setup work or long-running maintenance.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ from shell_session_manager.shellctl.shared.schemas import (
 
 
 class ShellctlService:
-    """SQLite-backed shellctl job service used by HTTP and direct CLI controllers.
+    """SQLite-backed shellctl job service used by HTTP and local server entrypoints.
 
     The service keeps only minimal in-memory coordination state:
 
@@ -117,12 +117,12 @@ class ShellctlService:
             await connection.run_sync(SQLModel.metadata.create_all)
 
     async def prepare_runtime(self) -> None:
-        """Prepare the minimal local runtime needed for one-shot controllers.
+        """Prepare the minimal local runtime needed for bounded server-side work.
 
         This startup path intentionally skips reconciliation, GC, and background
-        tasks. Direct CLI commands should stay bounded by the requested job
-        operation instead of scanning or maintaining the full historical job set
-        on every invocation.
+        tasks. Entry points that only need local runtime artifacts should stay
+        bounded by the requested operation instead of scanning or maintaining
+        the full historical job set on every invocation.
         """
 
         await self.initialize_database()

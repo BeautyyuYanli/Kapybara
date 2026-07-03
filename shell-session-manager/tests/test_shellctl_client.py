@@ -2,12 +2,16 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import ClassVar
 
-import httpx
+import httpx2 as httpx
 import pytest
 
 from shell_session_manager.shellctl.client import ShellctlClient, ShellctlClientError
 from shell_session_manager.shellctl.client import sdk as shellctl_sdk
-from shell_session_manager.shellctl.shared import DEFAULT_TERMINATE_GRACE_SECONDS
+from shell_session_manager.shellctl.shared import (
+    DEFAULT_TERMINATE_GRACE_SECONDS,
+    HealthResponse,
+    JobStatusName,
+)
 
 
 @pytest.mark.anyio
@@ -308,6 +312,169 @@ async def test_shellctl_client_closes_owned_client_on_close_and_context_exit(
 
 
 @pytest.mark.anyio
+async def test_shellctl_client_list_jobs_uses_query_params_and_auth() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/jobs"
+        assert request.url.params["status"] == "running"
+        assert request.url.params["limit"] == "5"
+        assert request.headers["authorization"] == "Bearer secret"
+        return httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "job_id": "job-1",
+                        "status": "running",
+                        "created_at": "2026-05-21T15:30:12Z",
+                    }
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient(
+        "http://127.0.0.1:8765", token="secret", transport=transport
+    ) as client:
+        result = await client.list_jobs(status="running", limit=5)
+
+    assert len(result) == 1
+    assert result[0].job_id == "job-1"
+    assert result[0].status == JobStatusName.RUNNING
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_wait_uses_body_and_omits_auth_without_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/jobs/job-1/wait"
+        assert "authorization" not in request.headers
+        assert json.loads(request.content.decode("utf-8")) == {
+            "offset": 3,
+            "timeout": 9.0,
+            "output_limit": 2048,
+            "idle_flush_seconds": 0.1,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "job_id": "job-1",
+                "done": False,
+                "status": "running",
+                "exit_code": None,
+                "output_path": "/tmp/wait.log",
+                "output": "chunk",
+                "offset": 8,
+                "truncated": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient(
+        "http://127.0.0.1:8765",
+        output_limit=2048,
+        idle_flush_seconds=0.1,
+        transport=transport,
+    ) as client:
+        result = await client.wait("job-1", offset=3, timeout=9)
+
+    assert result.job_id == "job-1"
+    assert result.offset == 8
+    assert result.output == "chunk"
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_input_uses_body_and_auth() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/jobs/job-1/input"
+        assert request.headers["authorization"] == "Bearer secret"
+        assert json.loads(request.content.decode("utf-8")) == {
+            "text": "ls\n",
+            "offset": 5,
+            "timeout": 4.0,
+            "output_limit": 512,
+            "idle_flush_seconds": 0.0,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "job_id": "job-1",
+                "done": False,
+                "status": "running",
+                "exit_code": None,
+                "output_path": "/tmp/input.log",
+                "output": "reply",
+                "offset": 10,
+                "truncated": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient(
+        "http://127.0.0.1:8765",
+        output_limit=512,
+        idle_flush_seconds=0.0,
+        token="secret",
+        transport=transport,
+    ) as client:
+        result = await client.input("job-1", "ls\n", offset=5, timeout=4)
+
+    assert result.output == "reply"
+    assert result.offset == 10
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_terminate_uses_body_and_auth() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/jobs/job-1/terminate"
+        assert request.headers["authorization"] == "Bearer secret"
+        assert json.loads(request.content.decode("utf-8")) == {"grace_seconds": 0.25}
+        return httpx.Response(
+            200,
+            json={
+                "job_id": "job-1",
+                "status": "terminated",
+                "done": True,
+                "created_at": "2026-05-21T15:30:12Z",
+                "started_at": "2026-05-21T15:30:13Z",
+                "ended_at": "2026-05-21T15:30:18Z",
+                "offset": 12,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient(
+        "http://127.0.0.1:8765", token="secret", transport=transport
+    ) as client:
+        result = await client.terminate("job-1", 0.25)
+
+    assert result.status == JobStatusName.TERMINATED
+    assert result.done is True
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_delete_uses_query_params_and_auth() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.url.path == "/v1/jobs/job-1"
+        assert request.url.params["force"] == "true"
+        assert request.url.params["grace_seconds"] == "0.5"
+        assert request.headers["authorization"] == "Bearer secret"
+        return httpx.Response(200, json={"job_id": "job-1", "deleted": True})
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient(
+        "http://127.0.0.1:8765", token="secret", transport=transport
+    ) as client:
+        result = await client.delete("job-1", force=True, grace_seconds=0.5)
+
+    assert result.job_id == "job-1"
+    assert result.deleted is True
+
+
+@pytest.mark.anyio
 async def test_shellctl_client_raises_structured_errors() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -351,3 +518,53 @@ async def test_shellctl_client_does_not_close_injected_client() -> None:
     assert injected_client.close_calls == 0
     await injected_client.aclose()
     assert injected_client.close_calls == 1
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_raises_invalid_json_errors() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b"{",
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient("http://127.0.0.1:8765", transport=transport) as client:
+        with pytest.raises(ShellctlClientError) as exc_info:
+            await client.status("job-1")
+
+    assert exc_info.value.code == "invalid_json"
+    assert exc_info.value.message == "{"
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_raises_invalid_payload_errors() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["not", "a", "dict"])
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient("http://127.0.0.1:8765", transport=transport) as client:
+        with pytest.raises(ShellctlClientError) as exc_info:
+            await client.healthz()
+
+    assert exc_info.value.code == "invalid_payload"
+    assert exc_info.value.message == '["not","a","dict"]'
+
+
+@pytest.mark.anyio
+async def test_shellctl_client_health_returns_model_and_healthz_stays_compatible() -> (
+    None
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/healthz"
+        return httpx.Response(200, json={"status": "ok"})
+
+    transport = httpx.MockTransport(handler)
+    async with ShellctlClient("http://127.0.0.1:8765", transport=transport) as client:
+        health = await client.health()
+        healthz = await client.healthz()
+
+    assert health == HealthResponse(status="ok")
+    assert healthz == {"status": "ok"}

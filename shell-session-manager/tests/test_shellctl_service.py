@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import anyio
-import httpx
+import httpx2 as httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -49,7 +49,9 @@ from shell_session_manager.shellctl.shared import (
     job_session_name,
 )
 
-server_cli_module = importlib.import_module("shell_session_manager.shellctl.server.cli")
+server_serve_module = importlib.import_module(
+    "shell_session_manager.shellctl.server.serve"
+)
 
 
 class FakeTmuxController:
@@ -188,7 +190,7 @@ def _capture_serve_config(
 ) -> tuple[dict[str, object], CliRunner]:
     captured: dict[str, object] = {}
 
-    def fake_create_app(config: ShellctlConfig):
+    def fake_create_app(config: ShellctlConfig) -> object:
         captured["config"] = config
         return object()
 
@@ -198,8 +200,8 @@ def _capture_serve_config(
         captured["port"] = port
         captured["log_level"] = log_level
 
-    monkeypatch.setattr(server_cli_module, "create_app", fake_create_app)
-    monkeypatch.setattr(server_cli_module.uvicorn, "run", fake_run)
+    monkeypatch.setattr(server_serve_module, "_create_app", fake_create_app)
+    monkeypatch.setattr(server_serve_module, "_uvicorn_run", fake_run)
     return captured, CliRunner()
 
 
@@ -1587,6 +1589,37 @@ def test_serve_cli_reads_auth_token_from_environment(
     config = captured["config"]
     assert isinstance(config, ShellctlConfig)
     assert config.auth_token == "env-token"
+
+
+def test_serve_cli_forwards_state_runtime_and_gc_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, runner = _capture_serve_config(monkeypatch)
+    state_dir = tmp_path / "state"
+    runtime_dir = tmp_path / "runtime"
+
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--state-dir",
+            str(state_dir),
+            "--runtime-dir",
+            str(runtime_dir),
+            "--gc-interval-seconds",
+            "12.5",
+            "--gc-finished-job-retention-seconds",
+            "345.0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, ShellctlConfig)
+    assert config.state_dir == state_dir
+    assert config.runtime_dir == runtime_dir
+    assert config.gc_interval_seconds == 12.5
+    assert config.gc_finished_job_retention_seconds == 345.0
 
 
 def test_runner_script_records_completion_metadata_without_direct_runner_exit(

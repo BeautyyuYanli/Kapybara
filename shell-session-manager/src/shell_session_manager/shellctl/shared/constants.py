@@ -2,10 +2,13 @@
 
 This module intentionally contains only literal defaults and bounds so callers
 can import stable configuration values without pulling in the heavier DTO,
-sanitize, or server packages.
+sanitize, or server packages. The network CLI depends on this file for its
+base URL and auth-token environment contract, so keep it import-light.
 """
 
 DEFAULT_AUTH_TOKEN_ENV = "SHELLCTL_AUTH_TOKEN"
+DEFAULT_BASE_URL_ENV = "SHELLCTL_BASE_URL"
+DEFAULT_BASE_URL = "http://127.0.0.1:8765"
 DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 8
 MAX_OUTPUT_LIMIT_BYTES = 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -25,6 +28,8 @@ DEFAULT_HEALTH_STATUS = "ok"
 
 __all__ = [
     "DEFAULT_AUTH_TOKEN_ENV",
+    "DEFAULT_BASE_URL",
+    "DEFAULT_BASE_URL_ENV",
     "DEFAULT_GC_FINISHED_JOB_RETENTION_SECONDS",
     "DEFAULT_GC_INTERVAL_SECONDS",
     "DEFAULT_HEALTH_STATUS",

@@ -1,37 +1,33 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
-import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import ClassVar
 
+import httpx2 as httpx
 import pytest
 import typer.main
 from typer.testing import CliRunner
 
-from shell_session_manager.shellctl.server import (
-    ShellctlConfig,
-    ShellctlServerError,
-    cli,
-)
-from shell_session_manager.shellctl.shared import (
+from shell_session_manager.shellctl.client import ShellctlClientError
+from shell_session_manager.shellctl.shared.constants import DEFAULT_BASE_URL
+from shell_session_manager.shellctl.shared.schemas import (
     DeleteJobResponse,
-    InputJobRequest,
+    HealthResponse,
+    JobInfo,
     JobResult,
     JobStatusName,
     JobStatusView,
-    ListJobsResponse,
-    RunJobRequest,
-    TerminateJobRequest,
-    WaitJobRequest,
+    TerminalSize,
 )
 
-cli_controller_module = importlib.import_module(
-    "shell_session_manager.shellctl.server.cli_controller"
-)
-
+cli_module = importlib.import_module("shell_session_manager.shellctl.cli")
+cli = cli_module.cli
 runner = CliRunner()
 
 
@@ -52,119 +48,163 @@ def _command_option(command_name: str, option_name: str):
     raise AssertionError(f"{option_name} not found on {command_name}")
 
 
-class RecordingShellctlService:
-    created_configs: ClassVar[list[ShellctlConfig]] = []
+class RecordingShellctlClient:
+    init_calls: ClassVar[list[dict[str, object]]] = []
     calls: ClassVar[list[tuple[str, tuple[object, ...], dict[str, object]]]] = []
     results: ClassVar[dict[str, object]] = {}
-    error: ClassVar[ShellctlServerError | None] = None
-    prepare_runtime_calls: ClassVar[int] = 0
-    initialize_calls: ClassVar[int] = 0
-    reconcile_calls: ClassVar[int] = 0
-    gc_once_calls: ClassVar[int] = 0
-    shutdown_calls: ClassVar[int] = 0
+    error: ClassVar[BaseException | None] = None
 
-    def __init__(self, config: ShellctlConfig) -> None:
-        self.config = config
-        type(self).created_configs.append(config)
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        output_limit: int,
+        idle_flush_seconds: float,
+        token: str | None = None,
+        client: object | None = None,
+        transport: object | None = None,
+    ) -> None:
+        del client, transport
+        type(self).init_calls.append(
+            {
+                "base_url": base_url,
+                "output_limit": output_limit,
+                "idle_flush_seconds": idle_flush_seconds,
+                "token": token,
+            }
+        )
 
     @classmethod
     def reset(cls) -> None:
-        cls.created_configs = []
+        cls.init_calls = []
         cls.calls = []
         cls.results = {}
         cls.error = None
-        cls.prepare_runtime_calls = 0
-        cls.initialize_calls = 0
-        cls.reconcile_calls = 0
-        cls.gc_once_calls = 0
-        cls.shutdown_calls = 0
+
+    async def __aenter__(self) -> RecordingShellctlClient:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
 
     def _result(self, method: str) -> object:
         if type(self).error is not None:
             raise type(self).error
         return type(self).results[method]
 
-    async def prepare_runtime(self) -> None:
-        type(self).prepare_runtime_calls += 1
+    async def health(self) -> HealthResponse:
+        type(self).calls.append(("health", (), {}))
+        return self._result("health")  # type: ignore[return-value]
 
-    async def initialize(self) -> None:
-        type(self).initialize_calls += 1
+    async def run(
+        self,
+        script: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: float,
+        terminal: TerminalSize | None = None,
+    ) -> JobResult:
+        type(self).calls.append(
+            (
+                "run",
+                (script,),
+                {
+                    "cwd": cwd,
+                    "env": env,
+                    "timeout": timeout,
+                    "terminal": terminal,
+                },
+            )
+        )
+        return self._result("run")  # type: ignore[return-value]
 
-    async def reconcile(self) -> None:
-        type(self).reconcile_calls += 1
+    async def wait(self, job_id: str, *, offset: int, timeout: float) -> JobResult:
+        type(self).calls.append(
+            ("wait", (job_id,), {"offset": offset, "timeout": timeout})
+        )
+        return self._result("wait")  # type: ignore[return-value]
 
-    async def gc_once(self) -> None:
-        type(self).gc_once_calls += 1
-
-    async def shutdown(self) -> None:
-        type(self).shutdown_calls += 1
-
-    async def run_job(self, request: RunJobRequest) -> JobResult:
-        type(self).calls.append(("run_job", (request,), {}))
-        return self._result("run_job")  # type: ignore[return-value]
-
-    async def wait_job(self, job_id: str, request: WaitJobRequest) -> JobResult:
-        type(self).calls.append(("wait_job", (job_id, request), {}))
-        return self._result("wait_job")  # type: ignore[return-value]
-
-    async def get_job_status(self, job_id: str) -> JobStatusView:
-        type(self).calls.append(("get_job_status", (job_id,), {}))
-        return self._result("get_job_status")  # type: ignore[return-value]
+    async def status(self, job_id: str) -> JobStatusView:
+        type(self).calls.append(("status", (job_id,), {}))
+        return self._result("status")  # type: ignore[return-value]
 
     async def list_jobs(
         self,
         *,
         status: JobStatusName | None = None,
         limit: int,
-    ) -> ListJobsResponse:
+    ) -> list[JobInfo]:
         type(self).calls.append(("list_jobs", (), {"status": status, "limit": limit}))
         return self._result("list_jobs")  # type: ignore[return-value]
 
-    async def send_input(self, job_id: str, request: InputJobRequest) -> JobResult:
-        type(self).calls.append(("send_input", (job_id, request), {}))
-        return self._result("send_input")  # type: ignore[return-value]
-
-    async def tail_job(self, job_id: str, *, output_limit: int) -> JobResult:
-        type(self).calls.append(("tail_job", (job_id,), {"output_limit": output_limit}))
-        return self._result("tail_job")  # type: ignore[return-value]
-
-    async def terminate_job(
+    async def input(
         self,
         job_id: str,
-        request: TerminateJobRequest,
-    ) -> JobStatusView:
-        type(self).calls.append(("terminate_job", (job_id, request), {}))
-        return self._result("terminate_job")  # type: ignore[return-value]
+        text: str,
+        *,
+        offset: int,
+        timeout: float,
+    ) -> JobResult:
+        type(self).calls.append(
+            (
+                "input",
+                (job_id, text),
+                {"offset": offset, "timeout": timeout},
+            )
+        )
+        return self._result("input")  # type: ignore[return-value]
 
-    async def delete_job(
+    async def tail(self, job_id: str) -> JobResult:
+        type(self).calls.append(("tail", (job_id,), {}))
+        return self._result("tail")  # type: ignore[return-value]
+
+    async def terminate(self, job_id: str, grace_seconds: float) -> JobStatusView:
+        type(self).calls.append(
+            ("terminate", (job_id,), {"grace_seconds": grace_seconds})
+        )
+        return self._result("terminate")  # type: ignore[return-value]
+
+    async def delete(
         self,
         job_id: str,
         *,
-        force: bool,
-        grace_seconds: float,
+        force: bool = False,
+        grace_seconds: float | None = None,
     ) -> DeleteJobResponse:
         type(self).calls.append(
             (
-                "delete_job",
+                "delete",
                 (job_id,),
                 {"force": force, "grace_seconds": grace_seconds},
             )
         )
-        return self._result("delete_job")  # type: ignore[return-value]
+        return self._result("delete")  # type: ignore[return-value]
 
 
 @pytest.fixture
-def patched_service(monkeypatch: pytest.MonkeyPatch) -> type[RecordingShellctlService]:
-    RecordingShellctlService.reset()
-    monkeypatch.setattr(
-        cli_controller_module,
-        "ShellctlService",
-        RecordingShellctlService,
+def patched_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> type[RecordingShellctlClient]:
+    RecordingShellctlClient.reset()
+    monkeypatch.setattr(cli_module, "ShellctlClient", RecordingShellctlClient)
+    return RecordingShellctlClient
+
+
+def _package_env() -> dict[str, str]:
+    package_root = Path(__file__).resolve().parents[1]
+    src_path = package_root / "src"
+    env = dict(os.environ)
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{src_path}{os.pathsep}{current_pythonpath}"
+        if current_pythonpath
+        else str(src_path)
     )
-    return RecordingShellctlService
+    return env
 
 
-def test_shellctl_help_lists_direct_controller_commands() -> None:
+def test_shellctl_help_lists_network_commands() -> None:
     result = runner.invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.stderr
@@ -177,63 +217,52 @@ def test_shellctl_help_lists_direct_controller_commands() -> None:
     assert "tail" in result.stdout
     assert "terminate" in result.stdout
     assert "delete" in result.stdout
+    assert "serve" in result.stdout
 
 
-def test_shellctl_run_help_shows_direct_options() -> None:
-    options = _command_option_names("run")
+def test_shellctl_run_and_serve_help_show_the_new_option_boundaries() -> None:
+    run_result = runner.invoke(cli, ["run", "--help"])
+    serve_result = runner.invoke(cli, ["serve", "--help"])
 
-    assert {
-        "--cwd",
-        "--env",
-        "--timeout",
-        "--output-limit",
-        "--idle-flush-seconds",
-        "--cols",
-        "--rows",
-        "--state-dir",
-        "--runtime-dir",
-    }.issubset(options)
-    assert "--auth-token" not in options
+    assert run_result.exit_code == 0, run_result.stderr
+    assert "--base-url" in run_result.stdout
+    assert "--auth-token" in run_result.stdout
+    assert "--state-dir" not in run_result.stdout
+    assert "--runtime-dir" not in run_result.stdout
+
+    assert serve_result.exit_code == 0, serve_result.stderr
+    assert "--state-dir" in serve_result.stdout
+    assert "--runtime-dir" in serve_result.stdout
+    assert "--auth-token" in serve_result.stdout
 
 
-def test_shellctl_health_uses_prepare_runtime_and_ignores_http_auth_env(
+def test_shellctl_health_uses_sdk_health_and_ignores_auth_token_input(
     monkeypatch: pytest.MonkeyPatch,
-    patched_service: type[RecordingShellctlService],
-    tmp_path: Path,
+    patched_client: type[RecordingShellctlClient],
 ) -> None:
-    monkeypatch.setenv("SHELLCTL_AUTH_TOKEN", "from-http-only-env")
+    patched_client.results["health"] = HealthResponse(status="ok")
+    monkeypatch.setenv("SHELLCTL_AUTH_TOKEN", "from-env")
 
-    result = runner.invoke(
-        cli,
-        [
-            "health",
-            "--state-dir",
-            str(tmp_path / "state"),
-            "--runtime-dir",
-            str(tmp_path / "run"),
-        ],
-    )
+    result = runner.invoke(cli, ["health", "--auth-token", "flag-token"])
 
     assert result.exit_code == 0, result.stderr
     assert json.loads(result.stdout) == {"status": "ok"}
-    assert result.stderr == ""
-    assert patched_service.prepare_runtime_calls == 1
-    assert patched_service.initialize_calls == 0
-    assert patched_service.reconcile_calls == 0
-    assert patched_service.gc_once_calls == 0
-    assert patched_service.shutdown_calls == 1
-    assert len(patched_service.created_configs) == 1
-    config = patched_service.created_configs[0]
-    assert config.state_dir == tmp_path / "state"
-    assert config.runtime_dir == tmp_path / "run"
-    assert config.auth_token is None
+    assert patched_client.calls == [("health", (), {})]
+    assert patched_client.init_calls == [
+        {
+            "base_url": DEFAULT_BASE_URL,
+            "output_limit": 8192,
+            "idle_flush_seconds": 0.5,
+            "token": None,
+        }
+    ]
 
 
-def test_shellctl_run_builds_request_and_emits_json(
-    patched_service: type[RecordingShellctlService],
+def test_shellctl_run_builds_sdk_request_and_emits_json(
+    patched_client: type[RecordingShellctlClient],
     tmp_path: Path,
 ) -> None:
-    patched_service.results["run_job"] = JobResult(
+    patched_client.results["run"] = JobResult(
         job_id="job-run",
         done=False,
         status=JobStatusName.RUNNING,
@@ -262,10 +291,6 @@ def test_shellctl_run_builds_request_and_emits_json(
             "0.25",
             "--cols",
             "90",
-            "--state-dir",
-            str(tmp_path / "state"),
-            "--runtime-dir",
-            str(tmp_path / "run"),
         ],
     )
 
@@ -279,26 +304,23 @@ def test_shellctl_run_builds_request_and_emits_json(
         "offset": 6,
         "truncated": False,
     }
-    assert patched_service.prepare_runtime_calls == 1
-    assert patched_service.initialize_calls == 0
-    assert patched_service.reconcile_calls == 0
-    assert patched_service.gc_once_calls == 0
-    assert patched_service.shutdown_calls == 1
-
-    call_name, args, kwargs = patched_service.calls[0]
-    assert call_name == "run_job"
-    assert kwargs == {}
-    request = args[0]
-    assert isinstance(request, RunJobRequest)
-    assert request.script == "printf hello\\n"
-    assert request.cwd == str(tmp_path / "workspace")
-    assert request.env == {"A": "1", "EMPTY": ""}
-    assert request.timeout == 12.0
-    assert request.output_limit == 4096
-    assert request.idle_flush_seconds == 0.25
-    assert request.terminal is not None
-    assert request.terminal.cols == 90
-    assert request.terminal.rows == 80
+    assert patched_client.init_calls == [
+        {
+            "base_url": DEFAULT_BASE_URL,
+            "output_limit": 4096,
+            "idle_flush_seconds": 0.25,
+            "token": None,
+        }
+    ]
+    assert patched_client.calls[0][0] == "run"
+    assert patched_client.calls[0][1] == ("printf hello\\n",)
+    assert patched_client.calls[0][2]["cwd"] == str(tmp_path / "workspace")
+    assert patched_client.calls[0][2]["env"] == {"A": "1", "EMPTY": ""}
+    assert patched_client.calls[0][2]["timeout"] == 12.0
+    terminal = patched_client.calls[0][2]["terminal"]
+    assert isinstance(terminal, TerminalSize)
+    assert terminal.cols == 90
+    assert terminal.rows == 80
 
 
 def test_shellctl_wait_and_input_require_offset() -> None:
@@ -307,9 +329,9 @@ def test_shellctl_wait_and_input_require_offset() -> None:
 
 
 def test_shellctl_wait_and_input_map_requests(
-    patched_service: type[RecordingShellctlService],
+    patched_client: type[RecordingShellctlClient],
 ) -> None:
-    patched_service.results["wait_job"] = JobResult(
+    patched_client.results["wait"] = JobResult(
         job_id="job-1",
         done=False,
         status=JobStatusName.RUNNING,
@@ -318,6 +340,7 @@ def test_shellctl_wait_and_input_map_requests(
         offset=5,
         truncated=False,
     )
+
     wait_result = runner.invoke(
         cli,
         [
@@ -335,18 +358,16 @@ def test_shellctl_wait_and_input_map_requests(
     )
 
     assert wait_result.exit_code == 0, wait_result.stderr
-    wait_call = patched_service.calls[0]
-    assert wait_call[0] == "wait_job"
-    assert wait_call[1][0] == "job-1"
-    wait_request = wait_call[1][1]
-    assert isinstance(wait_request, WaitJobRequest)
-    assert wait_request.offset == 3
-    assert wait_request.timeout == 9.0
-    assert wait_request.output_limit == 2048
-    assert wait_request.idle_flush_seconds == 0.1
+    assert patched_client.calls[0] == (
+        "wait",
+        ("job-1",),
+        {"offset": 3, "timeout": 9.0},
+    )
+    assert patched_client.init_calls[0]["output_limit"] == 2048
+    assert patched_client.init_calls[0]["idle_flush_seconds"] == 0.1
 
-    RecordingShellctlService.reset()
-    patched_service.results["send_input"] = JobResult(
+    RecordingShellctlClient.reset()
+    patched_client.results["input"] = JobResult(
         job_id="job-1",
         done=False,
         status=JobStatusName.RUNNING,
@@ -355,6 +376,7 @@ def test_shellctl_wait_and_input_map_requests(
         offset=8,
         truncated=False,
     )
+
     input_result = runner.invoke(
         cli,
         [
@@ -373,50 +395,44 @@ def test_shellctl_wait_and_input_map_requests(
     )
 
     assert input_result.exit_code == 0, input_result.stderr
-    input_call = patched_service.calls[0]
-    assert input_call[0] == "send_input"
-    assert input_call[1][0] == "job-1"
-    input_request = input_call[1][1]
-    assert isinstance(input_request, InputJobRequest)
-    assert input_request.text == "hello\n"
-    assert input_request.offset == 5
-    assert input_request.timeout == 4.0
-    assert input_request.output_limit == 512
-    assert input_request.idle_flush_seconds == 0.0
+    assert patched_client.calls[0] == (
+        "input",
+        ("job-1", "hello\n"),
+        {"offset": 5, "timeout": 4.0},
+    )
+    assert patched_client.init_calls[0]["output_limit"] == 512
+    assert patched_client.init_calls[0]["idle_flush_seconds"] == 0.0
 
 
 def test_shellctl_list_tail_status_terminate_and_delete_map_arguments(
-    patched_service: type[RecordingShellctlService],
+    patched_client: type[RecordingShellctlClient],
 ) -> None:
-    patched_service.results["list_jobs"] = ListJobsResponse(
-        jobs=[
-            {
-                "job_id": "job-2",
-                "status": "running",
-                "created_at": "2026-05-21T15:30:12Z",
-            }
-        ]
-    )
+    patched_client.results["list_jobs"] = [
+        JobInfo(
+            job_id="job-2",
+            status=JobStatusName.RUNNING,
+            created_at="2026-05-21T15:30:12Z",
+        )
+    ]
+
     list_result = runner.invoke(cli, ["list", "--status", "running", "--limit", "5"])
 
     assert list_result.exit_code == 0, list_result.stderr
-    assert json.loads(list_result.stdout) == {
-        "jobs": [
-            {
-                "job_id": "job-2",
-                "status": "running",
-                "created_at": "2026-05-21T15:30:12Z",
-            }
-        ]
-    }
-    assert patched_service.calls[0] == (
+    assert json.loads(list_result.stdout) == [
+        {
+            "job_id": "job-2",
+            "status": "running",
+            "created_at": "2026-05-21T15:30:12Z",
+        }
+    ]
+    assert patched_client.calls[0] == (
         "list_jobs",
         (),
         {"status": JobStatusName.RUNNING, "limit": 5},
     )
 
-    RecordingShellctlService.reset()
-    patched_service.results["tail_job"] = JobResult(
+    RecordingShellctlClient.reset()
+    patched_client.results["tail"] = JobResult(
         job_id="job-2",
         done=False,
         status=JobStatusName.RUNNING,
@@ -427,14 +443,11 @@ def test_shellctl_list_tail_status_terminate_and_delete_map_arguments(
     )
     tail_result = runner.invoke(cli, ["tail", "job-2", "--output-limit", "16"])
     assert tail_result.exit_code == 0, tail_result.stderr
-    assert patched_service.calls[0] == (
-        "tail_job",
-        ("job-2",),
-        {"output_limit": 16},
-    )
+    assert patched_client.calls[0] == ("tail", ("job-2",), {})
+    assert patched_client.init_calls[0]["output_limit"] == 16
 
-    RecordingShellctlService.reset()
-    patched_service.results["get_job_status"] = JobStatusView(
+    RecordingShellctlClient.reset()
+    patched_client.results["status"] = JobStatusView(
         job_id="job-2",
         status=JobStatusName.RUNNING,
         done=False,
@@ -444,10 +457,10 @@ def test_shellctl_list_tail_status_terminate_and_delete_map_arguments(
     )
     status_result = runner.invoke(cli, ["status", "job-2"])
     assert status_result.exit_code == 0, status_result.stderr
-    assert patched_service.calls[0] == ("get_job_status", ("job-2",), {})
+    assert patched_client.calls[0] == ("status", ("job-2",), {})
 
-    RecordingShellctlService.reset()
-    patched_service.results["terminate_job"] = JobStatusView(
+    RecordingShellctlClient.reset()
+    patched_client.results["terminate"] = JobStatusView(
         job_id="job-2",
         status=JobStatusName.TERMINATED,
         done=True,
@@ -461,22 +474,21 @@ def test_shellctl_list_tail_status_terminate_and_delete_map_arguments(
         ["terminate", "job-2", "--grace-seconds", "0.25"],
     )
     assert terminate_result.exit_code == 0, terminate_result.stderr
-    terminate_call = patched_service.calls[0]
-    assert terminate_call[0] == "terminate_job"
-    assert terminate_call[1][0] == "job-2"
-    terminate_request = terminate_call[1][1]
-    assert isinstance(terminate_request, TerminateJobRequest)
-    assert terminate_request.grace_seconds == 0.25
+    assert patched_client.calls[0] == (
+        "terminate",
+        ("job-2",),
+        {"grace_seconds": 0.25},
+    )
 
-    RecordingShellctlService.reset()
-    patched_service.results["delete_job"] = DeleteJobResponse(job_id="job-2")
+    RecordingShellctlClient.reset()
+    patched_client.results["delete"] = DeleteJobResponse(job_id="job-2")
     delete_result = runner.invoke(
         cli,
         ["delete", "job-2", "--force", "--grace-seconds", "0.5"],
     )
     assert delete_result.exit_code == 0, delete_result.stderr
-    assert patched_service.calls[0] == (
-        "delete_job",
+    assert patched_client.calls[0] == (
+        "delete",
         ("job-2",),
         {"force": True, "grace_seconds": 0.5},
     )
@@ -489,10 +501,10 @@ def test_shellctl_run_rejects_invalid_env_entry() -> None:
     assert "env entries must use NAME=VALUE format" in result.stderr
 
 
-def test_shellctl_direct_commands_render_server_errors_on_stderr(
-    patched_service: type[RecordingShellctlService],
+def test_shellctl_commands_render_sdk_errors_as_json_stderr(
+    patched_client: type[RecordingShellctlClient],
 ) -> None:
-    patched_service.error = ShellctlServerError(
+    patched_client.error = ShellctlClientError(
         404,
         "job_not_found",
         "Job missing is not found",
@@ -502,53 +514,178 @@ def test_shellctl_direct_commands_render_server_errors_on_stderr(
 
     assert result.exit_code == 1
     assert result.stdout == ""
-    assert result.stderr == "job_not_found: Job missing is not found\n"
+    assert json.loads(result.stderr) == {
+        "error": {
+            "code": "job_not_found",
+            "message": "Job missing is not found",
+        }
+    }
 
 
-@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
-def test_shellctl_run_and_delete_work_without_shellctl_serve(tmp_path: Path) -> None:
+def test_shellctl_commands_render_transport_errors_as_json_stderr(
+    patched_client: type[RecordingShellctlClient],
+) -> None:
+    patched_client.error = httpx.TransportError("connection refused")
+
+    result = runner.invoke(cli, ["status", "missing"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert json.loads(result.stderr) == {
+        "error": {
+            "code": "connection_error",
+            "message": "connection refused",
+        }
+    }
+
+
+def test_shellctl_commands_render_timeouts_as_json_stderr(
+    patched_client: type[RecordingShellctlClient],
+) -> None:
+    patched_client.error = httpx.TimeoutException("slow server")
+
+    result = runner.invoke(cli, ["status", "missing"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert json.loads(result.stderr) == {
+        "error": {
+            "code": "request_timeout",
+            "message": "request timed out",
+        }
+    }
+
+
+def test_shellctl_base_url_and_auth_token_flags_override_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    patched_client: type[RecordingShellctlClient],
+) -> None:
+    patched_client.results["status"] = JobStatusView(
+        job_id="job-2",
+        status=JobStatusName.RUNNING,
+        done=False,
+        created_at="2026-05-21T15:30:12Z",
+        started_at="2026-05-21T15:30:13Z",
+        offset=4,
+    )
+    monkeypatch.setenv("SHELLCTL_BASE_URL", "http://from-env:9999")
+    monkeypatch.setenv("SHELLCTL_AUTH_TOKEN", "from-env-token")
+
+    result = runner.invoke(
+        cli,
+        [
+            "status",
+            "job-2",
+            "--base-url",
+            "http://override:8765",
+            "--auth-token",
+            "flag-token",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert patched_client.init_calls == [
+        {
+            "base_url": "http://override:8765",
+            "output_limit": 8192,
+            "idle_flush_seconds": 0.5,
+            "token": "flag-token",
+        }
+    ]
+
+
+def test_shellctl_cli_controller_module_is_removed() -> None:
+    assert (
+        importlib.util.find_spec("shell_session_manager.shellctl.server.cli_controller")
+        is None
+    )
+
+
+def test_importing_shellctl_cli_for_run_help_skips_server_stack() -> None:
     package_root = Path(__file__).resolve().parents[1]
-    src_path = package_root / "src"
-    env = dict(os.environ)
-    current_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        f"{src_path}{os.pathsep}{current_pythonpath}"
-        if current_pythonpath
-        else str(src_path)
+    command = """
+import json
+import sys
+from typer.testing import CliRunner
+from shell_session_manager.shellctl.cli import cli
+
+result = CliRunner().invoke(cli, ["run", "--help"])
+print(json.dumps({
+    "exit_code": result.exit_code,
+    "stdout": result.stdout,
+    "modules": {
+        "fastapi": "fastapi" in sys.modules,
+        "uvicorn": "uvicorn" in sys.modules,
+        "sqlalchemy": "sqlalchemy" in sys.modules,
+        "sqlmodel": "sqlmodel" in sys.modules,
+        "service": "shell_session_manager.shellctl.server.service" in sys.modules,
+        "api": "shell_session_manager.shellctl.server.api" in sys.modules,
+        "tmux": "shell_session_manager.shellctl.server.tmux" in sys.modules,
+        "shared_runtime": "shell_session_manager.shellctl.shared.runtime" in sys.modules,
+        "shared_output": "shell_session_manager.shellctl.shared.output" in sys.modules,
+        "shared_sanitize": "shell_session_manager.shellctl.shared.sanitize" in sys.modules,
+    },
+}))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=package_root,
+        env=_package_env(),
     )
 
-    run_result = runner.invoke(
-        cli,
-        [
-            "run",
-            "echo Hello World",
-            "--state-dir",
-            str(tmp_path / "state"),
-            "--runtime-dir",
-            str(tmp_path / "run"),
-        ],
-        env=env,
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["exit_code"] == 0
+    assert "--base-url" in payload["stdout"]
+    assert payload["modules"] == {
+        "fastapi": False,
+        "uvicorn": False,
+        "sqlalchemy": False,
+        "sqlmodel": False,
+        "service": False,
+        "api": False,
+        "tmux": False,
+        "shared_runtime": False,
+        "shared_output": False,
+        "shared_sanitize": False,
+    }
+
+
+def test_importing_server_serve_command_skips_cli_and_sdk_modules() -> None:
+    package_root = Path(__file__).resolve().parents[1]
+    command = """
+import json
+import sys
+from shell_session_manager.shellctl.server import serve_command
+
+print(json.dumps({
+    "callable": callable(serve_command),
+    "modules": {
+        "cli": "shell_session_manager.shellctl.cli" in sys.modules,
+        "sdk": "shell_session_manager.shellctl.client.sdk" in sys.modules,
+        "client": "shell_session_manager.shellctl.client" in sys.modules,
+    },
+}))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=package_root,
+        env=_package_env(),
     )
 
-    assert run_result.exit_code == 0, run_result.stderr
-    payload = json.loads(run_result.stdout)
-    assert payload["output"] == "Hello World\n"
-
-    delete_result = runner.invoke(
-        cli,
-        [
-            "delete",
-            payload["job_id"],
-            "--state-dir",
-            str(tmp_path / "state"),
-            "--runtime-dir",
-            str(tmp_path / "run"),
-        ],
-        env=env,
-    )
-
-    assert delete_result.exit_code == 0, delete_result.stderr
-    assert json.loads(delete_result.stdout) == {
-        "job_id": payload["job_id"],
-        "deleted": True,
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["callable"] is True
+    assert payload["modules"] == {
+        "cli": False,
+        "sdk": False,
+        "client": False,
     }

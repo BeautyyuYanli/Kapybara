@@ -13,7 +13,7 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "anyio>=4.12.1",
     "fastapi>=0.116.1",
-    "httpx>=0.28.1",
+    "httpx2>=2.5.0",
     "pydantic>=2.12.5",
     "sqlmodel>=0.0.24",
     "typer>=0.16.1",
@@ -23,7 +23,7 @@ requires-python = ">=3.12"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 [project.scripts]
-shellctl = "shell_session_manager.shellctl.server:main"
+shellctl = "shell_session_manager.shellctl.cli:main"
 shellctl-sanitize-pty = "shellctl_runtime.sanitize:main"
 shellctl-runner-exit = "shellctl_runtime.runner_exit:main"
 

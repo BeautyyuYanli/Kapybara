@@ -63,10 +63,21 @@ serve` also reads `SHELLCTL_AUTH_TOKEN`, so you can export the token instead of
 passing the flag. Leave the flag/env var unset or empty to start without
 requiring an Authorization header.
 
-## shellctl direct CLI
+## shellctl network CLI
 
-For one-shot local job control, use the same `shellctl` console script without
-starting `shellctl serve`:
+Job-management commands now talk to a running `shellctl serve` instance. Start
+the server first, then point the CLI at it with `--base-url` or
+`SHELLCTL_BASE_URL` when you are not using the default `http://127.0.0.1:8765`.
+Authenticated job commands also read `SHELLCTL_AUTH_TOKEN`, and `--auth-token`
+overrides the environment when you need a different bearer token for one call.
+
+```bash
+export SHELLCTL_BASE_URL=http://127.0.0.1:8765
+export SHELLCTL_AUTH_TOKEN=your-token
+```
+
+The public health endpoint ignores auth configuration, but the option is still
+accepted for a consistent CLI surface.
 
 ```bash
 pdm run shellctl health
@@ -80,5 +91,7 @@ pdm run shellctl terminate <job-id>
 pdm run shellctl delete <job-id> --force
 ```
 
-These commands call `ShellctlService` directly, use the local state/runtime
-directories, and emit compact JSON on stdout.
+These commands emit compact JSON on stdout. `shellctl list` prints a bare JSON
+array matching `ShellctlClient.list_jobs()`, while the other commands print one
+JSON object each. SDK failures, HTTP errors, and network errors emit compact
+JSON error objects on stderr and exit non-zero.

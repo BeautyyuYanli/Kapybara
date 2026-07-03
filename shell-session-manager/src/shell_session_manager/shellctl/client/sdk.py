@@ -1,11 +1,11 @@
 """Async HTTP client for the shellctl server API.
 
-The SDK keeps transport-level knobs (`output_limit`, `idle_flush_seconds`, and
- bearer token handling) on the client instance so individual method calls stay
- close to the proposal's high-level workflow. Blocking shell operations reuse
- the shared client, but they override the HTTP read timeout per request so the
- transport does not fail before the server-side shell wait timeout or
- terminate-grace budget does.
+The SDK keeps transport-level knobs (`output_limit`, `idle_flush_seconds`, base
+URL selection, and bearer-token handling) on the client instance so individual
+method calls stay close to the network CLI's high-level workflow. Blocking shell
+operations reuse the shared client, but they override the HTTP read timeout per
+request so the transport does not fail before the server-side shell wait timeout
+or terminate-grace budget does.
 """
 
 from __future__ import annotations
@@ -13,10 +13,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import httpx
+import httpx2 as httpx
 
 from shell_session_manager.shellctl.shared.constants import (
     DEFAULT_AUTH_TOKEN_ENV,
+    DEFAULT_BASE_URL,
     DEFAULT_IDLE_FLUSH_SECONDS,
     DEFAULT_LIST_LIMIT,
     DEFAULT_OUTPUT_LIMIT_BYTES,
@@ -25,6 +26,7 @@ from shell_session_manager.shellctl.shared.constants import (
 )
 from shell_session_manager.shellctl.shared.schemas import (
     DeleteJobResponse,
+    HealthResponse,
     JobInfo,
     JobResult,
     JobStatusView,
@@ -35,7 +37,14 @@ from shell_session_manager.shellctl.shared.schemas import (
 
 
 class ShellctlClientError(RuntimeError):
-    """Raised when the shellctl server returns an error response."""
+    """Raised for API-declared failures and response decode/shape problems.
+
+    `ShellctlClient` raises this error when the server returns a structured
+    error payload, and also when an otherwise successful HTTP response contains
+    invalid JSON or a top-level payload shape that does not match the SDK
+    contract. Transport and timeout failures remain raw `httpx2` exceptions so
+    library callers can decide how to handle network-layer failures.
+    """
 
     def __init__(self, status_code: int, code: str, message: str) -> None:
         super().__init__(f"{code} ({status_code}): {message}")
@@ -55,7 +64,7 @@ class ShellctlClient:
 
     def __init__(
         self,
-        base_url: str,
+        base_url: str = DEFAULT_BASE_URL,
         *,
         output_limit: int = DEFAULT_OUTPUT_LIMIT_BYTES,
         idle_flush_seconds: float = DEFAULT_IDLE_FLUSH_SECONDS,
@@ -122,6 +131,11 @@ class ShellctlClient:
             DEFAULT_TERMINATE_GRACE_SECONDS if grace_seconds is None else grace_seconds
         )
         return self._wait_request_timeout(effective_grace_seconds)
+
+    async def health(self) -> HealthResponse:
+        """Call the public health endpoint and decode it as `HealthResponse`."""
+
+        return HealthResponse.model_validate(await self.healthz())
 
     async def healthz(self) -> dict[str, Any]:
         """Call the public health endpoint without requiring auth."""
