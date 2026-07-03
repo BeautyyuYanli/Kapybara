@@ -62,3 +62,23 @@ Pass `--auth-token your-token` when you want bearer auth enforced. `shellctl
 serve` also reads `SHELLCTL_AUTH_TOKEN`, so you can export the token instead of
 passing the flag. Leave the flag/env var unset or empty to start without
 requiring an Authorization header.
+
+## shellctl direct CLI
+
+For one-shot local job control, use the same `shellctl` console script without
+starting `shellctl serve`:
+
+```bash
+pdm run shellctl health
+pdm run shellctl run 'echo Hello World'
+pdm run shellctl wait <job-id> --offset <offset>
+pdm run shellctl input <job-id> $'hello\n' --offset <offset>
+pdm run shellctl tail <job-id>
+pdm run shellctl status <job-id>
+pdm run shellctl list --status running
+pdm run shellctl terminate <job-id>
+pdm run shellctl delete <job-id> --force
+```
+
+These commands call `ShellctlService` directly, use the local state/runtime
+directories, and emit compact JSON on stdout.

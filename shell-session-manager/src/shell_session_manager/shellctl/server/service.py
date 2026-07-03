@@ -1,9 +1,11 @@
 """SQLite-backed shellctl job service.
 
 This module owns the long-lived job lifecycle rules: artifact creation,
- SQLite compare-and-swap transitions, tmux reconciliation, runner exit
- materialization, and GC. API/CLI layers should call into `ShellctlService`
- rather than duplicating lifecycle logic.
+SQLite compare-and-swap transitions, tmux reconciliation, runner exit
+materialization, and GC. API and CLI controllers should call into
+`ShellctlService` rather than duplicating lifecycle logic, choosing either the
+lightweight `prepare_runtime()` bootstrap or the full `initialize()` startup
+depending on whether they need one-shot commands or long-running maintenance.
 """
 
 from __future__ import annotations
@@ -68,7 +70,7 @@ from shell_session_manager.shellctl.shared import (
 
 
 class ShellctlService:
-    """SQLite-backed shellctl job service used by the FastAPI app.
+    """SQLite-backed shellctl job service used by HTTP and direct CLI controllers.
 
     The service keeps only minimal in-memory coordination state:
 
@@ -109,11 +111,13 @@ class ShellctlService:
         async with self._engine.begin() as connection:
             await connection.run_sync(SQLModel.metadata.create_all)
 
-    async def initialize(self) -> None:
-        """Prepare directories, database, runner script, and tmux state.
+    async def prepare_runtime(self) -> None:
+        """Prepare the minimal local runtime needed for one-shot controllers.
 
-        Auth is configured at the API layer, so service startup must also work
-        when `shellctl serve` is intentionally running without a bearer token.
+        This startup path intentionally skips reconciliation, GC, and background
+        tasks. Direct CLI commands should stay bounded by the requested job
+        operation instead of scanning or maintaining the full historical job set
+        on every invocation.
         """
 
         await self.initialize_database()
@@ -122,6 +126,17 @@ class ShellctlService:
         self._ensure_dir(self.config.runner_path.parent)
         self._install_runner()
         await self._tmux.start_server()
+
+    async def initialize(self) -> None:
+        """Run the full server startup path used by `shellctl serve`.
+
+        Auth is configured at the API layer, so service startup must also work
+        when `shellctl serve` is intentionally running without a bearer token.
+        Unlike `prepare_runtime()`, this path also reconciles persisted jobs and
+        performs one foreground GC pass before the long-running server starts.
+        """
+
+        await self.prepare_runtime()
         await self.reconcile()
         await self.gc_once()
 

@@ -1,9 +1,10 @@
 """Typer CLI entrypoints for the shellctl server package.
 
-The server CLI only exposes commands that need the FastAPI/SQLite runtime.
-The PTY sanitizer now lives in `shell_session_manager.shellctl.sanitize_pty`
-as a separate lightweight module so tmux pipes do not have a second, heavier
-entry path to maintain.
+The root CLI exposes both the long-running HTTP server entrypoint and direct
+one-shot job-management commands that call `ShellctlService` locally. The PTY
+sanitizer still lives in `shell_session_manager.shellctl.sanitize_pty` as a
+separate lightweight module so tmux pipes do not have a second, heavier entry
+path to maintain.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import typer
 import uvicorn
 
 from shell_session_manager.shellctl.server.api import create_app
+from shell_session_manager.shellctl.server.cli_controller import register_cli_controller
 from shell_session_manager.shellctl.server.config import ShellctlConfig
 from shell_session_manager.shellctl.server.service import ShellctlService
 from shell_session_manager.shellctl.shared import (
@@ -25,6 +27,7 @@ from shell_session_manager.shellctl.shared import (
 )
 
 cli = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+register_cli_controller(cli)
 
 
 @cli.command("serve")
