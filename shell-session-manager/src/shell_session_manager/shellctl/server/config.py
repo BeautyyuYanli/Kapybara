@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-from shell_session_manager.shellctl.shared import (
+from shell_session_manager.shellctl.shared.constants import (
     DEFAULT_AUTH_TOKEN_ENV,
     DEFAULT_GC_FINISHED_JOB_RETENTION_SECONDS,
     DEFAULT_GC_INTERVAL_SECONDS,
@@ -22,20 +21,24 @@ from shell_session_manager.shellctl.shared import (
     MAX_LIST_LIMIT,
     MAX_OUTPUT_LIMIT_BYTES,
     MAX_WAIT_TIMEOUT_SECONDS,
+)
+from shell_session_manager.shellctl.shared.runtime import (
     default_runtime_dir,
     default_state_dir,
 )
+from shellctl_runtime.paths import DEFAULT_SQLITE_BUSY_TIMEOUT_MS
 
 
 @dataclass(slots=True, frozen=True)
 class ShellctlConfig:
     """Runtime configuration for the shellctl service and CLI.
 
-    `shellctl_command` deliberately defaults to `python -m ...server` so the
-    tmux-side `runner-exit` callback stays pinned to the same interpreter
-    environment that launched the API server. `sanitize_pty_command` uses the
-    same interpreter but points at a lightweight module so the pipe ready-file
-    handshake does not pay FastAPI/SQLAlchemy import costs.
+    The tmux subprocess hooks use dedicated console scripts instead of
+    `python -m shell_session_manager...` entrypoints so every job does not pay
+    the shellctl client/server import cost just to sanitize PTY bytes or record
+    an exit row. `sqlite_busy_timeout_ms` still applies to the out-of-process
+    `runner-exit` callback, so non-default deployments keep one SQLite timeout
+    policy across the service and tmux finalizer.
 
     Bearer auth is opt-in: if the explicit `auth_token` and the fallback
     `SHELLCTL_AUTH_TOKEN` environment variable are both missing or empty,
@@ -62,21 +65,9 @@ class ShellctlConfig:
     poll_interval_seconds: float = 0.05
     pipe_monitor_interval_seconds: float = 1.0
     pipe_ready_timeout_seconds: float = 10.0
-    sqlite_busy_timeout_ms: int = 5000
-    shellctl_command: tuple[str, ...] = field(
-        default_factory=lambda: (
-            sys.executable,
-            "-m",
-            "shell_session_manager.shellctl.server",
-        )
-    )
-    sanitize_pty_command: tuple[str, ...] = field(
-        default_factory=lambda: (
-            sys.executable,
-            "-m",
-            "shell_session_manager.shellctl.sanitize_pty",
-        )
-    )
+    sqlite_busy_timeout_ms: int = DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    sanitize_pty_command: tuple[str, ...] = ("shellctl-sanitize-pty",)
+    runner_exit_command: tuple[str, ...] = ("shellctl-runner-exit",)
 
     def __post_init__(self) -> None:
         if self.runtime_dir is None:

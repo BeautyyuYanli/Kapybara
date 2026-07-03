@@ -15,13 +15,15 @@ from typing import Any
 
 import httpx
 
-from shell_session_manager.shellctl.shared import (
+from shell_session_manager.shellctl.shared.constants import (
     DEFAULT_AUTH_TOKEN_ENV,
     DEFAULT_IDLE_FLUSH_SECONDS,
     DEFAULT_LIST_LIMIT,
     DEFAULT_OUTPUT_LIMIT_BYTES,
     DEFAULT_TERMINATE_GRACE_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
+)
+from shell_session_manager.shellctl.shared.schemas import (
     DeleteJobResponse,
     JobInfo,
     JobResult,

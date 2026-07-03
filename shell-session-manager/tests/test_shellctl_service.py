@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import importlib
 import json
 import os
@@ -18,7 +17,6 @@ import pytest
 from typer.testing import CliRunner
 
 import shell_session_manager.shellctl.server.service as server_service_module
-import shell_session_manager.shellctl.shared as shared_module
 from shell_session_manager.shellctl.server import (
     JobRow,
     ShellctlConfig,
@@ -130,7 +128,7 @@ async def _create_service(
 async def _create_real_service(
     tmp_path: Path,
     *,
-    shellctl_command: tuple[str, ...] | None = None,
+    runner_exit_command: tuple[str, ...] | None = None,
     sanitize_pty_command: tuple[str, ...] | None = None,
 ) -> ShellctlService:
     defaults = ShellctlConfig(
@@ -140,7 +138,7 @@ async def _create_real_service(
     config = ShellctlConfig(
         state_dir=tmp_path / "state",
         runtime_dir=tmp_path / "run",
-        shellctl_command=shellctl_command or defaults.shellctl_command,
+        runner_exit_command=runner_exit_command or defaults.runner_exit_command,
         sanitize_pty_command=sanitize_pty_command or defaults.sanitize_pty_command,
     )
     service = ShellctlService(config)
@@ -165,10 +163,7 @@ def _write_delayed_sanitize_wrapper(
                 "import time",
                 "from pathlib import Path",
                 "",
-                (
-                    f"REAL = [{sys.executable!r}, '-m', "
-                    "'shell_session_manager.shellctl.sanitize_pty']"
-                ),
+                (f"REAL = [{sys.executable!r}, '-m', 'shellctl_runtime.sanitize']"),
                 "args = sys.argv[1:]",
                 "if '--ready-file' in args:",
                 "    ready_file = Path(args[args.index('--ready-file') + 1])",
@@ -798,9 +793,7 @@ async def test_run_job_retries_after_sqlite_insert_conflict_and_cleans_artifacts
     generated_ids = iter(["05211530-k7p", "05211530-abc"])
 
     monkeypatch.setattr(
-        shared_module,
-        "generate_job_id",
-        lambda now=None: next(generated_ids),
+        server_service_module, "generate_job_id", lambda now=None: next(generated_ids)
     )
 
     result = await service.run_job(
@@ -1330,9 +1323,7 @@ async def test_allocate_job_dir_retries_on_atomic_mkdir_collision(
     generated_ids = iter(["05211530-k7p", "05211530-abc"])
 
     monkeypatch.setattr(
-        shared_module,
-        "generate_job_id",
-        lambda now=None: next(generated_ids),
+        server_service_module, "generate_job_id", lambda now=None: next(generated_ids)
     )
 
     job_id, job_dir = service._allocate_job_dir()
@@ -1490,7 +1481,6 @@ def test_serve_cli_passes_direct_auth_token_to_config(
     result = runner.invoke(
         cli,
         [
-            "serve",
             "--listen",
             "0.0.0.0:9999",
             "--auth-token",
@@ -1518,7 +1508,6 @@ def test_serve_cli_prefers_explicit_auth_token_over_environment(
     result = runner.invoke(
         cli,
         [
-            "serve",
             "--auth-token",
             "direct-token",
             "--state-dir",
@@ -1540,7 +1529,6 @@ def test_serve_cli_treats_empty_auth_token_as_disabled(
     result = runner.invoke(
         cli,
         [
-            "serve",
             "--auth-token",
             "",
             "--state-dir",
@@ -1563,7 +1551,6 @@ def test_serve_cli_explicit_empty_auth_token_beats_environment(
     result = runner.invoke(
         cli,
         [
-            "serve",
             "--auth-token",
             "",
             "--state-dir",
@@ -1586,7 +1573,6 @@ def test_serve_cli_reads_auth_token_from_environment(
     result = runner.invoke(
         cli,
         [
-            "serve",
             "--state-dir",
             str(tmp_path / "state"),
         ],
@@ -1622,16 +1608,17 @@ def test_shellctl_config_defaults_to_lightweight_sanitize_entrypoint(
     config = ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run")
 
     assert config.pipe_ready_timeout_seconds == 10.0
-    assert config.sanitize_pty_command == (
-        sys.executable,
-        "-m",
-        "shell_session_manager.shellctl.sanitize_pty",
-    )
+    assert config.sanitize_pty_command == ("shellctl-sanitize-pty",)
+    assert config.runner_exit_command == ("shellctl-runner-exit",)
 
 
 def test_pipe_command_finalizer_commits_runner_exit_after_drain(tmp_path: Path) -> None:
     controller = TmuxController(
-        ShellctlConfig(state_dir=tmp_path / "state", runtime_dir=tmp_path / "run")
+        ShellctlConfig(
+            state_dir=tmp_path / "state",
+            runtime_dir=tmp_path / "run",
+            sqlite_busy_timeout_ms=6789,
+        )
     )
     source = controller._pipe_command_source(
         job_id="05211530-k7p",
@@ -1639,120 +1626,26 @@ def test_pipe_command_finalizer_commits_runner_exit_after_drain(tmp_path: Path) 
         ready_file=tmp_path / "state" / "jobs" / "05211530-k7p" / ".pipe-ready",
     )
 
-    assert "shell_session_manager.shellctl.sanitize_pty" in source
-    assert "shell_session_manager.shellctl.server sanitize-pty" not in source
+    assert "shellctl-sanitize-pty" in source
     assert PIPE_DRAINED_FILENAME in source
     assert PIPE_ERROR_LOG_FILENAME in source
     assert PIPE_FAILED_FILENAME in source
     assert RUNNER_EXIT_CODE_FILENAME in source
     assert RUNNER_ENDED_AT_FILENAME in source
-    assert re.search(r"\brunner-exit\b", source) is not None
+    assert "shellctl-runner-exit" in source
+    assert "--sqlite-busy-timeout-ms 6789" in source
+    assert "2>>" in source
+    assert 'exit "$sanitize_status"' in source
     assert 'if [ "$sanitize_status" -eq 0 ]' in source
     assert "2>" in source
-    assert source.index("shell_session_manager.shellctl.sanitize_pty") < source.index(
-        PIPE_DRAINED_FILENAME
-    )
-    assert source.index(PIPE_DRAINED_FILENAME) < source.index("runner-exit")
-
-
-def test_sanitize_pty_module_uses_lightweight_imports_only() -> None:
-    module_path = (
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "shell_session_manager"
-        / "shellctl"
-        / "sanitize_pty.py"
-    )
-    tree = ast.parse(module_path.read_text(encoding="utf-8"))
-
-    imports: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imports.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            imports.add(node.module)
-
-    assert imports == {
-        "argparse",
-        "pathlib",
-        "sys",
-        "shell_session_manager.shellctl.shared.sanitize",
-    }
-
-
-def test_python_m_sanitize_pty_module_touches_ready_file_and_sanitizes_output(
-    tmp_path: Path,
-) -> None:
-    package_root = Path(__file__).resolve().parents[1]
-    src_path = package_root / "src"
-    env = dict(os.environ)
-    current_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        f"{src_path}{os.pathsep}{current_pythonpath}"
-        if current_pythonpath
-        else str(src_path)
-    )
-    ready_file = tmp_path / "ready"
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "shell_session_manager.shellctl.sanitize_pty",
-            "--ready-file",
-            str(ready_file),
-        ],
-        input=b"before\rafter\n",
-        capture_output=True,
-        check=False,
-        cwd=package_root,
-        env=env,
-    )
-
-    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
-    assert ready_file.exists()
-    assert result.stdout.decode("utf-8") == "after\n"
+    assert source.index("shellctl-sanitize-pty") < source.index(PIPE_DRAINED_FILENAME)
+    assert source.index(PIPE_DRAINED_FILENAME) < source.index("shellctl-runner-exit")
 
 
 def test_server_cli_no_longer_exposes_sanitize_pty_command() -> None:
     result = CliRunner().invoke(cli, ["sanitize-pty"])
 
     assert result.exit_code != 0
-    assert "No such command 'sanitize-pty'" in result.output
-
-
-def test_runner_exit_cli_accepts_runner_option_contract(tmp_path: Path) -> None:
-    async def setup_running_job() -> ShellctlConfig:
-        service, _fake_tmux = await _create_service(tmp_path)
-        await _seed_job(service, job_id="job-cli", status=JobStatusName.RUNNING)
-        config = service.config
-        await service.shutdown()
-        return config
-
-    config = anyio.run(setup_running_job)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "runner-exit",
-            "--state-dir",
-            str(config.state_dir),
-            "--job-id",
-            "job-cli",
-            "--exit-code",
-            "7",
-            "--ended-at",
-            "2026-05-21T15:30:19Z",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    with sqlite3.connect(config.db_path) as connection:
-        row = connection.execute(
-            "SELECT status, exit_code, ended_at FROM jobs WHERE job_id = ?",
-            ("job-cli",),
-        ).fetchone()
-
-    assert row == ("exited", 7, "2026-05-21T15:30:19Z")
 
 
 def test_python_m_shellctl_server_module_entrypoint_shows_cli_help() -> None:
@@ -1777,4 +1670,53 @@ def test_python_m_shellctl_server_module_entrypoint_shows_cli_help() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "sanitize-pty" not in result.stdout
-    assert "runner-exit" in result.stdout
+    assert "runner-exit" not in result.stdout
+
+
+def test_server_package_keeps_config_access_lazy() -> None:
+    package_root = Path(__file__).resolve().parents[1]
+    src_path = package_root / "src"
+    env = dict(os.environ)
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{src_path}{os.pathsep}{current_pythonpath}"
+        if current_pythonpath
+        else str(src_path)
+    )
+
+    script = """
+import json
+import sys
+
+import shell_session_manager.shellctl.server as server
+
+server.ShellctlConfig
+
+print(json.dumps({
+    "deny": sorted(
+        name for name in sys.modules
+        if name.split(".", 1)[0] in {"fastapi", "typer", "uvicorn"}
+    ),
+    "server_modules": sorted(
+        name for name in sys.modules
+        if name.startswith("shell_session_manager.shellctl.server.")
+    ),
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=package_root,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["deny"] == []
+    assert "shell_session_manager.shellctl.server.api" not in payload["server_modules"]
+    assert "shell_session_manager.shellctl.server.cli" not in payload["server_modules"]
+    assert (
+        "shell_session_manager.shellctl.server.service" not in payload["server_modules"]
+    )

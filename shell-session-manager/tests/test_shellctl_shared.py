@@ -9,13 +9,15 @@ from pydantic import ValidationError
 
 from shell_session_manager.shellctl.shared import (
     JOB_ID_ALPHABET,
-    PtySanitizer,
     RunJobRequest,
     generate_job_id,
     read_output_window,
+    tail_output_window,
+)
+from shellctl_runtime.sanitize import (
+    PtySanitizer,
     sanitize_pty_output,
     sanitize_pty_stream,
-    tail_output_window,
 )
 
 

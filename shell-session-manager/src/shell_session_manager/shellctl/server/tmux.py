@@ -25,11 +25,11 @@ from shell_session_manager.shellctl.server.artifacts import (
 )
 from shell_session_manager.shellctl.server.config import ShellctlConfig
 from shell_session_manager.shellctl.server.errors import ShellctlServerError
-from shell_session_manager.shellctl.shared import (
-    TerminalSize,
+from shell_session_manager.shellctl.shared.runtime import (
     job_pane_target,
     job_session_name,
 )
+from shell_session_manager.shellctl.shared.schemas import TerminalSize
 
 
 class TmuxControllerProtocol(Protocol):
@@ -186,6 +186,11 @@ class TmuxController:
         the lightweight sanitizer reaches EOF and flushes `output.log`
         successfully. Sanitizer stderr is captured into `pipe-error.log` so
         startup timeouts can distinguish slow imports from subprocess crashes.
+        If the follow-up `runner-exit` write fails, the drain marker remains in
+        place and stderr is appended to the same log with an explicit status
+        line. The pipe still exits with the sanitizer status so a drained job is
+        not misclassified as `pipe_failed` before reconciliation can recover the
+        SQLite write from the drained artifacts.
         """
 
         sanitize_command = self._shell_join(
@@ -197,12 +202,13 @@ class TmuxController:
         )
         runner_exit_command = self._shell_join(
             (
-                *self._config.shellctl_command,
-                "runner-exit",
+                *self._config.runner_exit_command,
                 "--state-dir",
                 str(self._config.state_dir),
                 "--job-id",
                 job_id,
+                "--sqlite-busy-timeout-ms",
+                str(self._config.sqlite_busy_timeout_ms),
             )
         )
         output_path = shlex.quote(str(job_dir / "output.log"))
@@ -215,14 +221,20 @@ class TmuxController:
             [
                 f"{sanitize_command} >> {output_path} 2> {error_log_path}",
                 "sanitize_status=$?",
+                "runner_exit_status=0",
                 (
                     'if [ "$sanitize_status" -eq 0 ]; then '
                     f": > {drained_path}; "
                     f"if [ -s {exit_code_path} ] && [ -s {ended_at_path} ]; then "
                     f'{runner_exit_command} --exit-code "$(cat {exit_code_path})" '
-                    f'--ended-at "$(cat {ended_at_path})"; fi; '
+                    f'--ended-at "$(cat {ended_at_path})" 2>> {error_log_path}; '
+                    "runner_exit_status=$?; "
+                    'if [ "$runner_exit_status" -ne 0 ]; then '
+                    f"printf 'runner-exit failed with status %s\\n' \"$runner_exit_status\" >> {error_log_path}; "
+                    "fi; fi; "
                     f"else : > {failed_path}; fi"
                 ),
+                'if [ "$sanitize_status" -ne 0 ]; then exit "$sanitize_status"; fi',
                 'exit "$sanitize_status"',
             ]
         )

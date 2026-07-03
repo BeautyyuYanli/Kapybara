@@ -1,8 +1,16 @@
-"""PTY sanitize helpers for shellctl output capture."""
+"""Lightweight PTY sanitizer used by tmux `pipe-pane`.
+
+This module stays stdlib-only because shellctl starts it once per job to drain
+PTY output into `output.log`. The ready-file handshake must happen before any
+stdin reads so the server can distinguish slow startup from a stuck tmux pipe.
+"""
 
 from __future__ import annotations
 
+import argparse
 import codecs
+import sys
+from pathlib import Path
 from typing import BinaryIO
 
 
@@ -64,7 +72,7 @@ class PtySanitizer:
                 self._escape_state = "osc"
                 return
             self._escape_state = "normal"
-            if char.isprintable() and char not in "\x1b":
+            if char.isprintable() and char != "\x1b":
                 self._consume_visible_char(char, parts)
             return
         if state == "csi":
@@ -136,4 +144,43 @@ def sanitize_pty_stream(
         stdout.flush()
 
 
-__all__ = ["PtySanitizer", "sanitize_pty_output", "sanitize_pty_stream"]
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the tiny CLI contract used by tmux `pipe-pane`."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ready-file", type=Path)
+    return parser.parse_args(argv)
+
+
+def run_sanitize_pty(
+    ready_file: Path | None,
+    *,
+    stdin: BinaryIO,
+    stdout: BinaryIO,
+) -> None:
+    """Touch the ready file, then sanitize stdin into stdout."""
+
+    if ready_file is not None:
+        ready_file.touch()
+    sanitize_pty_stream(stdin, stdout)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the standalone PTY sanitizer module."""
+
+    args = parse_args(argv)
+    run_sanitize_pty(args.ready_file, stdin=sys.stdin.buffer, stdout=sys.stdout.buffer)
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "PtySanitizer",
+    "main",
+    "parse_args",
+    "run_sanitize_pty",
+    "sanitize_pty_output",
+    "sanitize_pty_stream",
+]

@@ -44,8 +44,22 @@ from shell_session_manager.shellctl.server.tmux import (
     TmuxController,
     TmuxControllerProtocol,
 )
-from shell_session_manager.shellctl.shared import (
-    DEFAULT_AUTH_TOKEN_ENV,
+from shell_session_manager.shellctl.shared.constants import DEFAULT_AUTH_TOKEN_ENV
+from shell_session_manager.shellctl.shared.output import (
+    OutputWindow,
+    read_output_window,
+    tail_output_window,
+)
+from shell_session_manager.shellctl.shared.runtime import (
+    format_timestamp,
+    generate_job_id,
+    is_terminal_status,
+    job_pane_target,
+    job_session_name,
+    parse_timestamp,
+    utc_now,
+)
+from shell_session_manager.shellctl.shared.schemas import (
     DeleteJobResponse,
     InputJobRequest,
     JobInfo,
@@ -53,19 +67,10 @@ from shell_session_manager.shellctl.shared import (
     JobStatusName,
     JobStatusView,
     ListJobsResponse,
-    OutputWindow,
     RunJobRequest,
     TerminalSize,
     TerminateJobRequest,
     WaitJobRequest,
-    format_timestamp,
-    is_terminal_status,
-    job_pane_target,
-    job_session_name,
-    parse_timestamp,
-    read_output_window,
-    tail_output_window,
-    utc_now,
 )
 
 
@@ -1067,8 +1072,6 @@ class ShellctlService:
         """
 
         for _ in range(20):
-            from shell_session_manager.shellctl.shared import generate_job_id
-
             job_id = generate_job_id()
             job_dir = self.config.jobs_dir / job_id
             try:

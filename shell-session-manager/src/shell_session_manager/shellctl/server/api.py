@@ -11,13 +11,15 @@ from fastapi.responses import JSONResponse
 from shell_session_manager.shellctl.server.config import ShellctlConfig
 from shell_session_manager.shellctl.server.errors import ShellctlServerError
 from shell_session_manager.shellctl.server.service import ShellctlService
-from shell_session_manager.shellctl.shared import (
+from shell_session_manager.shellctl.shared.constants import (
     DEFAULT_HEALTH_STATUS,
     DEFAULT_LIST_LIMIT,
     DEFAULT_OUTPUT_LIMIT_BYTES,
     DEFAULT_TERMINATE_GRACE_SECONDS,
     MAX_LIST_LIMIT,
     MAX_OUTPUT_LIMIT_BYTES,
+)
+from shell_session_manager.shellctl.shared.schemas import (
     DeleteJobResponse,
     ErrorDetail,
     ErrorResponse,

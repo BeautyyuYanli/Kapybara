@@ -1,28 +1,27 @@
 """Typer CLI entrypoints for the shellctl server package.
 
 The root CLI exposes both the long-running HTTP server entrypoint and direct
-one-shot job-management commands that call `ShellctlService` locally. The PTY
-sanitizer still lives in `shell_session_manager.shellctl.sanitize_pty` as a
-separate lightweight module so tmux pipes do not have a second, heavier entry
-path to maintain.
+one-shot job-management commands that call `ShellctlService` locally. Tmux hot
+path helpers live under `shellctl_runtime` and are installed as dedicated
+console scripts so they do not share this heavier import path.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import anyio
 import typer
 import uvicorn
 
 from shell_session_manager.shellctl.server.api import create_app
 from shell_session_manager.shellctl.server.cli_controller import register_cli_controller
 from shell_session_manager.shellctl.server.config import ShellctlConfig
-from shell_session_manager.shellctl.server.service import ShellctlService
-from shell_session_manager.shellctl.shared import (
+from shell_session_manager.shellctl.shared.constants import (
     DEFAULT_AUTH_TOKEN_ENV,
     DEFAULT_GC_FINISHED_JOB_RETENTION_SECONDS,
     DEFAULT_GC_INTERVAL_SECONDS,
+)
+from shell_session_manager.shellctl.shared.runtime import (
     default_state_dir,
 )
 
@@ -61,26 +60,6 @@ def serve_command(
     uvicorn.run(create_app(config), host=host, port=port, log_level="info")
 
 
-@cli.command("runner-exit")
-def runner_exit_command(
-    state_dir: Path = typer.Option(..., "--state-dir"),
-    job_id: str = typer.Option(..., "--job-id"),
-    exit_code: int = typer.Option(..., "--exit-code"),
-    ended_at: str = typer.Option(..., "--ended-at"),
-) -> None:
-    """Internal runner callback that records a job exit in SQLite."""
-
-    async def _record() -> None:
-        service = ShellctlService(ShellctlConfig(state_dir=state_dir))
-        await service.initialize_database()
-        try:
-            await service.record_runner_exit(job_id, exit_code, ended_at)
-        finally:
-            await service.shutdown()
-
-    anyio.run(_record)
-
-
 def main() -> None:
     """CLI entrypoint used by the console script and `python -m` invocations."""
 
@@ -102,6 +81,5 @@ def _parse_listen(value: str) -> tuple[str, int]:
 __all__ = [
     "cli",
     "main",
-    "runner_exit_command",
     "serve_command",
 ]
