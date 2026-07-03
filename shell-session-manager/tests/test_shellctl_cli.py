@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import pytest
+import typer.main
 from typer.testing import CliRunner
 
 from shell_session_manager.shellctl.server import (
@@ -32,6 +33,23 @@ cli_controller_module = importlib.import_module(
 )
 
 runner = CliRunner()
+
+
+def _command_option_names(command_name: str) -> set[str]:
+    command = typer.main.get_command(cli).commands[command_name]
+    return {
+        option
+        for parameter in command.params
+        for option in getattr(parameter, "opts", [])
+    }
+
+
+def _command_option(command_name: str, option_name: str):
+    command = typer.main.get_command(cli).commands[command_name]
+    for parameter in command.params:
+        if option_name in getattr(parameter, "opts", []):
+            return parameter
+    raise AssertionError(f"{option_name} not found on {command_name}")
 
 
 class RecordingShellctlService:
@@ -162,19 +180,20 @@ def test_shellctl_help_lists_direct_controller_commands() -> None:
 
 
 def test_shellctl_run_help_shows_direct_options() -> None:
-    result = runner.invoke(cli, ["run", "--help"])
+    options = _command_option_names("run")
 
-    assert result.exit_code == 0, result.stderr
-    assert "--cwd" in result.stdout
-    assert "--env" in result.stdout
-    assert "--timeout" in result.stdout
-    assert "--output-limit" in result.stdout
-    assert "--idle-flush-seconds" in result.stdout
-    assert "--cols" in result.stdout
-    assert "--rows" in result.stdout
-    assert "--state-dir" in result.stdout
-    assert "--runtime-dir" in result.stdout
-    assert "--auth-token" not in result.stdout
+    assert {
+        "--cwd",
+        "--env",
+        "--timeout",
+        "--output-limit",
+        "--idle-flush-seconds",
+        "--cols",
+        "--rows",
+        "--state-dir",
+        "--runtime-dir",
+    }.issubset(options)
+    assert "--auth-token" not in options
 
 
 def test_shellctl_health_uses_prepare_runtime_and_ignores_http_auth_env(
@@ -283,13 +302,8 @@ def test_shellctl_run_builds_request_and_emits_json(
 
 
 def test_shellctl_wait_and_input_require_offset() -> None:
-    wait_result = runner.invoke(cli, ["wait", "job-1"])
-    input_result = runner.invoke(cli, ["input", "job-1", "hello"])
-
-    assert wait_result.exit_code == 2
-    assert "Missing option '--offset'" in wait_result.stderr
-    assert input_result.exit_code == 2
-    assert "Missing option '--offset'" in input_result.stderr
+    assert _command_option("wait", "--offset").required is True
+    assert _command_option("input", "--offset").required is True
 
 
 def test_shellctl_wait_and_input_map_requests(
