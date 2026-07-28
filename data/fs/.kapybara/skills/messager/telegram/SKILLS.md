@@ -1,18 +1,23 @@
 ---
-name: messager/telegram
-description: Uses curl to call the Telegram Bot API for the handful of methods we actually use.
+name: telegram
+description: Sends and manages Telegram Bot API text, documents, photos, stickers, topics, reactions, and deletions. Use for Telegram channel replies and bot messaging operations, including thread-scoped delivery.
 ---
 
+# Telegram
+
+Use `curl` and the bundled `send_document` helper to communicate through the
+Telegram Bot API. Prefer Rich Messages for text because Rich Markdown supports
+headings, tables, math, and other structured content.
+
 ## Upstream dependency
+
 - Upstream: Telegram Bot API
 - Official docs: https://core.telegram.org/bots/api
+- Current API: Bot API 10.2; Rich Messages were introduced in Bot API 10.1
 - Skill created: 2026-02-13
 
-# Telegram (Bot API) — minimal
+## Environment
 
-This skill is for sending/editing a few message types via **Telegram Bot API** using `curl`.
-
-Env:
 - `TELEGRAM_BOT_TOKEN` (required)
 
 Base URL:
@@ -28,59 +33,94 @@ BASE="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
 - If the input message is in a thread (`message_thread_id` present), all outgoing messages must stay in that same thread:
   include the same `message_thread_id` on every send call.
 
-## sendMessage
+## sendRichMessage
+
+Use `sendRichMessage` for text communication. Its `rich_message` parameter
+accepts a JSON-serialized `InputRichMessage` object containing Rich Markdown.
 
 ```bash
 CHAT_ID=123456789
 THREAD_ID=987654321  # use the input message's message_thread_id when replying in-thread
 
-MSG=$(cat <<'HTML'
-<b>Hi I'm here!</b> <i>Welcome</i> to the bot message. <u>Have a great day</u>
+MSG=$(cat <<'HEREDOC'
+# Highlights
 
-<b>Today’s Highlights:</b>
-• <b>Bold</b>, <i>italic</i>, <code>code</code>
-• <a href="https://core.telegram.org/bots/api">Telegram Bot API</a>
+Hello! This is a **Rich Message**.
 
-<blockquote>Stay curious, stay kind.</blockquote>
-HTML
+| Task | Status |
+|:---|:---|
+| Update Skill | ==Done== |
+| Test Demo | Pending |
+
+$$E = mc^2$$
+
+> "The best way to predict the future is to create it."
+HEREDOC
 )
 
-curl -sS -X POST "$BASE/sendMessage" \
+RICH_MSG_JSON=$(jq -n --arg md "$MSG" '{markdown: $md}')
+
+curl -sS -X POST "$BASE/sendRichMessage" \
   -d chat_id="$CHAT_ID" \
   -d message_thread_id="$THREAD_ID" \
-  --data-urlencode text="$MSG" \
-  -d parse_mode=HTML \
-  -d disable_web_page_preview=true | jq
+  --data-urlencode rich_message="$RICH_MSG_JSON" | jq
 ```
 
-## At-mentions (@Mentions)
+## At-mentions
 
-In Telegram, the **default and mandatory** way to mention users (especially those without public usernames) is to use HTML-formatted User ID links. This ensures the mention works reliably and correctly links to the user's profile. Avoid using the native `@username` format.
+In Rich Markdown, use the inline link syntax with the `tg://user?id=` protocol for reliable mentions.
 
-**Standard Format (HTML):**
-`<a href="tg://user?id=USER_ID">User Name</a>`
+Format: `[User Name](tg://user?id=USER_ID)`
 
 Example:
 ```bash
-MSG="Hello <a href=\"tg://user?id=567113516\">Yanli</a>!"
-# Then send with parse_mode=HTML
+MSG="Hello [Yanli](tg://user?id=567113516)!"
 ```
 
-## Telegra.ph handoff
+## editMessageText
 
-For long/structured content, use `skills:messager/telegraph/SKILLS.md`.
-**Note**: Telegra.ph requires **HTML**; Markdown is not supported.
-That skill creates the Telegra.ph page and prints the URL to stdout.
-
-After you capture the URL, send it back with `sendMessage`.
+To edit a message with rich formatting, use the `rich_message` parameter.
 
 ```bash
-URL=$(~/.kapybara/skills/messager/telegraph/create_telegraph "<h3>HTML content here</h3>" \
-  --title "Page Title")
+CHAT_ID=123
+MSG_ID=456
+MSG=$(cat <<'HEREDOC'
+# Updated content
+
+New table etc.
+HEREDOC
+)
+RICH_MSG_JSON=$(jq -n --arg md "$MSG" '{markdown: $md}')
+
+curl -sS -X POST "$BASE/editMessageText" \
+  -d chat_id="$CHAT_ID" \
+  -d message_id="$MSG_ID" \
+  --data-urlencode rich_message="$RICH_MSG_JSON" | jq
 ```
 
+## Long/structured Markdown handoff
 
-## createForumTopic (Sub-sessions)
+For extremely long/structured content (e.g., full reports), write a Markdown file and upload it with `sendDocument`. Telegram can render a direct Markdown file preview.
+
+```bash
+CHAT_ID=123
+THREAD_ID=987654321
+FILE_PATH="/tmp/report.md"
+CAPTION="Here's the full report"
+
+~/.kapybara/skills/messager/telegram/send_document \
+  "$FILE_PATH" \
+  --chat-id "$CHAT_ID" \
+  --message-thread-id "$THREAD_ID" \
+  --caption "$CAPTION"
+```
+
+Rules:
+
+- Use a `.md` suffix.
+- Preserve thread routing with `--message-thread-id`.
+
+## createForumTopic
 
 Use this to create a "thread" or "sub-session" in a private chat or forum supergroup.
 **Note**: For private chats, the bot must have "Forum Topic Mode" enabled in @BotFather.
@@ -96,7 +136,8 @@ curl -sS -X POST "$BASE/createForumTopic" \
 
 Response includes `message_thread_id`.
 
-### Send Sticker (via API)
+## sendSticker
+
 ```bash
 CHAT_ID=...
 THREAD_ID=...
@@ -140,30 +181,6 @@ curl -sS -X POST "$BASE/sendPhoto" \
   -d parse_mode=HTML | jq
 ```
 
-Reply to a message:
-
-```bash
-curl -sS -X POST "$BASE/sendMessage" \
-  -d chat_id="$CHAT_ID" \
-  -d message_thread_id="$THREAD_ID" \
-  -d reply_to_message_id=120 \
-  --data-urlencode text="Got it" | jq
-```
-
-## editMessageText
-
-```bash
-CHAT_ID=123
-MSG_ID=456
-NEW_TEXT="Updated text"
-
-curl -sS -X POST "$BASE/editMessageText" \
-  -d chat_id="$CHAT_ID" \
-  -d message_id="$MSG_ID" \
-  --data-urlencode text="$NEW_TEXT" \
-  -d parse_mode=HTML | jq
-```
-
 ## setMessageReaction
 
 Notes:
@@ -194,21 +211,8 @@ curl -sS -X POST "$BASE/deleteMessage" \
 
 ## Gotchas
 
-- Prefer `--data-urlencode text=...` so newlines / special chars are encoded correctly.
-- For formatting, `parse_mode=HTML` is usually easier than `MarkdownV2` (less escaping).
-- **Backticks and Code**: In `parse_mode=HTML`, backticks (`` ` ``) are **not** automatically rendered as code. Use `<code>...</code>` for inline code and `<pre>...</pre>` for blocks.
-- **Shell Escaping (Crucial)**: In shell scripts, avoid using double quotes `"` for variables containing backticks (e.g., `MSG="...`code`..."`), as the shell will attempt to execute the content inside backticks. Use single quotes `'` or a heredoc with quoted delimiter (`cat <<'HTML'`) to preserve backticks as literal text.
-- In shell scripts, using `cat <<'HTML'` (heredoc) allows direct use of newlines. **Do not use literal `\\n` characters inside the heredoc content**, as they will be treated as literal backslashes and the letter 'n' rather than a line break. The heredoc itself preserves actual newlines.
-- If you want to inspect the API response, parse the JSON and print it as UTF-8 (some formatters default to ASCII-escaped `\uXXXX` output):
-
-```bash
-# jq prints UTF-8 by default; avoid `jq -a/--ascii-output`.
-curl -sS -X POST "$BASE/getMe" | jq
-```
-
-
-## Important Note on HTML Sanitization
-When using `sendMessage` with `parse_mode=HTML`:
-- Always HTML-escape the content variables (like filenames or user-provided strings) before including them in the message.
-- Unescaped characters like `<` or `>` will cause the Telegram API to reject the message, often resulting in "blank" displays or delivery failures in certain clients if the tag is interpreted incorrectly.
-- Example: If you are mentioning a file path, ensure `/path/to/<file>` becomes `/path/to/&lt;file&gt;`.
+- **Rich Markdown**: Prefer `sendRichMessage` for structured text.
+- **Backticks and Code**: In Rich Markdown, `` `code` `` works as expected.
+- **Shell Escaping**: Use single quotes or heredocs with quoted delimiters (e.g., `cat <<'EOF'`) to preserve special characters like `$` or `` ` `` in your Markdown.
+- A quoted heredoc preserves real newlines. Do not use literal `\\n` characters
+  inside it; they remain a backslash and the letter `n`.
