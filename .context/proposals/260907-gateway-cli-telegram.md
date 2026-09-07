@@ -1,6 +1,8 @@
 # Gateway、CLI 与 Telegram 集成方案
 
-本方案以 `kapy_v2.md`、`docs/architecture.md` 和总设计师的 `docs/contracts.md` 为边界，面向 Linux、单个控制进程、多 session、多 execution machine。实现范围为 `src/kapy/gateway/`、`src/kapy/cli/`、`src/kapy/settings.py` 及对应 tests。公共接口在总设计师批准后落地；本次提交只包含方案。
+本方案以 `kapy_v2.md`、`docs/architecture.md` 和总设计师的 `docs/contracts.md` 为边界，面向 Linux、单个控制进程、多 session、多 execution machine。实现范围为 `src/kapy/gateway/`、`src/kapy/cli/`、`src/kapy/settings.py` 及对应 tests，按已批准的 State/Execution 契约和 Intelligence owner 的最终导出完成集成。
+
+Gateway 仅对实际服务作薄路由适配，不提供生产 stub 或另一套公共签名。HTTP 使用 dispatch_json，session.wait 使用 State.wait_submission；Skills/媒体存储借用 Gateway 自有 metadata pool，创建者授权保存在 Gateway，更新透传 expected_revision，媒体清理由 State 停止 Runner 后的 durable outbox 调用 Intelligence store.delete_session。机器测试限定 kapy-v2-machine:dev 容器且无 cgroup 字段或委派前提，token 仅使用 API usage。
 
 ## 1. 依赖依据与模块边界
 
