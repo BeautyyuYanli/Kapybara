@@ -30,21 +30,27 @@ setsid/double-fork descendants.
 
 Kill targets the ordinary process group. Only explicit kill, shutdown and
 failure cleanup use a two-second drain bound; forced truncation is reported with
-`output_complete=false` and an error. SQLite schema v2 stores process IDs,
+`output_complete=false` and an error. Stdio spools are fsynced before claiming
+complete output, and terminal spool lengths are checked during recovery.
+SQLite schema v2 stores process IDs,
 startup digests and terminal output metadata, without raw argv/env/tokens.
 Restart changes interrupted records to `lost` and never relaunches them; old
-groups are killed only when the leader's Linux start identity still matches.
-Released process IDs remain tombstones and cannot be reused.
+groups are killed only when both the Linux boot ID and leader start identity
+still match. Missing identity information skips killing. Released process IDs
+remain tombstones and cannot be reused; recovery retries leftover output removal.
 
 Session release revokes credentials, rejects starts, kills its processes,
-aborts transfers and deletes only its own managed directory. Interrupted release
+aborts transfers and deletes only its own managed directory. At most 64 release
+tasks run, and repeated release of the same session observes the existing task.
+Interrupted release
 is resumed before accepting requests. Child environments are explicit; the
 daemon adds the four KAPY machine/session/socket identity fields and does not
 inherit its environment. Session token refresh affects future children.
 
 Domain operations survive a WebSocket closing. Unexpected disconnection retries
 with 1–30 second jittered backoff; authentication/endpoint/protocol rejection is
-fatal. Optional idle disconnect requires no active work or local connection,
+fatal, as are binary frames on the text-only machine transport. Optional idle
+disconnect requires no active work or local connection,
 reconnects after the configured interval, and can be woken by local proxy calls.
 The proxy preserves caller auth separately from the target params and never
 retries a call with uncertain effects. No cgroup or systemd configuration is used.

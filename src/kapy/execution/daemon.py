@@ -24,6 +24,8 @@ from .paths import resolve_paths
 from .processes import ProcessManager
 from .store import ExecutionStore
 
+MAX_RELEASES = 64
+
 
 class MachineService:
     """Actual file/process/session handler, also usable by container integrations.
@@ -95,10 +97,12 @@ class MachineService:
             sid = session_identifier(params["session_id"])
             wait_ms = integer(params.get("wait_ms", 5000), "wait_ms", maximum=30_000)
             async with self._session_lock:
-                if not await self.store.begin_release(sid):
-                    return {"session_id": sid, "released": True}
                 task = self._releases.get(sid)
                 if task is None:
+                    if len(self._releases) >= MAX_RELEASES:
+                        raise error("resource_limit", "Too many session releases")
+                    if not await self.store.begin_release(sid):
+                        return {"session_id": sid, "released": True}
                     task = asyncio.create_task(self._release(sid), name="session-release")
                     self._releases[sid] = task
 
@@ -220,13 +224,16 @@ class _Connection:
                 ) as ws:
                     if ws.subprotocol != "kapy.jsonrpc.v1":
                         raise RuntimeError("Gateway did not select kapy.jsonrpc.v1")
+                    fatal_protocol_error = False
 
                     async def receive() -> str | None:
+                        nonlocal fatal_protocol_error
                         try:
                             message = await ws.recv()
                         except ConnectionClosed:
                             return None
                         if not isinstance(message, str):
+                            fatal_protocol_error = True
                             raise RpcDisconnected("Machine RPC requires text frames")
                         return message
 
@@ -257,6 +264,8 @@ class _Connection:
                             self.peer = None
                             closed.cancel()
                             await asyncio.gather(closed, return_exceptions=True)
+                    if fatal_protocol_error:
+                        raise RuntimeError("Machine RPC requires text frames")
             except InvalidStatus as exc:
                 if exc.response.status_code in {400, 401, 403, 404, 426}:
                     raise RuntimeError(
@@ -272,7 +281,9 @@ class _Connection:
             if time.monotonic() - connected_at > 30:
                 delay = 1.0
             sleep_for = (
-                self.config.idle_reconnect_after_s if idle else delay * random.uniform(0.8, 1.2)
+                self.config.idle_reconnect_after_s
+                if idle
+                else min(30.0, max(1.0, delay * random.uniform(0.8, 1.2)))
             )
             if not idle:
                 delay = min(30, delay * 2)
@@ -288,7 +299,8 @@ async def run_daemon(config: DaemonConfig, *, stop: anyio.Event | None = None) -
     paths = resolve_paths(
         state_dir=config.state_dir, data_dir=config.data_dir, runtime_dir=config.runtime_dir
     )
-    async with AsyncExitStack() as stack:
+    stack = AsyncExitStack()
+    try:
         store = await stack.enter_async_context(ExecutionStore(paths, config.machine_id))
         http = await stack.enter_async_context(
             httpx2.AsyncClient(trust_env=False, follow_redirects=False)
@@ -312,12 +324,18 @@ async def run_daemon(config: DaemonConfig, *, stop: anyio.Event | None = None) -
             for task in done:
                 task.result()
         finally:
-            for task in [*tasks, *([stop_task] if stop_task is not None else [])]:
-                task.cancel()
-            await asyncio.gather(
-                *tasks, *([stop_task] if stop_task is not None else []), return_exceptions=True
-            )
-            await asyncio.gather(
-                *(peer.aclose() for peer in connection.local_peers), return_exceptions=True
-            )
-            await store.io.run(paths.socket_path.unlink, True)
+            with anyio.CancelScope(shield=True):
+                for task in [*tasks, *([stop_task] if stop_task is not None else [])]:
+                    task.cancel()
+                await asyncio.gather(
+                    *tasks, *([stop_task] if stop_task is not None else []), return_exceptions=True
+                )
+                await asyncio.gather(
+                    *(peer.aclose() for peer in connection.local_peers), return_exceptions=True
+                )
+                await store.io.run(paths.socket_path.unlink, True)
+    finally:
+        # Shield the entire exit stack as well as connection teardown: AnyIO
+        # cancellation is level-triggered and otherwise interrupts each I/O.
+        with anyio.CancelScope(shield=True):
+            await stack.aclose()

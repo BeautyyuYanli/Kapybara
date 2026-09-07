@@ -71,6 +71,18 @@ def _identity(pid: int) -> str | None:
         return None
 
 
+def _boot_id() -> str | None:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _remove_root(root: Path) -> None:
+    if root.exists():
+        shutil.rmtree(root)
+
+
 def _kill_group(pid: int) -> None:
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -129,6 +141,7 @@ class ProcessManager:
         await self.store.save_process(entry.signature, dict(entry.info), dict(entry.meta))
 
     async def initialize(self) -> None:
+        boot_id = await self.store.io.run(_boot_id)
         for record in await self.store.process_records():
             info = cast(JsonObject, record["info"])
             meta = cast(JsonObject, record["meta"])
@@ -139,7 +152,12 @@ class ProcessManager:
             entry.tail = base64.b64decode(str(meta.get("tail", "")))
             if info["state"] not in TERMINAL:
                 old_pid = meta.get("pid")
-                if isinstance(old_pid, int) and meta.get("identity") is not None:
+                if (
+                    isinstance(old_pid, int)
+                    and meta.get("identity") is not None
+                    and boot_id is not None
+                    and meta.get("boot_id") == boot_id
+                ):
                     if await self.store.io.run(_identity, old_pid) == meta["identity"]:
                         await self.store.io.run(_kill_group, old_pid)
                 info.update(
@@ -149,10 +167,22 @@ class ProcessManager:
                 )
             if info["mode"] == "stdio" and info["state"] != "released":
                 for name in ("stdout", "stderr"):
+                    expected_size = entry.sizes.get(name, 0)
+                    missing = False
                     try:
-                        entry.sizes[name] = (await self.store.io.run((root / name).stat)).st_size
+                        actual_size = (await self.store.io.run((root / name).stat)).st_size
                     except FileNotFoundError:
-                        entry.sizes[name] = 0
+                        missing = True
+                        actual_size = 0
+                    if info["output_complete"] and (missing or actual_size != expected_size):
+                        info["output_complete"] = False
+                        info["error"] = {
+                            "kind": "io_error",
+                            "message": "Stored process output is missing or changed",
+                        }
+                    entry.sizes[name] = actual_size
+            if info["state"] == "released":
+                await self.store.io.run(_remove_root, root)
             entry.done.set()
             self._entries[sid, pid] = entry
             await self._save(entry)
@@ -365,6 +395,7 @@ class ProcessManager:
                 )
             entry.meta["pid"] = entry.child.pid
             entry.meta["identity"] = await self.store.io.run(_identity, entry.child.pid)
+            entry.meta["boot_id"] = await self.store.io.run(_boot_id)
             entry.info["state"] = "running"
             await self._save(entry)
             entry.task = asyncio.create_task(self._collect(entry), name="process-collect")
@@ -459,6 +490,10 @@ class ProcessManager:
             entry.info["exit_code"] = await entry.child.wait()
             while _group_alive(entry.child.pid):  # noqa: ASYNC110 - kernel has no group-exit event
                 await asyncio.sleep(0.05)
+            # Persist output before the durable terminal record claims it is
+            # complete. Failed fsync follows the explicit incomplete path.
+            for fd in entry.fds.values():
+                await self.store.io.run(os.fsync, fd)
         except Exception, asyncio.CancelledError:
             entry.complete = False
             for task in drains:
@@ -591,11 +626,7 @@ class ProcessManager:
             entry.tail = b""
             await self._save(entry)
 
-            def remove() -> None:
-                if entry.root.exists():
-                    shutil.rmtree(entry.root)
-
-            await self.store.io.run(remove)
+            await self.store.io.run(_remove_root, entry.root)
 
     async def release_session(self, session_id: str) -> None:
         async with self._begin_lock:

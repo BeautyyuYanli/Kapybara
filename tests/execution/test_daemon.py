@@ -238,3 +238,133 @@ async def test_idle_reconnect_and_local_wake(tmp_path: Path):
         finally:
             stop.set()
             await asyncio.wait_for(daemon, 5)
+
+
+@pytest.mark.asyncio
+async def test_binary_machine_frame_is_fatal_without_reconnect(tmp_path: Path):
+    attempts = 0
+
+    async def gateway(ws):
+        nonlocal attempts
+        attempts += 1
+        await ws.send(b"{}")
+        await ws.wait_closed()
+
+    async with serve(
+        gateway, "127.0.0.1", 0, subprotocols=[Subprotocol("kapy.jsonrpc.v1")]
+    ) as server:
+        port = server.sockets[0].getsockname()[1]
+        settings = config(tmp_path, f"ws://127.0.0.1:{port}/rpc/machines/machine")
+        with pytest.raises(RuntimeError, match="requires text frames"):
+            await asyncio.wait_for(run_daemon(settings), 5)
+        assert attempts == 1
+        paths = resolve_paths(
+            state_dir=settings.state_dir,
+            data_dir=settings.data_dir,
+            runtime_dir=settings.runtime_dir,
+        )
+        async with ExecutionStore(paths, "machine"):
+            pass
+        assert not paths.socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_anyio_level_cancellation_closes_active_daemon_and_store(tmp_path: Path):
+    peers: asyncio.Queue[RpcPeer] = asyncio.Queue()
+    cancelled = False
+
+    async def gateway(ws):
+        async def handler(method, params):
+            return None
+
+        async def receive():
+            try:
+                return await ws.recv()
+            except Exception:
+                return None
+
+        async with RpcPeer(
+            send_text=ws.send, receive_text=receive, close_transport=ws.close, handler=handler
+        ) as peer:
+            await peers.put(peer)
+            await peer.wait_closed()
+
+    async with serve(
+        gateway, "127.0.0.1", 0, subprotocols=[Subprotocol("kapy.jsonrpc.v1")]
+    ) as server:
+        port = server.sockets[0].getsockname()[1]
+        settings = config(tmp_path, f"ws://127.0.0.1:{port}/rpc/machines/machine")
+
+        async def run():
+            nonlocal cancelled
+            try:
+                await run_daemon(settings)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+
+        async with asyncio.timeout(5):
+            async with anyio.create_task_group() as group:
+                group.start_soon(run)
+                peer = await peers.get()
+                await peer.call("session.ensure", {"session_id": "s", "session_token": "token"})
+                await peer.call(
+                    "process.start",
+                    {
+                        "session_id": "s",
+                        "process_id": str(uuid4()),
+                        "mode": "stdio",
+                        "argv": [sys.executable, "-c", "import time; time.sleep(60)"],
+                        "wait_ms": 0,
+                    },
+                )
+                group.cancel_scope.cancel()
+        assert cancelled
+        paths = resolve_paths(
+            state_dir=settings.state_dir,
+            data_dir=settings.data_dir,
+            runtime_dir=settings.runtime_dir,
+        )
+        assert not paths.socket_path.exists()
+        async with ExecutionStore(paths, "machine") as store:
+            records = await store.process_records()
+            assert cast(Any, records[0]["info"])["state"] == "killed"
+
+
+@pytest.mark.asyncio
+async def test_session_release_admission_is_bounded_and_reuses_id(tmp_path: Path, monkeypatch):
+    import kapy.execution.daemon as daemon_module
+
+    paths = resolve_paths(
+        state_dir=tmp_path / "state", data_dir=tmp_path / "data", runtime_dir=tmp_path / "run"
+    )
+    async with (
+        ExecutionStore(paths, "machine") as store,
+        httpx2.AsyncClient(trust_env=False) as http,
+    ):
+        service = MachineService(store, http_client=http)
+        await service.initialize()
+        for sid in ("a", "b", "c"):
+            await service.handle("session.ensure", {"session_id": sid, "session_token": "token"})
+        release = service._release
+        gate = asyncio.Event()
+
+        async def delayed(sid):
+            await gate.wait()
+            await release(sid)
+
+        monkeypatch.setattr(service, "_release", delayed)
+        monkeypatch.setattr(daemon_module, "MAX_RELEASES", 2)
+        try:
+            for sid in ("a", "b", "a"):
+                assert await service.handle(
+                    "session.release", {"session_id": sid, "wait_ms": 0}
+                ) == {"session_id": sid, "released": False}
+            assert len(service._releases) == 2
+            with pytest.raises(RpcError, match="Too many session releases"):
+                await service.handle("session.release", {"session_id": "c", "wait_ms": 0})
+            assert store.authenticate_session("c", "token")
+            assert await store.session_cwd("c", require_token=True) == paths.session_cwd("c")
+        finally:
+            gate.set()
+            await service.aclose()

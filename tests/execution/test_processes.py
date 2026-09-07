@@ -252,3 +252,129 @@ async def test_startup_database_failure_still_reaps_and_unblocks_cleanup(
         monkeypatch.setattr(service.store, "save_process", original_save)
         released = await service.handle("session.release", {"session_id": "s"})
         assert released == {"session_id": "s", "released": True}
+
+
+@pytest.mark.asyncio
+async def test_spool_fsync_failure_reports_incomplete(service: MachineService, monkeypatch):
+    import kapy.execution.processes as processes
+
+    def fail_fsync(fd):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(processes.os, "fsync", fail_fsync)
+    result = cast(Any, await service.handle("process.start", start("print('collected')")))
+    assert result["process"]["state"] == "failed"
+    assert result["process"]["output_complete"] is False
+    assert result["process"]["error"]["kind"] == "io_error"
+    assert payload(result) == b"collected\n"
+    assert service.processes.active_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing", "shortened"])
+async def test_recovery_detects_damaged_terminal_spool(service: MachineService, damage: str):
+    from kapy.execution.processes import ProcessManager
+
+    params = start("print('durable output')")
+    result = cast(Any, await service.handle("process.start", params))
+    assert result["process"]["output_complete"] is True
+    entry = service.processes._entries["s", params["process_id"]]
+    spool = entry.root / "stdout"
+    if damage == "missing":
+        spool.unlink()
+    else:
+        spool.write_bytes(b"dur")
+    recovered = ProcessManager(service.store)
+    await recovered.initialize()
+    try:
+        result = cast(
+            Any,
+            await recovered.handle(
+                "process.wait",
+                {"session_id": "s", "process_id": params["process_id"], "wait_ms": 0},
+            ),
+        )
+        assert result["process"]["output_complete"] is False
+        assert result["process"]["error"]["kind"] == "io_error"
+        assert payload(result) == (b"" if damage == "missing" else b"dur")
+        records = await service.store.process_records()
+        assert cast(Any, records[0]["info"])["output_complete"] is False
+    finally:
+        await recovered.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_retries_interrupted_process_release(service: MachineService, monkeypatch):
+    import kapy.execution.processes as processes
+
+    params = start("print('will be released')")
+    await service.handle("process.start", params)
+    entry = service.processes._entries["s", params["process_id"]]
+    remove = processes._remove_root
+
+    def fail_remove(root):
+        raise OSError("simulated directory cleanup failure")
+
+    monkeypatch.setattr(processes, "_remove_root", fail_remove)
+    with pytest.raises(OSError, match="cleanup failure"):
+        await service.handle(
+            "process.release", {"session_id": "s", "process_id": params["process_id"]}
+        )
+    assert entry.root.exists()
+    monkeypatch.setattr(processes, "_remove_root", remove)
+    recovered = processes.ProcessManager(service.store)
+    await recovered.initialize()
+    await recovered.initialize()  # Cleanup remains harmless when already removed.
+    assert not entry.root.exists()
+    with pytest.raises(RpcError, match="released"):
+        await recovered.handle("process.start", params)
+    await recovered.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boot", ["matching", "different", "missing"])
+async def test_recovery_kills_only_same_boot_and_start_identity(service: MachineService, boot: str):
+    import kapy.execution.processes as processes
+
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(60)", start_new_session=True
+    )
+    process_id = str(uuid4())
+    meta: dict[str, Any] = {
+        "pid": child.pid,
+        "identity": processes._identity(child.pid),
+        "sizes": {"pty": 0},
+        "tail": "",
+    }
+    if boot != "missing":
+        meta["boot_id"] = processes._boot_id() if boot == "matching" else "another-boot"
+    info: dict[str, Any] = {
+        "session_id": "s",
+        "process_id": process_id,
+        "mode": "pty",
+        "cwd": str(service.store.paths.session_cwd("s")),
+        "state": "running",
+        "exit_code": None,
+        "output_complete": False,
+        "error": None,
+    }
+    await service.store.save_process("interrupted", info, meta)
+    recovered = processes.ProcessManager(service.store)
+    try:
+        await recovered.initialize()
+        result = cast(
+            Any,
+            await recovered.handle(
+                "process.wait", {"session_id": "s", "process_id": process_id, "wait_ms": 0}
+            ),
+        )
+        assert result["process"]["state"] == "lost"
+        if boot == "matching":
+            assert await asyncio.wait_for(child.wait(), 2) == -9
+        else:
+            assert child.returncode is None
+    finally:
+        if child.returncode is None:
+            child.kill()
+        await child.wait()
+        await recovered.aclose()
