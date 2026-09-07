@@ -38,7 +38,6 @@ class Client:
     settings: Settings
     session_id: str | None
     machine_id: str | None
-    admin: bool = False
 
     def target(self, value: str | None = None) -> str:
         target = value or self.session_id
@@ -123,12 +122,9 @@ def configure_control(
     ctx: typer.Context,
     session_id: Annotated[str | None, typer.Option("--session")] = None,
     machine: Annotated[str | None, typer.Option("--machine")] = None,
-    user: Annotated[bool, typer.Option("--user")] = False,
 ) -> None:
     settings = load_settings()
-    ctx.obj = Client(
-        settings, session_id or settings.session_id, machine or settings.machine_id, user
-    )
+    ctx.obj = Client(settings, session_id or settings.session_id, machine or settings.machine_id)
 
 
 @app.command("server")

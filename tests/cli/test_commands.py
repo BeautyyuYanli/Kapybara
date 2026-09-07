@@ -105,24 +105,20 @@ def test_failed_upload_preserves_identical_archive_for_explicit_retry(monkeypatc
     archive.parent.rmdir()
 
 
-def test_session_capability_wins_over_user_flag_and_partial_context_never_elevates(monkeypatch):
+def test_session_capability_wins_over_control_token_and_partial_context_never_elevates(monkeypatch):
     caller, target, calls = configured(monkeypatch)
     monkeypatch.setenv("KAPY_CONTROL_TOKEN", "admin-test")
-    result = CliRunner().invoke(
-        commands.app, ["control", "--user", "--session", target, "session", "get"]
-    )
+    result = CliRunner().invoke(commands.app, ["control", "--session", target, "session", "get"])
     assert result.exit_code == 0, result.output
     assert calls[0][2] == {"kind": "session", "session_id": caller, "token": "test-session-token"}
     calls.clear()
     monkeypatch.delenv("KAPY_SESSION_TOKEN")
-    result = CliRunner().invoke(commands.app, ["control", "--user", "session", "get"])
+    result = CliRunner().invoke(commands.app, ["control", "session", "get"])
     assert result.exit_code == 2
     assert calls == []
     monkeypatch.setenv("KAPY_SESSION_TOKEN", "test-session-token")
     monkeypatch.delenv("KAPY_SESSION_ID")
-    result = CliRunner().invoke(
-        commands.app, ["control", "--user", "--session", target, "session", "get"]
-    )
+    result = CliRunner().invoke(commands.app, ["control", "--session", target, "session", "get"])
     assert result.exit_code == 2
     assert calls == []
 

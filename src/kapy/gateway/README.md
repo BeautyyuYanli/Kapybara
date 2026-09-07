@@ -18,7 +18,7 @@ block recovery of an already committed creation.
 
 The local CLI uses Execution's authenticated Unix proxy. The inherited session identifies
 the caller; `kapy control --session UUID ...` selects the target independently. An explicit
-administrator bearer permits `--user` outside a session context. A session capability always
+administrator bearer is used when no session context is present. A session capability always
 keeps its session identity; an incomplete session context is rejected. Mutation request IDs
 and skill archive paths are printed to stderr before transport begins; stdout contains results.
 Prompt and SQL commands accept `--file PATH` or `--stdin`, and `session output` emits one JSON
