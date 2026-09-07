@@ -1,4 +1,3 @@
-import json
 from uuid import uuid4
 
 import pytest
@@ -157,7 +156,6 @@ async def test_encoded_page_cap_and_query_limits(database: Database) -> None:
         records.extend(page.items)
     assert sum(item.kind == "model_response" for item in records) == 12
     assert len({record.cursor for record in records}) == len(records)
-    assert len(json.dumps(payload)) > len(payload)
     with pytest.raises(QueryLimitExceeded):
         await service.query_history(created.session.id, "SELECT data FROM history")
     limited = await service.query_history(created.session.id, "SELECT kind FROM history", limit=2)

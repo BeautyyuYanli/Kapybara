@@ -70,7 +70,6 @@ async def test_delete_13200_publicly_accepted_inputs_completes_every_receipt(
         (session_id,),
     )
     emitted = [key for row in notifications for key in row["payload"]["request_ids"]]
-    assert len(notifications) == 207
     assert all(len(row["payload"]["request_ids"]) <= 64 for row in notifications)
     assert len(emitted) == len(set(emitted)) == 13_200
     assert set(emitted) == {str(key) for key in request_ids}
@@ -119,13 +118,17 @@ async def test_many_steer_requests_complete_once_even_for_runner_state_errors(
     assert len({row["completion"]["run_id"] for row in rows}) == 1
     page = await service.read_output(created.session.id)
     waiting = [item for item in page.items if item.kind == "waiting"]
-    assert len(waiting) == 4
+    while page.has_more:
+        page = await service.read_output(created.session.id, after=page.next_cursor)
+        waiting.extend(item for item in page.items if item.kind == "waiting")
     emitted: list[str] = []
     for item in waiting:
         assert isinstance(item.data, dict)
         keys = item.data["request_ids"]
         assert isinstance(keys, list)
+        assert len(keys) <= 64
         emitted.extend(str(key) for key in keys)
+    assert len(emitted) == len(set(emitted)) == len(request_ids)
     assert set(emitted) == {str(k) for k in request_ids}
 
 

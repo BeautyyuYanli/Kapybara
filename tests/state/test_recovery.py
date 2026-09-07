@@ -129,10 +129,9 @@ async def test_migration_checksum_and_epoch_fencing(database: Database) -> None:
         await service.create_session(spec(), request_id=uuid4())
 
 
-async def test_read_rows_do_not_validate_runner_state(database: Database) -> None:
+async def test_nested_session_configuration_is_read_back_unchanged(database: Database) -> None:
     service = await database.start(simple)
     created = await service.create_session(spec(), request_id=uuid4())
-    # Reads preserve arbitrary nested configuration; no ORM/Pydantic model construction occurs.
     uncommon = {"future_option": {"nested": [1, None, "中文", {"enabled": True}]}}
     await database.rows(
         "UPDATE sessions SET config=%s WHERE id=%s RETURNING id",
