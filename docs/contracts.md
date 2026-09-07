@@ -70,8 +70,8 @@ aliases for discarded draft names.
   degrade history. The latest approximately 10% may be selected by complete
   interaction blocks, without claiming that block counts measure tokens. Only an
   explicit context-length rejection permits bounded additional compression retries.
-- Intelligence exports an explicit session initialization function returning
-  RunnerState with the creation-time skill-description snapshot. Gateway invokes it.
+- Runner.initial_state returns RunnerState with the creation-time skill-description
+  snapshot. Gateway invokes it.
 - wait_for authorization uses an injected Gateway capability; UUID knowledge is
   not itself permission. State alone commits waiting and emits completion.
 - Skills use path-based upload/download through existing execution file transfers.
@@ -83,7 +83,7 @@ aliases for discarded draft names.
 
 ### Approved Python exports
 
-- Runner(config, machine_caller, *, http_client, payload_store, authorize_wait,
+- Runner(config, machine_caller, *, model_backend, payload_store, authorize_wait,
   plugins=()) borrows its dependencies; initial_state(*, instructions, skills)
   returns State.RunnerState. Its async call takes State.RunContext and returns
   State.RunResult. Construction has no I/O or background tasks.
@@ -105,3 +105,23 @@ aliases for discarded draft names.
   16 MiB; transport reuses Execution's file operations.
 - Skills/AgentPayloadStore have no separate resource factory, start/aclose or pool
   ownership. Gateway owns initialization and shutdown ordering.
+
+## Configurable adapters (2026-09-08)
+
+- `RunnerConfig` holds model/context/output/compression/media settings only.
+  `ModelBackend.create_model(model_name) -> Model` and
+  `classify_error(Exception) -> ModelFailure | None` isolate the adapter. The provided
+  `OpenAICompatibleBackend(*, base_url, api_key, http_client)` borrows its HTTP client.
+- `create_app(settings=None, *, model_backend=None, frontend_factories=None, plugins=None)`
+  registers trusted Python frontend factories selected through Settings.frontends. Context
+  contains Settings, ControlAPI, borrowed pool and schema; business calls use
+  `ControlAPI.call(method, params, *, principal)`. Frontend.run owns plugin migration/tasks.
+- `Principal("frontend", frontend_id=..., subject=...)` persists as `frontend_id:subject`.
+  operator/session namespaces remain reserved; old Telegram identity strings are unchanged.
+  Core migration/deletion no longer reference adapter-owned Telegram tables.
+- `ScriptTool(..., prepare=None)` optionally accepts an async `(ScriptHost, ProcessCommand)`
+  hook. Host.workspace/run/push wrap existing durable bounded machine operations; no Runtime
+  is exposed. Runner adds no plugins implicitly. Gateway's default configured plugin is
+  apply_patch, with explicit sequence or configuration allowing removal/replacement.
+- Model tools do not include file_read/file_write. Text inspection/editing uses process
+  commands and optional patch tools. Raw execution file RPCs and read_media are unchanged.

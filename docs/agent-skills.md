@@ -1,14 +1,23 @@
 # Agent and Skills modules
 
 `kapy.agent.Runner` is an async State `SessionRunner`. Construct it with explicit
-`RunnerConfig`, Gateway's `MachineCaller`, borrowed `httpx2.AsyncClient`, initialized
+`RunnerConfig`, Gateway's `MachineCaller`, borrowed `ModelBackend`, initialized
 `AgentPayloadStore`, and Gateway's `AuthorizeWait` callback. Construction starts no
 I/O. The agent does not load environment files or own these resources.
 
 At session creation, call `runner.initial_state(instructions=..., skills=await
 skills.catalog())`. Store that snapshot in State's `SessionSpec.initial_state`.
 Instructions and the catalog remain fixed for the session. Each run selects the
-optional `session.config.model`, falling back to `RunnerConfig.model`.
+optional `session.config.model`, falling back to `RunnerConfig.model`. Current session ID,
+associated machine IDs and default machine are appended for each run without rewriting
+the instruction/skill snapshot. Association does not claim that a machine is online.
+
+`RunnerConfig` contains model name, window/output limits and compression/media settings,
+not credentials. `OpenAICompatibleBackend(base_url=..., api_key=SecretStr(...),
+http_client=...)` implements the `ModelBackend` protocol: `create_model(model_name)` and
+`classify_error(error) -> ModelFailure | None`. The immutable failure contains `kind`
+(`context_length` or `media`) and a safe message. Unknown errors remain errors. Backend
+clients are borrowed and never closed by Runner; application composition owns their lifetime.
 
 ## Persistence and recovery
 
@@ -70,10 +79,19 @@ the State session ID and `timeout=60.0`. Model parameters cannot supply credenti
 session IDs, process-start IDs, or transfer IDs. Stable process/transfer UUIDs derive
 from session, State run, tool-call ID, and substep. Recovery observes known handles;
 an unconfirmable outcome remains `outcome_unknown` at the original call ID.
-Interrupted terminal writes are never automatically replayed.
+Interrupted terminal writes are never automatically replayed. Built-in model tools are
+process operations, read_media and wait. Ordinary text files use shell commands rather
+than extra file_read/file_write tools. An unfinished call to a removed tool gets an
+`outcome_unknown` return without replay; completed historical tool results remain intact.
+PTY/stdout/stderr cursor schemas specify byte positions. A display-truncated stdio chunk
+can be reread from its start with a smaller `max_bytes`; the full spool remains until release.
 
 `ScriptTool` takes a Pydantic parameter model and a renderer returning
-`ProcessCommand(argv, stdin, cwd)`. The wrapper validates parameters itself because
+`ProcessCommand(argv, stdin, cwd)`, plus an optional async `prepare(host, command)`
+returning a prepared command. `ScriptHost` exposes only `workspace()`, `run(argv)` and
+`push(path, bytes)`. Preparation run must reach a confirmed successful exit; otherwise
+the known process is retained and no script is launched. The host owns stable IDs,
+checkpointed transfer/process steps and unknown-outcome recovery. The wrapper validates parameters itself because
 `Tool.from_schema` publishes schema without validating it. `machine_id` is reserved.
 Stdin is uploaded as bytes and redirected with the fixed argv:
 
@@ -84,7 +102,10 @@ Stdin is uploaded as bytes and redirected with the fixed argv:
 Input files are removed only after process termination is confirmed. Running or
 unknown outcomes retain them until later cleanup or machine-session deletion.
 
-The built-in apply_patch plugin uses the verified upstream `rust-v0.153.4` release
+Runner registers only the supplied plugins; an empty sequence adds none. The Gateway
+uses `apply_patch_plugin()` by default, configured through `KAPY_TOOL_PLUGINS`; explicit
+`create_app(..., plugins=())` disables it and supplied definitions replace the default list.
+The apply_patch plugin uses the verified upstream `rust-v0.153.4` release
 from commit `8639ac2d93442bcec5631b693b4ed7c0144422b7`. Regenerate resources with:
 
 ```sh
@@ -95,7 +116,8 @@ The generator verifies both Linux bundle SHA-256 values and preserves upstream
 binary/license/source bytes. Its generated `.gitattributes` disables newline
 conversion. The model description changes only the FREEFORM transport wording to
 a JSON `patch` field and retains the complete grammar/examples. Installation uses
-managed `pwd`, `uname -m`, `mkdir`, file transfers, and `chmod` commands; no binary
+managed `pwd`, `uname -m`, executable SHA-256 verification, `mkdir`, file transfers,
+and `chmod` commands; no binary
 is run on the control host. Skill path instructions are not an OS sandbox.
 
 ## Skills service

@@ -2,12 +2,12 @@
 
 For a first start, inject environment variables explicitly: the CLI and Settings do not
 automatically load `.env` or `.env.example`. Replace the placeholders below and set the
-model's actual context window. The control server requires `OPENAI_API_KEY`,
+model's actual context window. The control server requires `KAPY_MODEL_API_KEY`,
 `KAPY_CONTEXT_WINDOW_TOKENS`, `KAPY_CONTROL_TOKEN`, and `KAPY_SESSION_SIGNING_KEY`:
 
 ```sh
-env OPENAI_API_KEY='<provider-api-key>' \
-  OPENAI_BASE_URL='https://api.openai.com/v1' OPENAI_MODEL='gpt-5.6-luna' \
+env KAPY_MODEL_API_KEY='<provider-api-key>' \
+  KAPY_MODEL_BASE_URL='https://api.openai.com/v1' KAPY_MODEL='gpt-5.6-luna' \
   KAPY_CONTEXT_WINDOW_TOKENS=100000 \
   KAPY_CONTROL_TOKEN='<control-admin-token>' \
   KAPY_SESSION_SIGNING_KEY='<random-signing-key>' \
@@ -17,9 +17,10 @@ env OPENAI_API_KEY='<provider-api-key>' \
 
 PostgreSQL and Valkey must be reachable. Set `KAPY_DATABASE_URL` and `KAPY_VALKEY_URL`
 for your network; development defaults use `127.0.0.1:55432` and `127.0.0.1:56379`.
-`OPENAI_BASE_URL` and `OPENAI_MODEL` select the provider endpoint and model; other
+`KAPY_MODEL_BASE_URL` and `KAPY_MODEL` select the provider endpoint and model; other
 settings use `KAPY_`. Telegram is optional: enabling `TELEGRAM_BOT_TOKEN` also requires
-the allowed numeric `TELEGRAM_CHAT_ID`.
+the allowed numeric `TELEGRAM_CHAT_ID`. An explicit `KAPY_FRONTENDS='[]'` disables
+frontends, including Telegram, without requiring or validating leftover Telegram configuration.
 
 In the project machine container, start its daemon using the exact machine ID and bearer
 from the control server's JSON mapping. This bearer is separate from the administrator
@@ -44,8 +45,30 @@ env KAPY_CONTROL_TOKEN='<control-admin-token>' kapy control session list
 `create_app` composes the actual State, RPC, Execution, Skills and Agent exports.
 Gateway owns its PostgreSQL metadata pool and HTTP client. Skills and agent payload
 storage borrow the pool; State creates and closes its own pool and Valkey client.
-No module reads `.env` implicitly. Settings retain `OPENAI_*` and `TELEGRAM_*` aliases;
+No module reads `.env` implicitly. Settings accept legacy `OPENAI_*` and existing `TELEGRAM_*` aliases;
 other environment names start with `KAPY_`. Secrets are not stored in route configuration.
+
+`create_app(settings=None, *, model_backend=None, frontend_factories=None, plugins=None)`
+accepts borrowed adapters. An injected ModelBackend removes the model-key requirement;
+Gateway creates/closes model HTTP resources only for its default OpenAI-compatible backend.
+`KAPY_MODEL_BASE_URL`, `KAPY_MODEL_API_KEY` and `KAPY_MODEL` override legacy `OPENAI_*` aliases.
+Model names have no vendor whitelist. The configured context window remains required.
+
+`Frontend`, `FrontendFactory`, `FrontendContext` and `ControlAPI` are exported by Gateway.
+The context exposes settings, a borrowed metadata pool/schema, and the single async
+`control.call(method, params, principal=...)` business port. Factories are trusted Python
+code registered in the application, selected by `KAPY_FRONTENDS` JSON names; unknown names
+fail before resources start. Unset frontend configuration auto-selects Telegram if a token
+exists. A frontend owns its tables/tasks and uses a namespaced frontend principal. Existing
+Telegram principal IDs remain `telegram:bot:chat:thread`, preserving ownership and receipts.
+Telegram owns its own four tables and session-delete cleanup; disabled frontends do not
+block core deletion. Re-enabled Telegram checks stale bindings, even blocked pending
+messages, before sending. Origin IDs live in its existing inbox JSON, with old saved create
+receipts used once to restore only routes that still have deliveries.
+
+`KAPY_TOOL_PLUGINS` defaults to `["apply_patch"]`; `[]` disables default script tools.
+`plugins=None` uses that configured list; an explicit sequence replaces it. Custom script
+plugins are passed to the same Runner, and use the same preparation/process machinery.
 
 `kapy control-server` listens on `0.0.0.0:8000` by default (`--host` and `--port` override).
 POST `/rpc` requires the configured administrator bearer and uses `dispatch_json`.

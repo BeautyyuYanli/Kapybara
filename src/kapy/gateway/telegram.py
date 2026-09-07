@@ -11,19 +11,20 @@ import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
-from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx2
 import psycopg
 from psycopg.types.json import Jsonb
 
 from kapy.rpc import JsonObject, RpcError
-from kapy.state import ServiceUnavailable
 
 from .auth import Principal
+from .storage import Metadata
+from .telegram_storage import migrate
 
 if TYPE_CHECKING:
-    from .app import FrontendContext
+    from .frontends import FrontendContext
 
 logger = logging.getLogger(__name__)
 COMMANDS = {
@@ -206,7 +207,7 @@ class TelegramFrontend:
     def __init__(self, context: FrontendContext) -> None:
         self.settings = context.settings
         self.control = context.control
-        self.metadata = context.control.metadata
+        self.metadata = Metadata(context.metadata_pool, schema=context.schema)
         token = context.settings.telegram_bot_token
         if token is None or context.settings.telegram_chat_id is None:
             raise ValueError("Telegram requires a token and an allowed chat")
@@ -221,6 +222,40 @@ class TelegramFrontend:
         self._chat_ready: dict[int, float] = {}
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._draft_sent: dict[int, tuple[str, float]] = {}
+
+    def principal(self, chat: int, thread: int) -> Principal:
+        return Principal(
+            "frontend", frontend_id="telegram", subject=f"{self.bot_id}:{chat}:{thread}"
+        )
+
+    async def session_view(self, session_id: str, chat: int, thread: int) -> dict[str, Any] | None:
+        try:
+            view = cast(
+                dict[str, Any],
+                await self.control.call(
+                    "session.get",
+                    {"session_id": session_id},
+                    principal=self.principal(chat, thread),
+                ),
+            )
+            if view["status"] != "deleting":
+                return view
+        except RpcError as exc:
+            if exc.code not in {-32004, -32001}:
+                raise
+        # Plugin-owned stale state is cleaned even after it was disabled during deletion.
+        async with self.metadata.connection() as conn:
+            await conn.execute(
+                "DELETE FROM gateway_telegram_delivery WHERE bot_id=%s AND chat_id=%s "
+                "AND thread_id=%s AND session_id=%s",
+                (self.bot_id, chat, thread, session_id),
+            )
+            await conn.execute(
+                "UPDATE gateway_telegram_routes SET session_id=NULL WHERE "
+                "bot_id=%s AND chat_id=%s AND thread_id=%s AND session_id=%s",
+                (self.bot_id, chat, thread, session_id),
+            )
+        return None
 
     async def api(self, method: str, params: dict[str, Any]) -> Any:
         try:
@@ -279,6 +314,7 @@ class TelegramFrontend:
             self._chat_ready[chat] = time.monotonic() + 1
 
     async def run(self) -> None:
+        await migrate(self.metadata.pool, schema=self.metadata.schema)
         async with httpx2.AsyncClient(timeout=40, trust_env=False) as self.client:
             while not self.disabled:
                 try:
@@ -343,7 +379,7 @@ class TelegramFrontend:
             except TelegramFailure as exc:
                 await asyncio.sleep(retry_delay(exc, failures))
                 failures += 1
-            except psycopg.Error, OSError, ServiceUnavailable:
+            except psycopg.Error, OSError, RpcError:
                 logger.warning("Telegram inbox storage unavailable; polling will retry")
                 await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
                 failures += 1
@@ -353,7 +389,7 @@ class TelegramFrontend:
             "title": "Telegram",
             "machine_ids": [],
             "default_machine_id": None,
-            "config": {"model": self.settings.openai_model},
+            "config": {"model": self.settings.model},
         }
         if len(self.settings.machine_tokens) == 1:
             machine = next(iter(self.settings.machine_tokens))
@@ -382,6 +418,9 @@ class TelegramFrontend:
         command = command.split("@")[0] if command.startswith("/") else ""
         sid = str(route["session_id"]) if route["session_id"] else None
         config = copy.deepcopy(route["config"])
+        view = await self.session_view(sid, inbox["chat_id"], inbox["thread_id"]) if sid else None
+        if sid and view is None:
+            sid = None
         if command == "/help":
             return {
                 "kind": "reply",
@@ -412,8 +451,7 @@ class TelegramFrontend:
                 config["config"][command[1:]] = argument
             update = False
             if sid and command != "/instructions":
-                view = await self.control.sessions.get_session(UUID(sid))
-                update = view.status == "waiting"
+                update = view is not None and view["status"] == "waiting"
             return {
                 "kind": "config",
                 "config": config,
@@ -464,7 +502,7 @@ class TelegramFrontend:
                 "WHERE bot_id=%s AND update_id=%s",
                 (Jsonb(action), self.bot_id, inbox["update_id"]),
             )
-        principal = Principal("telegram", telegram_route=(self.bot_id, chat, thread))
+        principal = self.principal(chat, thread)
         kind = action["kind"]
         reply = None
         if kind == "reply":
@@ -480,7 +518,13 @@ class TelegramFrontend:
             )
             if kind == "create":
                 sid = result["session"]["id"]
+                action["session_id"] = sid
                 async with self.metadata.connection() as conn:
+                    await conn.execute(
+                        "UPDATE gateway_telegram_inbox SET resolved_action=%s "
+                        "WHERE bot_id=%s AND update_id=%s",
+                        (Jsonb(action), self.bot_id, inbox["update_id"]),
+                    )
                     await conn.execute(
                         "UPDATE gateway_telegram_routes SET session_id=%s "
                         "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s",
@@ -600,19 +644,45 @@ class TelegramFrontend:
             try:
                 await self.process_once()
                 failures = 0
-            except psycopg.Error, OSError, ServiceUnavailable:
+            except psycopg.Error, OSError, RpcError:
                 logger.warning("Telegram processing storage unavailable; processing will retry")
                 await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
                 failures += 1
             await asyncio.sleep(0.25)
 
+    async def restore_origins(self) -> None:
+        """Resolve only retained legacy deliveries, using their exact saved create receipt."""
+        rows = await self.metadata.rows(
+            "SELECT i.* FROM gateway_telegram_inbox i WHERE i.bot_id=%s AND i.handled "
+            "AND i.resolved_action->>'kind'='create' AND NOT i.resolved_action ? 'session_id' "
+            "AND EXISTS(SELECT 1 FROM gateway_telegram_delivery d WHERE d.bot_id=i.bot_id "
+            "AND d.chat_id=i.chat_id AND d.thread_id=i.thread_id)",
+            (self.bot_id,),
+        )
+        for row in rows:
+            action = row["resolved_action"]
+            result = cast(
+                dict[str, Any],
+                await self.control.call(
+                    "session.create",
+                    action["params"],
+                    principal=self.principal(row["chat_id"], row["thread_id"]),
+                ),
+            )
+            action["session_id"] = result["session"]["id"]
+            await self.metadata.rows(
+                "UPDATE gateway_telegram_inbox SET resolved_action=%s WHERE "
+                "bot_id=%s AND update_id=%s",
+                (Jsonb(action), self.bot_id, row["update_id"]),
+            )
+
     async def deliver_once(self) -> None:
+        await self.restore_origins()
         rows = await self.metadata.rows(
             "SELECT d.*, origin.update_id FROM gateway_telegram_delivery d "
             "LEFT JOIN LATERAL (SELECT min(i.update_id) AS update_id "
-            "FROM gateway_telegram_inbox i JOIN gateway_requests r "
-            "ON r.request_id::text=i.resolved_action->'params'->>'request_id' "
-            "WHERE i.bot_id=d.bot_id AND r.target_session_id=d.session_id "
+            "FROM gateway_telegram_inbox i "
+            "WHERE i.bot_id=d.bot_id AND i.resolved_action->>'session_id'=d.session_id::text "
             "AND i.resolved_action->>'kind'='create') origin ON true "
             "WHERE d.bot_id=%s ORDER BY d.chat_id,d.thread_id,"
             "origin.update_id NULLS FIRST,d.session_id",
@@ -620,6 +690,11 @@ class TelegramFrontend:
         )
         busy: set[tuple[int, int]] = set()
         for row in rows:
+            if (
+                await self.session_view(str(row["session_id"]), row["chat_id"], row["thread_id"])
+                is None
+            ):
+                continue
             route = (row["chat_id"], row["thread_id"])
             if route in busy:
                 continue
@@ -637,10 +712,6 @@ class TelegramFrontend:
                 busy.add(route)
 
     async def _deliver_row(self, row: dict[str, Any]) -> bool:
-        from kapy.state import NotFound
-
-        from .control import plain
-
         key = (self.bot_id, row["chat_id"], row["thread_id"], row["session_id"])
         projection = row["projection"]
         if projection and projection.get("version") != 1:
@@ -654,15 +725,23 @@ class TelegramFrontend:
         has_more = False
         try:
             if pending is None:
-                page = await self.control.sessions.read_output(
-                    row["session_id"], after=cursor, limit=200, wait_seconds=0
+                page = cast(
+                    dict[str, Any],
+                    await self.control.call(
+                        "session.output",
+                        {
+                            "session_id": str(row["session_id"]),
+                            "after": cursor,
+                            "limit": 200,
+                            "wait_seconds": 0,
+                        },
+                        principal=self.principal(row["chat_id"], row["thread_id"]),
+                    ),
                 )
-                preview, projection = project(
-                    cast(list[dict[str, Any]], plain(page.items)), projection
-                )
-                cursor = projection.pop("cursor", page.next_cursor)
+                preview, projection = project(page["items"], projection)
+                cursor = projection.pop("cursor", page["next_cursor"])
                 pending = projection.get("pending")
-                has_more = page.has_more or cursor != page.next_cursor
+                has_more = page["has_more"] or cursor != page["next_cursor"]
                 if pending is None and preview and "draft" not in projection:
                     projection["draft"] = {"id": uuid4().int % (2**63 - 1) + 1}
                 await self.metadata.rows(
@@ -682,6 +761,13 @@ class TelegramFrontend:
                     rich = False
                     chunk, remainder = text_chunk(remaining)
                 if chunk:
+                    if (
+                        await self.session_view(
+                            str(row["session_id"]), row["chat_id"], row["thread_id"]
+                        )
+                        is None
+                    ):
+                        return False
                     try:
                         if rich:
                             await self.send_rich(row["chat_id"], row["thread_id"], chunk)
@@ -751,9 +837,14 @@ class TelegramFrontend:
                     "AND chat_id=%s AND thread_id=%s AND session_id=%s",
                     (Jsonb(projection), *key),
                 )
-            view = await self.control.sessions.get_session(row["session_id"])
-            return has_more or bool(projection.get("run_id")) or view.status != "waiting"
-        except NotFound:
+            view = await self.session_view(str(row["session_id"]), row["chat_id"], row["thread_id"])
+            return view is not None and (
+                has_more or bool(projection.get("run_id")) or view["status"] != "waiting"
+            )
+        except RpcError as exc:
+            if exc.code not in {-32004, -32001}:
+                raise
+            await self.session_view(str(row["session_id"]), row["chat_id"], row["thread_id"])
             return False
         except TelegramFailure as exc:
             await self.metadata.rows(
@@ -777,7 +868,7 @@ class TelegramFrontend:
             try:
                 await self.deliver_once()
                 failures = 0
-            except psycopg.Error, OSError, ServiceUnavailable:
+            except psycopg.Error, OSError, RpcError:
                 logger.warning("Telegram delivery storage unavailable; delivery will retry")
                 await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
                 failures += 1

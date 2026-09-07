@@ -183,10 +183,9 @@ async def test_environment_is_explicit_and_token_refresh(service: MachineService
     env = json.loads(payload(result))
     assert "PARENT_SECRET" not in env
     assert env["KAPY_SESSION_TOKEN"] == "new-token"
-    with pytest.raises(RpcError, match="reserved"):
-        await service.handle(
-            "process.start", {**start("pass"), "env": {"KAPY_MACHINE_TOKEN": "bad"}}
-        )
+    for name in ("KAPY_MACHINE_TOKEN", "OPENAI_API_KEY", "KAPY_MODEL_API_KEY"):
+        with pytest.raises(RpcError, match="reserved"):
+            await service.handle("process.start", {**start("pass"), "env": {name: "bad"}})
 
 
 @pytest.mark.asyncio

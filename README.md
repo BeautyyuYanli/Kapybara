@@ -20,7 +20,7 @@ flowchart LR
 需要 Docker Compose 和 uv。源码使用 Python 3.14；Docker 镜像提供对应运行环境。
 
 1. 使用 `.env.example` 创建 `.env`。本工作区已有 `.env` 时直接沿用。
-2. 填写 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`，并将
+2. 填写 `KAPY_MODEL_BASE_URL`、`KAPY_MODEL_API_KEY`、`KAPY_MODEL`，并将
    `KAPY_CONTEXT_WINDOW_TOKENS` 设置为所用模型的实际上下文窗口。
 3. 分别为 `KAPY_CONTROL_TOKEN`、`KAPY_SESSION_SIGNING_KEY`、
    `KAPY_MACHINE_TOKEN` 设置随机值。可重复执行
@@ -36,7 +36,7 @@ flowchart LR
 启动不连接 Telegram 的本地栈：
 
 ```sh
-TELEGRAM_BOT_TOKEN= TELEGRAM_CHAT_ID= docker compose --profile app up -d --build
+KAPY_FRONTENDS='[]' docker compose --profile app up -d --build
 docker compose --profile app ps
 ```
 
@@ -64,6 +64,20 @@ uv run --env-file .env python scripts/check_system.py --machine docker-machine
 
 该脚本创建临时会话，让模型调用执行机生成随机结果，核对最终回复与持久化工具
 记录，然后删除临时会话。测量及其适用范围见 [验收结果](docs/acceptance-results.md)。
+
+## 模型与前端配置
+
+模型默认使用 OpenAI-compatible Chat Completions，可配置任意兼容 endpoint、密钥和模型名，
+不限制为 OpenAI 自有型号。现有 `OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL` 环境变量
+仍可迁移使用；中性 `KAPY_MODEL_*` / `KAPY_MODEL` 优先。上下文窗口由部署显式配置，
+token 数只使用 API usage。
+
+Python 应用可通过 `create_app(settings, model_backend=..., frontend_factories=..., plugins=...)`
+注入模型适配器、注册可信前端工厂和选择脚本插件。`ModelBackend` 构造 Pydantic AI Model
+并分类可安全展示的错误；Runner 不拥有供应商客户端。前端只需实现 `run()`，并使用
+`FrontendContext.control.call(...)` 操作会话。`KAPY_FRONTENDS='["terminal"]'` 选择已注册的名称。
+显式 `plugins=()` 关闭脚本插件；`plugins=None` 使用 `KAPY_TOOL_PLUGINS` 的本地默认清单。
+接口及借用资源规则见 [Agent](docs/agent-skills.md) 和 [Gateway](src/kapy/gateway/README.md)。
 
 ## CLI 与递归会话
 
@@ -106,6 +120,7 @@ PostgreSQL，模型上下文压缩不会删掉原始历史。压缩依据 API �
 在 `.env` 中配置 `TELEGRAM_BOT_TOKEN` 和允许使用的 `TELEGRAM_CHAT_ID`，然后执行
 `docker compose --profile app up -d control daemon`，控制面即加载 Telegram 插件。
 支持 topic 的聊天按 topic 区分会话；其他聊天按 chat 区分。
+`KAPY_FRONTENDS` 未设置时按 token 自动启用 Telegram；显式 `[]` 关闭所有前端插件。
 
 - `/machine docker-machine`：保存默认执行机。
 - `/model gpt-5.6-luna`：保存模型。
@@ -136,8 +151,9 @@ kapy control skill read <skill-id>
 kapy control skill download <skill-id> ./downloaded-skill
 ```
 
-Agent 内置进程、媒体、等待和 `apply_patch` 工具；脚本插件声明参数模式和描述，
-通过同一个执行机进程管理器运行。`apply_patch` 二进制及清单由对应资源生成脚本
+Agent 内置进程、媒体和等待工具；`apply_patch` 由应用默认装配为可选脚本插件。
+`KAPY_TOOL_PLUGINS='[]'` 可关闭默认插件。脚本插件声明参数模式、描述及可选准备函数，
+通过同一个执行机进程管理器运行。普通文件通过 shell 命令读取、命令或补丁工具修改。`apply_patch` 二进制及清单由对应资源生成脚本
 维护，不能手工改动生成文件。
 
 ## 开发和检查

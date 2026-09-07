@@ -42,12 +42,12 @@ async def test_cli_daemon_gateway_transfer_reconnect_and_delete(tmp_path: Path):
         control_token="integration-admin",
         session_signing_key="integration-signing",
         machine_tokens={"one": "integration-machine"},
-        openai_api_key="integration-unused-provider",
-        openai_base_url="http://127.0.0.1:9/v1",
+        model_api_key="integration-unused-provider",
+        model_base_url="http://127.0.0.1:9/v1",
         context_window_tokens=100_000,
         telegram_bot_token=None,
     )
-    app = create_app(settings, frontends=[])
+    app = create_app(settings.model_copy(update={"frontends": []}))
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     port = listener.getsockname()[1]

@@ -1,5 +1,7 @@
 """Agent configuration, script plugins, and durable payload storage."""
 
+from .apply_patch import apply_patch_plugin
+from .models import ModelBackend, ModelFailure, OpenAICompatibleBackend
 from .payloads import (
     AgentPayloadStore,
     PayloadCorrupt,
@@ -14,10 +16,16 @@ from .types import (
     ContextBudgetExceeded,
     ProcessCommand,
     RunnerConfig,
+    ScriptHost,
     ScriptTool,
 )
 
 __all__ = [
+    "ScriptHost",
+    "apply_patch_plugin",
+    "ModelBackend",
+    "ModelFailure",
+    "OpenAICompatibleBackend",
     "AgentPayloadStore",
     "AgentResourceLimit",
     "AuthorizeWait",

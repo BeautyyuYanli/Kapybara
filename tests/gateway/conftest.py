@@ -14,6 +14,7 @@ from kapy.gateway.auth import Authenticator
 from kapy.gateway.control import ControlService
 from kapy.gateway.machines import MachineRegistry
 from kapy.gateway.storage import Metadata, migrate
+from kapy.gateway.telegram_storage import migrate as migrate_telegram
 from kapy.settings import Settings
 from kapy.skills import SkillService
 from kapy.state import CheckpointWrite, RunnerState, RunResult, SessionService
@@ -61,6 +62,7 @@ async def gateway() -> AsyncIterator[Any]:
     try:
         async with AsyncConnectionPool(DATABASE, open=False) as pool:
             await pool.wait()
+            await migrate_telegram(pool, schema=schema)
             metadata = Metadata(pool, schema=schema)
             skills = SkillService(pool, schema=schema)
             payloads = AgentPayloadStore(pool, schema=schema)

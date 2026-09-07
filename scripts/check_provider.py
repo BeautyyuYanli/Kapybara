@@ -1,7 +1,6 @@
 """Check the configured model's tool protocol without executing machine commands."""
 
 import json
-import os
 import uuid
 
 import anyio
@@ -10,15 +9,19 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 
+from kapy.settings import Settings
+
 
 async def main() -> None:
     marker = "KAPY-" + uuid.uuid4().hex[:12]
     calls: list[str] = []
+    settings = Settings()
+    assert settings.model_api_key is not None
     provider = OpenAIProvider(
-        base_url=os.environ["OPENAI_BASE_URL"], api_key=os.environ["OPENAI_API_KEY"]
+        base_url=settings.model_base_url, api_key=settings.model_api_key.get_secret_value()
     )
     agent = Agent(
-        OpenAIChatModel(os.environ["OPENAI_MODEL"], provider=provider),
+        OpenAIChatModel(settings.model, provider=provider),
         model_settings={"max_tokens": 256},
     )
 
@@ -37,7 +40,7 @@ async def main() -> None:
     print(
         json.dumps(
             {
-                "model": os.environ["OPENAI_MODEL"],
+                "model": settings.model,
                 "tool_calls": len(calls),
                 "requests": result.usage.requests,
                 "reply_matches_tool_result": ok,

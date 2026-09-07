@@ -56,7 +56,9 @@ async def test_receipt_idempotency_owner_and_deleted_wait(gateway):
         )
         == status
     )
-    stranger = Principal("telegram", telegram_route=(12345, -100, 7))
+    stranger = Principal(
+        "frontend", frontend_id="telegram", subject=":".join(map(str, (12345, -100, 7)))
+    )
     with pytest.raises(RpcError) as error:
         await gateway.call("session.create", params, principal=stranger)
     assert error.value.code == -32001

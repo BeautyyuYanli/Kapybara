@@ -11,8 +11,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
-from kapy.agent import AgentResourceLimit
-from kapy.agent import runner as runner_module
+from kapy.agent import AgentResourceLimit, OpenAICompatibleBackend
 from kapy.skills import SkillDescription
 from kapy.state import JsonValue, SessionInput
 
@@ -39,7 +38,7 @@ async def test_unfinished_or_oversized_tool_arguments_never_dispatch(
             raise asyncio.CancelledError
 
     model = FunctionModel(stream_function=stream)
-    monkeypatch.setattr(runner_module, "OpenAIChatModel", lambda *a, **kw: model)
+    monkeypatch.setattr(OpenAICompatibleBackend, "create_model", lambda *a, **kw: model)
     caller = Caller()
     async with httpx2.AsyncClient() as client:
         agent = runner(client, caller)
@@ -170,8 +169,6 @@ async def test_provider_usage_controls_next_projection_once_across_restart(
             assert isinstance(part, dict)
             parts.append(part)
     original = next(
-        p
-        for p in parts
-        if p.get("tool_call_id") == "old-call" and p["part_kind"] == "tool-return"
+        p for p in parts if p.get("tool_call_id") == "old-call" and p["part_kind"] == "tool-return"
     )
     assert "original-result-evidence" in json.dumps(original["content"])

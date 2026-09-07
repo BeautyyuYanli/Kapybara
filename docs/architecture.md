@@ -1,8 +1,7 @@
 # Kapy v2 implementation boundaries
 
 `kapy_v2.md` is the product specification. This document assigns ownership and
-sets the initial integration contract; seniors refine concrete signatures during
-proposal review before implementation. The initial target is Linux, one control
+describes the implemented integration contract. The initial target is Linux, one control
 server process, multiple independent sessions and execution machines. Durable
 state survives control-server restarts. No clustering framework is required.
 
@@ -10,18 +9,17 @@ Read `docs/contracts.md` for architect decisions resolving older proposal confli
 
 ## Ownership
 
-| Senior | Packages | Responsibility |
+| Module | Packages | Responsibility |
 | --- | --- | --- |
 | Execution | `kapy.execution`, `kapy.rpc` | JSON-RPC 2.0 duplex peer, machine daemon, PTY/stdio, SQLite/XDG state, file transfer, local proxy endpoint, reconnect |
 | State | `kapy.state` | PostgreSQL schema and history, safe session SQL, Valkey client, events, session lifecycle and runner coordination |
 | Intelligence | `kapy.agent`, `kapy.skills` | Pydantic AI runner, tools and plugins, media fallback, compression, skill archive CRUD |
 | Gateway | `kapy.gateway`, `kapy.cli`, `kapy.settings` | App composition, authenticated machine registry/control RPC, user API, CLI, Telegram frontend |
 
-Seniors own their corresponding tests and module docs. The architect owns shared
-project configuration, Docker environment, integration harness and product docs.
-Subagents used by cmd-impl remain the senior's responsibility.
+The lead owns integration and shared configuration. Domain boundaries describe resource
+ownership rather than requiring a separate deployment or a separate contributor.
 
-## Cross-module contracts to finalize in proposals
+## Cross-module contracts
 
 All external calls use JSON-RPC 2.0. WebSockets support requests in both directions
 with bounded frames, concurrent request dispatch, ids, errors and disconnect cleanup.
@@ -34,18 +32,15 @@ Execution exports an async RpcPeer with `call(method, params)` and a request han
 callback. Gateway exports a machine caller for agent tools with
 `call(machine_id, method, params)`; session_id travels in machine RPC params.
 Execution methods use `process.*`, `file.*`, and `session.ensure`; control methods
-use `session.*`, `event.*`, `history.*`, and `skill.*`. Concrete method names and
-parameter shapes must be written down by both owners before implementation.
+use `session.*`, `event.*`, `history.*`, and `skill.*`. Concrete method names and parameter shapes are documented in `docs/contracts.md`.
 
 State exports SessionService. Gateway delegates session/input/output/event/history
 operations to it. State owns per-session serialization, durable input buffers,
 waiting-channel subscriptions, output cursors and state transitions. Intelligence
-provides an injected runner callback: it receives a session run context, input and
-history; emits deltas/messages through that context; polls steer input at model/tool
+provides an injected runner callback: it receives a State RunContext containing inputs and durable runner state; emits deltas/messages through that context; polls steer input at model/tool
 boundaries; and returns final output plus waiting ids. State alone transitions to
 waiting and emits completion events. Final natural model completion also waits on
-the session's own input channel. The detailed RunContext/RunResult must be agreed
-between State and Intelligence. Output/history reads always scope by session.
+the session's own input channel. The shared RunContext/RunResult types are exported by State. Output/history reads always scope by session.
 
 PostgreSQL stores authoritative sessions, inputs, outputs/history and pending events.
 Valkey provides wakeup hints/caching where useful; loss of a hint cannot lose an input
@@ -59,6 +54,29 @@ bounded extraction, paths and metadata. Agent sessions load skill descriptions a
 creation and can fetch newly added skills later. Agent tools run on the selected
 machine, defaulting to the session default machine.
 
+## Configurable application boundaries
+
+Runner borrows a `ModelBackend`, whose `create_model(name)` returns a Pydantic AI Model
+and whose `classify_error(error)` returns a safe context-length/media failure or None.
+The initial `OpenAICompatibleBackend` implements Chat Completions; provider HTTP client,
+endpoint and key belong to application composition. Other native provider protocols are
+outside the current scope. Model names and context window are explicit deployment/session
+configuration, not a fixed OpenAI catalogue.
+
+Frontend factories are selected by configured names. Each receives `FrontendContext`
+with `ControlAPI`, settings, a borrowed metadata pool and schema. Only `ControlAPI.call`
+is used for session/input/output/history operations. A trusted frontend authenticates
+its own users and constructs `Principal("frontend", frontend_id=..., subject=...)`;
+core authorization and recovery use its stable namespaced identity. Telegram keeps its
+historical identity strings, owns its four tables, and cleans stale route/delivery rows
+through session observations. Core migrations and deletion never require Telegram tables.
+
+Runner registers only supplied ScriptTool definitions. Optional preparation receives a
+narrow ScriptHost (workspace, successful stdio command, bounded file push), followed by
+the ordinary script process path. Application composition provides apply_patch by default;
+it can be disabled or replaced. No core tool dispatcher special-cases that plugin name.
+The generated upstream resources are changed only by their generator.
+
 ## Product acceptance
 
 Acceptance covers process interactivity/timeouts/tree cleanup/8192-byte PTY buffers,
@@ -66,7 +84,7 @@ large stdio and chunked files, reconnect, session isolation and restart recovery
 steer/queue sequencing, broadcast/queued/self-excluded events, recursive completion,
 history cursor replay and SQL isolation/search, compression and protocol-valid model
 history, media rejection fallback, skills/plugins, CLI and Telegram chat/topic routing.
-Use live PostgreSQL/Valkey plus real local subprocesses for integration. A small
+Use real PostgreSQL/Valkey and non-root Docker subprocesses for integration. A small
 live gpt-5.6-luna inference/tool test uses root .env; Telegram outbound calls are
 tested against a fake Bot API until separately authorized. No unfinished stubs count
 as delivery. Keep operational limits explicit and measurable.

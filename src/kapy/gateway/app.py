@@ -2,20 +2,20 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
-from typing import Protocol
 
 import httpx2
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from psycopg_pool import AsyncConnectionPool
 
+from kapy.agent import ModelBackend, OpenAICompatibleBackend, ScriptTool, apply_patch_plugin
 from kapy.rpc import JsonParams, JsonValue, RpcError, RpcPeer, dispatch_json
 from kapy.settings import Settings, load_settings
 
 from .auth import Authenticator, bearer
 from .control import ControlService
+from .frontends import FrontendContext, FrontendFactory
 from .machines import Connection, MachineRegistry
 from .storage import Metadata, migrate
 
@@ -37,26 +37,32 @@ async def supervise(name: str, run: Callable[[], Awaitable[None]]) -> None:
             return
 
 
-class Frontend(Protocol):
-    async def run(self) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class FrontendContext:
-    settings: Settings
-    control: ControlService
-    metadata_pool: AsyncConnectionPool
-
-
-type FrontendFactory = Callable[[FrontendContext], Frontend]
-
-
 def create_app(
     settings: Settings | None = None,
     *,
-    frontends: Sequence[FrontendFactory] | None = None,
+    model_backend: ModelBackend | None = None,
+    frontend_factories: Mapping[str, FrontendFactory] | None = None,
+    plugins: Sequence[ScriptTool] | None = None,
 ) -> FastAPI:
     config = settings if settings is not None else load_settings()
+    from .telegram import TelegramFrontend
+
+    factories: dict[str, FrontendFactory] = {"telegram": TelegramFrontend}
+    if frontend_factories is not None:
+        factories.update(frontend_factories)
+    enabled = config.enabled_frontends()
+    unknown = set(enabled) - factories.keys()
+    if unknown:
+        raise ValueError(f"Unknown frontends: {', '.join(sorted(unknown))}")
+    if "telegram" in enabled and (not config.telegram_bot_token or config.telegram_chat_id is None):
+        raise ValueError("Telegram requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+    selected_plugins = plugins
+    if selected_plugins is None:
+        if set(config.tool_plugins) - {"apply_patch"} or len(config.tool_plugins) != len(
+            set(config.tool_plugins)
+        ):
+            raise ValueError("Unknown or repeated tool plugin name")
+        selected_plugins = tuple(apply_patch_plugin() for _ in config.tool_plugins)
     auth = Authenticator(config)
 
     @asynccontextmanager
@@ -66,7 +72,7 @@ def create_app(
         from kapy.state import SessionService
         from kapy.state import migrate as migrate_state
 
-        config.require_control()
+        config.require_control(model_backend_supplied=model_backend is not None)
         database_url = config.database_url.get_secret_value()
         await migrate_state(database_url, schema=config.database_schema)
         await migrate(database_url, schema=config.database_schema)
@@ -74,7 +80,13 @@ def create_app(
             pool = AsyncConnectionPool(database_url, open=False, min_size=1, max_size=8)
             await resources.enter_async_context(pool)
             await pool.wait()
-            http = await resources.enter_async_context(httpx2.AsyncClient(trust_env=False))
+            backend = model_backend
+            if backend is None:
+                http = await resources.enter_async_context(httpx2.AsyncClient(trust_env=False))
+                assert config.model_api_key is not None
+                backend = OpenAICompatibleBackend(
+                    base_url=config.model_base_url, api_key=config.model_api_key, http_client=http
+                )
             metadata = Metadata(pool, schema=config.database_schema)
             skills = SkillService(pool, schema=config.database_schema)
             payloads = AgentPayloadStore(pool, schema=config.database_schema)
@@ -86,12 +98,10 @@ def create_app(
             async def authorize_wait(session_id, waiting_ids) -> None:
                 await control.authorize_wait(session_id, waiting_ids)
 
-            assert config.openai_api_key is not None and config.context_window_tokens is not None
+            assert config.context_window_tokens is not None
             runner = Runner(
                 RunnerConfig(
-                    base_url=config.openai_base_url,
-                    api_key=config.openai_api_key,
-                    model=config.openai_model,
+                    model=config.model,
                     context_window_tokens=config.context_window_tokens,
                     max_output_tokens=config.max_output_tokens,
                     compression_ratio=config.compression_ratio,
@@ -99,9 +109,10 @@ def create_app(
                     media_max_bytes=config.media_max_bytes,
                 ),
                 machines,
-                http_client=http,
+                model_backend=backend,
                 payload_store=payloads,
                 authorize_wait=authorize_wait,
+                plugins=selected_plugins,
             )
 
             async def run(context):
@@ -128,12 +139,7 @@ def create_app(
             app.state.control = control
             app.state.machines = machines
             app.state.metadata = metadata
-            context = FrontendContext(config, control, pool)
-            factories = frontends
-            if factories is None:
-                from .telegram import TelegramFrontend
-
-                factories = (TelegramFrontend,) if config.telegram_bot_token else ()
+            context = FrontendContext(config, control, pool, config.database_schema)
             tasks = [
                 asyncio.create_task(
                     supervise("gateway-recovery", control.background),
@@ -144,7 +150,7 @@ def create_app(
                 asyncio.create_task(
                     supervise(type(frontend).__name__, frontend.run),
                 )
-                for frontend in (factory(context) for factory in factories)
+                for frontend in (factories[name](context) for name in enabled)
             )
             try:
                 yield

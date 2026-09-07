@@ -3,10 +3,8 @@
 import base64
 import codecs
 import hashlib
-import json
 import mimetypes
 from dataclasses import asdict
-from importlib.resources import files
 from pathlib import PurePosixPath
 from typing import Any, Literal, cast
 from uuid import UUID, uuid5
@@ -26,28 +24,75 @@ class OutcomeUnknown(Exception):
 
 class Params(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    machine_id: str | None = None
+    machine_id: str | None = Field(
+        None, description="Associated machine to use; omit for the current default machine."
+    )
 
 
 class Start(Params):
-    command: str
-    mode: Literal["stdio", "pty"] = "pty"
-    cwd: str | None = None
-    wait_ms: int = Field(default=1000, ge=0, le=30_000)
+    command: str = Field(
+        description="Shell command, interpreted by /bin/sh -c on the selected machine."
+    )
+    mode: Literal["stdio", "pty"] = Field(
+        "pty",
+        description="pty for interactive terminal input; stdio for separate, fully saved "
+        "stdout and stderr.",
+    )
+    cwd: str | None = Field(
+        None, description="Working directory; omit for this session's directory on that machine."
+    )
+    wait_ms: int = Field(
+        default=1000,
+        ge=0,
+        le=30_000,
+        description="Observe for at most this many milliseconds; 0 reads immediately. Does "
+        "not stop the process.",
+    )
 
 
 class Process(Params):
-    process_id: UUID
+    process_id: UUID = Field(
+        description="Process ID returned by process_start on the same machine."
+    )
+
+
+class PtyCursor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pty: int = Field(ge=0, strict=True, description="Next byte position from the PTY output chunk.")
+
+
+class StdioCursor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    stdout: int = Field(ge=0, strict=True, description="Next byte position from stdout.")
+    stderr: int = Field(ge=0, strict=True, description="Next byte position from stderr.")
 
 
 class Wait(Process):
-    cursor: dict[str, int] | None = None
-    wait_ms: int = Field(default=1000, ge=0, le=30_000)
-    max_bytes: int = Field(default=65_536, ge=1, le=65_536)
+    cursor: PtyCursor | StdioCursor | None = Field(
+        None,
+        description="Use each output chunk's next position; omit to read from the "
+        "beginning. Match the process mode.",
+    )
+    wait_ms: int = Field(
+        default=1000,
+        ge=0,
+        le=30_000,
+        description="Observation deadline in milliseconds; 0 reads immediately without "
+        "stopping the process.",
+    )
+    max_bytes: int = Field(
+        default=65_536,
+        ge=1,
+        le=65_536,
+        description="Maximum original bytes to read per output stream.",
+    )
 
 
 class Write(Process):
-    input: str
+    input: str = Field(
+        description="Terminal keystrokes, including an explicit newline to submit a line or"
+        " \u0003 for Ctrl-C."
+    )
 
 
 class Resize(Process):
@@ -65,57 +110,55 @@ class ListProcesses(Params):
 
 
 class PathParams(Params):
-    path: str
-
-
-class Read(PathParams):
-    offset: int = Field(default=0, ge=0)
-    limit: int = Field(default=65_536, ge=1, le=65_536)
-
-
-class FileWrite(PathParams):
-    content: str
-
-
-class Patch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    patch: str
+    path: str = Field(
+        description="Media path on the selected machine, relative to this session directory"
+        " unless absolute."
+    )
 
 
 BUILTINS: dict[str, tuple[type[Params], str]] = {
     "process_start": (
         Start,
-        "Run a shell command. A timeout leaves it running; keep its process ID.",
+        "Run a shell command. Choose PTY for interaction (8192-byte tail) or "
+        "stdio for complete saved stdout/stderr. Quiet output or timeout is "
+        "only an observation; keep the ID and use process_wait until "
+        "process.state is exited, killed, failed or lost. Use each stream's "
+        "next byte cursor to continue. If display_truncated is true, first "
+        "reread from that chunk's start with max_bytes=16384 to recover the "
+        "undisplayed text.",
     ),
-    "process_wait": (Wait, "Read more output and observe a process. Cursors count original bytes."),
-    "process_write": (Write, "Write terminal input once. Use process_wait to see what happened."),
+    "process_wait": (
+        Wait,
+        "Read saved output and observe a process. Check process.state for "
+        "exited, killed, failed or lost; quiet and timeout do not stop it. "
+        "Supply {pty: next} or {stdout: next, stderr: next} from the previous "
+        "output chunks. PTY output older than its 8192-byte tail may be "
+        "truncated; stdio remains fully saved until release.",
+    ),
+    "process_write": (
+        Write,
+        "Write PTY keystrokes once; unavailable for stdio. Include a newline to"
+        " submit input, or \u0003 for Ctrl-C to interrupt the foreground job. "
+        "Use process_wait afterward to observe output and state.",
+    ),
     "process_resize": (Resize, "Resize a terminal to the given rows and columns."),
     "process_kill": (
         Kill,
-        "Stop a process group and tracked descendants, with best-effort cleanup.",
+        "Stop the process group with best-effort cleanup. Descendants that "
+        "leave the group are not guaranteed to be stopped.",
     ),
     "process_list": (ListProcesses, "List this session's processes on a machine."),
     "process_release": (
         Process,
         "Delete a finished process's saved output. This cannot be undone.",
     ),
-    "file_read": (Read, "Read a bounded UTF-8 file range. Use offsets for larger files."),
-    "file_write": (FileWrite, "Replace a file with UTF-8 text, at most 64 KiB. Parent must exist."),
     "read_media": (
         PathParams,
-        "Read a complete media file, at most 20 MiB, for the model to inspect.",
+        "Inspect a complete image, audio, video or PDF on the selected machine,"
+        " at most 20 MiB. Unsupported media returns a text explanation; inspect"
+        " ordinary text files using shell commands.",
     ),
 }
-
-
-def apply_patch_plugin() -> ScriptTool[Patch]:
-    resource = files("kapy.agent").joinpath("resources/apply_patch/description.md")
-    return ScriptTool(
-        "apply_patch",
-        resource.read_text(),
-        Patch,
-        lambda args: ProcessCommand(("apply_patch",), stdin=args.patch.encode()),
-    )
 
 
 class MachineTools:
@@ -135,6 +178,7 @@ class MachineTools:
             schema.setdefault("properties", {})["machine_id"] = {
                 "anyOf": [{"type": "string"}, {"type": "null"}],
                 "default": None,
+                "description": "Associated machine to use; omit for the current default machine.",
             }
             result.append(self._tool(name, schema, plugin.description))
         return result
@@ -156,6 +200,7 @@ class MachineTools:
     async def execute(self, name: str, args: dict[str, Any], call_id: str) -> Any:
         try:
             command = None
+            prepare = None
             if name in BUILTINS:
                 parameters = BUILTINS[name][0].model_validate(args)
                 machine = parameters.machine_id
@@ -163,6 +208,7 @@ class MachineTools:
                 fields.pop("machine_id", None)
             else:
                 plugin = self.plugins[name]
+                prepare = plugin.prepare
                 fields = dict(args)
                 machine = fields.pop("machine_id", None)
                 command = plugin.render(plugin.parameters.model_validate(fields))
@@ -174,9 +220,8 @@ class MachineTools:
             operation = Operation(self.runtime, self.caller, machine, call_id, name, args)
             if name in self.plugins:
                 assert command is not None
-                if name == "apply_patch":
-                    binary = await operation.install_apply_patch()
-                    command = ProcessCommand((binary,), stdin=command.stdin, cwd=command.cwd)
+                if prepare is not None:
+                    command = await prepare(OperationHost(operation), command)
                 return await operation.script(command)
             if name == "process_start":
                 fields["argv"] = ["/bin/sh", "-c", fields.pop("command")]
@@ -189,42 +234,8 @@ class MachineTools:
                     raise ValueError("Terminal input exceeds 64 KiB")
                 fields["data_base64"] = base64.b64encode(data).decode()
             if name.startswith("process_"):
-                if name == "process_wait" and "cursor" in fields:
-                    cursor = fields["cursor"]
-                    if set(cursor) not in ({"pty"}, {"stdout", "stderr"}) or any(
-                        isinstance(v, bool) or v < 0 for v in cursor.values()
-                    ):
-                        raise ValueError("Cursor must have pty or stdout/stderr byte positions")
                 result = await operation.rpc(name.replace("_", ".", 1), fields)
                 return operation.decode_update(result) if name == "process_wait" else result
-            if name == "file_write":
-                content = fields["content"].encode()
-                if len(content) > 65_536:
-                    raise ValueError("File text exceeds 64 KiB")
-                await operation.push(fields["path"], content)
-                return {
-                    "path": fields["path"],
-                    "bytes": len(content),
-                    "sha256": hashlib.sha256(content).hexdigest(),
-                }
-            if name == "file_read":
-                data, size = await operation.pull(
-                    fields["path"], offset=fields["offset"], limit=fields["limit"]
-                )
-                try:
-                    text = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    text = (
-                        "[This range is binary or splits a UTF-8 character; choose another range.]"
-                    )
-                return {
-                    "path": fields["path"],
-                    "offset": fields["offset"],
-                    "next_offset": fields["offset"] + len(data),
-                    "size": size,
-                    "eof": fields["offset"] + len(data) >= size,
-                    "text": text,
-                }
             data, _ = await operation.pull(
                 fields["path"], maximum=self.runtime.config.media_max_bytes
             )
@@ -233,7 +244,7 @@ class MachineTools:
                 media_type.startswith(("image/", "audio/", "video/"))
                 or media_type == "application/pdf"
             ):
-                return "Unrecognized media type; use file_read or a machine command to inspect it."
+                return "Unrecognized media type; use a machine command to inspect it."
             metadata = {
                 "machine_id": machine,
                 "path": fields["path"],
@@ -544,7 +555,8 @@ class Operation:
         update = await self.command(argv)
         if not self.finished(update) or update["process"]["exit_code"] != 0:
             raise OutcomeUnknown(
-                "Preparation did not finish successfully; its process was retained"
+                f"Preparation process {update['process']['process_id']} did not finish "
+                "successfully; its handle was retained"
             )
         return update
 
@@ -571,33 +583,20 @@ class Operation:
             await self.preparation(("rm", "-f", "--", stdin_path))
         return result
 
-    async def install_apply_patch(self) -> str:
-        workspace = await self.workspace()
-        update = await self.preparation(("uname", "-m"))
-        arch = base64.b64decode(update["output"]["stdout"]["data_base64"]).decode().strip()
-        resources = files("kapy.agent").joinpath("resources/apply_patch")
-        manifest = json.loads(resources.joinpath("manifest.json").read_text())
-        if arch not in manifest["platforms"]:
-            raise ValueError(f"apply_patch has no verified binary for {arch}")
-        platform = manifest["platforms"][arch]
-        directory = f"{workspace}/.kapy-tools/apply-patch/{platform['bundle_sha256']}"
-        key = f"{self.machine}:{platform['bundle_sha256']}"
-        assert self.record is not None
-        needed = self.record.setdefault(
-            "install_needed", key not in self.runtime.data.setdefault("installed_plugins", [])
+
+class OperationHost:
+    """Expose only the current operation's preparation capabilities to script plugins."""
+
+    def __init__(self, operation: Operation) -> None:
+        self._operation = operation
+
+    async def workspace(self) -> str:
+        return await self._operation.workspace()
+
+    async def run(self, argv: tuple[str, ...]) -> JsonObject:
+        return cast(
+            JsonObject, self._operation.decode_update(await self._operation.preparation(argv))
         )
-        if needed:
-            await self.preparation(("mkdir", "-p", "--", directory))
-            for name, metadata in platform["files"].items():
-                data = resources.joinpath(arch, name).read_bytes()
-                if (
-                    len(data) != metadata["bytes"]
-                    or hashlib.sha256(data).hexdigest() != metadata["sha256"]
-                ):
-                    raise ValueError("Bundled apply_patch resource failed verification")
-                await self.push(f"{directory}/{name}", data)
-            await self.preparation(("chmod", "700", "--", f"{directory}/apply_patch"))
-            if key not in self.runtime.data["installed_plugins"]:
-                self.runtime.data["installed_plugins"].append(key)
-            await self.runtime.checkpoint()
-        return f"{directory}/apply_patch"
+
+    async def push(self, path: str, data: bytes) -> None:
+        await self._operation.push(path, data)

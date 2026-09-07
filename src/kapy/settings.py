@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Self
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,9 +16,16 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    openai_base_url: str = Field("https://api.openai.com/v1", validation_alias="OPENAI_BASE_URL")
-    openai_api_key: SecretStr | None = Field(None, validation_alias="OPENAI_API_KEY")
-    openai_model: str = Field("gpt-5.6-luna", validation_alias="OPENAI_MODEL")
+    model_base_url: str = Field(
+        "https://api.openai.com/v1",
+        validation_alias=AliasChoices("KAPY_MODEL_BASE_URL", "OPENAI_BASE_URL"),
+    )
+    model_api_key: SecretStr | None = Field(
+        None, validation_alias=AliasChoices("KAPY_MODEL_API_KEY", "OPENAI_API_KEY")
+    )
+    model: str = Field("gpt-5.6-luna", validation_alias=AliasChoices("KAPY_MODEL", "OPENAI_MODEL"))
+    frontends: list[str] | None = None
+    tool_plugins: list[str] = Field(default_factory=lambda: ["apply_patch"])
     telegram_bot_token: SecretStr | None = Field(None, validation_alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: int | None = Field(None, validation_alias="TELEGRAM_CHAT_ID")
     database_url: SecretStr = SecretStr("postgresql://kapy:kapy-local@127.0.0.1:55432/kapy")
@@ -48,7 +55,7 @@ class Settings(BaseSettings):
     media_max_bytes: int = Field(20 * 1024 * 1024, gt=0)
 
     @field_validator(
-        "openai_api_key",
+        "model_api_key",
         "telegram_bot_token",
         "telegram_chat_id",
         "control_token",
@@ -77,14 +84,21 @@ class Settings(BaseSettings):
                 raise ValueError("machine tokens must not be empty")
         return self
 
-    def require_control(self) -> None:
-        for name in ("control_token", "session_signing_key", "openai_api_key"):
+    def require_control(self, *, model_backend_supplied: bool = False) -> None:
+        for name in ("control_token", "session_signing_key"):
             if not getattr(self, name):
                 raise ValueError(f"{name} is required for control-server")
         if self.context_window_tokens is None:
             raise ValueError("KAPY_CONTEXT_WINDOW_TOKENS is required for control-server")
-        if self.telegram_bot_token and self.telegram_chat_id is None:
-            raise ValueError("TELEGRAM_CHAT_ID is required when Telegram is enabled")
+        if not model_backend_supplied and not self.model_api_key:
+            raise ValueError("KAPY_MODEL_API_KEY is required for the default model backend")
+
+    def enabled_frontends(self) -> tuple[str, ...]:
+        if self.frontends is None:
+            return ("telegram",) if self.telegram_bot_token else ()
+        if len(self.frontends) != len(set(self.frontends)):
+            raise ValueError("Frontend names must not repeat")
+        return tuple(self.frontends)
 
 
 def load_settings(*, env_file: str | None = None) -> Settings:

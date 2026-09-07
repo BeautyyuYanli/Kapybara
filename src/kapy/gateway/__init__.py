@@ -2,11 +2,13 @@
 
 from kapy.rpc import MachineCaller
 
-from .app import Frontend, FrontendContext, FrontendFactory, create_app
+from .app import create_app
 from .auth import Principal
 from .control import ControlService
+from .frontends import ControlAPI, Frontend, FrontendContext, FrontendFactory
 
 __all__ = [
+    "ControlAPI",
     "ControlService",
     "Frontend",
     "FrontendContext",

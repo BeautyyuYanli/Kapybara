@@ -9,10 +9,10 @@ import httpx2
 import psycopg
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
-from pydantic import SecretStr
 
-from kapy.agent import AgentPayloadStore, Runner, RunnerConfig
+from kapy.agent import AgentPayloadStore, OpenAICompatibleBackend, Runner, RunnerConfig
 from kapy.rpc import JsonObject, JsonValue
+from kapy.settings import Settings
 from kapy.state import SessionService, SessionSpec, migrate
 
 
@@ -34,6 +34,8 @@ async def no_external_wait(session_id: UUID, channels: tuple[UUID, ...]) -> None
 
 
 async def check() -> None:
+    settings = Settings()
+    assert settings.model_api_key is not None
     database_url = os.environ["KAPY_DATABASE_URL"]
     valkey_url = os.environ["KAPY_VALKEY_URL"]
     schema = "kapy_runner_" + uuid4().hex
@@ -49,14 +51,16 @@ async def check() -> None:
             await payloads.initialize()
             runner = Runner(
                 RunnerConfig(
-                    base_url=os.environ["OPENAI_BASE_URL"],
-                    api_key=SecretStr(os.environ["OPENAI_API_KEY"]),
-                    model=os.environ["OPENAI_MODEL"],
+                    model=settings.model,
                     context_window_tokens=1_050_000,
                     max_output_tokens=256,
                 ),
                 NoMachine(),
-                http_client=http,
+                model_backend=OpenAICompatibleBackend(
+                    base_url=settings.model_base_url,
+                    api_key=settings.model_api_key,
+                    http_client=http,
+                ),
                 payload_store=payloads,
                 authorize_wait=no_external_wait,
             )
@@ -119,7 +123,7 @@ async def check() -> None:
                 print(
                     json.dumps(
                         {
-                            "model": os.environ["OPENAI_MODEL"],
+                            "model": settings.model,
                             "reply_matches_input": True,
                             "responses_replayed_after_reopen": len(responses),
                             "api_usage": usage,

@@ -34,19 +34,6 @@ TABLES = (
     "state text NOT NULL DEFAULT 'deleting')",
     "gateway_machine_resources (session_id uuid NOT NULL, machine_id text NOT NULL, "
     "PRIMARY KEY(session_id,machine_id))",
-    "gateway_telegram_poll (bot_id bigint PRIMARY KEY, next_update_id bigint NOT NULL)",
-    "gateway_telegram_inbox (bot_id bigint NOT NULL, update_id bigint NOT NULL, "
-    "chat_id bigint NOT NULL, thread_id bigint NOT NULL, payload jsonb NOT NULL, "
-    "resolved_action jsonb, handled boolean NOT NULL DEFAULT false, "
-    "next_attempt_at timestamptz, PRIMARY KEY(bot_id,update_id))",
-    "gateway_telegram_routes (bot_id bigint NOT NULL, chat_id bigint NOT NULL, "
-    "thread_id bigint NOT NULL, session_id uuid, config jsonb NOT NULL DEFAULT '{}', "
-    "PRIMARY KEY(bot_id,chat_id,thread_id))",
-    "gateway_telegram_delivery (bot_id bigint NOT NULL, chat_id bigint NOT NULL, "
-    "thread_id bigint NOT NULL, session_id uuid NOT NULL, cursor text, "
-    "projection jsonb NOT NULL DEFAULT '{}', item_offset integer NOT NULL DEFAULT 0, "
-    "next_attempt_at timestamptz, blocked_error text, "
-    "PRIMARY KEY(bot_id,chat_id,thread_id,session_id))",
 )
 
 
@@ -168,7 +155,7 @@ class Metadata:
             allowed = session_id == principal.session_id or row["parent_session_id"] == (
                 principal.session_id
             )
-        elif principal.kind == "telegram":
+        elif principal.kind == "frontend":
             allowed = row["owner_id"] == principal.id
         if not allowed:
             raise denied()
@@ -254,11 +241,6 @@ class Metadata:
                 "ON CONFLICT DO NOTHING",
                 (session_id, request_id, Jsonb(list(machine_ids))),
             )
-            await conn.execute(
-                "UPDATE gateway_telegram_delivery SET blocked_error='session deleting' "
-                "WHERE session_id=%s",
-                (session_id,),
-            )
 
     async def mark_deleted(self, session_id: UUID) -> None:
         async with self.connection() as conn:
@@ -267,12 +249,5 @@ class Metadata:
             )
             await conn.execute(
                 "UPDATE gateway_session_cleanup SET state='releasing' WHERE session_id=%s",
-                (session_id,),
-            )
-            await conn.execute(
-                "DELETE FROM gateway_telegram_delivery WHERE session_id=%s", (session_id,)
-            )
-            await conn.execute(
-                "UPDATE gateway_telegram_routes SET session_id=NULL WHERE session_id=%s",
                 (session_id,),
             )

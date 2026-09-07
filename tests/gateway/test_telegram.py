@@ -8,7 +8,7 @@ import httpx2
 import psycopg
 import pytest
 
-from kapy.gateway.app import FrontendContext
+from kapy.gateway.frontends import FrontendContext
 from kapy.gateway.telegram import TelegramFailure, TelegramFrontend, request_id
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -16,7 +16,11 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 class Bot(TelegramFrontend):
     def __init__(self, gateway):
-        super().__init__(FrontendContext(gateway.settings, gateway, gateway.metadata.pool))
+        super().__init__(
+            FrontendContext(
+                gateway.settings, gateway, gateway.metadata.pool, gateway.metadata.schema
+            )
+        )
         self.sent = []
         self.fail = False
 
@@ -130,13 +134,15 @@ async def test_delivery_resume_partial_unicode_output(gateway):
 async def test_poll_retries_uncommitted_batch_and_restarts_at_committed_offset(
     gateway, monkeypatch
 ):
-    context = FrontendContext(gateway.settings, gateway, gateway.metadata.pool)
+    context = FrontendContext(
+        gateway.settings, gateway, gateway.metadata.pool, gateway.metadata.schema
+    )
     bot = TelegramFrontend(context)
     current = bot
     batch = [update(10, "first", 7), update(11, "second", 8)]
     offsets = []
     fail_commit = False
-    connection = gateway.metadata.connection
+    connection = bot.metadata.connection
 
     @asynccontextmanager
     async def interrupted_transaction():
@@ -148,7 +154,7 @@ async def test_poll_retries_uncommitted_batch_and_restarts_at_committed_offset(
                 # Both inbox writes and the new offset have executed, but neither commits.
                 raise psycopg.OperationalError("Injected failure before inbox commit")
 
-    monkeypatch.setattr(gateway.metadata, "connection", interrupted_transaction)
+    monkeypatch.setattr(bot.metadata, "connection", interrupted_transaction)
 
     async def respond(request):
         nonlocal fail_commit
@@ -184,7 +190,9 @@ async def test_poll_retries_uncommitted_batch_and_restarts_at_committed_offset(
 
 
 async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadline(gateway):
-    context = FrontendContext(gateway.settings, gateway, gateway.metadata.pool)
+    context = FrontendContext(
+        gateway.settings, gateway, gateway.metadata.pool, gateway.metadata.schema
+    )
     bot = TelegramFrontend(context)
     content = "A" * 3990 + "😀" * 10000 + "tail"
     attempts, delivered = [], []
@@ -250,7 +258,7 @@ async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadlin
 
 async def install_output(gateway, monkeypatch, records, *, private=True, thread=0):
     """Real durable gateway rows, with a controllable State output feed."""
-    from types import SimpleNamespace
+    from kapy.state import RecordPage
 
     bot = Bot(gateway)
     await bot.ingest([update(1, "/machine one", thread), update(2, "/new", thread)])
@@ -267,13 +275,12 @@ async def install_output(gateway, monkeypatch, records, *, private=True, thread=
     async def read_output(session_id, *, after, limit, wait_seconds):
         start = int(after or 0)
         page = records[start : start + limit]
-        return SimpleNamespace(
-            items=page,
+        return RecordPage(
+            items=tuple(page),
             next_cursor=str(start + len(page)),
             has_more=start + len(page) < len(records),
         )
 
-    # plain() handles dataclasses; the output page itself stays outside plain().
     monkeypatch.setattr(gateway.sessions, "read_output", read_output)
     return bot, sid
 
@@ -442,7 +449,7 @@ async def test_ack_failure_repeats_unacknowledged_final(gateway, monkeypatch):
     records = []
     bot, _ = await install_output(gateway, monkeypatch, records)
     feed(records, record("final", output="one final"))
-    original = gateway.metadata.rows
+    original = bot.metadata.rows
     failed = False
 
     async def rows(query, params=()):
@@ -452,7 +459,7 @@ async def test_ack_failure_repeats_unacknowledged_final(gateway, monkeypatch):
             raise psycopg.OperationalError("ack lost")
         return await original(query, params)
 
-    monkeypatch.setattr(gateway.metadata, "rows", rows)
+    monkeypatch.setattr(bot.metadata, "rows", rows)
     with pytest.raises(psycopg.OperationalError):
         await bot.deliver_once()
     restored = Bot(gateway)
@@ -462,7 +469,7 @@ async def test_ack_failure_repeats_unacknowledged_final(gateway, monkeypatch):
 
 
 async def test_route_order_backoff_and_waiting_session_release(gateway, monkeypatch):
-    from types import SimpleNamespace
+    from kapy.state import RecordPage
 
     records = []
     bot, old = await install_output(gateway, monkeypatch, records, private=False)
@@ -477,7 +484,7 @@ async def test_route_order_backoff_and_waiting_session_release(gateway, monkeypa
     async def read(session_id, *, after, limit, wait_seconds):
         start = int(after or 0)
         page = outputs[session_id][start : start + limit]
-        return SimpleNamespace(items=page, next_cursor=str(start + len(page)), has_more=False)
+        return RecordPage(items=tuple(page), next_cursor=str(start + len(page)), has_more=False)
 
     monkeypatch.setattr(gateway.sessions, "read_output", read)
     bot.sent.clear()

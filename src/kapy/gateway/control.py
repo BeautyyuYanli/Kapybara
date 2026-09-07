@@ -434,19 +434,8 @@ class ControlService:
             "AND left(method,8)='session.'"
         )
         for row in rows:
-            principal_id = row["principal_id"]
-            if principal_id == "operator":
-                principal = Principal("operator")
-            elif principal_id.startswith("telegram:"):
-                principal = Principal(
-                    "telegram",
-                    telegram_route=cast(
-                        tuple[int, int, int], tuple(map(int, principal_id.split(":")[1:]))
-                    ),
-                )
-            else:
-                # Replay a previously authorized durable intent, even if its caller was deleted.
-                principal = Principal("session", session_id=UUID(principal_id.split(":")[1]))
+            # Replay a previously authorized durable intent, even if its caller was deleted.
+            principal = Principal.from_id(row["principal_id"])
             lock = self._locks.setdefault(row["request_id"], asyncio.Lock())
             async with lock:
                 current = await self.metadata.request(row["request_id"])

@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
@@ -20,10 +21,22 @@ def denied(message: str = "Permission denied") -> Rejected:
 
 @dataclass(frozen=True, slots=True)
 class Principal:
-    kind: Literal["operator", "session", "telegram"]
+    kind: Literal["operator", "session", "frontend"]
     machine_id: str | None = None
     session_id: UUID | None = None
-    telegram_route: tuple[int, int, int] | None = None
+    frontend_id: str | None = None
+    subject: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind == "frontend" and (
+            not self.frontend_id
+            or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", self.frontend_id)
+            or self.frontend_id in {"operator", "session"}
+            or not self.subject
+            or len(self.subject) > 1024
+            or any(ord(c) < 32 for c in self.subject)
+        ):
+            raise ValueError("Frontend identity requires a valid namespace and subject")
 
     @property
     def id(self) -> str:
@@ -31,9 +44,21 @@ class Principal:
             return "operator"
         if self.kind == "session" and self.session_id is not None:
             return f"session:{self.session_id}"
-        if self.kind == "telegram" and self.telegram_route is not None:
-            return "telegram:" + ":".join(map(str, self.telegram_route))
+        if self.kind == "frontend":
+            return f"{self.frontend_id}:{self.subject}"
         raise denied("Incomplete identity")
+
+    @classmethod
+    def from_id(cls, identity: str) -> Principal:
+        """Decode a previously authenticated durable identity, never a user-supplied token."""
+        if identity == "operator":
+            return cls("operator")
+        namespace, separator, subject = identity.partition(":")
+        if not separator:
+            raise ValueError("Invalid persisted principal")
+        if namespace == "session":
+            return cls("session", session_id=UUID(subject))
+        return cls("frontend", frontend_id=namespace, subject=subject)
 
 
 class Authenticator:

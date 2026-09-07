@@ -15,6 +15,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart
 
 from kapy.agent import (
     AgentPayloadStore,
+    OpenAICompatibleBackend,
     PayloadCorrupt,
     PayloadNotFound,
     PayloadRef,
@@ -32,7 +33,7 @@ from .test_runner import Caller, Context, authorize, response  # type: ignore[mi
 async def test_postgres_media_and_external_context_survive_full_resource_restart() -> None:
     schema = f"test_agent_restart_{uuid4().hex}"
     dsn = os.environ.get("KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy")
-    config = RunnerConfig("https://model.invalid/v1", SecretStr("dummy-key"), 1_000_000)
+    config = RunnerConfig(1_000_000)
     original_bytes = b"\x89PNG\r\n\x1a\noriginal durable image"
     caller = Caller(original_bytes)
     calls = 0
@@ -52,7 +53,15 @@ async def test_postgres_media_and_external_context_survive_full_resource_restart
             payloads = AgentPayloadStore(pool, schema=schema)
             await payloads.initialize()
             agent = Runner(
-                config, caller, http_client=client, payload_store=payloads, authorize_wait=authorize
+                config,
+                caller,
+                model_backend=OpenAICompatibleBackend(
+                    base_url="https://model.invalid/v1",
+                    api_key=SecretStr("dummy-key"),
+                    http_client=client,
+                ),
+                payload_store=payloads,
+                authorize_wait=authorize,
             )  # type: ignore[bad-argument-type]
             ctx = Context(agent.initial_state(instructions="durable-instructions", skills=[]))
             codec = MessageCodec(payloads, ctx.session.id)
@@ -136,7 +145,11 @@ async def test_postgres_media_and_external_context_survive_full_resource_restart
                 return Runner(
                     config,
                     resumed_caller,
-                    http_client=new_client,
+                    model_backend=OpenAICompatibleBackend(
+                        base_url="https://model.invalid/v1",
+                        api_key=SecretStr("dummy-key"),
+                        http_client=new_client,
+                    ),
                     payload_store=new_store,
                     authorize_wait=authorize,
                 )

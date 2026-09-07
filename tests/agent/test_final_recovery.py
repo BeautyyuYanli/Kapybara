@@ -9,7 +9,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, RetryPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
-from kapy.agent import runner as runner_module
+from kapy.agent import OpenAICompatibleBackend
 from kapy.state import CheckpointWrite, SessionInput
 
 from .test_runner import Caller, Context, runner  # type: ignore[missing-import]
@@ -56,7 +56,7 @@ async def test_recovered_final_keeps_result_and_finishes_batch_before_new_input(
             }
 
     model = FunctionModel(stream_function=stream)
-    monkeypatch.setattr(runner_module, "OpenAIChatModel", lambda *args, **kwargs: model)
+    monkeypatch.setattr(OpenAICompatibleBackend, "create_model", lambda *args, **kwargs: model)
     caller = Caller()
     async with httpx2.AsyncClient() as client:
         agent = runner(client, caller)
@@ -153,8 +153,8 @@ async def test_batch_retry_blocks_later_wait_but_new_response_can_finish(
             return cursor
 
     monkeypatch.setattr(
-        runner_module,
-        "OpenAIChatModel",
+        OpenAICompatibleBackend,
+        "create_model",
         lambda *args, **kwargs: FunctionModel(stream_function=stream),
     )
     async with httpx2.AsyncClient() as client:
@@ -223,8 +223,8 @@ async def test_output_retry_preserves_same_batch_successful_wait(
             return cursor
 
     monkeypatch.setattr(
-        runner_module,
-        "OpenAIChatModel",
+        OpenAICompatibleBackend,
+        "create_model",
         lambda *args, **kwargs: FunctionModel(stream_function=stream),
     )
     async with httpx2.AsyncClient() as client:

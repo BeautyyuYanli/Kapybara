@@ -10,7 +10,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
 async def test_authenticated_shared_codec_and_transport_limits(gateway):
-    app = create_app(gateway.settings, frontends=[])
+    app = create_app(gateway.settings.model_copy(update={"frontends": []}))
     app.state.control = gateway
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -45,7 +45,7 @@ async def test_authenticated_shared_codec_and_transport_limits(gateway):
 
 
 async def test_websocket_rejects_missing_or_wrong_machine_token_before_upgrade(gateway):
-    app = create_app(gateway.settings, frontends=[])
+    app = create_app(gateway.settings.model_copy(update={"frontends": []}))
     app.state.control = gateway
     app.state.machines = gateway.machines
 

@@ -47,7 +47,7 @@ async def test_real_manager_patch_and_checkpoint_order(tmp_path: Path) -> None:
         "*** Begin Patch\n*** Update File: hello.txt\n@@\n-original\n+updated\n*** End Patch\n",
     ]
     tools = [("apply_patch", {"patch": patch}) for patch in patches]
-    tools.append(("file_read", {"path": "hello.txt"}))
+    tools.append(("process_start", {"command": "cat hello.txt", "mode": "stdio"}))
     requests = 0
     dispatched: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
 
@@ -95,7 +95,8 @@ async def test_real_manager_patch_and_checkpoint_order(tmp_path: Path) -> None:
                 pending = data["pending_tools"][-1]
                 assert (pending["name"], pending["args"]) == tools[requests - 1]
                 call = next(
-                    p for p in archived_parts(ctx)
+                    p
+                    for p in archived_parts(ctx)
                     if p.get("tool_call_id") == pending["tool_call_id"]
                     and p["part_kind"] == "tool-call"
                 )
@@ -138,14 +139,13 @@ async def test_real_manager_patch_and_checkpoint_order(tmp_path: Path) -> None:
                 assert isinstance(info, dict)
                 assert info["state"] == "exited" and info["exit_code"] == 0
             pushes = [p for m, p, _ in dispatched if m == "file.push"]
-            pulls = [p for m, p, _ in dispatched if m == "file.pull"]
-            assert len(pushes) >= 3 and len(pulls) == 1
+            assert len(pushes) >= 3
             finished = {
                 p["transfer_id"]: value
                 for method, p, value in dispatched
                 if method == "file.finish"
             }
-            assert all(finished[p["transfer_id"]]["state"] == "complete" for p in pushes + pulls)
+            assert all(finished[p["transfer_id"]]["state"] == "complete" for p in pushes)
         finally:
             await service.aclose()
 

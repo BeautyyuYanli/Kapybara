@@ -54,6 +54,7 @@ def safe_env(value: JsonValue) -> dict[str, str]:
                     "MACHINE_TOKEN",
                     "DATABASE_URL",
                     "OPENAI_API_KEY",
+                    "KAPY_MODEL_API_KEY",
                     "TELEGRAM",
                     "CONTROL_TOKEN",
                 )
