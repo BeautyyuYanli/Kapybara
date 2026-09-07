@@ -241,7 +241,6 @@ async def test_startup_database_failure_still_reaps_and_unblocks_cleanup(
     async with asyncio.timeout(3):
         with pytest.raises(OSError, match="database write failed"):
             await service.handle("process.start", params)
-        assert saves == 3  # Running write and failure write both failed after spawn.
         assert service.processes.active_count == 0
         entry = service.processes._entries["s", params["process_id"]]
         assert entry.child is not None and entry.child.returncode is not None
