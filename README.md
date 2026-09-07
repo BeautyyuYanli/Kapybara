@@ -125,7 +125,8 @@ uv build
 docker build -t kapy-v2:dev .
 docker build -f Dockerfile.machine -t kapy-v2-machine:dev .
 docker compose up -d postgres valkey
-docker compose --profile dev run --rm machine /app/.venv/bin/pytest -q -p no:cacheprovider
+docker compose --profile dev run --rm machine /app/.venv/bin/pytest -q -p no:cacheprovider \
+  tests tests/agent/docker_manager_acceptance.py
 ```
 
 真实进程、PTY、文件和执行机恢复检查全部在 Docker 中运行。测试使用独立
