@@ -24,7 +24,9 @@
 
 ## 旧投影接续与边界
 
-无版本 projection 由一次性转换函数处理并原子保存新版本。已有 cursor 之前仅恢复当前未完成 run 必需的正文上下文，不重建或补发历史 completed run。旧 pending 按原有渲染规则从 cursor 到 pending.cursor 重建带来源的文本片段，忠实包含旧 256 KiB 限制、纠正文案及八条 message 裁剪，再以原 item_offset 切分，剔除 Gateway 生成的日志，只接续尚未确认的正文；不能用正则删除可能属于用户正文的方括号。仅为当前 legacy run 保存已交付正文前缀：final 可延续则补尾部，否则发送一次自然说明的完整修正版；该 run 投完即删除兼容字段。旧 pending.next 不冒充发送回执，正常投递不保留两套渲染路径。
+新建空 projection 正常初始化。检测到旧的非空无 version projection 时明确要求排空和迁移，不重播、不丢弃、不在服务运行时自动 reset。提供极小纯函数返回新版空 projection，或在模块文档写出精确合法 shape；不实现旧 renderer、历史重建、已交付前缀算法或迁移框架。
+
+architect 负责受控静默切换：停止旧 control 后复核所有 session 无 active run、旧 delivery 已读至末尾且无 pending/item_offset，再转换为新版空 projection，保留 cursor。若存在竞争输入或待发正文，恢复旧版本排空后再停；绝不清空未确认正文。Gateway 本次实现不操作运行服务。
 
 Telegram 与 PostgreSQL 无共同事务：sendMessage 已成功、响应或本地 ack 丢失时，重试可能重复该分段，保证仍为 at-least-once；草稿 ID 不能提供正式消息幂等。已被旧版截断且记作完成的历史不主动重播修补。
 
