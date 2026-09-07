@@ -38,6 +38,9 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["kapy"]
+
 [tool.pyrefly]
 project-includes = ["src", "tests"]
 python-version = "3.14"

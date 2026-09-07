@@ -15,8 +15,8 @@ from psycopg import sql
 from kapy.state import (
     CheckpointWrite,
     RunContext,
-    RunResult,
     RunnerState,
+    RunResult,
     SessionService,
     SessionSpec,
 )
