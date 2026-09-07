@@ -26,9 +26,17 @@ class Bot(TelegramFrontend):
         self.sent.append((method, params))
         return {"message_id": len(self.sent), "type": "supergroup"}
 
+    async def send_rich(self, chat, thread, text):
+        self._chat_ready.clear()
+        await super().send_rich(chat, thread, text)
+
     async def send(self, chat, thread, text):
         self._chat_ready.clear()
         await super().send(chat, thread, text)
+
+
+def sent_text(params):
+    return params["rich_message"]["markdown"] if "rich_message" in params else params["text"]
 
 
 def update(number, text, thread=0, chat=-100):
@@ -97,7 +105,7 @@ async def test_state_commit_then_reply_failure_retries_original_route_action(gat
 
 async def test_delivery_resume_partial_unicode_output(gateway):
     bot = Bot(gateway)
-    await bot.ingest([update(1, "/machine one", 7), update(2, "😀" * 5000, 7)])
+    await bot.ingest([update(1, "/machine one", 7), update(2, "😀" * 10000, 7)])
     await bot.process_once()
     await bot.process_once()
     sid = (await bot.route(-100, 7))["session_id"]
@@ -108,14 +116,14 @@ async def test_delivery_resume_partial_unicode_output(gateway):
     await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
     assert row["item_offset"] > 0
-    first = bot.sent[0][1]["text"]
+    first = sent_text(bot.sent[0][1])
     bot = Bot(gateway)
-    for _ in range(6):
+    for _ in range(12):
         await bot.deliver_once()
-    rest = "".join(item[1]["text"] for item in bot.sent)
+    rest = "".join(sent_text(item[1]) for item in bot.sent)
     combined = first + rest
-    assert combined.count("😀") == 5000
-    assert all(len(item[1]["text"].encode("utf-16-le")) // 2 <= 4000 for item in bot.sent)
+    assert combined.count("😀") == 10000
+    assert all(len(sent_text(item[1]).encode("utf-16-le")) // 2 <= 4000 for item in bot.sent)
     assert all(item[1]["message_thread_id"] == 7 for item in bot.sent)
 
 
@@ -178,20 +186,20 @@ async def test_poll_retries_uncommitted_batch_and_restarts_at_committed_offset(
 async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadline(gateway):
     context = FrontendContext(gateway.settings, gateway, gateway.metadata.pool)
     bot = TelegramFrontend(context)
-    content = "A" * 3990 + "😀" * 2500 + "tail"
+    content = "A" * 3990 + "😀" * 10000 + "tail"
     attempts, delivered = [], []
 
     def respond(request):
-        assert request.url.path.endswith("/sendMessage")
+        assert request.url.path.endswith(("/sendMessage", "/sendRichMessage"))
         params = json.loads(request.content)
-        if params["text"] != "Settings saved. Instructions apply to new sessions.":
-            attempts.append(params["text"])
+        if sent_text(params) != "Settings saved. Instructions apply to new sessions.":
+            attempts.append(sent_text(params))
             if len(attempts) == 2:
                 return httpx2.Response(
                     429,
                     json={"ok": False, "error_code": 429, "parameters": {"retry_after": 2}},
                 )
-            delivered.append(params["text"])
+            delivered.append(sent_text(params))
         return httpx2.Response(200, json={"ok": True, "result": {"message_id": 1}})
 
     async def delivery():
@@ -286,20 +294,20 @@ async def test_private_drafts_restart_refresh_and_final(gateway, monkeypatch):
     records[-1]["data"]["text"] = "o"
     await bot.deliver_once()
     first = bot.sent[-1][1]
-    assert bot.sent[-1][0] == "sendMessageDraft"
-    assert first["text"] == "o" and first["draft_id"] != 0 and first["message_thread_id"] == 7
+    assert bot.sent[-1][0] == "sendRichMessageDraft"
+    assert sent_text(first) == "o" and first["draft_id"] != 0 and first["message_thread_id"] == 7
     feed(records, record("text_delta", part_index=2))
     records[-1]["data"]["text"] = "l"
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert bot.sent[-1][1]["text"] == "lo"
+    assert sent_text(bot.sent[-1][1]) == "lo"
     feed(records, record("text_delta", part_index=0))
     records[-1]["data"]["text"] = "He"
     feed(records, record("text_delta", part_index=2))
     records[-1]["data"]["text"] = "l"
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert bot.sent[-1][1]["text"] == "Hello"
+    assert sent_text(bot.sent[-1][1]) == "Hello"
     assert bot.sent[-1][1]["draft_id"] == first["draft_id"]
     restored = Bot(gateway)
     await restored.deliver_once()
@@ -310,7 +318,7 @@ async def test_private_drafts_restart_refresh_and_final(gateway, monkeypatch):
     assert len(restored.sent) == 2
     feed(records, record("model_response", "Hello"), record("final", output="Hello"))
     await restored.deliver_once()
-    assert [p["text"] for m, p in restored.sent if m == "sendMessage"] == ["Hello"]
+    assert [sent_text(p) for m, p in restored.sent if m == "sendRichMessage"] == ["Hello"]
     assert (await gateway.metadata.rows("SELECT item_offset FROM gateway_telegram_delivery"))[0][
         "item_offset"
     ] == 0
@@ -325,7 +333,7 @@ async def test_pages_runs_many_messages_retry_and_interrupted(gateway, monkeypat
     records[-1]["data"]["text"] = "bad"
     await bot.deliver_once()
     first_draft = bot.sent[-1][1]
-    assert first_draft["text"] == "checking\n\nbad"
+    assert sent_text(first_draft) == "checking\n\nbad"
     feed(
         records,
         {
@@ -336,26 +344,26 @@ async def test_pages_runs_many_messages_retry_and_interrupted(gateway, monkeypat
     )
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert bot.sent[-1][1]["text"] == "checking"
+    assert sent_text(bot.sent[-1][1]) == "checking"
     assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
     feed(records, record("text_delta", message="unfinished"))
     records[-1]["data"]["text"] = "do not retain"
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert bot.sent[-1][1]["text"] == "checking\n\ndo not retain"
+    assert sent_text(bot.sent[-1][1]) == "checking\n\ndo not retain"
     feed(records, record("interrupted"))
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert bot.sent[-1][1]["text"] == "checking"
+    assert sent_text(bot.sent[-1][1]) == "checking"
     assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
     feed(records, *(record("model_response", f"part{i}", message=f"m{i}") for i in range(12)))
     bot._chat_ready.clear()
     await bot.deliver_once()
     body = "\n\n".join(["checking", *(f"part{i}" for i in range(12))])
-    assert bot.sent[-1][1]["text"] == body
+    assert sent_text(bot.sent[-1][1]) == body
     bot = Bot(gateway)
     await bot.deliver_once()
-    assert bot.sent[-1][1]["text"] == body
+    assert sent_text(bot.sent[-1][1]) == body
     assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
     feed(
         records,
@@ -372,10 +380,10 @@ async def test_pages_runs_many_messages_retry_and_interrupted(gateway, monkeypat
     await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
     assert row["cursor"] == terminal
-    assert bot.sent[-1][0] == "sendMessage"
-    assert bot.sent[-1][1]["text"] == body + "\n\ncorrected"
+    assert bot.sent[-1][0] == "sendRichMessage"
+    assert sent_text(bot.sent[-1][1]) == body + "\n\ncorrected"
     await bot.deliver_once()
-    assert [p["text"] for _, p in bot.sent][-1] == "corrected"
+    assert [sent_text(p) for _, p in bot.sent][-1] == "corrected"
     assert all(p["message_thread_id"] == 9 for _, p in bot.sent)
 
 
@@ -387,6 +395,8 @@ async def test_draft_400_falls_back_and_error_is_safe(gateway, monkeypatch):
     original = bot.api
 
     async def api(method, params):
+        if method == "sendRichMessageDraft":
+            raise TelegramFailure(400, rich_content_rejected=True)
         if method == "sendMessageDraft":
             raise TelegramFailure(400)
         return await original(method, params)
@@ -394,7 +404,11 @@ async def test_draft_400_falls_back_and_error_is_safe(gateway, monkeypatch):
     monkeypatch.setattr(bot, "api", api)
     await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
-    assert row["blocked_error"] is None and row["projection"]["draft"]["unavailable"]
+    assert row["blocked_error"] is None and row["projection"]["draft"]["plain"]
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
+    assert row["projection"]["draft"]["unavailable"]
     feed(
         records,
         {
@@ -406,7 +420,8 @@ async def test_draft_400_falls_back_and_error_is_safe(gateway, monkeypatch):
     )
     await bot.deliver_once()
     assert len(bot.sent) == 1
-    text = bot.sent[0][1]["text"]
+    assert bot.sent[0][0] == "sendMessage"
+    text = sent_text(bot.sent[0][1])
     assert "SECRET" not in text and "unconfirmed" not in text and "RuntimeError" in text
 
 
@@ -443,7 +458,7 @@ async def test_ack_failure_repeats_unacknowledged_final(gateway, monkeypatch):
     restored = Bot(gateway)
     await restored.deliver_once()
     assert bot.sent == restored.sent
-    assert bot.sent[0][1]["text"] == "one final"
+    assert sent_text(bot.sent[0][1]) == "one final"
 
 
 async def test_route_order_backoff_and_waiting_session_release(gateway, monkeypatch):
@@ -479,7 +494,7 @@ async def test_route_order_backoff_and_waiting_session_release(gateway, monkeypa
     await gateway.metadata.rows("UPDATE gateway_telegram_delivery SET next_attempt_at=NULL")
     await bot.deliver_once()
     await bot.deliver_once()
-    assert [p["text"] for _, p in bot.sent] == ["first", "second"]
+    assert [sent_text(p) for _, p in bot.sent] == ["first", "second"]
 
 
 async def test_large_body_exceeds_previous_limit_without_loss(gateway, monkeypatch):
@@ -498,8 +513,13 @@ async def test_large_body_exceeds_previous_limit_without_loss(gateway, monkeypat
         row = (await gateway.metadata.rows("SELECT projection FROM gateway_telegram_delivery"))[0]
         if "pending" not in row["projection"]:
             break
-    assert "".join(p["text"] for _, p in bot.sent) == body
-    assert all(len(p["text"].encode("utf-16-le")) // 2 <= 4000 for _, p in bot.sent)
+    assert "".join(sent_text(p) for _, p in bot.sent) == body
+    assert all(
+        len(sent_text(p).encode("utf-8")) <= 32768
+        if m == "sendRichMessage"
+        else len(sent_text(p).encode("utf-16-le")) // 2 <= 4000
+        for m, p in bot.sent
+    )
 
 
 @pytest.mark.parametrize("last, final", [("last", "last"), ("", "检查结果")])
@@ -512,11 +532,13 @@ async def test_durable_message_order_and_empty_last_response(gateway, monkeypatc
         record("model_response", last, message="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
     )
     await bot.deliver_once()
-    assert bot.sent[-1][1]["text"] == "正在检查\n\n" + last
+    assert sent_text(bot.sent[-1][1]) == "正在检查\n\n" + last
     # Restart forces projection through PostgreSQL JSONB, which sorts object keys.
     restored = Bot(gateway)
     await restored.deliver_once()
-    assert restored.sent[-1][1]["text"] == bot.sent[-1][1]["text"]
+    assert sent_text(restored.sent[-1][1]) == sent_text(bot.sent[-1][1])
     feed(records, record("final", output=final))
     await restored.deliver_once()
-    assert [p["text"] for m, p in restored.sent if m == "sendMessage"] == ["正在检查\n\n" + final]
+    assert [sent_text(p) for m, p in restored.sent if m == "sendRichMessage"] == [
+        "正在检查\n\n" + final
+    ]
