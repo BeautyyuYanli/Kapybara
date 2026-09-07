@@ -97,8 +97,35 @@ Read docs/contracts.md. It overrides older proposal drafts and cgroup assumption
 
 ## Main and verified milestones
 
-Main contains scaffolding, State public types, approved proposals, acceptance scripts,
-and actual RPC/XDG modules. There is still no complete runnable application.
+Main contains scaffolding, the final reviewed State implementation, approved
+proposals, acceptance scripts and actual RPC/XDG modules. An isolated provisional
+composition now runs the complete product; the other three final reviews/merges
+remain pending. Do not mistake older milestone descriptions below for current status.
+
+Current update at ~14:18 UTC:
+- State ac18037 final report .context/impl/260907-state-service.md reviewed and
+  merged as acf69fc. All 102 combined State/RPC tests passed in Docker (83.57s).
+  Root scaffold pyrefly search-path fix087d440; full Ruff/pyrefly pass.
+- Execution current8cbbfd8 includes actual daemon/process08f9a90 and recovery fixes;
+  Intelligence currentb22cde2 includes actual Runner and final/cancellation fixes;
+  Gateway e70c2d1 is reviewing. No other final report received yet.
+- Image kapy-v2:acceptance-1 and isolated Compose project kapy-v2-acceptance-1 run
+  from .local/acceptance/product-1 generated snapshots: Stateac18037/Exec08f9a90/
+  Agent22934b2/Gatewaye70c2d1. PG localhost32768, Valkey32769, control32771.
+  Override .local/acceptance/compose-product-1.json; TG explicitly disabled. Never
+  dump container env/config or credentials. Daemon has no provider/control secrets.
+- scripts/check_system.py PASS: real model→Docker process random marker→matching
+  durable tool-return/final, 8 history records, create replay stable, delete success.
+  Input19.94ms, complete7.69s. No active exec session from this run remains.
+- Root regenerated .env machine JSON with single outer quotes; uv --env-file had
+  stripped unquoted JSON. .env stays0600/ignored. Example documents quoting.
+- Gateway working tree now uses cursor(row_factory=dict_row), restoring borrowed
+  pool isolation for the earlier payload bug; final combination still to retest.
+- New confirmed PATH issue assigned to Intelligence via
+  kapy-intelligence-login-shell-integration-20260907: process_start uses sh -lc,
+  resets child_env PATH and hides /app/.venv/bin/kapy. In Docker sh -c finds kapy,
+  sh -lc does not. Owner must fix minimally and verify recursive CLI in Docker.
+- Preview candidate reported http://127.0.0.1:32771/docs, user told Browser button.
 
 At 13:27 UTC the old Execution session515746bc was cancelled and archived. Despite
 repeated explicit corrections, old queued prompts had again made it research host

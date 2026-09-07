@@ -79,3 +79,40 @@ This verifies the real model/Runner/checkpoint/history path. It has no execution
 machine or Telegram frontend; those remain separate end-to-end checks. Only model
 credentials were forwarded to the container, and its unique database schema was
 removed afterward.
+
+## Reviewed State integration
+
+The final State delivery `ac18037` was merged into main as `acf69fc`. All 102
+combined State/RPC tests passed in Docker in 83.57 s, using the development
+PostgreSQL/Valkey services with isolated test schemas/namespaces. Repository Ruff
+and pyrefly checks passed after configuring the shared test import search path.
+
+The included State load scenario accepted, completed and replayed all 2,000 inputs
+across 100 sessions in 16.117 s (124.1 inputs/s), preserving each session's order.
+The event scenario delivered and consumed all 100 distinct listener inputs;
+delivery took 0.506 s and completion took 1.317 s.
+
+## First complete live task
+
+An isolated Compose project `kapy-v2-acceptance-1` was built from committed owned
+package snapshots: State `ac18037`, Execution `08f9a90`, Intelligence `22934b2`, and
+Gateway `e70c2d1`. Only State had completed final review at this point. The project
+has its own PostgreSQL, Valkey and machine volumes; Telegram was explicitly disabled.
+
+`scripts/check_system.py` passed against the running HTTP API and Docker daemon:
+
+- Repeating the creation request returned the same session.
+- The real configured model invoked a process tool to generate an unpredictable
+  random marker inside the execution container.
+- The final model reply matched the marker in the durable tool-return history.
+- Eight history records were replayed; the temporary session was deleted afterward.
+- Input acceptance took 19.94 ms; task completion took 7.69 s.
+
+Startup exposed an environment-formatting issue: unquoted JSON in `.env` loses its
+double quotes under `uv --env-file`. The local machine-token mapping was regenerated
+with outer single quotes, and `.env.example` now documents that format.
+
+This is an early end-to-end result. A separate check found that the Agent's login
+shell resets the configured PATH and hides the installed `kapy` CLI; Intelligence
+owns its correction and recursive-control regression verification. Final component
+reviews and the remaining product acceptance scenarios are still in progress.
