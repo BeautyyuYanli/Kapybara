@@ -115,10 +115,10 @@ one stable draft ID, followed by one final update notification to the configured
 user chat. This proves real Bot API draft/final transport; automated tests cover
 State projection/recovery and ordering. No claim of exactly-once final delivery.
 
-## Rich Markdown follow-up (2026-09-08, in progress)
+## Rich Markdown follow-up (2026-09-08, delivered)
 
 User requests the latest Telegram Rich Messages rendering Markdown. The same new
-Gateway senior94ba8801 is preparing a small proposal from main39bca06 on
+Gateway senior94ba8801 prepared the proposal from main39bca06 on
 feat/kapy-telegram-rich-markdown; this is a new authorized follow-up.
 Official InputRichMessage.markdown and sendRichMessage/sendRichMessageDraft were
 verified against the current API. Architect live preflight sent two rich drafts
@@ -141,4 +141,12 @@ oversized final messages were published:
 Only these verified descriptions may drive the new narrow content-rejection
 fallback. The guessed English parsing/limit patterns must be removed; unknown400,
 auth/rate/network/server errors remain on the existing failure/retry path.
-Remaining senior review, integration and deployment are pending.
+Final delivery3e310927 completed all five review stages and was merged. Independent
+full-suite nonroot Docker run:306passed130.44s, zero skips. Ruff passed and Pyrefly
+reported zero errors (two suppressions,15 warnings). The rebuilt control image was
+deployed with the existing configuration; no projection reset or migration was
+needed. The existing daemon reconnected and both services still run UID/GID10001.
+Live verification through the new production send_rich_draft/send_rich methods
+succeeded: two updates sharing a draft ID and one final notification. Telegram
+returned rich_message with heading,paragraph,list,pre blocks; prior native API
+preflight also verified tables. Control HTTP200 and healthy startup confirmed.
