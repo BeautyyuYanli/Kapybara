@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import httpx2
 import pytest
 
-from kapy.gateway.telegram import TelegramFrontend, rich_chunk
+from kapy.gateway.telegram import TelegramFailure, TelegramFrontend, rich_chunk
 
 from .test_telegram import Bot, feed, install_output, record, sent_text
 
@@ -124,7 +124,7 @@ async def test_explicit_format_rejection_persists_plain_before_restart(gateway, 
             json={
                 "ok": False,
                 "error_code": 400,
-                "description": "Bad Request: can't parse rich message: invalid block SECRET",
+                "description": "Bad Request: RICH_MESSAGE_DEPTH_INVALID",
             },
         )
 
@@ -134,7 +134,7 @@ async def test_explicit_format_rejection_persists_plain_before_restart(gateway, 
             await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
     assert row["item_offset"] == len(prefix) and row["blocked_error"] is None
-    assert "SECRET" not in json.dumps(row["projection"])
+    assert "RICH_MESSAGE_DEPTH_INVALID" not in json.dumps(row["projection"])
     if draft:
         assert row["projection"]["draft"]["plain"]
     else:
@@ -174,8 +174,16 @@ async def test_explicit_format_rejection_persists_plain_before_restart(gateway, 
             False,
         ),
         (429, {"ok": False, "error_code": 429, "parameters": {"retry_after": 4}}, False),
-        (500, {"ok": False, "error_code": 400, "description": "can't parse rich message"}, False),
-        (400, {"error_code": 400, "description": "can't parse rich message"}, False),
+        (
+            500,
+            {
+                "ok": False,
+                "error_code": 400,
+                "description": "Bad Request: RICH_MESSAGE_DEPTH_INVALID",
+            },
+            False,
+        ),
+        (400, {"error_code": 400, "description": "Bad Request: RICH_MESSAGE_DEPTH_INVALID"}, False),
         (401, {"ok": False, "error_code": 401, "description": "Unauthorized"}, False),
         (403, {"ok": False, "error_code": 403, "description": "Forbidden"}, False),
         (503, {}, True),
@@ -267,3 +275,83 @@ async def test_oversized_fence_draft_uses_plain_but_final_can_use_rich(gateway, 
         "sendRichMessage",
         {"chat_id": -100, "rich_message": {"markdown": "# Done"}},
     )
+
+
+# Real rejected-request samples from architect commit ec34cc0 (.context/delivery.md).
+@pytest.mark.parametrize(
+    "code, source",
+    [
+        ("RICH_MESSAGE_TEXT_TOO_LONG", "x" * 32769),
+        ("RICH_MESSAGE_BLOCKS_TOO_MANY", "\n\n".join(["x"] * 501)),
+        ("RICH_MESSAGE_TABLE_COLS_TOO_MANY", "|".join(["x"] * 21) + "\n" + "|".join(["---"] * 21)),
+        ("RICH_MESSAGE_DEPTH_INVALID", "> " * 17 + "x"),
+    ],
+)
+@pytest.mark.parametrize("draft", [False, True])
+async def test_verified_rejection_samples(gateway, code, source, draft):
+    bot = Bot(gateway)
+
+    def respond(request):
+        assert json.loads(request.content)["rich_message"] == {"markdown": source}
+        return httpx2.Response(
+            400,
+            json={
+                "ok": False,
+                "error_code": 400,
+                "description": "Bad Request: " + code,
+            },
+        )
+
+    async with transport(bot, respond):
+        with pytest.raises(TelegramFailure) as rejected:
+            if draft:
+                await bot.send_rich_draft(-100, 0, 1, source)
+            else:
+                await bot.send_rich(-100, 0, source)
+    assert rejected.value.rich_content_rejected is True
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Bad Request: can't parse rich message: unknown",
+        "Bad Request: can't parse markdown: unknown",
+        "Bad Request: rich message is too long",
+        "Bad Request: too many blocks in rich message",
+        "Bad Request: rich message nesting is too deep",
+        "Bad Request: too many columns in rich message table",
+        "Bad Request: RICH_MESSAGE_UNKNOWN",
+        "Bad Request: RICH_MESSAGE_DEPTH_INVALID extra",
+    ],
+)
+async def test_unverified_descriptions_do_not_classify(gateway, description):
+    bot = Bot(gateway)
+
+    def respond(request):
+        return httpx2.Response(
+            400, json={"ok": False, "error_code": 400, "description": description}
+        )
+
+    async with transport(bot, respond):
+        with pytest.raises(TelegramFailure) as rejected:
+            await bot.send_rich(-100, 0, "raw")
+    assert rejected.value.rich_content_rejected is False
+
+
+async def test_verified_code_on_plain_method_does_not_classify(gateway):
+    bot = Bot(gateway)
+
+    def respond(request):
+        return httpx2.Response(
+            400,
+            json={
+                "ok": False,
+                "error_code": 400,
+                "description": "Bad Request: RICH_MESSAGE_DEPTH_INVALID",
+            },
+        )
+
+    async with transport(bot, respond):
+        with pytest.raises(TelegramFailure) as rejected:
+            await bot.send(-100, 0, "raw")
+    assert rejected.value.rich_content_rejected is False

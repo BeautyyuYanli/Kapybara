@@ -100,13 +100,12 @@ def rich_rejection(description: Any) -> bool:
     if not isinstance(description, str):
         return False
     description = description.lower().removeprefix("bad request: ")
-    return description.startswith(
-        ("can't parse rich message:", "can't parse markdown:")
-    ) or description in {
-        "rich message is too long",
-        "too many blocks in rich message",
-        "rich message nesting is too deep",
-        "too many columns in rich message table",
+    # Architect's rejected-request samples: .context/delivery.md, commit ec34cc0.
+    return description in {
+        "rich_message_text_too_long",
+        "rich_message_blocks_too_many",
+        "rich_message_table_cols_too_many",
+        "rich_message_depth_invalid",
     }
 
 

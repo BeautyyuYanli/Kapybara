@@ -151,7 +151,7 @@ Commands and error pending bodies always use plain text. New final pending adds
 `item_offset` counts acknowledged Python characters in original source, including CRLF,
 never encoded bytes or added formatting. No migration is required.
 
-Only explicit rich HTTP/API 400 content parse/limit descriptions trigger persistent
+Only the four verified rich HTTP/API 400 content-limit descriptions trigger persistent
 `format: "plain"`; raw descriptions are neither saved nor logged. Unknown/non-content
 400 stays blocked; 429, network errors, server failures, and lost acknowledgements
 keep the original format and offset. A rich prefix may be followed by plain remaining
@@ -159,3 +159,11 @@ source if an oversized fence/table cannot be safely split. Draft format rejectio
 an oversized indivisible preview sets a run-local plain marker and clears its send cache;
 final rich formatting is attempted independently. Drafts may contain incomplete Markdown.
 See https://core.telegram.org/bots/api#rich-message-formatting-options.
+
+Content rejection evidence is recorded in `.context/delivery.md` at architect commit
+`ec34cc0`: both rich methods returned HTTP 400, `ok: false`, `error_code: 400`, and
+`Bad Request: ` followed by exactly one of `RICH_MESSAGE_TEXT_TOO_LONG`,
+`RICH_MESSAGE_BLOCKS_TOO_MANY`, `RICH_MESSAGE_TABLE_COLS_TOO_MANY`, or
+`RICH_MESSAGE_DEPTH_INVALID`. Classification requires all these conditions and exact
+case-normalized code matching after the optional prefix. Guessed English parsing
+messages and all other `RICH_MESSAGE_*` codes are deliberately unclassified.
