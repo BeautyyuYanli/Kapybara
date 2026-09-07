@@ -19,17 +19,17 @@
 | 表 | 主键、主要内容与约束 |
 | --- | --- |
 | `service_meta` | 单行，`epoch UUID`；短写事务先锁此行并检查当前 epoch，形成统一提交顺序 |
-| `sessions` | `id UUID`；title、machine_ids JSONB、default_machine_id、config JSONB、initial_state JSONB、status、latest_run_id、next_seq BIGINT、created_at/updated_at；status 为 waiting/running/deleting |
+| `sessions` | `id UUID`；不可变 owner_id、parent_session_id 可空；title、machine_ids JSONB、default_machine_id、config JSONB、initial_state JSONB、status、latest_run_id、next_seq BIGINT、created_at/updated_at；status 为 waiting/running/deleting |
 | `runs` | `id UUID`，session_id FK；attempt、status running/waiting/failed/interrupted、checkpoint_no、runner_state JSONB、started_at/finished_at；每 session 至多一个未结束 run |
 | `inputs` | `id UUID`，session_id FK；event_id 可空、mode steer/queue、payload JSONB、seq、run_id 可空、state pending/reserved/consumed；`UNIQUE(event_id, session_id)` 防止重复事件投递 |
 | `records` | `(session_id, seq)`；run_id/attempt/message_id 可空、kind、data JSONB、text、created_at、search_vector；兼作持久输出流和历史，避免两份游标事实源 |
 | `subscriptions` | `(channel_id, session_id)`；持久订阅。默认频道订阅不可移除；外部频道由 wait_for 替换 |
 | `events` | `id UUID`；channel_id、producer_session_id 可空、mode、payload、state pending/delivered、created_at；pending 表示尚无合格接收者 |
-| `requests` | `id UUID`；operation create/input/publish、参数指纹、返回 receipt JSONB、target_session_id 可空、input_id 可空、waiting_id 可空、completed_run_id 可空；用于重试去重及 completion 归属 |
+| `requests` | `id UUID`；`UNIQUE(key_scope, request_key)`；operation create/update/delete/input/publish、参数指纹、返回 receipt JSONB、target_session_id 可空、input_id 可空、waiting_id 可空、completion JSONB 可空；用于重试去重及 completion 非消费观察 |
 
 频道直接由 UUID 标识，不另建只有 id 的 channel 表；session 默认频道就是 session_id，其他 waiting_id 由调用方提供或由 State 分配。events/subscriptions 持久保存频道名，频道无需先创建。UUID 不充当顺序号。所有 session 记录和输入顺序由同一事务中的 `sessions.next_seq` 分配；事务回滚同时回滚计数，后来的已提交游标不会越过较早未提交记录。不同 session 的顺序互不关联。
 
-索引包括 inputs(session_id, state, mode, seq)、events(channel_id, created_at, id) WHERE pending、subscriptions(session_id)、records(session_id, kind, seq)、records 的部分 GIN(search_vector)。所有 session 子表使用 session_id FK；订阅、输入、run、记录随 session 删除，其他 session 已接收的事件输入不级联删除。requests 保留不含原 prompt 的最小 receipt，使 create/input 重试不会复活已删除 session。
+索引包括 inputs(session_id, state, mode, seq)、events(channel_id, created_at, id) WHERE pending、subscriptions(session_id)、records(session_id, kind, seq)、records 的部分 GIN(search_vector)。输入、run、记录和订阅使用 session_id FK 并随 session 删除，其他 session 已接收的事件输入不级联删除。parent_session_id 是不可变的创建来源标识，不随父 session 删除清空；requests 的目标标识也不级联删除。requests 保留原操作返回值、必要的 owner/parent 来源与 completion，使重放不会复活已删除 session，且删除通知仍可观察。
 
 ## 3. 运行与资源所有权
 
@@ -43,7 +43,7 @@ Gateway 在应用 lifespan 中创建并进入 `SessionService`，退出时关闭
 
 关闭顺序为停止新请求、取消并 await runner、取消协调/long-poll、unsubscribe 并 aclose PubSub/client、关闭 pool 和锁连接。仅取消内存监听不会删除持久 subscriptions。未正常结束的 run 保留恢复所需状态，不伪造 waiting completion。
 
-删除先在事务内标记 deleting 并使 runner 写入失效，然后事务外取消并 await runner，再事务内完成未完成请求的 deleted completion、移除订阅和 session 数据。启动扫描会继续未完成的 deleting。删除不负责杀 execution 进程、删 machine cwd 或删 skill；Gateway/Execution 按各自所有权处理。
+删除先在事务内记录请求 key/指纹并标记 deleting，使 runner 写入失效，然后事务外取消并 await runner，再事务内完成未完成请求的 deleted completion、移除订阅和 session 数据，并保存 delete 返回值。删除未结束时请求结果为空；同键重试加入或恢复这次删除，不另开一次删除。启动扫描会继续未完成的 deleting。删除不负责杀 execution 进程、删 machine cwd 或删 skill；Gateway/Execution 按各自所有权处理。
 
 ## 4. 输入、检查点与 waiting
 
@@ -56,6 +56,8 @@ runner 在模型/工具边界提交 checkpoint：原子更新 runner_state、追
 正常返回的最终事务执行：检查 attempt 和 checkpoint 序号；提交最终 checkpoint 和 final output；将 run/session 置为 waiting；替换外部 wait_for、保留默认订阅；处理新订阅频道 backlog；为本 run 已消费的 create/input 请求分别发 completion；向 session 默认频道发一次 waiting completion。全部一起提交。queue 或 backlog 即使已可运行，也必须经过这个真实 waiting 边界再开启下一轮。
 
 completion 只对应实际进入该 run 且已确认消费的输入。运行中刚到、尚未交给 runner 的 queue/steer 不会被提前完成。同一 request 的 completion 只生成一次；同一 waiting_id 可关联多个请求并多次发布。一个 run 合并多个请求时，各请求按各自 request_id 收到完成信号。若请求 waiting_id 恰为目标 session 默认频道，合并为该次默认 completion，payload 中保留所有 request_ids，避免同一频道双发。
+
+create/input 的 request receipt 在同一 waiting 事务中写入 completion JSONB；`wait_submission` 只读取这份持久结果，不注册 subscriptions、不改变 events 状态、不弹出 inputs。多个 UI/CLI 可反复观察同一 receipt，agent 是否已消费频道事件不影响观察结果。超时返回 completion=null，未知请求或 target 不匹配报 NotFound；只有已完成、失败或删除才返回对应终态。按 waiting_id 本身不能确定某次请求是否完成，观察始终使用 session_id+request_id。
 
 空 session 创建即处于 waiting，create receipt 当场完成；携带初始 input 的创建在首次消费该 input 的 run 进入 waiting 时完成。自然模型结束等价于 wait_for=()，始终保留默认输入订阅。runner 最终返回时不得遗留自己 reserved 但未处理的输入；State 将其视为 runner contract error。
 
@@ -83,6 +85,7 @@ self exclusion 按可信 producer_session_id 与接收 session_id 比较，不�
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from types import TracebackType
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -90,6 +93,11 @@ type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, J
 type JsonObject = dict[str, JsonValue]
 type InputMode = Literal["steer", "queue"]
 type Cursor = str
+
+@dataclass(frozen=True, slots=True)
+class RequestKey:
+    scope: str
+    key: str
 
 @dataclass(frozen=True, slots=True)
 class RunnerState:
@@ -107,6 +115,8 @@ class SessionSpec:
 @dataclass(frozen=True, slots=True)
 class SessionView:
     id: UUID
+    owner_id: str
+    parent_session_id: UUID | None
     title: str
     machine_ids: tuple[str, ...]
     default_machine_id: str | None
@@ -123,11 +133,26 @@ class Submission:
     session_id: UUID
     input_id: UUID | None
     waiting_id: UUID
+    owner_id: str
+    parent_session_id: UUID | None
 
 @dataclass(frozen=True, slots=True)
 class CreatedSession:
     session: SessionView
     submission: Submission
+
+@dataclass(frozen=True, slots=True)
+class Completion:
+    run_id: UUID | None
+    outcome: Literal["completed", "failed", "deleted"]
+    output: str
+    cursor: Cursor
+    completed_at: datetime
+
+@dataclass(frozen=True, slots=True)
+class SubmissionStatus:
+    submission: Submission
+    completion: Completion | None
 
 @dataclass(frozen=True, slots=True)
 class SessionInput:
@@ -173,6 +198,13 @@ class Record:
 class RecordPage:
     items: tuple[Record, ...]
     next_cursor: Cursor
+    has_more: bool
+
+@dataclass(frozen=True, slots=True)
+class HistoryExportPage:
+    items: tuple[Record, ...]
+    next_cursor: Cursor
+    snapshot_cursor: Cursor
     has_more: bool
 
 @dataclass(frozen=True, slots=True)
@@ -224,10 +256,14 @@ class SessionService:
         schema: str = "kapy_state", namespace: str = "kapy_state",
     ) -> None: ...
     async def __aenter__(self) -> SessionService: ...
-    async def __aexit__(self, exc_type, exc, tb) -> None: ...
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None,
+        exc: BaseException | None, tb: TracebackType | None,
+    ) -> None: ...
 
     async def create_session(
-        self, spec: SessionSpec, *, request_id: UUID,
+        self, spec: SessionSpec, *, request_key: RequestKey, owner_id: str,
+        parent_session_id: UUID | None = None,
         input: JsonValue = None, mode: InputMode = "queue",
         waiting_id: UUID | None = None,
     ) -> CreatedSession: ...
@@ -237,21 +273,26 @@ class SessionService:
         after: UUID | None = None, limit: int = 100,
     ) -> SessionPage: ...
     async def update_session(
-        self, session_id: UUID, *, title: str,
+        self, session_id: UUID, *, request_key: RequestKey, title: str,
         machine_ids: tuple[str, ...], default_machine_id: str | None,
         config: JsonObject,
     ) -> SessionView: ...
-    async def delete_session(self, session_id: UUID) -> bool: ...
+    async def delete_session(
+        self, session_id: UUID, *, request_key: RequestKey,
+    ) -> bool: ...
     async def submit_input(
-        self, session_id: UUID, payload: JsonValue, *, request_id: UUID,
+        self, session_id: UUID, payload: JsonValue, *, request_key: RequestKey,
         mode: InputMode = "steer", waiting_id: UUID | None = None,
     ) -> Submission: ...
     async def read_output(
         self, session_id: UUID, *, after: Cursor | None = None,
         limit: int = 200, wait_seconds: float = 0,
     ) -> RecordPage: ...
+    async def wait_submission(
+        self, session_id: UUID, request_id: UUID, *, wait_seconds: float = 0,
+    ) -> SubmissionStatus: ...
     async def publish_event(
-        self, waiting_id: UUID, payload: JsonValue, *, request_id: UUID,
+        self, waiting_id: UUID, payload: JsonValue, *, request_key: RequestKey,
         producer_session_id: UUID | None, mode: InputMode = "steer",
     ) -> EventReceipt: ...
     async def read_history(
@@ -267,6 +308,10 @@ class SessionService:
         self, session_id: UUID, sql: str, *,
         params: JsonObject | None = None, limit: int = 200,
     ) -> QueryResult: ...
+    async def export_history(
+        self, session_id: UUID, *, after: Cursor | None = None,
+        snapshot: Cursor | None = None, limit: int = 200,
+    ) -> HistoryExportPage: ...
 
 async def migrate(database_url: str, *, schema: str = "kapy_state") -> None: ...
 ```
@@ -277,29 +322,35 @@ checkpoint number 在同 run 中严格递增，重复 number 且内容相同返�
 
 update 使用完整可修改字段集合以避免 null/未提供歧义；machine/default/config 仅在 waiting 且没有活动 run 时修改，default 必须在 machine_ids 中。当前 run 使用启动时快照。创建前 Gateway 调 Intelligence 的 session 初始化入口取得 skill description 快照和 initial_state；该内容在 create 事务中持久化。create 的 input=null 明确表示不提交初始输入。
 
+RequestKey.scope 由 Gateway 根据已认证主体生成，key 是本次逻辑操作的稳定键，二者 UTF-8 长度各为 1..256 bytes，均不可含密钥。Telegram 可用 scope=`telegram:<bot_numeric_id>`、key=`update:<update_id>:<step>`，不同步骤必须使用不同 key。State 用 (scope,key) 原子去重并生成返回的 request_id UUID；相同键/相同规范化参数返回首次提交的原结果，不再次更新状态。相同键/不同操作、目标或参数报 Conflict。create/update/delete/input/publish 均适用；update/delete 的去重检查早于当前 session 状态检查，防止重放覆盖后来设置或重复删除。执行失败且未提交的操作不占用成功幂等键。
+
+owner_id 与 parent_session_id 由 Gateway 从可信 caller 注入，不是 session.create 的普通外部参数，也不能通过 update 修改。owner_id 是 Gateway 的稳定主体标识；递归创建时 parent_session_id 是调用方 session，目标新 session 由 State 分配。Gateway 可依据这些不可变事实实现 self/created-child 权限；State 不推导授权，不把 owner 相同自动解释为 session token 可访问全部 session。Submission 同时保留此来源，使 Gateway 在 session 删除后仍能对 receipt 观察授权。caller token、目标 session_id、request key scope 分别传递，互不替代。
+
 ## 7. JSON-RPC 参数与结果
 
-下表所有方法 params 均为 object，省略字段采用 Python 默认值；`request_id` 为调用者生成的 UUID，JSON-RPC envelope.id 不承担幂等责任。UUID 用字符串，datetime 用 UTC RFC3339，tuple 用 array，cursor 为绑定 session 的不透明字符串。表中类型名称表示第 6 节值对象逐字段 JSON 化，没有额外包裹。
+下表所有方法 params 均为 object，省略字段采用 Python 默认值；变更参数 `request_key` 是调用方提供的稳定字符串，Gateway 注入 scope 后构造 Python RequestKey；返回的 `request_id` 是 State 生成的 UUID，用于 receipt 观察。JSON-RPC envelope.id 不承担幂等责任。UUID 用字符串，datetime 用 UTC RFC3339，tuple 用 array，cursor 为绑定 session 的不透明字符串。表中类型名称表示第 6 节值对象逐字段 JSON 化，没有额外包裹。
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `session.create` | `{request_id,title,machine_ids,default_machine_id,config,input?,mode?,waiting_id?}`；initial_state 由 Gateway 调 Intelligence 生成 | `CreatedSession` |
+| `session.create` | `{request_key,title,machine_ids,default_machine_id,config,input?,mode?,waiting_id?}`；initial_state、owner_id、parent_session_id 由 Gateway 可信注入 | `CreatedSession` |
 | `session.get` | `{session_id}` | `SessionView` |
 | `session.list` | `{after?,limit?}`；Gateway 内部传授权 session_ids | `SessionPage` |
-| `session.update` | `{session_id,title,machine_ids,default_machine_id,config}` | `SessionView` |
-| `session.delete` | `{session_id}` | `{deleted: bool}` |
-| `session.input` | `{session_id,request_id,payload,mode?,waiting_id?}` | `Submission` |
+| `session.update` | `{session_id,request_key,title,machine_ids,default_machine_id,config}` | `SessionView` |
+| `session.delete` | `{session_id,request_key}` | `{deleted: bool}` |
+| `session.input` | `{session_id,request_key,payload,mode?,waiting_id?}` | `Submission` |
 | `session.output` | `{session_id,after?,limit?,wait_seconds?}` | `RecordPage` |
-| `event.publish` | `{waiting_id,request_id,payload,mode?}`；producer_session_id 来自 Gateway 认证上下文 | `EventReceipt` |
+| `session.wait` | `{session_id,request_id,wait_seconds?}`；只观察 create/input receipt | `SubmissionStatus` |
+| `event.publish` | `{waiting_id,request_key,payload,mode?}`；producer_session_id 来自 Gateway 认证上下文 | `EventReceipt` |
 | `history.read` | `{session_id,after?,limit?}` | `RecordPage` |
 | `history.search` | `{session_id,query,mode?,after?,limit?}` | `RecordPage` |
 | `history.query` | `{session_id,sql,params?,limit?}` | `QueryResult` |
+| `history.export` | `{session_id,after?,snapshot?,limit?}` | `HistoryExportPage` |
 
-订阅由 runner 的 wait tool 返回 wait_for，经 State 提交；不增加前端 event.subscribe/event.ack 接口。普通 CLI 等待使用 session.output 的 long-poll；运行在 session 内的递归 CLI 把 waiting_id 交给 wait tool。waiting_id 是频道名而非一次性 future。
+订阅由 runner 的 wait tool 返回 wait_for，经 State 提交；不增加前端 event.subscribe/event.ack 接口。普通 CLI/Telegram 等待某次请求用 session.wait 的非消费 long-poll，读取输出用 session.output；运行在 session 内的递归 CLI 把 waiting_id 交给 wait tool。waiting_id 是可反复发布的频道名，request_id 标识一次请求，cursor 标识 session 记录位置，三者不可互换。
 
 completion payload 精确为 `{type:"session.waiting",session_id,run_id,request_ids:[UUID],outcome:"completed"|"failed"|"deleted",output:string,cursor:Cursor}`；空创建的 run_id 为 null。event 输入保留 `{type:"event",event_id,waiting_id,producer_session_id,payload}`，外层 SessionInput.mode 决定调度。submitted payload 不改变用户原值。
 
-重复 request_id+相同操作/参数返回首次 receipt；同 id 不同参数报 Conflict。create 参数指纹只包含用户请求字段，不含 Gateway 衍生的 initial_state；重试采用首次成功持久化的 skill/runner 快照，不要求 Gateway 再维护一份持久去重缓存。输出 record.kind 为 input、text_delta、tool_call、tool_result、notice、model_request、model_response、final、waiting、error、interrupted。final.data 为 `{output:string}`；waiting.data 为上述 completion payload；输入记录 data 为原输入或事件 envelope。
+重复 RequestKey+相同操作/参数返回首次结果；同键不同参数报 Conflict。create 参数指纹包含用户请求字段及可信 owner/parent 来源，不含 Gateway 衍生的 initial_state；重试采用首次成功持久化的 skill/runner 快照。Telegram inbox 必须固定逻辑步骤的请求参数和 key，不能重放时改用后来 saved config。State 的幂等记录无需与 Gateway inbox 跨包同事务：State 提交后 Gateway 崩溃会以同键重试，再完成自己的 binding/inbox 提交。输出 record.kind 为 input、text_delta、tool_call、tool_result、notice、model_request、model_response、final、waiting、error、interrupted。final.data 为 `{output:string}`；waiting.data 为上述 completion payload；输入记录 data 为原输入或事件 envelope。
 
 Gateway 负责把标准无效参数映射 -32602；建议 State 错误映射 NotFound=-32004、Conflict=-32009、UnsafeQuery=-32020、QueryLimitExceeded=-32021、ServiceUnavailable=-32030。错误 data 使用 `{kind,retryable}`，不返回原始 SQL、DSN 或数据库内部异常。认证及 channel 发布/订阅权限由 Gateway/Intelligence 的可信边界处理，State 的 UUID 不是授权凭据。
 
@@ -308,6 +359,8 @@ Gateway 负责把标准无效参数映射 -32602；建议 State 错误映射 Not
 `session.output(after=None)` 从最初记录开始读取，之后以 next_cursor 续读，排空后同一接口 wait_seconds>0 进入实时 long-poll；先注册本地唤醒、再读 PostgreSQL，睡醒后重读，且最多 1 秒重查，避免检查与等待之间的丢唤醒。空页保留已扫描 cursor；断开只取消读者，不修改 session 或订阅。
 
 输出由 PostgreSQL 分页承载，不为每个前端保存无限内存缓冲。一次 emit 对应一次短事务，返回意味着已持久化；runner 可把连续文本合成一个不超过 16KiB 的 delta。完整 model_response 使用 message_id 替换其 delta 投影，final 表示该 run 的最终结果。前端按 message_id 维护展示，不把完整消息再追加一份。history.read/search 只返回 input/model_request/model_response/final/waiting/error，使用相同顺序空间但不作为实时切换入口；可靠回放到实时统一走 session.output。
+
+history.export 导出同一历史子集。首个请求捕获已提交最高 seq 作为 snapshot_cursor，后续请求必须带回该 snapshot 及 next_cursor，只读取 `(after,snapshot]`，末页 next_cursor 到 snapshot。传 after 却未传 snapshot 时拒绝请求，避免分页中悄悄改变边界。records 只追加，所以无需跨 RPC 保持数据库事务即可得到稳定有限快照。after/snapshot 都验证绑定的 session；删除期间无法继续导出时明确报 NotFound。Gateway 将页面序列化为流式 NDJSON/下载文件，State 不一次性拼接全部历史，也不持有文件或 HTTP response。每页仍受 200 行/1MiB 限制。
 
 历史 SQL 提供 PostgreSQL SELECT 的明确子集，只能读取逻辑关系 `history(seq,run_id,kind,message_id,text,data,created_at)`。SQLGlot 负责解析，State 安全编译器对每个节点及其参数槽做完整白名单，并从已验证节点生成 SQL；不执行调用者原字符串，不采用函数黑名单。[SQLGlot AST API](https://sqlglot.com/sqlglot.html)
 
@@ -329,10 +382,10 @@ State 代码按 `contracts.py`、`store.py`、`service.py`、`history.py` 与 mi
 
 Intelligence 按 SessionRunner 契约实现 runner、codec、创建时 skill 快照与等待工具；在模型/工具边界 poll_steer，检查点确认输入，返回 RunResult。模型上下文压缩和多模态错误修复完全归 Intelligence；状态读出不做反序列化模型校验。RunContext 是可信能力对象，不把 SessionService/数据库连接交给模型。
 
-Gateway 在启动时先 migrate，再 lifespan 管理 SessionService；保证 machine/default 合法和身份授权，转发确定的参数/结果；为 session.create 取得 initial_state，为 session.list 提供授权范围，不把 None 当作用户可请求的全量范围。session config 只存模型名称、阈值等非秘密设置；API key 保持在装配层。频道权限在调用 State 前处理，runner wait_for 也需通过 Intelligence 注入的授权检查。
+Gateway 在启动时先 migrate，再 lifespan 管理 SessionService；保证 machine/default 合法和身份授权，转发确定的参数/结果；为 session.create 取得 initial_state，为 session.list 提供授权范围，不把 None 当作用户可请求的全量范围。session config 只存模型名称、阈值等非秘密设置；API key 保持在装配层。频道权限在调用 State 前处理，runner wait_for 也需通过 Intelligence 注入的授权检查。Gateway 的 durable inbox、chat/topic binding、saved config、output cursor 和认证/grant 表由 Gateway 自包拥有；总设计师的装配入口依次调用各 owner 的迁移。`kapy.state.migrate` 只管理 State schema，不反向导入 Gateway，也不执行文档中的任意 DDL。
 
-Execution 无需依赖 State。递归 CLI 需要保留 request_id 和等待频道，并把 session token 交 Gateway；恢复外部工具时应允许按现有 process/request id 查询已知状态，不能因控制连接重连自动重复命令。Gateway/Execution 对 JSON-RPC frame 上限至少容纳本方案 1MiB 页面加 envelope，或装配时统一下调 State 页面字节上限。
+Execution 无需依赖 State。递归 CLI 需要保留 request_key、返回的 request_id 和等待频道，并把 session token 交 Gateway；恢复外部工具时应允许按现有 process/request id 查询已知状态，不能因控制连接重连自动重复命令。Gateway/Execution 对 JSON-RPC frame 上限至少容纳本方案 1MiB 页面加 envelope，或装配时统一下调 State 页面字节上限。
 
 单个输入、事件或 model message 上限建议 256KiB JSON，单条 delta 16KiB，checkpoint 4MiB，wait_for 至多 128 个，page limit≤200，long-poll≤30s；超限在变更前明确拒绝。媒体通过引用进入历史，不把大型二进制直接编码到 records。pending/backlog 和历史不按内存窗口丢弃，也不在首版自动设置 TTL。
 
-总设计师需要统一批准的契约取舍为：本方案精确 Python/RPC 导出；直接 session.input 与 MPMC event.publish 的区分；sticky wait_for 到下一次返回时替换；受限 SELECT 而非任意 PostgreSQL；内置 Unicode/CJK 全文策略；外部工具结果未知时不自动重发。这些均按上述具体默认方案提交，没有在实现中留给临时判断的空白。
+总设计师需要统一批准的契约取舍为：本方案精确 Python/RPC 导出，包括 RequestKey、不可变 owner/parent 来源、非消费 session.wait 和分页 history.export；直接 session.input 与 MPMC event.publish 的区分；sticky wait_for 到下一次返回时替换；受限 SELECT 而非任意 PostgreSQL；内置 Unicode/CJK 全文策略；外部工具结果未知时不自动重发。这些均按上述具体默认方案提交，没有在实现中留给临时判断的空白。
