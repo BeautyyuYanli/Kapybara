@@ -1,11 +1,12 @@
 import asyncio
+import hashlib
 import threading
 import weakref
 from typing import cast
 from uuid import uuid4
 
 import pytest
-from psycopg import sql
+from psycopg import AsyncCursor, sql
 from psycopg_pool import AsyncConnectionPool
 
 from kapy.agent import AgentPayloadStore, PayloadNotFound
@@ -14,6 +15,113 @@ from kapy.skills import service as skill_service
 from kapy.skills.archive import Archive, validate_archive
 
 from .test_archive import archive  # type: ignore[missing-import]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_revision_race_download_snapshot_and_receipt_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = f"test_skill_race_{uuid4().hex}"
+    async with AsyncConnectionPool(
+        "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy",
+        open=False,
+    ) as pool:
+        try:
+            service = SkillService(pool, schema=schema)
+            await service.initialize()
+            initial = await service.create(archive(), request_key="create")
+            archives = {
+                name: archive(description=name) for name in ("left", "right", "after-fault")
+            }
+            barrier = asyncio.Barrier(3)
+
+            async def update(description: str):
+                await barrier.wait()
+                return await service.update(
+                    initial.id,
+                    archives[description],
+                    expected_revision=1,
+                    request_key=description,
+                )
+
+            snapshots = []
+
+            async def download_during_race():
+                await barrier.wait()
+                for _ in range(4):
+                    snapshots.append(await service.download(initial.id))
+
+            results = await asyncio.gather(
+                update("left"), update("right"), download_during_race(), return_exceptions=True
+            )
+            assert results[-1] is None
+            updates = results[:2]
+            assert sum(isinstance(value, SkillConflict) for value in updates) == 1
+            winner = next(value for value in updates if not isinstance(value, BaseException))
+            info, downloaded = await service.download(initial.id)
+            assert info == winner and info.revision == 2
+            assert validate_archive(downloaded).description == info.description
+            assert hashlib.sha256(downloaded).hexdigest() == info.sha256
+            assert downloaded == archives[info.description]
+            for snapshot, payload in snapshots:
+                assert snapshot in (initial, info)
+                assert hashlib.sha256(payload).hexdigest() == snapshot.sha256
+                assert validate_archive(payload).description == snapshot.description
+            with pytest.raises(SkillConflict, match="different arguments"):
+                await service.update(
+                    initial.id,
+                    archive(description="reused key different bytes"),
+                    expected_revision=1,
+                    request_key=info.description,
+                )
+
+            execute = AsyncCursor.execute
+
+            class ReceiptFailure(Exception):
+                pass
+
+            async def fail_receipt(cur, query, *args, **kwargs):
+                if isinstance(query, sql.Composable):
+                    text = query.as_string(cur.connection)
+                    if text.lstrip().startswith("INSERT INTO") and '"skill_requests"' in text:
+                        # Observe the changed row inside this same transaction before failing.
+                        await execute(
+                            cur,
+                            sql.SQL("SELECT revision,description FROM {} WHERE id=%s").format(
+                                service.skills
+                            ),
+                            (initial.id,),
+                        )
+                        changed = await cur.fetchone()
+                        assert changed["revision"] == 3 and changed["description"] == "after-fault"
+                        raise ReceiptFailure
+                return await execute(cur, query, *args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(AsyncCursor, "execute", fail_receipt)
+                with pytest.raises(ReceiptFailure):
+                    await service.update(
+                        initial.id,
+                        archives["after-fault"],
+                        expected_revision=2,
+                        request_key="retry-after-fault",
+                    )
+            assert await service.download(initial.id) == (info, downloaded)
+            retried = await service.update(
+                initial.id,
+                archives["after-fault"],
+                expected_revision=2,
+                request_key="retry-after-fault",
+            )
+            assert retried.revision == 3
+            assert await service.download(initial.id) == (
+                retried,
+                archives["after-fault"],
+            )
+        finally:
+            async with pool.connection() as conn:
+                await conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
 @pytest.mark.integration
