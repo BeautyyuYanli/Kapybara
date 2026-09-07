@@ -81,6 +81,55 @@ that durable handoff do not retroactively receive it. Handoff creates durable in
 transaction and marks the event delivered. This is the event acknowledgement; frontends read
 output and never consume agent subscriber queues.
 
+`submit_input(session_id, payload, ...)` stores the caller's JSON payload unchanged and
+creates an input only for that target session. Its `waiting_id` selects a completion channel;
+it does not broadcast the submitted prompt. `publish_event(waiting_id, payload, ...)` instead
+broadcasts to that channel's eligible subscribers. Each receiving `SessionInput.payload` and
+its input record's `data` contain this envelope (UUID placeholders below are JSON strings):
+
+```json
+{
+  "type": "event",
+  "event_id": "<event UUID>",
+  "waiting_id": "<channel UUID>",
+  "producer_session_id": null,
+  "payload": null
+}
+```
+
+`producer_session_id` is the trusted producer's UUID string or `null`; `payload` is the original
+published JSON value, including objects/arrays/scalars/null, without content transformation.
+`event_id` identifies the publication and also appears in `SessionInput.event_id`. Delivery mode
+is carried separately in `SessionInput.mode`: the publication's `steer` or `queue`, defaulting
+to `steer`. The envelope does not contain a mode field.
+
+A completion publication uses the following object as that envelope's inner `payload`.
+The same object appears directly as `Record.data` on the source session's `waiting` record:
+
+```json
+{
+  "type": "session.waiting",
+  "session_id": "<source session UUID>",
+  "run_id": null,
+  "request_ids": ["<request UUID>"],
+  "outcome": "completed",
+  "output": "final output text",
+  "cursor": "<source session waiting-record cursor>"
+}
+```
+
+`run_id` is the source run's UUID string or `null` when there is no run, such as empty creation.
+`outcome` is `completed`, `failed`, or `deleted`. The source session is the trusted producer,
+so its own default-channel completion cannot wake itself. Completions always use `steer`.
+For the default channel (`waiting_id == source session_id`), each notification carries at most
+64 `request_ids`; a larger completion therefore produces several same-run notifications in
+one transaction, each with its corresponding waiting-record cursor. A completion without
+associated requests still publishes one default notification with an empty `request_ids` array.
+For each request whose chosen waiting channel differs from the default channel, State also
+publishes to that channel with exactly that request's single id. Requests choosing the default
+channel are included in its batch without a second notification. Subscribers receive these
+completion objects inside the event envelope above, not as unwrapped completion inputs.
+
 A normal runner exception, including a runner-raised NotFound or ServiceUnavailable, produces
 a sanitized error and failed completion for its accepted inputs, then permits queued work to run.
 Failure completion first verifies that the service still runs and the durable attempt is active;
@@ -102,6 +151,14 @@ before fetching records, so concurrent writes cannot move a returned cursor past
 same API's bounded long poll for live output. Full message records and their deltas share a
 message id for frontend replacement. Raw history is append-only, unaffected by model compression.
 Database read rows are assembled into dataclasses without ORM or Pydantic validation.
+
+`read_history`, `search_history`, `export_history`, and the logical relation available to
+`query_history` include only `input`, `model_request`, `model_response`, `final`, `waiting`,
+and `error` records. They omit delta/notice/tool-stream records and `interrupted` markers.
+Use `read_output` for complete output replay, including deltas and interrupted attempts.
+Filtered history pages share the session sequence space and may advance their cursor across
+omitted records; a history/search/export cursor is therefore not evidence that all output
+through that position has been read. Keep the `read_output` cursor for replay-to-live consumption.
 
 `export_history` returns `HistoryExportPage(items, next_cursor, snapshot_cursor, has_more)`.
 Its first page captures the current history upper cursor; supply that same `snapshot` and the
