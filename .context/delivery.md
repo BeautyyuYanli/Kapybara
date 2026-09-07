@@ -17,14 +17,14 @@ token estimates. docs/contracts.md and docs/acceptance.md updated; obsolete
 scripts/with_cgroup.sh removed. Dockerfile.machine and Compose dev-profile machine
 added: dedicated PID namespace/init, 2 GiB memory, 256 PIDs, read-only src/tests/
 scripts/pyproject mounts, no .env mount. Image kapy-v2-machine:dev builds on the
-already built kapy-v2:dev scaffold image; build/up currently in exec session 82428.
+already built kapy-v2:dev scaffold image; build/up passed; the dedicated machine container is running.
 
 IMPORTANT: Lody completions and cross-session/user messages can remain queued while
 the lead's active turn continues. Occasionally read lody_session_history(current),
 filter recent user entries and incorporate actual user corrections immediately.
 Do not merely wait for native injection. Initial proposals operation is finished;
 its result was retrieved once (not a polling loop). Relevant incoming messages are
-visible in current Lody history. Last read included messages through 12:29 UTC.
+visible in current Lody history. Last read included messages through 12:39:49 UTC; no newer real-user steering then.
 
 State early public contracts 4b42349 were reviewed/merged to main; Ruff and pyrefly
 pass. Only dataclasses/protocols/errors are implemented on main, no SessionService
@@ -38,7 +38,7 @@ Initial scaffold: a715b926c1f7da46be82b2afc26f31e330d9bf94.
 | --- | --- | --- | --- |
 | Execution | 515746bc-f9e2-4d09-a894-65067a65f369 | feat/kapyrpc | cmd-impl approved |
 | State | 37703573-1ccd-4f8b-a137-ba52ca9e8e60 | feat/kapy | cmd-impl approved |
-| Intelligence | a88a199c-41c1-49d6-ad09-2d5b87f80b12 | feat/kapy-agentskills | Proposal in progress |
+| Intelligence | a88a199c-41c1-49d6-ad09-2d5b87f80b12 | feat/kapy-agentskills | cmd-impl approved |
 | Gateway | 0f9cff83-dff7-4881-b5a1-a6b1e761dd27 | feat/kapycli | cmd-impl approved |
 
 Initial asynchronous operation: kapy-v2-initial-proposals-20260907.
@@ -61,12 +61,8 @@ and integrate committed branches. Route implementation defects back to owners.
   runnable application). CLI entry is `kapy.cli:main`, Docker CMD `kapy control-server`.
 - `uv run --env-file .env python scripts/check_provider.py` passed: real configured
   model, one harmless tool call, two model requests, exact marker returned.
-- Lody's cgroup is not delegated. A separate `systemd-run --user --scope --collect
-  --property=Delegate=yes` scope was verified to have writable cgroup.procs and
-  cgroup.kill. Do not modify Lody's service/cgroup. Execution senior owns daemon
-  logic; architect can run integrated checks in a dedicated delegated scope.
 
-## Proposal review in progress
+## Historical proposal coordination (superseded by later approvals)
 
 All four draft proposals are on disk under their worktree `.context/proposals/`:
 `260907-execution-rpc.md`, `260907-state-service.md`, `260907-agent-skills.md`,
@@ -96,9 +92,8 @@ Directed revisions already sent through Lody:
 - Intelligence must resolve 20 MiB BinaryContent versus 256 KiB message / 4 MiB
   checkpoint bounds using durable references and hydration, and provide explicit
   session initialization export for Gateway. wait_for checks use Gateway authority.
-- Execution must document ordinary-user delegated-cgroup startup and safe tests;
-  root environment prerequisite is verified. Any required stdin extension must be
-  small/bounded and agreed; large plugin scripts can use existing file transfers.
+- The original cgroup proposal is superseded by the Docker/best-effort decision.
+  Script stdin uses existing file transfers and managed file redirection.
 
 Recent durable operations: kapy-v2-interface-drafts-20260907,
 kapy-v2-gateway-review-directions-20260907,
@@ -106,7 +101,7 @@ kapy-v2-intelligence-review-directions-20260907,
 kapy-execution-delegation-evidence-20260907. All are asynchronous continuations,
 not reasons to poll operation_get. Inspect final commits/proposals as delivered.
 
-## Implementation approvals
+## Initial implementation approvals (later corrections take precedence)
 
 - State: `kapy-state-impl-approval-20260907` at 12:12 UTC. Approved 1fbe9a5 +
   7cae039, with 512 KiB page cap amendment. Ask for early public contract commit,
@@ -143,8 +138,29 @@ not reasons to poll operation_get. Inspect final commits/proposals as delivered.
 
 ## Remaining lead work
 
-1. Review four proposals and publish exact shared contracts.
-2. Authorize implementations and handle cross-module dependency requests.
-3. Integrate completed branches and run docs/acceptance.md scenarios.
-4. Delegate concrete defects, merge corrections, complete product docs and report
+1. All four proposals reviewed and implementations approved. Handle concrete
+   cross-module dependency requests without reopening settled design decisions.
+2. Integrate completed branches and run docs/acceptance.md scenarios.
+3. Delegate concrete defects, merge corrections, complete product docs and report
    measured results, actual limitations and runnable commands.
+
+## Intelligence final approval at 12:46 UTC
+
+`kapy-intelligence-impl-approval-20260907` formally approves cmd-impl after the
+complete revised proposal review. Deterministic corrections are already approved,
+so the senior should apply them and implement without another approval round:
+- Per-response provider usage only; no tiktoken or media token reserve. One sweep
+  per fresh usage, approximately latest 10% by complete interaction blocks.
+- AgentPayloadStore borrows Gateway pool, has delete_session, no FK to State or
+  state_schema setting; cleanup after runner stops via Gateway durable cleanup.
+- Runner/initial_state/AuthorizeWait and Skills section 7/8 exports approved.
+- Skill mutations use Gateway-scoped internal request_key plus expected_revision;
+  public RPC request_id naming must stay aligned with Gateway.
+- Real execution tests only in Docker; apply_patch assets generated by their tool.
+
+Gateway was sent the exact approved dependencies via
+`kapy-gateway-intelligence-final-exports-20260907`. All four seniors are now
+authorized to implement, each managing its own complete cmd-impl review workflow.
+No full service is merged yet. At ~12:49, State has about 2,150 Python lines in its
+worktree and Execution about 890; these are unreviewed implementation progress,
+not completed deliveries or acceptance evidence.
