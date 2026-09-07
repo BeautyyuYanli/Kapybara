@@ -1,0 +1,53 @@
+[project]
+name = "kapy"
+version = "0.1.0"
+description = "An agent control plane with remote execution and Telegram sessions"
+requires-python = ">=3.14"
+dependencies = [
+    "anyio>=4.15.1",
+    "fastapi>=0.141.1",
+    "httpx2>=2.12.0",
+    "logfire>=5.0.0",
+    "platformdirs>=4.11.7",
+    "psycopg[binary,pool]>=3.3.5",
+    "pydantic>=2.13.5",
+    "pydantic-ai-slim[openai]>=2.40.0",
+    "pydantic-settings>=2.15.0",
+    "python-multipart>=0.0.32",
+    "pyyaml>=6.0.3",
+    "sqlalchemy>=2.0.52",
+    "sqlglot>=30.18.0",
+    "typer>=0.27.2",
+    "uvicorn[standard]>=0.52.4",
+    "uvloop>=0.22.1",
+    "valkey>=6.1.1",
+    "websockets>=17.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.pyrefly]
+project-includes = ["src", "tests"]
+python-version = "3.14"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires local PostgreSQL and Valkey", "live: requires explicit live service credentials"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pyrefly>=1.2.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.6",
+]
