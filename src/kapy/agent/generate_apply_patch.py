@@ -24,6 +24,8 @@ HASHES = {
 def generate(bundle_dir: Path | None = None) -> None:
     destination = Path(__file__).parent / "resources" / "apply_patch"
     destination.mkdir(parents=True, exist_ok=True)
+    # Upstream license bytes participate in the manifest digest, including CRLF.
+    (destination / ".gitattributes").write_text("* -text\n** -text\n", encoding="utf-8")
     manifest = {
         "generated_by": "kapy.agent.generate_apply_patch",
         "version": VERSION,

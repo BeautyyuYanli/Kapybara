@@ -28,6 +28,7 @@ class Archive:
     skill_md: str
     root: str
     files: tuple[tuple[str, bytes, int], ...]
+    directories: tuple[str, ...]
 
 
 def _metadata(markdown: str) -> tuple[str, str]:
@@ -144,7 +145,14 @@ def validate_archive(data: bytes) -> Archive:
         or any(p != root and not p.startswith(f"{root}/") for p in paths)
     ):
         raise InvalidSkill("ZIP root directory must match the skill name")
-    return Archive(name, description, markdown, root, tuple(files))
+    return Archive(
+        name,
+        description,
+        markdown,
+        root,
+        tuple(files),
+        tuple(path for path, directory in paths.items() if directory),
+    )
 
 
 def pack_skill(source_dir: Path, archive_path: Path) -> None:
@@ -180,6 +188,10 @@ def pack_skill(source_dir: Path, archive_path: Path) -> None:
                 if count > MAX_ENTRIES:
                     raise SkillTooLarge("Source exceeds 4096 entries")
                 if stat.S_ISDIR(info.st_mode):
+                    zi = zipfile.ZipInfo(f"{name}/{path.relative_to(source).as_posix()}/")
+                    zi.create_system = 3
+                    zi.external_attr = (stat.S_IFDIR | 0o755) << 16
+                    archive.writestr(zi, b"")
                     continue
                 if info.st_size > MAX_MEMBER:
                     raise SkillTooLarge("Source member exceeds 32 MiB")
@@ -199,12 +211,12 @@ def pack_skill(source_dir: Path, archive_path: Path) -> None:
                     raise SkillTooLarge("ZIP exceeds 16 MiB")
     data = buffer.getvalue()
     validate_archive(data)
-    try:
-        with target.open("xb") as file:
+    with target.open("xb") as file:
+        try:
             file.write(data)
-    except BaseException:
-        # Only remove a target created by this operation.
-        raise
+        except BaseException:
+            target.unlink()
+            raise
 
 
 def extract_skill(archive_path: Path, destination: Path) -> Path:
@@ -215,6 +227,8 @@ def extract_skill(archive_path: Path, destination: Path) -> Path:
     archive = validate_archive(data)
     staging = Path(tempfile.mkdtemp(prefix=".kapy-skill-", dir=destination.parent))
     try:
+        for name in archive.directories:
+            (staging / name).mkdir(parents=True, exist_ok=True)
         for name, content, mode in archive.files:
             path = staging / name
             path.parent.mkdir(parents=True, exist_ok=True)

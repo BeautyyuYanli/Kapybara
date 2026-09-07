@@ -60,12 +60,18 @@ class AgentPayloadStore:
         task = asyncio.create_task(write())
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             # State's cancellation barrier must also cover payload writes before cleanup.
-            try:
-                await task
-            finally:
-                raise
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
+            raise cancelled
         return ref
 
     async def get(self, session_id: UUID, ref: PayloadRef) -> bytes:

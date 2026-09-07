@@ -38,7 +38,11 @@ class ProcessCommand:
     cwd: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.argv or any(not isinstance(arg, str) or "\x00" in arg for arg in self.argv):
+        if (
+            not self.argv
+            or not self.argv[0]
+            or any(not isinstance(arg, str) or "\x00" in arg for arg in self.argv)
+        ):
             raise ValueError("Command requires nonempty argv without NUL bytes")
 
 

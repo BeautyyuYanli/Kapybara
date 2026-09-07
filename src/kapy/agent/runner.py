@@ -41,7 +41,15 @@ from kapy.state import (
     SessionInput,
 )
 
-from .codec import CODEC, DELTA_LIMIT, INLINE_LIMIT, MessageCodec, check_checkpoint, json_bytes
+from .codec import (
+    CODEC,
+    DELTA_LIMIT,
+    INLINE_LIMIT,
+    MESSAGE_LIMIT,
+    MessageCodec,
+    check_checkpoint,
+    json_bytes,
+)
 from .compression import projection, sweep, usage_sweep
 from .machine import BUILTINS, MachineTools, apply_patch_plugin
 from .payloads import AgentPayloadStore
@@ -277,14 +285,15 @@ class Runtime:
             if isinstance(part, TextPart)
             or (isinstance(part, UserPromptPart) and isinstance(part.content, str))
         )
-        self.messages.append(
-            MessageWrite(
-                message_id,
-                "model_request" if isinstance(message, ModelRequest) else "model_response",
-                text,
-                cast(JsonObject, encoded),
-            )
+        write = MessageWrite(
+            message_id,
+            "model_request" if isinstance(message, ModelRequest) else "model_response",
+            text,
+            cast(JsonObject, encoded),
         )
+        if len(json_bytes({**asdict(write), "message_id": str(message_id)})) > MESSAGE_LIMIT:
+            raise AgentResourceLimit("Complete message envelope exceeds 256 KiB")
+        self.messages.append(write)
         self.current["messages"].append(encoded)
         if commit:
             await self.checkpoint()

@@ -12,7 +12,7 @@ import httpx2
 import pytest
 from pydantic import SecretStr
 
-from kapy.agent import AgentPayloadStore, PayloadRef, Runner, RunnerConfig
+from kapy.agent import AgentPayloadStore, ContextBudgetExceeded, PayloadRef, Runner, RunnerConfig
 from kapy.agent.codec import DELTA_LIMIT, json_bytes
 from kapy.state import (
     CheckpointWrite,
@@ -396,3 +396,78 @@ async def test_rejected_wait_is_correctable_and_large_media_stays_text() -> None
     assert "exceeds" in json.dumps(requests[2])
     assert not any(call[1] == "file.chunk" for call in caller.calls)
     assert any(call[1] == "file.abort" for call in caller.calls)
+
+
+@pytest.mark.asyncio
+async def test_explicit_context_rejection_is_bounded_across_recovery() -> None:
+    requests = []
+
+    def reject(request: httpx2.Request) -> httpx2.Response:
+        requests.append(json.loads(request.content))
+        return httpx2.Response(
+            400,
+            json={
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "maximum context length exceeded",
+                }
+            },
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(reject)) as client:
+        agent = runner(client)
+        initial = agent.initial_state(instructions="fixed", skills=[])
+        cycles: list[dict[str, Any]] = []
+        for index in range(10):
+            cycles.append(
+                {
+                    "turn_id": str(index),
+                    "closed": True,
+                    "level": 0,
+                    "inputs": [f"old input {index}"],
+                    "output": "old answer",
+                    "messages": [
+                        {
+                            "kind": "request",
+                            "parts": [
+                                {"part_kind": "user-prompt", "content": f"old input {index}"}
+                            ],
+                        },
+                        {
+                            "kind": "response",
+                            "parts": [{"part_kind": "text", "content": "old answer"}],
+                        },
+                    ],
+                }
+            )
+        initial.data["cycles"] = cast(Any, cycles)
+        ctx = Context(initial)
+        with pytest.raises(ContextBudgetExceeded):
+            await agent(ctx)
+        assert len(requests) == 3
+        assert ctx.state.data["context_retries"] == 2
+        ctx.attempt, ctx.recovered = 2, True
+        with pytest.raises(ContextBudgetExceeded):
+            await agent(ctx)
+        assert len(requests) == 4
+        assert ctx.state.data["context_retries"] == 2
+
+
+@pytest.mark.asyncio
+async def test_authentication_error_does_not_trigger_media_or_context_retries() -> None:
+    requests = []
+
+    def reject(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(
+            401, json={"error": {"message": "Invalid API key for image service"}}
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(reject)) as client:
+        agent = runner(client)
+        ctx = Context(agent.initial_state(instructions="", skills=[]))
+        with pytest.raises(Exception) as caught:
+            await agent(ctx)
+    assert getattr(caught.value, "status_code", None) == 401
+    assert len(requests) == 1
+    assert not any(delta.kind == "notice" for delta in ctx.deltas)

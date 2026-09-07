@@ -5,6 +5,7 @@ import codecs
 import hashlib
 import json
 import mimetypes
+from dataclasses import asdict
 from importlib.resources import files
 from pathlib import PurePosixPath
 from typing import Any, Literal, cast
@@ -15,6 +16,7 @@ from pydantic_ai import BinaryContent, ModelRetry, RunContext, Tool, ToolReturn
 
 from kapy.rpc import JsonObject, MachineCaller, RpcDisconnected, RpcError, RpcTimeout
 
+from .payloads import PayloadRef
 from .types import ProcessCommand, ScriptTool
 
 
@@ -294,18 +296,38 @@ class Operation:
 
     async def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         params = {"session_id": str(self.runtime.context.session.id), **params}
+        saved_params = await self.externalize(params)
         assert self.record is not None
         steps: list[dict[str, Any]] = self.record["steps"]
         index = self.index
         self.index += 1
         if index < len(steps):
             step = steps[index]
-            if step["method"] != method or step["params"] != params:
+            if step["method"] != method or step["params"] != saved_params:
                 raise OutcomeUnknown(
                     "Recovered operation parameters differ; no command was replayed"
                 )
             if "result" in step:
-                return step["result"]
+                return await self.hydrate(step["result"])
+            result = await self.observe(method, params)
+        else:
+            step = {"method": method, "params": saved_params}
+            steps.append(step)
+            await self.runtime.checkpoint()
+            try:
+                result = await self.caller.call(
+                    self.machine, method, cast(JsonObject, params), timeout=60.0
+                )
+            except RpcDisconnected, RpcTimeout:
+                result = await self.observe(method, params)
+        if not isinstance(result, dict):
+            raise ValueError("Machine returned an invalid result")
+        step["result"] = await self.externalize(result)
+        await self.runtime.checkpoint()
+        return result
+
+    async def observe(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        try:
             if method.startswith("process.") and "process_id" in params:
                 result = await self.caller.call(
                     self.machine,
@@ -319,7 +341,7 @@ class Operation:
                 )
                 if method not in ("process.start", "process.wait"):
                     raise OutcomeUnknown(
-                        "Observed process after an interrupted operation; result unknown"
+                        "Process observed; interrupted operation outcome is unknown"
                     )
             elif "transfer_id" in params:
                 result = await self.caller.call(
@@ -333,22 +355,40 @@ class Operation:
                     timeout=60.0,
                 )
                 if method not in ("file.push", "file.pull", "file.finish"):
-                    raise OutcomeUnknown(
-                        "Observed interrupted transfer; chunk delivery outcome unknown"
-                    )
+                    raise OutcomeUnknown("Transfer observed; chunk delivery outcome is unknown")
             else:
-                raise OutcomeUnknown("Interrupted non-idempotent operation was not replayed")
-        else:
-            step = {"method": method, "params": params}
-            steps.append(step)
-            await self.runtime.checkpoint()
-            result = await self.caller.call(
-                self.machine, method, cast(JsonObject, params), timeout=60.0
-            )
+                raise OutcomeUnknown("Interrupted operation was not replayed")
+        except (RpcError, RpcDisconnected, RpcTimeout) as exc:
+            raise OutcomeUnknown("Could not recover the known process or transfer handle") from exc
         if not isinstance(result, dict):
-            raise ValueError("Machine returned an invalid result")
-        step["result"] = result
-        await self.runtime.checkpoint()
+            raise OutcomeUnknown("Invalid observation of an interrupted operation")
+        return result
+
+    async def externalize(self, value: dict[str, Any]) -> dict[str, Any]:
+        result = dict(value)
+        if isinstance(result.get("data_base64"), str) and len(result["data_base64"]) > 4096:
+            data = base64.b64decode(result.pop("data_base64"), validate=True)
+            ref = await self.runtime.codec.store.put(self.runtime.context.session.id, data)
+            result["kapy_chunk_payload"] = asdict(ref)
+        # Process output carries chunks one level below output/stream.
+        if "output" in result:
+            result["output"] = {
+                key: await self.externalize(item) if isinstance(item, dict) else item
+                for key, item in result["output"].items()
+            }
+        return result
+
+    async def hydrate(self, value: dict[str, Any]) -> dict[str, Any]:
+        result = dict(value)
+        if "kapy_chunk_payload" in result:
+            ref = PayloadRef(**result.pop("kapy_chunk_payload"))
+            data = await self.runtime.codec.store.get(self.runtime.context.session.id, ref)
+            result["data_base64"] = base64.b64encode(data).decode()
+        if "output" in result:
+            result["output"] = {
+                key: await self.hydrate(item) if isinstance(item, dict) else item
+                for key, item in result["output"].items()
+            }
         return result
 
     def decode_update(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -498,7 +538,7 @@ class Operation:
 
     @staticmethod
     def finished(update: dict[str, Any]) -> bool:
-        return update["process"]["state"] in ("exited", "killed", "failed", "lost", "released")
+        return update["process"]["state"] in ("exited", "killed", "failed")
 
     async def preparation(self, argv: tuple[str, ...]) -> dict[str, Any]:
         update = await self.command(argv)
@@ -542,7 +582,11 @@ class Operation:
         platform = manifest["platforms"][arch]
         directory = f"{workspace}/.kapy-tools/apply-patch/{platform['bundle_sha256']}"
         key = f"{self.machine}:{platform['bundle_sha256']}"
-        if key not in self.runtime.data.setdefault("installed_plugins", []):
+        assert self.record is not None
+        needed = self.record.setdefault(
+            "install_needed", key not in self.runtime.data.setdefault("installed_plugins", [])
+        )
+        if needed:
             await self.preparation(("mkdir", "-p", "--", directory))
             for name, metadata in platform["files"].items():
                 data = resources.joinpath(arch, name).read_bytes()
@@ -553,6 +597,7 @@ class Operation:
                     raise ValueError("Bundled apply_patch resource failed verification")
                 await self.push(f"{directory}/{name}", data)
             await self.preparation(("chmod", "700", "--", f"{directory}/apply_patch"))
-            self.runtime.data["installed_plugins"].append(key)
+            if key not in self.runtime.data["installed_plugins"]:
+                self.runtime.data["installed_plugins"].append(key)
             await self.runtime.checkpoint()
         return f"{directory}/apply_patch"
