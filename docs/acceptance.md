@@ -10,7 +10,7 @@ and installed CLI, using distinct PostgreSQL schemas and execution XDG directori
 | Machine connection | Authenticated outbound WS connects; pending RPC fails promptly on disconnect; reconnect restores requests without losing still-running daemon processes |
 | stdio | Exact stdout/stderr and exit status for ordinary and large output; no 8192-byte truncation; bounded resident memory through streaming/spooling |
 | PTY | isatty true, interactive input and Ctrl-C, timeout leaves process alive, subsequent wait completes, concurrent PTYs independent |
-| Process lifecycle | Kill handles descendants, completed jobs are reaped, daemon shutdown cleans up owned children; session and machine context available in child CLI |
+| Process lifecycle | Process-group kill, child reaping and best-effort descendant cleanup in a dedicated Docker machine; session and machine context available in child CLI; escaped descendants are a documented limit |
 | PTY buffer | At most 8192 raw bytes retained with explicit truncation/cursor information after sustained large output |
 | Files | Direct chunk transfer and presigned HTTP upload/download preserve hash for a 64 MiB file; interrupted transfer is reported without claiming success |
 | Sessions | Concurrent distinct sessions, no overlapping runs within one session, durable CRUD and default/multiple-machine selection |
@@ -39,6 +39,9 @@ and installed CLI, using distinct PostgreSQL schemas and execution XDG directori
   measure response latency and count explicit errors/timeouts, never silently discard.
 
 Do not restart shared development database containers while senior tests are running.
+Machine research and real process/file tests run in a dedicated Docker container,
+not on the host or within Lody's runtime. Perfect cleanup of escaped descendants is
+not a gate. Compression token counts must use provider API usage, per user direction.
 Restart tests use an isolated control process/schema or dedicated disposable service.
 Real Telegram messages are excluded until explicitly authorized. No throughput target
 was requested, so report measurements rather than inventing a service-level guarantee.

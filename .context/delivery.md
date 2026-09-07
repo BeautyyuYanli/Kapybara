@@ -1,5 +1,36 @@
 # Kapy v2 delivery ledger
 
+## Latest user corrections — override older proposal/environment notes
+
+The lead discovered queued user steering by reading CURRENT Lody session history
+at 12:30 UTC; these messages had not appeared in the active model conversation:
+- 12:08: Research/test execution machines in Docker containers, not on the host.
+- 12:08: Perfect process-tree cleanup is not required; use reasonable best effort.
+- 12:09–12:10: The product is Kapy v2. Lody is only the delegation tool; do not
+  investigate Lody's runtime environment.
+- 12:15: Token counts must come from API usage; do not count with tiktoken.
+
+Lead acknowledged these corrections and sent `kapy-v2-user-steering-critical-20260907`
+to all seniors at 12:31 UTC. Execution implementation approval remains valid, with
+cgroup requirements removed. Intelligence must use provider usage only, no local
+token estimates. docs/contracts.md and docs/acceptance.md updated; obsolete
+scripts/with_cgroup.sh removed. Dockerfile.machine and Compose dev-profile machine
+added: dedicated PID namespace/init, 2 GiB memory, 256 PIDs, read-only src/tests/
+scripts/pyproject mounts, no .env mount. Image kapy-v2-machine:dev builds on the
+already built kapy-v2:dev scaffold image; build/up currently in exec session 82428.
+
+IMPORTANT: Lody completions and cross-session/user messages can remain queued while
+the lead's active turn continues. Occasionally read lody_session_history(current),
+filter recent user entries and incorporate actual user corrections immediately.
+Do not merely wait for native injection. Initial proposals operation is finished;
+its result was retrieved once (not a polling loop). Relevant incoming messages are
+visible in current Lody history. Last read included messages through 12:29 UTC.
+
+State early public contracts 4b42349 were reviewed/merged to main; Ruff and pyrefly
+pass. Only dataclasses/protocols/errors are implemented on main, no SessionService
+yet. State revised proposal 3a3a10e was approved and merged; its wait_submission,
+export_history and update/delete request_id additions are authorized.
+
 Lead workspace: /home/beautyyu/Development/kapy_v2, branch main.
 Initial scaffold: a715b926c1f7da46be82b2afc26f31e330d9bf94.
 

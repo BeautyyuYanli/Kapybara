@@ -46,9 +46,11 @@ aliases for discarded draft names.
 - Local proxy uses Execution's call_local_proxy with ProxyAuth, NDJSON proxy.call,
   remote control.proxy, and KAPY_DAEMON_SOCKET. Gateway CLI owns argument parsing;
   Execution owns transport/framing. An Execution-owned XDG path resolver is allowed.
-- A writable delegated cgroup v2 subtree is required for reliable process-tree
-  cleanup. scripts/with_cgroup.sh establishes a dedicated user scope and exports
-  KAPY_CGROUP_ROOT. Never change or kill the enclosing Lody service/cgroup.
+- User clarification: execution-machine research and acceptance run in a dedicated
+  Docker container. Use ordinary process groups and best-effort descendant cleanup;
+  perfect cleanup of escaped setsid/double-fork descendants is not required. There
+  is no mandatory cgroup delegation or cgroup_root setting. Lody is only the agent
+  coordination tool, not part of Kapy's execution environment.
 - Any stdin capability needed by plugins must be agreed between Execution and
   Intelligence and remain bounded. Existing file transfer supports large content;
   executable permissions can be established by ordinary managed commands.
@@ -60,6 +62,9 @@ aliases for discarded draft names.
   Store content before the referencing checkpoint and use the saved content on
   recovery. Intelligence exports initialization and session-media cleanup for
   Gateway to compose. Model-attempt markers fit existing opaque output data.
+- User clarification: token counts come from provider API usage. Do not calculate
+  a second token count with tiktoken or byte-length heuristics. Preserve reported
+  usage for compression decisions; before the first report the count is unknown.
 - Intelligence exports an explicit session initialization function returning
   RunnerState with the creation-time skill-description snapshot. Gateway invokes it.
 - wait_for authorization uses an injected Gateway capability; UUID knowledge is
