@@ -7,6 +7,7 @@ from .payloads import (
     PayloadRef,
     PayloadTooLarge,
 )
+from .runner import Runner
 from .types import (
     AgentResourceLimit,
     AuthorizeWait,
@@ -27,5 +28,6 @@ __all__ = [
     "PayloadTooLarge",
     "ProcessCommand",
     "RunnerConfig",
+    "Runner",
     "ScriptTool",
 ]
