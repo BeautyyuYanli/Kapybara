@@ -205,10 +205,13 @@ Database errors are mapped to State errors without exposing original SQL or conn
 Run `uv run ruff check src/kapy/state tests/state`,
 `uv run pyrefly check src/kapy/state tests/state`, and
 `uv run pytest -q -s tests/state`. `tests/state/pyrefly.toml` supplies only the test package's import
-roots; no shared configuration or dependencies changed. Tests use the architect's loopback
-PostgreSQL/Valkey with a new `state_test_<uuid>` schema/namespace per test. Cleanup drops only
-that exact owned schema. Recovery kills only a dedicated control subprocess; no shared database
-or Valkey restart/flush is performed. No Telegram messages are sent.
+roots; no shared configuration or dependencies changed. Tests read `KAPY_DATABASE_URL` and
+`KAPY_VALKEY_URL` from the process environment, without loading `.env`. When unset, they fall back
+to `postgresql://kapy:kapy-local@127.0.0.1:55432/kapy` and `redis://127.0.0.1:56379/0`.
+The recovery subprocess receives those same effective addresses explicitly in its environment.
+Each test uses a new `state_test_<uuid>` schema/namespace; cleanup drops only that exact owned
+schema. Recovery kills only a dedicated control subprocess; no shared database or Valkey
+restart/flush is performed. No Telegram messages are sent.
 
 The load tests print accepted/completed/replayed counts, ordering and timings for 100 sessions
 with 20 inputs each, and distinct deliveries/consumption/latency for 100 event listeners.

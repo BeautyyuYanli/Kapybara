@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 from uuid import uuid4
 
@@ -8,7 +9,7 @@ from psycopg.types.json import Jsonb
 
 from kapy.state import CheckpointWrite, Conflict, RunContext, RunnerState, RunResult, migrate
 
-from .conftest import DATABASE_URL, Database, spec
+from .conftest import DATABASE_URL, VALKEY_URL, Database, spec
 from .test_service import result, simple
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -18,7 +19,7 @@ async def test_abrupt_control_process_exit_recovers_committed_checkpoint(
     database: Database,
 ) -> None:
     worker = """
-import asyncio, json, sys
+import asyncio, json, os, sys
 from uuid import uuid4
 from kapy.state import SessionService, SessionSpec, RunnerState, CheckpointWrite
 async def runner(ctx):
@@ -27,8 +28,8 @@ async def runner(ctx):
     print(json.dumps({"session_id": str(ctx.session.id), "run_id": str(ctx.run_id)}), flush=True)
     await asyncio.Event().wait()
 async def main():
-    async with SessionService(database_url="postgresql://kapy:kapy-local@127.0.0.1:55432/kapy",
-            valkey_url="redis://127.0.0.1:56379/0", runner=runner,
+    async with SessionService(database_url=os.environ["KAPY_DATABASE_URL"],
+            valkey_url=os.environ["KAPY_VALKEY_URL"], runner=runner,
             schema=sys.argv[1], namespace=sys.argv[1]) as service:
         await service.create_session(SessionSpec("crash", (), None, {}, RunnerState("fake-v1", {})),
                                      request_id=uuid4(), input="once")
@@ -40,6 +41,7 @@ asyncio.run(main())
         "-c",
         worker,
         database.schema,
+        env={**os.environ, "KAPY_DATABASE_URL": DATABASE_URL, "KAPY_VALKEY_URL": VALKEY_URL},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

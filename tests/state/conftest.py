@@ -1,6 +1,7 @@
 """Each test owns a fresh schema; no shared service is restarted or flushed."""
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,8 +15,10 @@ from valkey.asyncio import Valkey
 
 from kapy.state import RunnerState, SessionRunner, SessionService, SessionSpec, migrate
 
-DATABASE_URL = "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
-VALKEY_URL = "redis://127.0.0.1:56379/0"
+DATABASE_URL = os.environ.get(
+    "KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
+)
+VALKEY_URL = os.environ.get("KAPY_VALKEY_URL", "redis://127.0.0.1:56379/0")
 
 
 def spec(title: str = "test") -> SessionSpec:
