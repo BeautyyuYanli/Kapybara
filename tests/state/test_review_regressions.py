@@ -270,6 +270,15 @@ async def test_receipt_wait_is_nonconsuming_repeatable_and_closes_promptly(
     for target, key in ((uuid4(), created.submission.request_id), (created.session.id, uuid4())):
         with pytest.raises(NotFound):
             await service.wait_submission(target, key)
+    release.set()
+    # Read the durable result directly before any observer can touch a completed receipt.
+    await database.completed(created.submission.request_id)
+    events = await database.rows("SELECT id,state FROM events ORDER BY ordinal")
+    assert any(event["state"] == "pending" for event in events)
+    subscriptions = await database.rows(
+        "SELECT * FROM subscriptions ORDER BY channel_id,session_id"
+    )
+    inputs = await database.rows("SELECT id,state,event_id FROM inputs ORDER BY id")
     observers = [
         asyncio.create_task(
             service.wait_submission(
@@ -278,20 +287,16 @@ async def test_receipt_wait_is_nonconsuming_repeatable_and_closes_promptly(
         )
         for _ in range(2)
     ]
-    release.set()
     first, second = await asyncio.gather(*observers)
     assert first == second and first.completion is not None
     assert first.completion.output == "receipt output"
-    events = await database.rows("SELECT id,state FROM events ORDER BY ordinal")
-    subscriptions = await database.rows(
-        "SELECT * FROM subscriptions ORDER BY channel_id,session_id"
-    )
     assert await service.wait_submission(created.session.id, created.submission.request_id) == first
     assert await database.rows("SELECT id,state FROM events ORDER BY ordinal") == events
     assert (
         await database.rows("SELECT * FROM subscriptions ORDER BY channel_id,session_id")
         == subscriptions
     )
+    assert await database.rows("SELECT id,state,event_id FROM inputs ORDER BY id") == inputs
     await service.__aexit__(None, None, None)
     reopened = await database.start(blocked)
     assert (

@@ -49,10 +49,13 @@ async def test_hundred_sessions_twenty_inputs_and_replay(database: Database) -> 
     async with asyncio.timeout(120):
         while True:
             counts = await database.rows(
-                "SELECT count(*) AS completed FROM requests WHERE operation='input' "
-                "AND completion IS NOT NULL"
+                "SELECT count(*) FILTER (WHERE completion->>'outcome'='completed') AS completed, "
+                "count(*) FILTER (WHERE completion->>'outcome'='failed') AS failed "
+                "FROM requests WHERE operation='input'"
             )
-            if counts[0]["completed"] == 2000:
+            assert counts[0]["failed"] == 0, "load inputs must complete successfully"
+            completed = counts[0]["completed"]
+            if completed == 2000:
                 break
             await asyncio.sleep(0.05)
     elapsed = time.perf_counter() - started
@@ -78,7 +81,7 @@ async def test_hundred_sessions_twenty_inputs_and_replay(database: Database) -> 
             {
                 "sessions": 100,
                 "accepted": 2000,
-                "completed": 2000,
+                "completed": completed,
                 "replayed": replayed,
                 "ordered_sessions": len(seen),
                 "seconds": round(elapsed, 3),
