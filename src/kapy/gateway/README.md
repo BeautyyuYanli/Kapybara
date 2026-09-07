@@ -109,3 +109,32 @@ machine image. The container needs network access to the development PostgreSQL/
 ports; process and filesystem isolation remain enabled. The regression starts the actual
 `kapy server` entry, exercises authenticated child CLI calls and multichunk skill transfers,
 checks reconnect, and waits for durable final deletion to remove the machine session.
+
+Telegram replies use one stable nonzero `sendMessageDraft` ID per logical run in
+private chats (including private topics), refreshing changed text and idle drafts
+about every 20 seconds. Tool calls and waiting/attempt notices are not chat messages.
+Completed model messages provide authoritative text; failed temporary attempts are
+removed. Groups and group topics receive only the final reply. Final replies are
+persisted with `sendMessage`, split at paragraph/scalar boundaries within 4000 UTF-16
+units without truncation. A draft is temporary, expires after roughly 30 seconds,
+and is never a final receipt. Restart sends the active draft again. Draft HTTP 400
+falls back to final-only delivery; errors remain natural, explicit failures without
+raw exception strings. Normal replies and implicit session creation have no session
+IDs; `/new` gives a brief confirmation.
+
+Delivery projection version 1 reuses the existing cursor, pending text, and acknowledged
+character offset. Terminal processing stops at the terminal record's cursor, leaving
+later runs for another read. Same-route sessions follow their creating inbox update
+order; pending or running replies block later sessions, while drained waiting sessions
+do not. HTTP retry deadlines survive restart. A successful send with a lost response
+or database acknowledgement may repeat the unacknowledged segment (at least once).
+
+Upgrade contract: `empty_projection()` returns exactly `{"version": 1, "messages": {}}`.
+A newly empty `{}` initializes normally. Any nonempty unversioned projection requires
+operator migration and is left untouched; Gateway logs the required offline drain.
+For the controlled upgrade, stop old control, verify every session has no active run,
+every delivery cursor has reached output end, and no pending text or nonzero offset
+exists. Only then replace projections with this empty shape while preserving cursors.
+If input or output raced the stop, resume the old version and drain before trying again.
+Never reset active delivery state, replay historical completed messages, or discard
+unacknowledged text. No migration runner or legacy rendering emulation is provided.

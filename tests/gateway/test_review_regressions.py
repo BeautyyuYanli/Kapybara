@@ -9,7 +9,7 @@ from kapy.agent import AgentResourceLimit
 from kapy.gateway.auth import Principal
 from kapy.gateway.machines import Connection
 from kapy.gateway.params import Create
-from kapy.gateway.telegram import MESSAGE_BYTES, TelegramFailure, TelegramFrontend, project
+from kapy.gateway.telegram import TelegramFailure, TelegramFrontend, project
 from kapy.rpc import RpcError
 
 from .test_control import OPERATOR, create
@@ -233,17 +233,14 @@ async def test_model_command_updates_waiting_session_with_persistent_run_id(gate
     assert (await gateway.sessions.get_session(sid)).config["model"] == "newer-model"
 
 
-async def test_projection_stays_bounded_across_many_pages():
-    projection = {}
-    notices = 0
-    for _ in range(200):
-        text, projection = project(
-            [{"kind": "text_delta", "message_id": "same", "data": {"text": "😀" * 2000}}],
-            projection,
-        )
-        notices += text.count("further text omitted")
-        assert len(projection["messages"]["same"].encode()) <= MESSAGE_BYTES
-    assert notices == 1
+async def test_terminal_projection_releases_accumulated_messages():
+    preview, projection = project(
+        [{"kind": "text_delta", "message_id": "same", "data": {"text": "Hello"}}], {}
+    )
+    assert preview == "Hello"
+    _, projection = project([{"kind": "final", "data": {"output": "Hello"}}], projection)
+    assert projection["pending"]["text"] == "Hello"
+    assert projection["pending"]["next"] == {"version": 1, "messages": {}}
 
 
 @pytest.mark.parametrize("loop", ["poll", "process", "deliver"])
