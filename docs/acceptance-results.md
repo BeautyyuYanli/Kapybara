@@ -139,3 +139,16 @@ last 8,192 bytes and reported truncation. Process release and session directory
 cleanup succeeded. The Python benchmark process peaked at 72,948 KiB RSS. These
 are sequential peak-RSS deltas, not total container/child memory or concurrency
 ceilings; the measurements do not claim complete cleanup of escaped descendants.
+
+## Credentials and package distribution
+
+The supplied Telegram token passed `getMe`, and `getChat` returned the configured
+private chat ID. Both calls returned HTTP 200 / `ok=true`. No real message was sent,
+no updates were consumed and no bot configuration was changed.
+
+`uv build` produced the complete provisional product wheel from the recorded
+`product-tests-2` snapshot. All seven package entry modules were present; bundled
+`apply_patch` resource hashes matched the generated manifest for x86_64 and aarch64.
+Installing this wheel with `uvx --from <wheel> kapy --help` succeeded in a temporary
+Docker container and exposed `server`, `control-server` and `control`. This checks
+distribution of the committed snapshot; the final reviewed main build remains due.
