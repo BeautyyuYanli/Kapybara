@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import threading
 import weakref
 from typing import cast
@@ -16,6 +17,8 @@ from kapy.skills.archive import Archive, validate_archive
 
 from .test_archive import archive  # type: ignore[missing-import]
 
+DATABASE = os.environ.get("KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy")
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio
@@ -24,7 +27,7 @@ async def test_revision_race_download_snapshot_and_receipt_rollback(
 ) -> None:
     schema = f"test_skill_race_{uuid4().hex}"
     async with AsyncConnectionPool(
-        "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy",
+        DATABASE,
         open=False,
     ) as pool:
         try:
@@ -129,7 +132,7 @@ async def test_revision_race_download_snapshot_and_receipt_rollback(
 async def test_durable_crud_replay_and_session_payload_isolation() -> None:
     schema = f"test_intelligence_{uuid4().hex}"
     async with AsyncConnectionPool(
-        "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy",
+        DATABASE,
         open=False,
     ) as pool:
         try:
