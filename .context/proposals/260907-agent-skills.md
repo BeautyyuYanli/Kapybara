@@ -315,7 +315,7 @@ HTTP 400/422 必须带媒体字段/类型/解码相关错误证据才归入此�
 
 压缩仅改变 Runner 的模型上下文投影。State 原始 PostgreSQL 历史完整保留，基础 instruction 说明可用 `kapy control history` 查找旧记录；不引入向量库、LLM 总结、摘要树或独立检索系统。[Pydantic 消息历史说明](https://pydantic.dev/docs/ai/core-concepts/message-history/)
 
-窗口 C 来自配置。每次完整模型响应保存该响应自身的 `ModelResponse.usage`（RequestUsage），按 main 统一裁决使用 `input_tokens + output_tokens >= 0.70 * C` 决定在下一次请求前进行一次压缩。两项都是这一次响应的 API 实报值，不是本地估算下一请求。input_tokens 按 provider 定义包含 cached input，不减去 cache_read_tokens，也不重复加上它。不能用整个 AgentRunResult.usage 的累加值判断单次上下文；result.usage 仍是可用于报告的属性。实际 Chat 适配器为流式请求设置 include_usage；未收到有效 usage 或适配器仅有缺省全零值时，计数视为未知。
+窗口 C 来自配置。每次完整模型响应保存该响应自身的 `ModelResponse.usage`（RequestUsage），按用户最新最高优先级规则使用 `input_tokens >= 0.70 * C` 决定在下一次请求前进行一次压缩。input_tokens 是该次完整请求的 API 实报值，按 provider 定义包含 cached input，不减去 cache_read_tokens，也不重复加上它；output_tokens 可保留用于记录，但不加入这一压缩判据。不能用整个 AgentRunResult.usage 的累加值判断单次上下文；result.usage 仍是可用于报告的属性。实际 Chat 适配器为流式请求设置 include_usage；未收到有效 usage 或适配器仅有缺省全零值时，计数视为未知。
 
 不调用 tiktoken，不按字节、字符或媒体大小换算 tokens，不给媒体添加估算 reserve。第一次请求没有历史 usage，不能在创建 session 时虚构 token 计数；initial_state 只校验配置和持久化大小。max_output_tokens 作为发送给模型的输出上限配置，不声称仅凭前一次请求的 usage 能精确预测下一次请求大小。
 
