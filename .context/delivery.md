@@ -26,6 +26,52 @@ and integrate committed branches. Route implementation defects back to owners.
 - Root .env contains existing provider/Telegram configuration, chmod 600, ignored.
 - Real model inference is authorized; sending Telegram messages requires explicit
   user authorization. Test outbound behavior against a local fake until then.
+- Python wheel/sdist and Docker `kapy-v2:dev` scaffold builds pass (not yet a
+  runnable application). CLI entry is `kapy.cli:main`, Docker CMD `kapy control-server`.
+- `uv run --env-file .env python scripts/check_provider.py` passed: real configured
+  model, one harmless tool call, two model requests, exact marker returned.
+- Lody's cgroup is not delegated. A separate `systemd-run --user --scope --collect
+  --property=Delegate=yes` scope was verified to have writable cgroup.procs and
+  cgroup.kill. Do not modify Lody's service/cgroup. Execution senior owns daemon
+  logic; architect can run integrated checks in a dedicated delegated scope.
+
+## Proposal review in progress
+
+All four draft proposals are on disk under their worktree `.context/proposals/`:
+`260907-execution-rpc.md`, `260907-state-service.md`, `260907-agent-skills.md`,
+`260907-gateway-cli-telegram.md`. Lead read all four drafts. No implementation has
+been approved yet; await cmd-proposal simplification pass and final committed result.
+
+Directed revisions already sent through Lody:
+
+- Adopt State's exact SessionSpec/View/Submission/RecordPage and Python UUID IDs,
+  request_id, RunContext/RunnerState/CheckpointWrite/OutputDelta/RunResult contract.
+  Intelligence must not define a competing runner protocol; Gateway must not invent
+  another SessionService. Telegram derives UUID5 request ids from bot/update/action.
+- State owns its pool/Valkey; Gateway owns its metadata pool (may lend it to Skills).
+  Run each module's migrations in application lifespan; no centralized framework.
+- Gateway owns creator/child-session ACLs, channel grants and machine cleanup outbox;
+  State takes authorized session_ids filters, not an AuthorizationScope framework.
+  Session capability signatures must bind session_id AND machine_id.
+- Adopt Execution's RpcPeer async-context callbacks, MachineCaller timeout, NDJSON
+  proxy.call/control.proxy auth envelope, KAPY_DAEMON_SOCKET, session.release and
+  process.start(mode)/wait/read plus file.push/pull/chunk/finish/abort contracts.
+  Intelligence must not assume process.run/file.stat/read/write RPCs exist.
+- State page cap should be 512 KiB to leave envelope room within 1 MiB RPC frames.
+- Skills use path-based upload/download over existing machine file transfer instead
+  of another chunk-upload handle subsystem; bounded archive bytes in PostgreSQL okay.
+- Intelligence must resolve 20 MiB BinaryContent versus 256 KiB message / 4 MiB
+  checkpoint bounds using durable references and hydration, and provide explicit
+  session initialization export for Gateway. wait_for checks use Gateway authority.
+- Execution must document ordinary-user delegated-cgroup startup and safe tests;
+  root environment prerequisite is verified. Any required stdin extension must be
+  small/bounded and agreed; large plugin scripts can use existing file transfers.
+
+Recent durable operations: kapy-v2-interface-drafts-20260907,
+kapy-v2-gateway-review-directions-20260907,
+kapy-v2-intelligence-review-directions-20260907,
+kapy-execution-delegation-evidence-20260907. All are asynchronous continuations,
+not reasons to poll operation_get. Inspect final commits/proposals as delivered.
 
 ## Remaining lead work
 
