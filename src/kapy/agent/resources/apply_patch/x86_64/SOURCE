@@ -1,0 +1,4 @@
+Upstream repository: https://github.com/openai/codex
+Upstream path: codex-rs/apply-patch
+Upstream ref: rust-v0.153.4
+Upstream commit: 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a

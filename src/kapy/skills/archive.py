@@ -221,14 +221,14 @@ def extract_skill(archive_path: Path, destination: Path) -> Path:
             with path.open("xb") as file:
                 file.write(content)
             path.chmod(mode)
-        # Reserve the destination so an existing directory cannot be overwritten.
+        # Reserve an empty destination, then publish the complete tree atomically.
         destination.mkdir()
         try:
-            for child in staging.iterdir():
-                child.rename(destination / child.name)
+            staging.rename(destination)
         except BaseException:
-            shutil.rmtree(destination)
+            destination.rmdir()
             raise
     finally:
-        shutil.rmtree(staging)
+        if staging.exists():
+            shutil.rmtree(staging)
     return destination / archive.root if archive.root else destination

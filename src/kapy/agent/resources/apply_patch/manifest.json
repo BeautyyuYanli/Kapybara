@@ -1,0 +1,67 @@
+{
+  "generated_by": "kapy.agent.generate_apply_patch",
+  "platforms": {
+    "aarch64": {
+      "bundle_sha256": "0b518abbbd75016f615a6164c45f1a7571c3be6d6d55559f3019ee4913cfe0b5",
+      "files": {
+        "LICENSE": {
+          "bytes": 10926,
+          "sha256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc"
+        },
+        "NOTICE": {
+          "bytes": 242,
+          "sha256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"
+        },
+        "SKILL.md": {
+          "bytes": 11074,
+          "sha256": "c67dae643839794edfa26b9303715e78e5a1b022ecb0a96feef88100084cbc14"
+        },
+        "SOURCE": {
+          "bytes": 175,
+          "sha256": "a3f493636a17840b74edb49d843af0af8aeab82e9221b5005187f9ac5fe1e3a7"
+        },
+        "THIRD_PARTY_LICENSES.html": {
+          "bytes": 765931,
+          "sha256": "723c746c714f440c47aa7eda68f8301a2f11d552557989a568e1b2d462d23982"
+        },
+        "apply_patch": {
+          "bytes": 9227816,
+          "sha256": "b9cd56036f8f602455e32b5622cdd1dcc44b6daf65e5eb3b3f0ca2cf87f6fec4"
+        }
+      },
+      "url": "https://github.com/BeautyyuYanli/codex-apply-patch/releases/download/rust-v0.153.4/apply-patch-rust-v0.153.4-aarch64-unknown-linux-gnu.tar.gz"
+    },
+    "x86_64": {
+      "bundle_sha256": "d2b6db33f1ebdbca9691237287fe25ee4fe53b90f0255a7e3cfb82b70c721567",
+      "files": {
+        "LICENSE": {
+          "bytes": 10926,
+          "sha256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc"
+        },
+        "NOTICE": {
+          "bytes": 242,
+          "sha256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"
+        },
+        "SKILL.md": {
+          "bytes": 11074,
+          "sha256": "c67dae643839794edfa26b9303715e78e5a1b022ecb0a96feef88100084cbc14"
+        },
+        "SOURCE": {
+          "bytes": 175,
+          "sha256": "a3f493636a17840b74edb49d843af0af8aeab82e9221b5005187f9ac5fe1e3a7"
+        },
+        "THIRD_PARTY_LICENSES.html": {
+          "bytes": 765931,
+          "sha256": "723c746c714f440c47aa7eda68f8301a2f11d552557989a568e1b2d462d23982"
+        },
+        "apply_patch": {
+          "bytes": 9744992,
+          "sha256": "87edcdfcc262fa014651e84510d7c19e00cdae79c4e52646fe89b05c4eac68c0"
+        }
+      },
+      "url": "https://github.com/BeautyyuYanli/codex-apply-patch/releases/download/rust-v0.153.4/apply-patch-rust-v0.153.4-x86_64-unknown-linux-gnu.tar.gz"
+    }
+  },
+  "source_commit": "8639ac2d93442bcec5631b693b4ed7c0144422b7",
+  "version": "rust-v0.153.4"
+}
