@@ -27,6 +27,25 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+  machine:
+    profiles: ["dev"]
+    image: kapy-v2-machine:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.machine
+    init: true
+    working_dir: /workspace
+    environment:
+      PYTHONPATH: /workspace/src
+      KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
+      KAPY_VALKEY_URL: redis://valkey:6379/0
+    volumes:
+      - ./src:/workspace/src:ro
+      - ./tests:/workspace/tests:ro
+      - ./scripts:/workspace/scripts:ro
+      - ./pyproject.toml:/workspace/pyproject.toml:ro
+    mem_limit: 2g
+    pids_limit: 256
 volumes:
   postgres-data:
   valkey-data:

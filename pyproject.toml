@@ -24,6 +24,9 @@ dependencies = [
     "websockets>=17.1",
 ]
 
+[project.scripts]
+kapy = "kapy.cli:main"
+
 [build-system]
 requires = ["uv_build>=0.11.13,<0.12.0"]
 build-backend = "uv_build"
@@ -34,6 +37,9 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kapy"]
 
 [tool.pyrefly]
 project-includes = ["src", "tests"]

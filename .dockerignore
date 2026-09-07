@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+.venv
+.context
+.local
+__pycache__
+.pytest_cache
+.ruff_cache
+.pyrefly_cache
+dist
+build
+*.sqlite3
+*.log
