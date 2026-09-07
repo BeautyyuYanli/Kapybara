@@ -5,8 +5,8 @@ Initial scaffold: a715b926c1f7da46be82b2afc26f31e330d9bf94.
 
 | Owner | Lody session | Branch | Status |
 | --- | --- | --- | --- |
-| Execution | 515746bc-f9e2-4d09-a894-65067a65f369 | feat/kapyrpc | Proposal in progress |
-| State | 37703573-1ccd-4f8b-a137-ba52ca9e8e60 | feat/kapy | Proposal in progress |
+| Execution | 515746bc-f9e2-4d09-a894-65067a65f369 | feat/kapyrpc | cmd-impl approved |
+| State | 37703573-1ccd-4f8b-a137-ba52ca9e8e60 | feat/kapy | cmd-impl approved |
 | Intelligence | a88a199c-41c1-49d6-ad09-2d5b87f80b12 | feat/kapy-agentskills | Proposal in progress |
 | Gateway | 0f9cff83-dff7-4881-b5a1-a6b1e761dd27 | feat/kapycli | Proposal in progress |
 
@@ -40,7 +40,9 @@ and integrate committed branches. Route implementation defects back to owners.
 All four draft proposals are on disk under their worktree `.context/proposals/`:
 `260907-execution-rpc.md`, `260907-state-service.md`, `260907-agent-skills.md`,
 `260907-gateway-cli-telegram.md`. Lead read all four drafts. No implementation has
-been approved yet; await cmd-proposal simplification pass and final committed result.
+been approved at the time of that first reading. State and Execution have since
+completed their single simplification passes and received implementation approval
+(operations below); Intelligence and Gateway still need their directed revisions.
 
 Directed revisions already sent through Lody:
 
@@ -72,6 +74,19 @@ kapy-v2-gateway-review-directions-20260907,
 kapy-v2-intelligence-review-directions-20260907,
 kapy-execution-delegation-evidence-20260907. All are asynchronous continuations,
 not reasons to poll operation_get. Inspect final commits/proposals as delivered.
+
+## Implementation approvals
+
+- State: `kapy-state-impl-approval-20260907` at 12:12 UTC. Approved 1fbe9a5 +
+  7cae039, with 512 KiB page cap amendment. Ask for early public contract commit,
+  then full cmd-impl and real-service checks. Prior proposal coordination does not
+  mean it needs to stop for approval again.
+- Execution: `kapy-execution-impl-approval-20260907` at 12:12 UTC. Approved
+  9110153, plus ordinary-user delegated startup, request_id naming, and shared
+  `dispatch_json(payload: str, handler: RequestHandler) -> str | None` for HTTP
+  codec reuse. Ask for early rpc/types/DaemonConfig commit then full cmd-impl.
+- These two doc branches were merged into main. Future implementation merges must
+  be reviewed and tested separately. Intelligence/Gateway are not approved yet.
 
 ## Remaining lead work
 
