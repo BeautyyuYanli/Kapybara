@@ -34,6 +34,9 @@ services:
       context: .
       dockerfile: Dockerfile.machine
     init: true
+    user: "10001:10001"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     working_dir: /workspace
     environment:
       PYTHONPATH: /workspace/src
@@ -105,6 +108,9 @@ services:
     profiles: ["app"]
     image: kapy-v2:dev
     init: true
+    user: "10001:10001"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     command: ["kapy", "server"]
     # Separate filesystems/PID namespaces; loopback transport for local development.
     network_mode: service:network
@@ -119,7 +125,7 @@ services:
     volumes:
       - machine-data:/var/lib/kapy
     tmpfs:
-      - /run/kapy:mode=0700
+      - /run/kapy:uid=10001,gid=10001,mode=0700
     depends_on:
       control:
         condition: service_healthy

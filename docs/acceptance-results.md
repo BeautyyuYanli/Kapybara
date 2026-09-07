@@ -1,8 +1,9 @@
 # Acceptance results
 
-Final main passed **262 tests in 110.74 s**, with zero failures, errors or skips,
+The latest non-root deployment passed **262 tests in 116.92 s**, with zero failures, errors or skips,
 on the standard `kapy-v2_default` Docker bridge. The container had init, private
-process/filesystem namespaces, read-only code, 2 GiB memory and 256 PIDs. Tests
+process/filesystem namespaces, UID/GID 10001, no capabilities, no-new-privileges,
+read-only code, 2 GiB memory and 256 PIDs. Tests
 used PostgreSQL/Valkey service URLs with isolated schemas/namespaces. Shared pytest
 configuration now explicitly includes `docker_manager_acceptance.py`; the JUnit
 report confirms all three real Agent/MachineService checks were collected.
@@ -10,7 +11,8 @@ report confirms all three real Agent/MachineService checks were collected.
 | Final check | Result |
 | --- | --- |
 | Ruff / pyrefly | PASS / 0 errors |
-| Standard Docker test suite | 262 passed, 110.74 s |
+| Standard Docker test suite | 262 passed as non-root, 116.92 s |
+| Execution privileges | UID/GID 10001; all capabilities absent; setuid(0) denied |
 | Real model → installed CLI → child task → parent event resume | PASS, 16.20 s |
 | Control SIGKILL during real machine work | PASS; attempts 1/2, machine command executed once |
 | Wheel, generated resource hashes, Docker images, uvx CLI | PASS |
@@ -265,3 +267,26 @@ resource files match their manifest sizes and SHA-256 values for aarch64/x86_64.
 `uvx --from <wheel> kapy --help` installs and runs successfully inside Docker.
 The product and development Docker images build successfully. Old isolated
 acceptance stacks and their temporary data volumes have been removed.
+
+## Non-root execution follow-up — 2026-09-08
+
+The previous daemon and development-machine containers ran as UID 0. Both image
+defaults now use the dedicated kapy account (UID/GID 10001), and Compose explicitly
+sets that user, drops all capabilities and enables no-new-privileges. Application
+code and its virtual environment remain root-owned and unwritable by the machine.
+The runtime tmpfs is owned by 10001 with mode 0700. Root is used during image builds
+and one-time offline volume maintenance, not to run execution workloads.
+
+With no active sessions, the daemon was stopped and its existing named volume was
+migrated to UID/GID 10001. Hash checks confirmed all four regular files' contents
+were unchanged. A separate disposable container verified that newly created volumes
+and the runtime tmpfs are also owned by 10001, private (0700), and writable by kapy.
+
+Runtime checks inside both machine containers confirmed every process was non-root,
+all five capability sets were zero, no-new-privileges was active, setuid(0) failed,
+and application files were not writable. The full Compose-configured suite passed
+262 distinct tests with no skips, including real PTY/process/file/proxy checks.
+The live check_system.py task also passed on the running non-root daemon: exact
+random marker in tool history and final reply, stable create replay, eight history
+records, 44.38 ms input acceptance and 7.54 s completion. Its session was deleted.
+Telegram remains disabled.

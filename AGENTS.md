@@ -9,6 +9,10 @@ User clarifications: machine research and real process/PTY/file tests run only i
 Docker. Do not investigate the host or Lody runtime. Ordinary process groups and
 best-effort descendant cleanup suffice; do not require cgroup/systemd delegation.
 Token counts come from provider API usage, never tiktoken or local token estimates.
+Execution daemons, agent commands and machine tests must run as non-root. Docker
+machine services use UID/GID 10001, drop all capabilities and forbid privilege
+escalation. Root is only for image builds or offline volume maintenance, never
+for running the daemon or agent workload.
 
 The lead architect owns scaffolding, integration, acceptance and merging.
 Seniors implement domain logic in isolated Lody worktree sessions. Each senior must

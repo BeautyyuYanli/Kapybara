@@ -69,3 +69,17 @@ Gateway de51640 and passed a single-connection regression. Earlier Execution
 session515746bc was archived and replaced; do not revive its cgroup implementation.
 The clean closeout senior completed the approved PATH/fixture/type corrections and
 all five review stages. No implementation work remains assigned to the lead.
+
+## Non-root deployment follow-up (2026-09-08)
+
+User requires machines to have no root privileges. Architect-owned Dockerfiles now
+default to kapy UID/GID10001. Compose daemon and dev machine explicitly select that
+user, drop ALL capabilities, and set no-new-privileges. /run/kapy tmpfs has matching
+ownership and mode0700; new volume roots are created with that owner in the image.
+Existing kapy-v2_machine-data was migrated offline after confirming zero active
+sessions; all four regular files retained identical content. Runtime checks passed
+for both containers: all processes nonroot, all capability sets zero, setuid(0)
+denied, application and venv unwritable. Full Compose suite262PASS116.92s, no skips;
+JUnit .local/acceptance/nonroot.xml. Live check_system PASS7.54s, session deleted.
+Fresh anonymous-volume/tmpfs ownership and ordinary-user writes also passed.
+No domain code or dependencies changed; normal local stack runs the updated images.

@@ -45,6 +45,16 @@ daemon 使用独立文件系统与 PID 空间，由常驻 `network` 服务提供
 网络，使控制容器重启不改变 daemon 的网络空间；PostgreSQL、Valkey 和
 机器数据使用命名卷。`docker compose --profile app down` 停止栈并保留这些卷。
 
+执行机 daemon 和开发 machine 以 `kapy` 用户（UID/GID `10001:10001`）运行，
+移除全部 Linux capabilities，并启用 `no-new-privileges`。Agent 启动的命令继承
+这个普通用户身份。镜像中的应用和虚拟环境由 root 所有，执行机只能读取和执行。
+会话数据目录与运行时 socket 目录由 kapy 所有，权限为 `0700`。
+
+从旧版 root 容器升级时，先停止 daemon，将已有 machine-data 卷内数据的所有权
+迁移到 `10001:10001`，保留文件权限，再启动新镜像；不能用放宽为 `0777` 代替。
+新建数据卷自动使用镜像中正确的目录所有权。直接在 Linux 安装时，也应以普通用户
+运行 `kapy server`，不授予 sudo、容器管理权限或额外 capabilities。
+
 执行一条真实模型和机器工具验收任务：
 
 ```sh
