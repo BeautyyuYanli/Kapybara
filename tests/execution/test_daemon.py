@@ -151,6 +151,7 @@ async def test_recovery_lost_and_finished_output(tmp_path: Path):
         state_dir=tmp_path / "state", data_dir=tmp_path / "data", runtime_dir=tmp_path / "run"
     )
     pid = str(uuid4())
+    pty_id = str(uuid4())
     params: JsonObject = {
         "session_id": "s",
         "process_id": pid,
@@ -162,9 +163,24 @@ async def test_recovery_lost_and_finished_output(tmp_path: Path):
         await service.initialize()
         await store.ensure_session("s", "secret")
         await service.handle("process.start", params)
+        terminal = cast(
+            Any,
+            await service.handle(
+                "process.start",
+                {
+                    "session_id": "s",
+                    "process_id": pty_id,
+                    "mode": "pty",
+                    "argv": [sys.executable, "-c", "import os; os.write(1,b'z'*10000+b'TAIL')"],
+                },
+            ),
+        )
+        expected_tail = (b"z" * 10000 + b"TAIL")[-8192:]
+        assert terminal["process"]["state"] == "exited"
+        assert base64.b64decode(terminal["output"]["pty"]["data_base64"]) == expected_tail
         await service.aclose()
         records = await store.process_records()
-        record = records[0]
+        record = next(item for item in records if cast(Any, item["info"])["process_id"] == pid)
         info = cast(Any, record["info"])
         meta = cast(Any, record["meta"])
         info["process_id"] = str(uuid4())
@@ -182,6 +198,42 @@ async def test_recovery_lost_and_finished_output(tmp_path: Path):
                 ),
             )
             assert base64.b64decode(result["output"]["stdout"]["data_base64"]) == b"kept\n"
+            restored = cast(
+                Any,
+                await service.handle(
+                    "process.wait",
+                    {
+                        "session_id": "s",
+                        "process_id": pty_id,
+                        "wait_ms": 0,
+                        "max_bytes": 4096,
+                    },
+                ),
+            )
+            chunk = restored["output"]["pty"]
+            assert restored["process"]["state"] == "exited"
+            assert restored["process"]["output_complete"] is True
+            assert chunk["available"] == 10004
+            assert chunk["start"] == 10004 - 8192
+            assert chunk["truncated"] is True
+            assert base64.b64decode(chunk["data_base64"]) == expected_tail[:4096]
+            remaining = cast(
+                Any,
+                await service.handle(
+                    "process.wait",
+                    {
+                        "session_id": "s",
+                        "process_id": pty_id,
+                        "wait_ms": 0,
+                        "cursor": {"pty": chunk["next"]},
+                    },
+                ),
+            )["output"]["pty"]
+            assert remaining["start"] == chunk["next"]
+            assert remaining["next"] == 10004
+            assert remaining["truncated"] is False
+            assert remaining["eof"] is True
+            assert base64.b64decode(remaining["data_base64"]) == expected_tail[4096:]
             listed = cast(Any, await service.handle("process.list", {"session_id": "s"}))
             assert {item["state"] for item in listed["items"]} == {"exited", "lost"}
             with pytest.raises(RpcError, match="ensured"):

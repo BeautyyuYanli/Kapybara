@@ -4,6 +4,8 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -86,6 +88,7 @@ async def test_complete_64mib_spool_paged_hash(service: MachineService):
     assert result["process"]["output_complete"]
     cursor: dict[str, Any] = {"stdout": 0, "stderr": 0}
     digest = hashlib.sha256()
+    stderr = bytearray()
     while cursor["stdout"] < 64 * 1024 * 1024:
         result = cast(
             Any,
@@ -102,19 +105,23 @@ async def test_complete_64mib_spool_paged_hash(service: MachineService):
         chunk = payload(result)
         assert len(chunk) <= 65536
         digest.update(chunk)
+        stderr.extend(payload(result, "stderr"))
         cursor = {name: result["output"][name]["next"] for name in cursor}
     expected = hashlib.sha256()
     for _ in range(1024):
         expected.update(b"x" * 65536)
     assert digest.digest() == expected.digest()
     assert result["output"]["stdout"]["eof"]
+    assert bytes(stderr) == b"error"
+    assert result["output"]["stderr"]["eof"]
 
 
 @pytest.mark.asyncio
 async def test_pty_tail_resize_input_and_ctrlc(service: MachineService):
     params = start(
         "import os,time; os.write(1,b'x'*20000); print('READY',flush=True); "
-        "s=input(); print('GOT:'+s,flush=True); time.sleep(30)",
+        "s=input(); print('GOT:'+s,flush=True); "
+        "print('SIZE:'+str(os.get_terminal_size()),flush=True); time.sleep(30)",
         mode="pty",
     )
     first: Any = await service.handle("process.start", params)
@@ -132,6 +139,7 @@ async def test_pty_tail_resize_input_and_ctrlc(service: MachineService):
         {**identity, "wait_ms": 1000, "cursor": {"pty": first["output"]["pty"]["next"]}},
     )
     assert b"GOT:hello" in payload(result, "pty")
+    assert b"SIZE:os.terminal_size(columns=100, lines=45)" in payload(result, "pty")
     await service.handle("process.write", {**identity, "data_base64": "Aw=="})
     result = cast(Any, await service.handle("process.wait", {**identity, "wait_ms": 3000}))
     assert result["process"]["state"] == "exited"
@@ -188,19 +196,39 @@ async def test_cancelled_observer_does_not_cancel_process(service: MachineServic
 async def test_kill_after_leader_exit_and_closed_outputs(service: MachineService):
     params = start(
         "import os,time; p=os.fork(); os._exit(0) if p else None; "
-        "os.close(1); os.close(2); time.sleep(60)",
+        "print(os.getpid(),flush=True); os.close(1); os.close(2); time.sleep(60)",
         wait_ms=100,
     )
     first = cast(Any, await service.handle("process.start", params))
-    assert first["process"]["state"] == "running"
-    killed = cast(
-        Any,
-        await service.handle(
-            "process.kill", {"session_id": "s", "process_id": params["process_id"]}
-        ),
-    )
-    assert killed["state"] == "killed"
-    assert service.processes.active_count == 0
+    descendant_pid = int(payload(first).strip())
+
+    def alive() -> bool:
+        try:
+            state = Path(f"/proc/{descendant_pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            return state != "Z"
+        except FileNotFoundError:
+            return False
+
+    try:
+        assert first["process"]["state"] == "running"
+        assert alive()
+        killed = cast(
+            Any,
+            await service.handle(
+                "process.kill", {"session_id": "s", "process_id": params["process_id"]}
+            ),
+        )
+        assert killed["state"] == "killed"
+        assert service.processes.active_count == 0
+        async with asyncio.timeout(2):
+            while alive():  # noqa: ASYNC110 - observing an OS descendant, not an asyncio task
+                await asyncio.sleep(0.01)
+    finally:
+        if alive():
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.asyncio
