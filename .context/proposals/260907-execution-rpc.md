@@ -8,7 +8,7 @@
 
 `httpx2.AsyncClient.stream()` 支持 `content: AsyncIterable[bytes]`，响应支持 `aiter_raw(chunk_size=...)`，足够完成 presigned GET/PUT；本期不引入 OpenDAL。WebSocket 客户端使用实际存在的 `additional_headers`、`max_size`、`max_queue`、`write_limit` 参数。
 
-模块保持四个主要职责：`rpc/peer.py` 处理协议；`execution/daemon.py` 组织本地服务和远端连接；`execution/processes.py` 管进程；`execution/files.py` 管传输。`execution/store.py` 管 SQLite/XDG，`execution/_launcher.py` 仅负责在用户代码执行前建立进程边界和 controlling terminal。类型放各包 `types.py`，`__init__.py` 只导出下述公共接口。
+模块保持四个主要职责：`rpc/peer.py` 管 duplex 连接，`rpc/messages.py` 共用 envelope/error/batch 处理；`execution/daemon.py` 组织本地服务和远端连接；`execution/processes.py` 管进程；`execution/files.py` 管传输。`execution/store.py` 管 SQLite/XDG，`execution/client.py` 提供 CLI 可调用的本地代理客户端，`execution/_launcher.py` 仅负责在用户代码执行前建立进程边界和 controlling terminal。类型放各包 `types.py`，`__init__.py` 只导出下述公共接口。
 
 ## 2. 公共 Python 接口
 
@@ -37,6 +37,10 @@ class RpcError(Exception):
 class RpcDisconnected(Exception): ...
 class RpcTimeout(Exception): ...
 
+async def handle_request(
+    body: bytes, *, handler: RequestHandler,
+) -> bytes | None: ...
+
 class RpcPeer:
     def __init__(
         self, *, send_text: SendText, receive_text: ReceiveText,
@@ -57,17 +61,34 @@ class RpcPeer:
 class MachineCaller(Protocol):
     async def call(
         self, machine_id: str, method: str, params: JsonObject,
-        *, timeout: float = 60.0,
     ) -> JsonValue: ...
 ```
 
-`MachineCaller` 是共享类型，具体 registry/caller 由 Gateway 实现。Intelligence 持有该协议的实例，不直接导入 daemon。`params.session_id` 必须存在，Gateway 在路由前验证 session 与 machine 的关联。
+`MachineCaller` 是共享类型，具体 registry/caller 由 Gateway 实现，调用 deadline 由 Gateway 的实例配置控制，不增加公共 keyword 参数。Intelligence 持有该协议的实例，不直接导入 daemon。`params.session_id` 必须存在，Gateway 在路由前验证 session 与 machine 的关联。
 
 ```python
 # kapy.execution
 from pathlib import Path
+from typing import Literal, TypedDict
 import anyio
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from kapy.rpc import JsonObject, JsonValue
+
+class SessionProxyAuth(TypedDict):
+    kind: Literal["session"]
+    session_id: str
+    token: str
+
+class UserProxyAuth(TypedDict):
+    kind: Literal["user"]
+    token: str
+
+type ProxyAuth = SessionProxyAuth | UserProxyAuth
+
+async def call_local_proxy(
+    socket_path: Path, method: str, params: JsonObject, *,
+    auth: ProxyAuth, timeout: float = 60.0,
+) -> JsonValue: ...
 
 class DaemonConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -94,6 +115,10 @@ async def run_daemon(
 已连接的 transport 由调用方交给 peer，peer 在退出时调用 `close_transport()` 一次。`receive_text()` 返回一个完整 JSON 文本，返回 `None` 表示 EOF；transport 错误也导致断线。WebSocket adapter 将非文本消息视为协议错误；Gateway 用 Starlette `receive_text/send_text/close` 包装，daemon 用 websockets `recv/send/close` 包装。handler 的闭包绑定连接的认证身份，peer 不导入业务服务，也不从 params 推断权限。
 
 进入 async context 时启动唯一 reader 和 writer；退出时清理这两个任务及当前连接的 handlers。接收循环立即处理 response，并发 dispatch request；不能等待某个业务 handler 完成才继续接收，否则 handler 内反向 `call()` 会死锁。写入统一串行。
+
+`RpcPeer` 不另提供重复的 serve/run 启动方式。Gateway 在 `async with RpcPeer(...) as peer` 内注册已认证连接，然后 `await peer.wait_closed()` 持续服务；context 退出时注销 registry 并关闭 peer，显式 `aclose()` 可提前结束。`__aenter__` 完成后 reader/writer 已就绪，才允许 `call/notify`；重复进入或 context 外调用失败，不暗中重启已关闭连接。
+
+HTTP `POST /rpc` 由 Gateway 限长读取原始 body、处理 HTTP 认证，然后调用 `kapy.rpc.handle_request(body, handler=...)`。返回 bytes 即 UTF-8 JSON-RPC 单个或 batch 响应，Gateway 用 HTTP 200/application/json 发出；返回 None 表示有效 notification 或全 notification batch，HTTP 204 无 body。无效 JSON/UTF-8、envelope、参数和业务 RpcError 均由 rpc 包编码；HTTP 认证失败和 body 超限分别由 Gateway 返回 401/403、413。该函数只接受 request/notification，传入 response envelope 作为 Invalid Request。它与 peer 共用解析、request 校验、dispatch、error 和 batch 编码，不通过虚拟 duplex transport 模拟 HTTP。handler 仍用闭包携带认证主体；HTTP 跨请求的总并发上限由 Gateway 控制，单次处理沿用下述 rpc 限额。
 
 JSON-RPC 2.0 支持 request、response、notification、batch、命名及位置参数；缺省 params 归一为 `{}`。业务 machine/local/control 方法只接受命名参数。发送请求用连接内唯一字符串 ID；接收端保留请求 ID 的类型和值，区分缺失 ID 与 `null`。notification 无论成功或失败都不返回响应。禁止 NaN/Infinity，拒绝畸形 response，标准错误使用 -32700/-32600/-32601/-32602/-32603。[JSON-RPC 规范](https://www.jsonrpc.org/specification)
 
@@ -229,6 +254,8 @@ URL GET 没有读完整文件后才写盘的阶段，PUT 没有预读全文件�
 
 本地 endpoint 是 `${runtime_dir}/daemon.sock`，AF_UNIX stream；每行一个 UTF-8 JSON-RPC 2.0 message，末尾一个 LF，JSON 字符串内换行必须转义。行长度含 LF 不超过 1 MiB，读入时就限长。多个请求靠 ID 关联，连接可以复用。仅相同 UID 的 peer 可连接；socket 权限和 SO_PEERCRED 检查作为本机边界。
 
+Gateway CLI 调用 `kapy.execution.call_local_proxy(socket_path, method, params, auth=...)`，不自行实现 envelope、ID、error 或 framing。该函数拥有一次调用的 Unix connection/RpcPeer，返回业务 result 或抛出 RpcError/RpcTimeout/RpcDisconnected，finally 关闭连接；timeout 覆盖连接与等待的总时限，不自动重试。Gateway CLI 负责从环境/设置解析 socket_path 和 auth，并把 domain params 原样传入；客户端只包装 `proxy.call`，不读取 `.env`，不解析 CLI 命令。原始 token 不得进入客户端日志。
+
 本地只公开 `proxy.call`，不把机器进程管理 API 暴露给任意本地 CLI。params 形状如下；session 身份与人工管理员身份二选一：
 
 ```json
@@ -250,7 +277,9 @@ ProxyAuth = {kind: "session", session_id: str, token: str}
 ProxyParams = {auth: ProxyAuth, method: str, params: JsonObject}
 ```
 
-daemon 对 session auth 与内存 token 作恒时比较，拒绝尚未 ensure 或 released 的 session，然后经远端 peer 调用 **daemon → Gateway** 的 `control.proxy(ProxyParams)`。Gateway 从已鉴权 WebSocket 获取 machine_id，验证 token 与 origin session/machine 绑定及内层目标权限；内层只接受 `session.*`、`event.*`、`history.*`、`skill.*`，不能再代理 proxy/machine/process 方法。Gateway 直接返回业务 JsonValue；本地返回相同 result，保留 CLI request ID。业务 RpcError 原样映射，连接错误为 offline；不把远端 request ID 或连接认证细节当作业务结果。
+daemon 对 session auth 与内存 token 作恒时比较，拒绝尚未 ensure 或 released 的 session，然后经远端 peer 调用 **daemon → Gateway** 的 `control.proxy(ProxyParams)`。`auth.session_id` 始终是调用来源；内层 `params.session_id` 若存在，是本次操作目标，两者不能混用或相互补全。Gateway 从已鉴权 WebSocket 获取 machine_id，验证 token 与 origin session/machine 绑定及内层目标权限；内层只接受 `session.*`、`event.*`、`history.*`、`skill.*`，不能再代理 proxy/machine/process 方法。Gateway 直接返回业务 JsonValue；本地返回相同 result，保留 CLI request ID。业务 RpcError 原样映射，连接错误为 offline；不把远端 request ID 或连接认证细节当作业务结果。
+
+Gateway 下发 `session.ensure` 的完整 params 是 `{"session_id":"origin-session","session_token":"<session-machine-capability>"}`，result 是 `{"session_id":"origin-session","cwd":"<absolute-XDG-session-cwd>"}`。machine_id 来自调用所用机器连接，不在 params 中另传；cwd 由 daemon 创建，不由 token 或 CLI 指定。该方法仅存在于 Gateway → daemon 方向，和控制面的 session CRUD 方法分开 dispatch。
 
 child env 固定携带：
 
@@ -267,17 +296,17 @@ session token 的签发、撤销和持久化由 Gateway 拥有；提议每个 se
 
 ## 9. Outbound reconnect 与 idle
 
-daemon 只主动连接 `gateway_url`，使用 `Authorization: Bearer <machine_token>` 与 `kapy.jsonrpc.v1` subprotocol；Gateway 决定路由路径并验证连接对应 machine_id。WebSocket ping/pong 20 秒，不作为 JSON-RPC 业务。一个 machine 只有一个 registry 中有效的 peer，重复连接 fencing/替换由 Gateway 完成。
+daemon 只主动连接 `gateway_url`，拟采用 Gateway 的 `/rpc/machines/{machine_id}` 路径，使用 `Authorization: Bearer <machine_token>` 与 `kapy.jsonrpc.v1` subprotocol；每个机器有独立 bearer，Gateway 验证凭证与路径中的 machine_id 匹配。`DaemonConfig.gateway_url` 传完整 URL，daemon 不自行追加路径。WebSocket ping/pong 20 秒，不作为 JSON-RPC 业务。一个 machine 只有一个 registry 中有效的 peer，重复连接 fencing/替换由 Gateway 完成。
 
 网络断线按带 jitter 的指数退避重连，初始 1 秒，上限 30 秒，健康连接后复位；认证拒绝、错误配置或协议版本不匹配作为终止错误，不无限重试。重连创建新 RpcPeer，Gateway 重新 ensure session；命令和传输继续运行，stdio 继续落盘，PTY 继续维护尾窗。State/Intelligence 用原 process_id/transfer_id 查询，不重新执行副作用。process.start 的业务 ID、State 的 request_key 负责各自领域的幂等。
 
-默认 `idle_disconnect_after_s=None` 保持连接。启用后，仅在无活动进程、无传输、无 pending call/handler/local proxy，且达到业务空闲时间时断开。最多休眠 `idle_reconnect_after_s` 后主动重连；本地 proxy 到达可立即唤醒。没有独立唤醒通道，远端调用需要 Gateway 等待下次上线，受 MachineCaller timeout 限制；不能承诺离线瞬时可达。idle 关闭与远端请求竞争时按普通断线处理，不能隐式重放可能已执行的操作。
+默认 `idle_disconnect_after_s=None` 保持连接。启用后，仅在无活动进程、无传输、无 pending call/handler/local proxy，且达到业务空闲时间时断开。最多休眠 `idle_reconnect_after_s` 后主动重连；本地 proxy 到达可立即唤醒。没有独立唤醒通道，远端调用需要 Gateway 等待下次上线，受 Gateway 为 caller 配置的 deadline 限制；不能承诺离线瞬时可达。idle 关闭与远端请求竞争时按普通断线处理，不能隐式重放可能已执行的操作。
 
-Gateway caller 对暂时 offline 的机器可在 timeout 内等待一次可用连接；若超时返回 offline。daemon 接收本地 proxy 时唤醒连接并在 60 秒 call deadline 内等待；本地 caller 中断不撤销控制面可能已接收的写操作，request_key 必须由 CLI/State 配合保持。
+Gateway caller 对暂时 offline 的机器可在配置的 deadline 内等待一次可用连接；若超时返回 offline。daemon 接收本地 proxy 时唤醒连接并在 60 秒 call deadline 内等待；本地 caller 中断不撤销控制面可能已接收的写操作，request_key 必须由 CLI/State 配合保持。
 
 ## 10. 跨模块要求
 
-Gateway 接入 `RpcPeer` callbacks 和 `MachineCaller` 协议，实现 `control.proxy`、认证的 machine WS endpoint、connection fencing、按 session-machine 关联的 ensure/token 下发，以及上述 NDJSON CLI 客户端。CLI 命令参数、用户 API、Telegram 和管理员配置继续由 Gateway 拥有；Execution 不增加第二套 control dispatcher。
+Gateway 接入 `RpcPeer` callbacks 和 `MachineCaller` 协议，实现 `control.proxy`、认证的 machine WS endpoint、connection fencing、按 session-machine 关联的 ensure/token 下发；HTTP `/rpc` 调用共享 `handle_request`，CLI 调用 Execution 导出的 `call_local_proxy`。CLI 命令参数、用户 API、Telegram 和管理员配置继续由 Gateway 拥有；Execution 不增加第二套 control dispatcher。
 
 State 提供 session-machine 关联与删除状态，删除 session 前协调 machine `session.release`，离线机器保留待清理关联，重新连接后完成释放。控制面数据库中 session/input/history/event 不迁入 SQLite。递归 CLI 的 request_key、waiting_id、权限范围和完成语义仍由 State/Gateway/Intelligence 协调。
 
