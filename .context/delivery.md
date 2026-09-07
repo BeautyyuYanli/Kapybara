@@ -256,6 +256,32 @@ does not yet test interrupted model-run recovery. No associated exec remains act
 Execution later4258267 report reviewed: d6bce34 test-only Ctrl-C cursor correction,
 stages3/4/5 rerunPASS plus100tests; merged as28a6648. No production change.
 
+Update ~15:16 UTC: all four reviewed baselines are now merged. Intelligence final
+c334b42 report read/full five stagesPASS,59tests+2Docker real manager; merge12eba96.
+Gateway finalac665c6 report read/full5PASS,144Gateway/CLI/Exec/RPC Docker checks;
+merge81b71ec (main at this point). Still NOT final product acceptance complete:
+rootcheck pyrefly finds79errors only tests/agent/docker_manager_acceptance.py and
+tests/agent/test_acceptance.py with actualJsonValue type; full captured report at
+.local/acceptance/pyrefly-integrated.txt. Root Ruff passes. Native tests still cannot
+all run on Compose bridge until Intelligence/Gateway localhost fixtures acceptenv.
+At15:09 root sent ONE consolidated post-delivery corrections task to both seniors
+operation kapy-final-delivery-integration-corrections-20260907, deadline17:09: Agent
+sh-lc PATH fix+PGenv; GatewayPG/Valkeyenv. At15:13 added the newly observed79typeerrors
+to Intelligence via kapy-intelligence-integrated-typecheck-20260907 deadline17:13.
+They must fix owned files/use relevant cmd-impl reviews. No new proposal needed.
+Do not root-patch domain tests/code. Agent5da029d later onlydocs, unmerged.
+
+New product-3 generated source snapshot: main95e591d + Agentde2227e + Gateway9ff3086,
+imagekapy-v2:acceptance-3 built from currentuvlock without unusedSQLA/multipart. New
+isolated projectkapy-v2-acceptance-3 uses ownPG/Valkey/machine volumes, TGdisabled;
+networkpublishedcontrol32775,PG32774,Valkey32776. Overridecompose-product-3.json under
+.local/acceptance. Preview now32775/docs. Root check_recovery.py PASSED on this stack:
+counterwritten→SIGKILLcontrol→restartonlycontrol→originalrequestcompleted,attempts1/2,
+commandcounterexactly1,daemonStartedAtunchanged,marker in durabletoolreturn. Initial
+harness had punctuation appended to exact shell command, causingchildexit1before
+counter; fixedpromptnewlines and actualcrashrunpasses. Alltempdata/sessioncleaned;
+no activeexecfromcrashtest. Check_recursive.py still awaits realCLI PATH fix.
+
 Concrete integration defect dispatched at ~13:35 via
 kapy-shared-pool-integration-defect-20260907 to Intelligence and Gateway:
 Gateway Metadata.connection sets conn.row_factory=dict_row and returns it to the

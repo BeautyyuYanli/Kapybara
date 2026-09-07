@@ -186,3 +186,21 @@ passed afterward: stable creation replay, exact random machine marker in final a
 durable history, eight history records, 18.09 ms acceptance / 5.99 s completion.
 The temporary task was deleted. This check establishes transport recovery after
 control-container restart; interrupted model-run recovery remains a separate test.
+
+## Forced crash during a live machine task
+
+The newer isolated `kapy-v2-acceptance-3` stack combines main `95e591d` (final State
+and Execution), Agent `de2227e`, and Gateway `9ff3086`. `scripts/check_recovery.py`
+observed the machine command's first filesystem effect, sent SIGKILL to the control
+container, and restarted only that container while the machine command kept running.
+
+The original submission completed successfully after recovery. Its history recorded
+attempts **1 and 2**, and the final random marker matched a durable tool return.
+The execution daemon's start timestamp was unchanged. An append-only execution
+counter contained exactly **one byte**, confirming that the command ran once across
+the control crash. The temporary session and counter file were cleaned afterward.
+
+This check passed after correcting punctuation in the harness's exact-command
+prompt; the initial harness attempt exited before creating the counter and never
+reached the crash phase. The pass is evidence for the tested recoverable process
+operation, not a general exactly-once guarantee for arbitrary external effects.

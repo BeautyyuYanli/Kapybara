@@ -77,9 +77,9 @@ async def check(machine: str, control: str, daemon: str) -> None:
                 mode="queue",
                 payload=(
                     "Use process_start in stdio mode on the default machine to execute this "
-                    "exact command once: "
+                    "exact command once:\n"
                     + shlex.join(["python", "-c", code])
-                    + ". If it is still running, wait for that same process to finish. "
+                    + "\n\nIf it is still running, wait for that same process to finish. "
                     "Do not start it again. Reply with only the random KAPY_RECOVERY_ marker "
                     "that the process printed."
                 ),
