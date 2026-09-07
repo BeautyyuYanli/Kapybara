@@ -140,8 +140,19 @@ async def test_pty_tail_resize_input_and_ctrlc(service: MachineService):
     )
     assert b"GOT:hello" in payload(result, "pty")
     assert b"SIZE:os.terminal_size(columns=100, lines=45)" in payload(result, "pty")
+    cursor = {"pty": result["output"]["pty"]["next"]}
     await service.handle("process.write", {**identity, "data_base64": "Aw=="})
-    result = cast(Any, await service.handle("process.wait", {**identity, "wait_ms": 3000}))
+    # Quiet output is an observation, not termination. Advance beyond each
+    # observed chunk and keep one total deadline for the real Ctrl-C exit.
+    async with asyncio.timeout(3):
+        while result["process"]["state"] == "running":
+            result = cast(
+                Any,
+                await service.handle(
+                    "process.wait", {**identity, "wait_ms": 3000, "cursor": cursor}
+                ),
+            )
+            cursor = {"pty": result["output"]["pty"]["next"]}
     assert result["process"]["state"] == "exited"
     assert result["process"]["exit_code"] != 0
 
