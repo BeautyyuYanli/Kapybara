@@ -156,6 +156,11 @@ def validate_archive(data: bytes) -> Archive:
 
 
 def pack_skill(source_dir: Path, archive_path: Path) -> None:
+    """Pack a regular skill directory into a new ZIP archive.
+
+    The output must not exist, must be outside the source directory, and must
+    have an existing parent directory. Existing output is never overwritten.
+    """
     source = source_dir.absolute()
     target = archive_path.absolute()
     if source.is_symlink() or not source.is_dir():
@@ -220,6 +225,11 @@ def pack_skill(source_dir: Path, archive_path: Path) -> None:
 
 
 def extract_skill(archive_path: Path, destination: Path) -> Path:
+    """Extract into a nonexistent destination whose parent directory exists.
+
+    Never overwrite an existing target. Return the actual skill root, which may
+    be destination/name rather than destination; SKILL.md is under that root.
+    """
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
     with archive_path.open("rb") as file:

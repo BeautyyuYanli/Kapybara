@@ -117,17 +117,38 @@ should invoke these synchronous helpers in a bounded thread; the service limits
 concurrent archive validation to two tasks. Gateway owns transport chunking and
 authorization; no second transfer API is introduced.
 
-## Verification and remaining integration boundary
+## Verification
 
 Module tests use real PostgreSQL with independent random schemas for archive CRUD,
-replay/revision checks, and payload isolation. Agent tests use dummy-key
-`httpx2.MockTransport` with the actual OpenAI Chat streaming adapter and fake
-machine callers. They cover media refusal, steer, waiting authorization, cancellation
-recovery, compression, durable codec, large transfer references, and script argv.
+revision races, replay conflicts, transaction rollback, and payload isolation.
+Recovery tests serialize media and external context references, close and rebuild
+the pool, payload store, and Runner, then verify original media hydration and
+explicit missing/corrupt reference failures without rereading the machine.
+Agent tests use model and State test doubles, including dummy-key
+`httpx2.MockTransport` with the actual OpenAI Chat streaming adapter. They cover
+media refusal, steer, waiting authorization, cancellation recovery, concurrent
+session isolation, and usage-driven compression across restart.
 
-`tests/agent/docker_verify_patch.py` must run only inside a disposable Docker
-machine. It verifies the pinned binary, stdin redirection, add/update behavior, and
-literal shell-looking input. This is separate from the pending end-to-end test
-through Execution's actual process manager. That integration requires its owner to
-publish the concrete handler; the module does not supply a substitute manager.
-No real model requests or Telegram messages are part of these tests.
+Run the real Execution manager acceptance tests with:
+
+```sh
+uv run --locked python tests/agent/run_docker_acceptance.py
+```
+
+The local Git repository must contain commit `27a34dd`, and the local Docker image
+`kapy-v2-machine:dev` must be available. The launcher exports that committed
+Execution snapshot and mounts it read-only alongside this worktree's Agent and
+Skills source in a disposable container with bounded memory and process counts.
+It uses the actual `ExecutionStore` and `MachineService` to verify plugin
+installation, upload/download transfers, fixed stdin redirection, add/update
+behavior, process exits, and input-file cleanup. Assertions at RPC dispatch verify
+that complete tool calls and stable operation parameters are checkpointed;
+assertions at the next model request verify that tool results are checkpointed.
+The same Docker suite checks that interrupted extraction publishes no partial
+destination, removes its staging tree, and preserves existing content.
+
+The Docker suite still uses model and State test doubles. It makes no real model
+requests or Telegram sends, mounts no environment files or Docker socket, and
+does not test the daemon's network transport. The separate
+`tests/agent/docker_verify_patch.py` helper checks the pinned binary directly;
+the manager acceptance suite supplies the Agent-to-manager integration evidence.
