@@ -10,7 +10,7 @@ import random
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx2
 import psycopg
@@ -25,14 +25,6 @@ if TYPE_CHECKING:
     from .app import FrontendContext
 
 logger = logging.getLogger(__name__)
-MESSAGE_BYTES = 256 * 1024
-
-
-def bounded_text(text: str, budget: int = MESSAGE_BYTES) -> tuple[str, bool]:
-    encoded = text.encode("utf-8")
-    return encoded[:budget].decode("utf-8", errors="ignore"), len(encoded) > budget
-
-
 COMMANDS = {
     "new": "Create a session using saved settings",
     "settings": "Show saved settings",
@@ -68,70 +60,97 @@ def text_chunk(text: str, units: int = 4000) -> tuple[str, str]:
     for index, char in enumerate(text):
         width = 2 if ord(char) > 0xFFFF else 1
         if count + width > units:
+            boundary = text.rfind("\n\n", 0, index)
+            if boundary >= index // 2:
+                index = boundary + 2
             return text[:index], text[index:]
         count += width
     return text, ""
 
 
+def empty_projection() -> dict[str, Any]:
+    """Only install over a legacy row after an offline, verified drain."""
+    return {"version": 1, "messages": {}}
+
+
+class ProjectionMigrationRequired(ValueError):
+    """An operator must drain the old control before converting its projection."""
+
+
 def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    projection = copy.deepcopy(previous)
-    messages = projection.setdefault("messages", {})
-    limited = projection.setdefault("limited", [])
-    output: list[str] = []
+    if previous and previous.get("version") != 1:
+        raise ProjectionMigrationRequired(
+            "Telegram projection requires offline drain and migration"
+        )
+    projection = copy.deepcopy(previous or empty_projection())
+    messages = projection["messages"]
     for record in records:
         kind = record["kind"]
         data = record.get("data") or {}
         if not isinstance(data, dict):
             data = {}
+        if record.get("cursor") is not None:
+            projection["cursor"] = record["cursor"]
+        if kind not in {"text_delta", "model_response", "final", "error", "interrupted", "notice"}:
+            continue
+        run = record.get("run_id")
+        if run is not None:
+            projection["run_id"] = run
         key = record.get("message_id") or ""
-        text = record.get("text", "")
-        if kind == "text_delta":
-            if key in limited:
-                continue
-            text = str(data.get("text", text))
-            old = messages.get(key, "")
-            text, overflow = bounded_text(text, MESSAGE_BYTES - len(old.encode("utf-8")))
-            messages[key] = old + text
-            output.append(text)
-            if overflow:
-                limited.append(key)
-                output.append("\n[Response exceeded 256 KiB; further text omitted]\n")
-        elif kind == "model_response":
-            text, overflow = bounded_text(text)
-            if overflow and key not in limited:
-                limited.append(key)
-                output.append("\n[Response exceeded 256 KiB; further text omitted]\n")
-            old = messages.get(key, "")
-            if text.startswith(old):
-                output.append(text[len(old) :])
-            elif text != old:
-                output.append("\n[Corrected response]\n" + text)
-            messages[key] = text
-            projection["last_response"] = text
-        elif kind == "final":
-            final, overflow = bounded_text(str(data.get("output", text)))
-            if overflow:
-                output.append("\n[Final response exceeded 256 KiB; further text omitted]\n")
-            if final and final != projection.get("last_response"):
-                output.append("\n" + final)
-            projection["last_response"] = final
+        if kind in {"text_delta", "model_response"}:
+            message = messages.setdefault(key, {"parts": {}, "text": None})
+            if kind == "model_response":
+                message["text"] = record.get("text", "")
+                message["parts"] = {}
+            elif message["text"] is None:
+                part = str(data.get("part_index", 0))
+                message["parts"][part] = message["parts"].get(part, "") + str(data.get("text", ""))
         elif kind == "notice" and data.get("kind") == "attempt_failed":
-            output.append("\n[Model attempt failed; retrying]\n")
-            failed = projection.setdefault("failed", [])
-            failed.append(data.get("failed_message_id"))
-            projection["failed"] = failed[-32:]
-        elif kind in {"waiting", "error", "interrupted"}:
-            output.append("\n[" + kind + "]" + (" " + text if text else "") + "\n")
-        elif kind == "tool_call":
-            output.append("\n[Tool: " + str(data.get("name", "running")) + "]\n")
-        elif kind == "notice" and text:
-            output.append("\n" + text + "\n")
-        while len(messages) > 8:
-            oldest = next(iter(messages))
-            del messages[oldest]
-            if oldest in limited:
-                limited.remove(oldest)
-    return "".join(output), projection
+            failed = data.get("failed_message_id")
+            if failed in messages and messages[failed]["text"] is None:
+                del messages[failed]
+        elif kind in {"interrupted", "error"}:
+            for message_id in list(messages):
+                if messages[message_id]["text"] is None:
+                    del messages[message_id]
+        if kind in {"final", "error"}:
+            completed = [m["text"] for m in messages.values() if m["text"]]
+            if kind == "final":
+                final = str(data.get("output", record.get("text", "")))
+                # The final result replaces the last response, preserving tool preambles.
+                if final:
+                    if completed:
+                        completed[-1] = final
+                    else:
+                        completed.append(final)
+            else:
+                category = data.get("kind", "")
+                # State persists an exception class, never its raw message.
+                safe = (
+                    category
+                    if isinstance(category, str) and category.isidentifier() and len(category) <= 80
+                    else ""
+                )
+                completed.append(
+                    "Sorry, I couldn’t complete this reply." + (f" ({safe})" if safe else "")
+                )
+            text = "\n\n".join(completed)
+            following = empty_projection()
+            if "chat_type" in projection:
+                following["chat_type"] = projection["chat_type"]
+            projection["pending"] = {
+                "text": text,
+                "cursor": projection.get("cursor"),
+                "next": following,
+            }
+            break
+    preview = "\n\n".join(
+        m["text"]
+        if m["text"] is not None
+        else "".join(m["parts"][part] for part in sorted(m["parts"], key=int))
+        for m in messages.values()
+    )
+    return preview, projection
 
 
 class TelegramFrontend:
@@ -152,6 +171,7 @@ class TelegramFrontend:
         self.disabled = False
         self._chat_ready: dict[int, float] = {}
         self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._draft_sent: dict[int, tuple[str, float]] = {}
 
     async def api(self, method: str, params: dict[str, Any]) -> Any:
         try:
@@ -170,15 +190,21 @@ class TelegramFrontend:
             raise TelegramFailure(503, random.uniform(1, 3)) from None
 
     async def send(self, chat: int, thread: int, text: str) -> None:
+        await self._send("sendMessage", chat, thread, text)
+
+    async def send_draft(self, chat: int, thread: int, draft_id: int, text: str) -> None:
+        await self._send("sendMessageDraft", chat, thread, text, draft_id=draft_id)
+
+    async def _send(self, method: str, chat: int, thread: int, text: str, **extra: Any) -> None:
         lock = self._chat_locks.setdefault(chat, asyncio.Lock())
         async with lock:
             while (delay := self._chat_ready.get(chat, 0) - time.monotonic()) > 0:  # noqa: ASYNC110 - deadline
                 await asyncio.sleep(delay)
-            params: dict[str, Any] = {"chat_id": chat, "text": text}
+            params: dict[str, Any] = {"chat_id": chat, "text": text, **extra}
             if thread:
                 params["message_thread_id"] = thread
             try:
-                await self.api("sendMessage", params)
+                await self.api(method, params)
             except TelegramFailure as exc:
                 self._chat_ready[chat] = time.monotonic() + retry_delay(exc)
                 raise
@@ -398,7 +424,11 @@ class TelegramFrontend:
                         "ON CONFLICT DO NOTHING",
                         (self.bot_id, chat, thread, sid),
                     )
-                reply = "Session " + sid[:8] + " created."
+                reply = (
+                    "Ready for a new conversation."
+                    if action["params"].get("input") is None
+                    else None
+                )
         elif kind == "config":
             await self.metadata.rows(
                 "UPDATE gateway_telegram_routes SET config=%s "
@@ -510,75 +540,135 @@ class TelegramFrontend:
 
     async def deliver_once(self) -> None:
         rows = await self.metadata.rows(
-            "SELECT * FROM gateway_telegram_delivery WHERE bot_id=%s AND blocked_error IS NULL "
-            "AND (next_attempt_at IS NULL OR next_attempt_at <= now())",
+            "SELECT d.*, origin.update_id FROM gateway_telegram_delivery d "
+            "LEFT JOIN LATERAL (SELECT min(i.update_id) AS update_id "
+            "FROM gateway_telegram_inbox i JOIN gateway_requests r "
+            "ON r.request_id::text=i.resolved_action->'params'->>'request_id' "
+            "WHERE i.bot_id=d.bot_id AND r.target_session_id=d.session_id "
+            "AND i.resolved_action->>'kind'='create') origin ON true "
+            "WHERE d.bot_id=%s ORDER BY d.chat_id,d.thread_id,"
+            "origin.update_id NULLS FIRST,d.session_id",
             (self.bot_id,),
         )
+        busy: set[tuple[int, int]] = set()
         for row in rows:
-            key = (self.bot_id, row["chat_id"], row["thread_id"], row["session_id"])
-            projection = row["projection"]
-            pending = projection.get("pending")
-            offset = row["item_offset"]
-            if pending is None:
-                try:
-                    page = await self.control.sessions.read_output(
-                        row["session_id"],
-                        after=row["cursor"],
-                        limit=200,
-                        wait_seconds=0,
-                    )
-                except Exception as exc:
-                    from kapy.state import NotFound
-
-                    if not isinstance(exc, NotFound):
-                        raise
-                    continue
-                from .control import plain
-
-                text, updated = project(cast(list[dict[str, Any]], plain(page.items)), projection)
-                if not text:
-                    await self.metadata.rows(
-                        "UPDATE gateway_telegram_delivery SET cursor=%s,projection=%s "
-                        "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s AND session_id=%s",
-                        (page.next_cursor, Jsonb(updated), *key),
-                    )
-                    continue
-                pending = {"text": text, "cursor": page.next_cursor, "next": updated}
-                projection["pending"] = pending
-                offset = 0
-                await self.metadata.rows(
-                    "UPDATE gateway_telegram_delivery SET projection=%s,item_offset=0 "
-                    "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s AND session_id=%s",
-                    (Jsonb(projection), *key),
-                )
-            prefix = f"[{str(row['session_id'])[:8]}] "
-            chunk, remainder = text_chunk(pending["text"][offset:], 4000 - len(prefix))
+            route = (row["chat_id"], row["thread_id"])
+            if route in busy:
+                continue
+            # Include blocked/backoff rows in ordering: later replies cannot overtake them.
+            if row["blocked_error"] or (
+                row["next_attempt_at"] and row["next_attempt_at"].timestamp() > time.time()
+            ):
+                busy.add(route)
+                continue
             try:
-                await self.send(row["chat_id"], row["thread_id"], prefix + chunk)
-            except TelegramFailure as exc:
+                if await self._deliver_row(row):
+                    busy.add(route)
+            except ProjectionMigrationRequired:
+                logger.error("Telegram projection requires offline drain and migration")
+                busy.add(route)
+
+    async def _deliver_row(self, row: dict[str, Any]) -> bool:
+        from kapy.state import NotFound
+
+        from .control import plain
+
+        key = (self.bot_id, row["chat_id"], row["thread_id"], row["session_id"])
+        projection = row["projection"]
+        if projection and projection.get("version") != 1:
+            raise ProjectionMigrationRequired(
+                "Telegram projection requires offline drain and migration"
+            )
+        projection = copy.deepcopy(projection or empty_projection())
+        offset = row["item_offset"]
+        pending = projection.get("pending")
+        cursor = row["cursor"]
+        has_more = False
+        try:
+            if pending is None:
+                page = await self.control.sessions.read_output(
+                    row["session_id"], after=cursor, limit=200, wait_seconds=0
+                )
+                preview, projection = project(
+                    cast(list[dict[str, Any]], plain(page.items)), projection
+                )
+                cursor = projection.pop("cursor", page.next_cursor)
+                pending = projection.get("pending")
+                has_more = page.has_more or cursor != page.next_cursor
+                if pending is None and preview and "draft" not in projection:
+                    projection["draft"] = {"id": uuid4().int % (2**63 - 1) + 1}
                 await self.metadata.rows(
-                    "UPDATE gateway_telegram_delivery SET blocked_error=%s, "
-                    "next_attempt_at=now()+%s*interval '1 second' "
+                    "UPDATE gateway_telegram_delivery SET cursor=%s,projection=%s "
                     "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s AND session_id=%s",
+                    (cursor, Jsonb(projection), *key),
+                )
+            else:
+                preview = ""
+            if pending is not None:
+                chunk, remainder = text_chunk(pending["text"][offset:])
+                if chunk:
+                    await self.send(row["chat_id"], row["thread_id"], chunk)
+                await self.metadata.rows(
+                    "UPDATE gateway_telegram_delivery SET cursor=%s,projection=%s,item_offset=%s,"
+                    "next_attempt_at=NULL WHERE bot_id=%s AND chat_id=%s "
+                    "AND thread_id=%s AND session_id=%s",
                     (
-                        str(exc.code) if exc.code in {400, 403} else None,
-                        retry_delay(exc),
+                        cursor,
+                        Jsonb(projection if remainder else pending["next"]),
+                        offset + len(chunk) if remainder else 0,
                         *key,
                     ),
                 )
-                continue
-            offset += len(chunk)
+                if not remainder and (draft := projection.get("draft")):
+                    self._draft_sent.pop(draft["id"], None)
+                # Revisit this route next tick, including any remaining records on this page.
+                return True
+            draft = projection.get("draft")
+            if draft and not draft.get("unavailable"):
+                if "chat_type" not in projection:
+                    chat_rows = await self.metadata.rows(
+                        "SELECT payload->'message'->'chat'->>'type' AS type "
+                        "FROM gateway_telegram_inbox "
+                        "WHERE bot_id=%s AND chat_id=%s "
+                        "AND payload->'message'->'chat'->>'type' IS NOT NULL "
+                        "ORDER BY update_id DESC LIMIT 1",
+                        (self.bot_id, row["chat_id"]),
+                    )
+                    projection["chat_type"] = (
+                        chat_rows[0]["type"]
+                        if chat_rows
+                        else (await self.api("getChat", {"chat_id": row["chat_id"]}))["type"]
+                    )
+                if projection["chat_type"] == "private":
+                    text = text_chunk(preview)[0]
+                    sent = self._draft_sent.get(draft["id"])
+                    if sent is None or sent[0] != text or time.monotonic() - sent[1] >= 20:
+                        try:
+                            await self.send_draft(
+                                row["chat_id"], row["thread_id"], draft["id"], text
+                            )
+                            self._draft_sent[draft["id"]] = (text, time.monotonic())
+                        except TelegramFailure as exc:
+                            if exc.code != 400:
+                                raise
+                            draft["unavailable"] = True
+                await self.metadata.rows(
+                    "UPDATE gateway_telegram_delivery SET projection=%s WHERE bot_id=%s "
+                    "AND chat_id=%s AND thread_id=%s AND session_id=%s",
+                    (Jsonb(projection), *key),
+                )
+            view = await self.control.sessions.get_session(row["session_id"])
+            return has_more or bool(projection.get("run_id")) or view.status != "waiting"
+        except NotFound:
+            return False
+        except TelegramFailure as exc:
             await self.metadata.rows(
-                "UPDATE gateway_telegram_delivery SET cursor=%s,projection=%s,item_offset=%s,"
-                "next_attempt_at=NULL WHERE bot_id=%s AND chat_id=%s "
-                "AND thread_id=%s AND session_id=%s",
-                (
-                    row["cursor"] if remainder else pending["cursor"],
-                    Jsonb(projection if remainder else pending["next"]),
-                    offset if remainder else 0,
-                    *key,
-                ),
+                "UPDATE gateway_telegram_delivery SET blocked_error=%s, "
+                "next_attempt_at=now()+%s*interval '1 second' "
+                "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s AND session_id=%s",
+                (str(exc.code) if exc.code in {400, 403} else None, retry_delay(exc), *key),
             )
+            return True
 
     async def deliver(self) -> None:
         failures = 0
