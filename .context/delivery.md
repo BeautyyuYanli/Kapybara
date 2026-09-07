@@ -30,7 +30,7 @@ Root Lody session: 05144158-4e23-407a-ba4f-563faa33aafa.
 
 | Owner | Session ID | Branch | Current scope |
 | --- | --- | --- | --- |
-| Execution replacement | 3312c3ad-b9ee-4150-928f-2bf7654b1aca | feat/kapy-execution-complete (requested) | Focused cmd-proposal for remaining daemon/process, then approve impl |
+| Execution replacement | 3312c3ad-b9ee-4150-928f-2bf7654b1aca | feat/kapy-execution-complete | Complete remaining daemon/process cmd-impl approved |
 | State | 37703573-1ccd-4f8b-a137-ba52ca9e8e60 | feat/kapy | Complete state cmd-impl including approved additions |
 | Intelligence | a88a199c-41c1-49d6-ad09-2d5b87f80b12 | feat/kapy-agentskills | Complete agent/skills cmd-impl |
 | Gateway | 0f9cff83-dff7-4881-b5a1-a6b1e761dd27 | feat/kapycli | Complete gateway/cli/settings/TG cmd-impl |
@@ -112,7 +112,12 @@ groups/best effort, Docker tests only, remaining process/daemon/lifecycle/reconn
 Gateway and Intelligence were informed through kapy-execution-owner-change-20260907;
 they should continue implementing and await the replacement owner's real exports.
 Old Execution branch remains readable for fdf4cb6, but the old session must not be
-restored/restarted or sent more tasks. New proposal approval is still outstanding.
+restored/restarted or sent more tasks. New proposal c7d2d3f was fully reviewed and
+approved at13:39 by kapy-execution-completion-impl-approval-20260907, deadline17:39.
+It was cherry-picked to main as0cd7deb. One precise amendment was approved directly:
+bounded output cleanup is for kill/release/shutdown/failure, not arbitrary truncation
+of normally producing stdio descendants just because their leader exited. The new
+senior must now own its complete cmd-impl and send actual DaemonConfig early exports.
 - State contracts original 4b42349 merged as 090c122; final proposal 3a3a10e merged.
 - Intelligence bf1f55f proposal merged as 5d052d9. Later old queued doc churn is not
   a new implementation blocker; consolidated instructions freeze final differences.
