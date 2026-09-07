@@ -1,6 +1,6 @@
 # Gateway、CLI 与 Telegram 集成方案
 
-本方案以 `kapy_v2.md` 和 `docs/architecture.md` 为边界，面向 Linux、单个控制进程、多 session、多 execution machine。实现范围为 `src/kapy/gateway/`、`src/kapy/cli/`、`src/kapy/settings.py` 及对应 tests。公共接口在总设计师批准后落地；本次提交只包含方案。
+本方案以 `kapy_v2.md`、`docs/architecture.md` 和总设计师的 `docs/contracts.md` 为边界，面向 Linux、单个控制进程、多 session、多 execution machine。实现范围为 `src/kapy/gateway/`、`src/kapy/cli/`、`src/kapy/settings.py` 及对应 tests。公共接口在总设计师批准后落地；本次提交只包含方案。
 
 ## 1. 依赖依据与模块边界
 
@@ -70,7 +70,7 @@ def load_settings(*, env_file: str | None = None) -> Settings: ...
 
 `Principal` 是 Gateway 定义、不可由 RPC 参数反序列化的 frozen dataclass：`kind: Literal["operator", "session", "telegram"]`、`machine_id: str | None`、`session_id: str | None`、`telegram_route: tuple[int, int] | None`。HTTP/WS 入口根据认证结果构造，Telegram 根据允许的 chat 和 durable binding 构造。`ControlService` 不接受远端提交的 `Principal`；机器连接身份只提供来源证明，不能单独变成 operator。
 
-`create_app` 无 import-time I/O。lifespan 使用 `AsyncExitStack`：先依次执行 State、Gateway 的迁移，再打开 Gateway 自有 metadata pool 和 HTTP clients；构造借用该 pool 的 SkillService 并 await initialize，随后初始化 Intelligence 的 AgentPayloadStore、装配 MachineRegistry 与 Runner；最后进入 `SessionService` 异步上下文并启动前端。State 根据 database_url/valkey_url 创建并拥有自己的 pool、Valkey、PubSub、锁连接和后台任务；Gateway 不借出自己的 pool 给 State，也不替它关闭资源。
+`create_app` 无 import-time I/O。lifespan 使用 `AsyncExitStack`：先依次执行 State、Gateway 的迁移，再打开 Gateway 自有 metadata pool 和 HTTP clients；构造借用该 pool 的 SkillService 并 await initialize，随后构造并 await Intelligence 的 AgentPayloadStore.initialize()、装配 MachineRegistry 与 Runner；最后进入 `SessionService` 异步上下文并启动前端。State 根据 database_url/valkey_url 创建并拥有自己的 pool、Valkey、PubSub、锁连接和后台任务；Gateway 不借出自己的 pool 给 State，也不替它关闭资源。
 
 Gateway 持有 metadata pool 和 HTTP clients 的创建、打开、关闭权；Skills 借用 pool，每次方法自行获取/释放连接与短事务，没有 start/aclose，也不关闭 pool。Intelligence 的 AgentPayloadStore 采用同样的借用边界。lifespan 按顺序调用各模块迁移/初始化函数，每个函数只处理自包表；没有集中迁移框架、跨包 migration registry 或跨服务共享事务。Gateway 自有表使用 gateway_ 前缀。schema 显式传入，不采用 Skills 默认 public；同一次集成可让各 owner 的表位于该次独立 schema，使用各包自己的表名且不跨包引用物理表。
 
@@ -104,7 +104,6 @@ registry 的授权 callback 通过 composition closure 引用已创建的 Sessio
 | `KAPY_SESSION_ID` | `session_id: str \| None` | daemon 为 session 子进程注入的来源上下文 |
 | `KAPY_SESSION_TOKEN` | `session_token: SecretStr \| None` | session 子进程调用代理的 capability |
 | `KAPY_DAEMON_SOCKET` | `daemon_socket: Path \| None` | CLI socket override；默认由 Execution 的路径解析函数提供 |
-| `KAPY_CGROUP_ROOT` | `cgroup_root: Path \| None` | 默认 None；Execution 从当前 unit 发现，显式值可指定当前 delegated scope/service 根并由 Execution 验证 |
 | `KAPY_EXECUTION_STATE_DIR` | `execution_state_dir: Path \| None` | 映射 DaemonConfig.state_dir |
 | `KAPY_EXECUTION_DATA_DIR` | `execution_data_dir: Path \| None` | 映射 DaemonConfig.data_dir |
 | `KAPY_EXECUTION_RUNTIME_DIR` | `execution_runtime_dir: Path \| None` | 映射 DaemonConfig.runtime_dir |
@@ -155,7 +154,7 @@ async def grant_channel(
 ) -> None: ...
 ```
 
-grant_channel 只允许 channel 创建者向自身或有权控制的直接子 session 发放权限；operator 可管理该部署的 grants。该入口属于 Gateway 自有 metadata，不向 State 新增 grant 方法。Intelligence 的精确注入类型为 `AuthorizeWait = Callable[[UUID, tuple[UUID, ...]], Awaitable[None]]`；Gateway 提供同形状的 `authorize_wait(session_id: UUID, waiting_ids: tuple[UUID, ...]) -> None` 异步适配器，内部调用 `authorize_channels(..., action="subscribe")`。Runner 在返回 wait_for 前 await 此回调，拒绝作为可纠正工具错误；Gateway 的 SessionRunner wrapper 在把 RunResult 交 State 前再检查，协议仍为 SessionRunner(ctx)。
+grant_channel 只允许 channel 创建者向自身或有权控制的直接子 session 发放权限；operator 可管理该部署的 grants。该入口属于 Gateway 自有 metadata，不向 State 新增 grant 方法。Intelligence 的精确注入类型为 `AuthorizeWait = Callable[[UUID, tuple[UUID, ...]], Awaitable[None]]`；Gateway 提供同形状的 `authorize_wait(session_id: UUID, waiting_ids: tuple[UUID, ...]) -> None` 异步适配器，内部调用 `authorize_channels(..., action="subscribe")`。Runner 在返回 wait_for 前 await 此回调，成功返回 None，拒绝抛 PermissionError 并作为可纠正工具错误；Gateway 的 SessionRunner wrapper 在把 RunResult 交 State 前再检查，协议仍为 SessionRunner(ctx)。
 
 event.publish 的可信入口校验 publish 权；session 调用使用 `authorize_channels(..., action="publish")`，operator/Telegram 根据其可信 principal 与同一 grants 表判断，producer_session_id 从认证身份注入。Runner 当前没有直接 publish 服务，模型通过普通 process/CLI 代理调用该入口。发布与订阅均不以 UUID 存在或合法为授权依据，不新增第二套 channel broker。
 
@@ -217,7 +216,7 @@ HTTP `POST /rpc` 使用 Execution 的 `dispatch_json(payload: str, handler: Requ
 | `session.output` | `{session_id,after?: Cursor,limit?: int,wait_seconds?: float}` | `RecordPage` |
 | `session.wait` | `{session_id,request_id: UUID,wait_seconds?: float}` | `SubmissionStatus` |
 
-创建前由 Intelligence 的初始化入口提供 `RunnerState`，Gateway 组合 State `SessionSpec(title,machine_ids,default_machine_id,config,initial_state)`；可信 owner_id、parent_session_id 保存在 Gateway 自有授权表，不添加到 State DTO 或外部参数。默认机器可为 null；非空时必须属于 machine_ids。config 保存模型及非秘密配置，不保存 key/token。input=null 表示空创建，当场完成 receipt；有 input 的 create/input receipt 只在对应输入实际被该 run 接手后完成，不因 session 之前处于 waiting 而提前完成。
+创建前调用 Intelligence 的 `runner.initial_state(instructions=..., skills=...)` 提供 `RunnerState`，Gateway 组合 State `SessionSpec(title,machine_ids,default_machine_id,config,initial_state)`；可信 owner_id、parent_session_id 保存在 Gateway 自有授权表，不添加到 State DTO 或外部参数。默认机器可为 null；非空时必须属于 machine_ids。config 保存模型及非秘密配置，不保存 key/token。input=null 表示空创建，当场完成 receipt；有 input 的 create/input receipt 只在对应输入实际被该 run 接手后完成，不因 session 之前处于 waiting 而提前完成。
 
 State submit_input 的服务默认是 steer；CLI/Telegram 普通输入显式传 queue，用户选择 steer 时原样传入。输入 payload 保持 JsonValue，不在 Gateway 改成另一种 envelope。普通文本使用字符串；其他格式由 runner 输入协议定义。
 
@@ -345,7 +344,7 @@ class SessionService:
 async def migrate(database_url: str, *, schema: str = "kapy_state") -> None: ...
 ```
 
-Gateway 在 SessionService 外围负责 auth、参数 validation 和 JSON 化。State 默认 submit_input=steer、read_output limit=200/wait_seconds=0，与前端选择 queue/long-poll 分别显式传参。Intelligence 的 runner 适配为 State SessionRunner(ctx)；创建初始化返回 RunnerState 并写入 SessionSpec.initial_state。技能 description 快照与 codec 的生产归 Intelligence，Gateway 不拼装 Pydantic AI 历史。
+Gateway 在 SessionService 外围负责 auth、参数 validation 和 JSON 化。State 默认 submit_input=steer、read_output limit=200/wait_seconds=0，与前端选择 queue/long-poll 分别显式传参。Intelligence 的 runner 适配为 State SessionRunner(ctx)；创建调用 Runner.initial_state 返回 RunnerState 并写入 SessionSpec.initial_state。技能 description 快照与 codec 的生产归 Intelligence，Gateway 不拼装 Pydantic AI 历史。
 
 Execution 已明确导出 RpcPeer、ProxyAuth、dispatch_json、resolve_paths 和 call_local_proxy，直接使用这些名字。CLI 的 Typer 命令、参数与结果处理归 Gateway，NDJSON helper 使用 Execution 已接受的 call_local_proxy：
 
@@ -399,7 +398,7 @@ class MachineCaller(Protocol):
     ) -> JsonValue: ...
 ```
 
-DaemonConfig 是 frozen/extra-forbid Pydantic model：必填 machine_id:str、gateway_url:str、machine_token:SecretStr；可选 cgroup_root/state_dir/data_dir/runtime_dir:Path|None，child_env:dict[str,str]={}，idle_disconnect_after_s:float|None=None，idle_reconnect_after_s:float=30.0。Gateway 从 Settings 显式构造；gateway_url 是 `/rpc/machines/{machine_id}` 的完整 ws/wss URL。非 loopback 使用 wss。cgroup_root 默认 None，由 Execution 从当前 unit 发现；显式值可传当前 delegated scope/service 根，实际委派和迁移能力由 Execution 验证。Gateway 不把任意可写目录当委派，也不自行修改主机权限。
+DaemonConfig 是 frozen/extra-forbid Pydantic model：必填 machine_id:str、gateway_url:str、machine_token:SecretStr；可选 state_dir/data_dir/runtime_dir:Path|None，child_env:dict[str,str]={}，idle_disconnect_after_s:float|None=None，idle_reconnect_after_s:float=30.0。Gateway 从 Settings 显式构造；gateway_url 是 `/rpc/machines/{machine_id}` 的完整 ws/wss URL。非 loopback 使用 wss。执行机器的调研和验收在专用 Docker 容器运行，采用普通进程组与尽力清理后代；按总设计师裁决不提供强制 cgroup 委派或 cgroup_root 配置。进程管理细节由 Execution 实现。
 
 CLI 的 socket/cwd 路径使用 Execution 当前的纯路径导出，不需构造带机器密钥的 DaemonConfig；路径规则仅由 Execution 实现：
 
@@ -474,7 +473,7 @@ class SkillConflict(Exception): ...
 class SkillTooLarge(Exception): ...
 ```
 
-Runner 直接采用 kapy.agent 的构造与初始化签名；MachineCaller、State 的 RunContext/RunnerState/RunResult 均为原包导出。Runner 构造无 I/O、无 start/aclose；Gateway 只注入依赖并以符合 State SessionRunner 的授权 wrapper 调用：
+Runner、RunnerConfig 直接从 kapy.agent 导入，初始化入口采用 docs/contracts.md 已批准的 Runner.initial_state；MachineCaller、State 的 RunContext/RunnerState/RunResult 均为原包导出。Runner 构造无 I/O、无 start/aclose；Gateway 只注入依赖并以符合 State SessionRunner 的授权 wrapper 调用：
 
 ```python
 from kapy.rpc import MachineCaller
@@ -510,9 +509,9 @@ class Runner:
     async def __call__(self, context: RunContext) -> RunResult: ...
 ```
 
-OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL 分别映射 RunnerConfig.base_url/api_key/model；其余映射 KAPY_CONTEXT_WINDOW_TOKENS、KAPY_MAX_OUTPUT_TOKENS、KAPY_COMPRESSION_RATIO、KAPY_KEEP_RECENT_RATIO、KAPY_MEDIA_MAX_BYTES，类型与默认值遵循 RunnerConfig。context_window_tokens 没有库默认值，control-server 要求显式提供可信窗口配置。模型覆盖从 State.config 读取，具体支持字段由 Intelligence 解释；instructions 仅在新 session 的 initial_state 中注入。API key 始终仅来自注入的 SecretStr，不进入 session config。
+OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL 分别映射 RunnerConfig.base_url/api_key/model；其余映射 KAPY_CONTEXT_WINDOW_TOKENS、KAPY_MAX_OUTPUT_TOKENS、KAPY_COMPRESSION_RATIO、KAPY_KEEP_RECENT_RATIO、KAPY_MEDIA_MAX_BYTES，类型与默认值遵循 RunnerConfig。context_window_tokens 没有库默认值，control-server 要求显式提供可信窗口配置。Runner 每次调用从 context.session.config 的可选 model 读取模型名称，缺失则用 RunnerConfig.model；非法类型或空串拒绝，运行内使用启动快照。instructions 仅在新 session 的 initial_state 中注入。API key 始终仅来自注入的 SecretStr，不进入 session config。
 
-Intelligence 当前要求注入下列持久 payload store，借用 Gateway pool；Gateway 不实现媒体 codec，也不改 State 表结构：
+Intelligence 拥有媒体 durable blob、reference 编码、codec 替换与 hydration；下列 AgentPayloadStore 借用 Gateway metadata pool 和显式受控 schema。State 仅存既有 checkpoint/history 中的 opaque reference JSON，Gateway 只装配初始化和清理入口：
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -530,7 +529,9 @@ class AgentPayloadStore:
     async def delete_session(self, session_id: UUID) -> None: ...
 ```
 
-AgentPayloadStore.initialize 只迁移自包 agent_payloads，不建立对 State 物理表的 FK。put/get 与不可变 bytes 的上限由 Intelligence 管理，PayloadNotFound/PayloadCorrupt/PayloadTooLarge 由 kapy.agent 导出。Gateway 的既有 session cleanup outbox 在 State 删除并 await Runner 收束后调用幂等 delete_session；正常控制端停机不删除 payload。Runner 必须在取消时 await 未完成的 store 操作，防止清理后迟到写入。
+AgentPayloadStore.initialize 只迁移 Intelligence 自包 agent_payloads，不建立对 State 物理表的 FK。Intelligence 在包含引用的 checkpoint 提交前持久化不可变 bytes；恢复通过保存的 reference/hydration 还原，缺失或损坏明确失败，不重新读取已变化的机器 path。put/get 与不可变 bytes 的上限由 Intelligence 管理，PayloadNotFound/PayloadCorrupt/PayloadTooLarge 由 kapy.agent 导出。Gateway 的既有 session cleanup outbox 在 State 删除并 await Runner 收束后调用幂等 delete_session；正常控制端停机不删除 payload。Runner 必须在取消时 await 未完成的 store 操作，防止清理后迟到写入。
+
+模型请求的 attempt_id 属于 Intelligence，放在既有 OutputDelta.data / MessageWrite.data 等 opaque 字段。State 的 run_id 与 attempt 继续表示 session 运行及恢复次数；一次媒体重试不新建 State run、不递增其 attempt。Gateway 不增加 State blob 服务、checkpoint 参数或公共 retry DTO。
 
 ## 7. CLI 命令形状与上下文
 
@@ -562,7 +563,7 @@ CLI upload/download 必须有 KAPY_SESSION_ID 上下文或显式 `--session`；�
 
 Telegram 作为 `Frontend` 使用 httpx2 异步 Bot API client；只启用一个 long poller，`getUpdates(timeout=25, limit=100, allowed_updates=["message"])`，HTTP read timeout 大于 long poll timeout。`TELEGRAM_CHAT_ID` 是唯一允许的 chat，未配置不能进入开放接收模式；忽略其他 chat、机器人消息，非文本输入回复明确的文本输入提示并消费 update。普通消息/commands 都带相同 chat/topic 授权。群迁移时记录明确错误并保留状态，由配置更新允许的 chat；不自动改变 allowlist。
 
-route key 为 `(bot_id, chat_id, thread_id)`，没有 `message_thread_id` 时将 thread_id 规范化为 0；发送时 0 省略，非零原样传回。不同 topic 的 config、active session 和 cursor 独立。saved config 保存 `{title,machine_ids,default_machine_id,config}`，初始模型取 OPENAI_MODEL；initial_state 由每次创建时的 Intelligence 初始化产生。`bot_id` 使用配置 token 的公开数字前缀，不保存 token。
+route key 为 `(bot_id, chat_id, thread_id)`，没有 `message_thread_id` 时将 thread_id 规范化为 0；发送时 0 省略，非零原样传回。不同 topic 的 config、active session 和 cursor 独立。saved config 保存 `{title,machine_ids,default_machine_id,config}`，初始模型取 OPENAI_MODEL；initial_state 由每次创建时的 Intelligence Runner.initial_state 产生。`bot_id` 使用配置 token 的公开数字前缀，不保存 token。
 
 Gateway 拥有以下 PostgreSQL 表定义和参数化查询；由 app lifespan 分别调用各 owner 迁移，State 不迁移 Gateway 表。schema 参数由连接 search_path 或受控 SQL Identifier 设置，不能插入未校验文本。
 
@@ -602,6 +603,8 @@ Telegram 只读取 State RecordPage，不进入 subscriptions。record.kind 原�
 
 输出按约一秒或长度上限合并后追加纯文本，waiting/error/interrupted 及时刷新。Gateway 持久化当前消息投影（message_id、run_id、attempt、已接受可见正文）及发送位置；读取 delta 拼成可见文本，model_response 的完整 text 替换同 message_id 的投影。完整正文与已发送前缀一致时只追加剩余文字，不重发整段；若内容不一致则明确追加更正。final.data.output 作为最终结果，仅在未由最后一条响应呈现时补发；waiting 展示状态。interrupted 明确标记未完成 attempt，后续 attempt 使用新的投影身份。
 
+媒体重试沿用 Intelligence 已定义的 data：text_delta/tool_call/tool_result 可含模型 attempt_id；`notice` 的 `{kind:"attempt_failed",attempt_id,failed_message_id,code,message}` 标记该次模型请求失败。Gateway 在 durable projection 中标记对应 message_id，发送必要的失败提示；下一次模型尝试使用新 message_id，最终完整消息只合并成功尝试的 delta。已经发送的失败片段不能静默变成成功结果，也不与后续尝试拼接。该 notice 不作为 session completion，不改变 State run_id/attempt；只有既有 waiting/error/interrupted 运行记录决定 session 展示状态。前端仅使用可见文字与引用摘要，不 hydration 或发送原始媒体 blob。
+
 单消息投影受 State 256 KiB message 限制；每条发送正文≤4000 UTF-16 code units，保持 Unicode 字符完整并预留 session 标注空间。大型输出继续由 State records 分页承载，不一次读全历史。各 topic 共用 chat 限流，429 尊重 retry_after。Bot API 的 topic、文本上限与 offset 确认规则以[官方文档](https://core.telegram.org/bots/api)为依据。
 
 cursor 只在所覆盖文本成功发送或明确为不可见记录后推进；item_offset 保存部分记录的已发送字符数。投影和 cursor 同事务保存，重启能继续比较完整 message 与已输出前缀。`/new` 不删除旧 session，旧 delivery 可继续发送并附 session 简短标识。网络/5xx 采用 1–30 秒 jitter 退避；next_attempt_at 持久化。401 停用 bot；403/topic 不可发仅阻塞对应 route，不热循环，后续该 route 有效输入可触发恢复。send 已成功但 response 丢失或本地 cursor 提交前崩溃可能重复，不能承诺 exactly-once。
@@ -616,6 +619,6 @@ cursor 只在所覆盖文本成功发送或明确为不可见记录后推进；i
 
 PostgreSQL 是 session、输入、history/output、event、Skills archive、Gateway 授权和 Telegram ingress/delivery 的权威存储；前端 completion 从既有 waiting records 读取；Valkey 只提供唤醒提示，Gateway registry 是连接事实的内存映射。没有将控制状态改用 SQLite/内存的路径。Execution 的 XDG SQLite/进程资源归 Execution。
 
-每次集成调用使用独立 `KAPY_DATABASE_SCHEMA=gw_<uuid>`、`KAPY_VALKEY_NAMESPACE=gw:<uuid>`，使用总设计师提供的 PostgreSQL/Valkey 地址；清理只作用于自己的 schema/namespace。Gateway 与其他 senior 不共享测试路由、session ids、上传临时目录或 XDG root。Telegram send/getUpdates/setMyCommands 全部对 fake Bot API 或 MockTransport，不发送真实消息；本轮没有读取主目录 `.env`。已只读查看 main 的 `docs/acceptance.md`（61af09e），按其 Gateway 并发 polling、机器中断、Telegram 恢复场景提供对应 module tests；不重启或 flush 共用开发服务。
+每次集成调用使用独立 `KAPY_DATABASE_SCHEMA=gw_<uuid>`、`KAPY_VALKEY_NAMESPACE=gw:<uuid>`，使用总设计师提供的 PostgreSQL/Valkey 地址；清理只作用于自己的 schema/namespace。Gateway 与其他 senior 不共享测试路由、session ids、上传临时目录或 XDG root；涉及真实 Execution 的检查使用总设计师指定的专用 Docker 容器。Telegram send/getUpdates/setMyCommands 全部对 fake Bot API 或 MockTransport，不发送真实消息；本轮没有读取主目录 `.env`。已只读查看 main 的 `docs/acceptance.md`（61af09e），按其 Gateway 并发 polling、机器中断、Telegram 恢复场景提供对应 module tests；不重启或 flush 共用开发服务。
 
-跨模块交付要求：State 提供本方案直接采用的 DTO、UUID request_id/receipts、非消费 read_output/read_history、history.export 和独立迁移；Execution 提供 RpcPeer/dispatch_json/call_local_proxy、MachineCaller timeout、DaemonConfig/run_daemon、ensure/release、resolve_paths 与既有 file.*；Intelligence 提供 State SessionRunner 兼容的 Runner、AuthorizeWait 注入、创建时 initial_state、借用 Gateway pool 的 SkillService/AgentPayloadStore 与 pack_skill/extract_skill。Skills 的 request_key 仅为内部认证 scope + UUID 适配，外部统一 request_id:UUID；creator/直接子 session/channel grants 均由 Gateway 保存。总设计师统一剩余接口、错误码和配置示例；CLI script 与 Docker CMD 已在 main 完成。Gateway 不并行修改其他 senior 包或共享 `pyproject.toml`、`uv.lock`、`compose.yaml`、README。
+跨模块交付要求：State 提供本方案直接采用的 DTO、UUID request_id/receipts、非消费 read_output/read_history、history.export 和独立迁移；Execution 提供 RpcPeer/dispatch_json/call_local_proxy、MachineCaller timeout、DaemonConfig/run_daemon、ensure/release、resolve_paths 与既有 file.*；Intelligence 提供 State SessionRunner 兼容的 Runner、AuthorizeWait 注入、Runner.initial_state、借用 Gateway pool 的 SkillService/AgentPayloadStore 与 pack_skill/extract_skill。Skills 的 request_key 仅为内部认证 scope + UUID 适配，外部统一 request_id:UUID；creator/直接子 session/channel grants 均由 Gateway 保存。总设计师统一剩余接口、错误码和配置示例；CLI script 与 Docker CMD 已在 main 完成。Gateway 不并行修改其他 senior 包或共享 `pyproject.toml`、`uv.lock`、`compose.yaml`、README。
