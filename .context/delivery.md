@@ -114,3 +114,15 @@ Live production TelegramFrontend send_draft/send calls passed: two updates with
 one stable draft ID, followed by one final update notification to the configured
 user chat. This proves real Bot API draft/final transport; automated tests cover
 State projection/recovery and ordering. No claim of exactly-once final delivery.
+
+## Rich Markdown follow-up (2026-09-08, in progress)
+
+User requests the latest Telegram Rich Messages rendering Markdown. The same new
+Gateway senior94ba8801 is preparing a small proposal from main39bca06 on
+feat/kapy-telegram-rich-markdown; this is a new authorized follow-up.
+Official InputRichMessage.markdown and sendRichMessage/sendRichMessageDraft were
+verified against the current API. Architect live preflight sent two rich drafts
+with one stable ID and one final preview to the configured user chat. Both methods
+succeeded; returned rich_message blocks were heading,paragraph,list,table,pre.
+This verifies transport/rendering support only; normal reply integration remains
+pending proposal approval, implementation and deployment.
