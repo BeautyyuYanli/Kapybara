@@ -1,5 +1,46 @@
 # Gateway, CLI and Telegram
 
+For a first start, inject environment variables explicitly: the CLI and Settings do not
+automatically load `.env` or `.env.example`. Replace the placeholders below and set the
+model's actual context window. The control server requires `OPENAI_API_KEY`,
+`KAPY_CONTEXT_WINDOW_TOKENS`, `KAPY_CONTROL_TOKEN`, and `KAPY_SESSION_SIGNING_KEY`:
+
+```sh
+env OPENAI_API_KEY='<provider-api-key>' \
+  OPENAI_BASE_URL='https://api.openai.com/v1' OPENAI_MODEL='gpt-5.6-luna' \
+  KAPY_CONTEXT_WINDOW_TOKENS=100000 \
+  KAPY_CONTROL_TOKEN='<control-admin-token>' \
+  KAPY_SESSION_SIGNING_KEY='<random-signing-key>' \
+  KAPY_MACHINE_TOKENS='{"docker-machine":"<machine-bearer>"}' \
+  kapy control-server
+```
+
+PostgreSQL and Valkey must be reachable. Set `KAPY_DATABASE_URL` and `KAPY_VALKEY_URL`
+for your network; development defaults use `127.0.0.1:55432` and `127.0.0.1:56379`.
+`OPENAI_BASE_URL` and `OPENAI_MODEL` select the provider endpoint and model; other
+settings use `KAPY_`. Telegram is optional: enabling `TELEGRAM_BOT_TOKEN` also requires
+the allowed numeric `TELEGRAM_CHAT_ID`.
+
+In the project machine container, start its daemon using the exact machine ID and bearer
+from the control server's JSON mapping. This bearer is separate from the administrator
+token. The loopback example assumes the control server is reachable in that network
+namespace; use a reachable HTTPS control URL for a remote server:
+
+```sh
+env KAPY_CONTROL_URL='http://127.0.0.1:8000' \
+  KAPY_MACHINE_ID='docker-machine' KAPY_MACHINE_TOKEN='<machine-bearer>' \
+  kapy server
+```
+
+Run `kapy control` on that same machine, with access to the daemon's Unix socket
+(`KAPY_DAEMON_SOCKET` overrides its XDG default). Daemon-managed session processes inherit
+their session credentials. For an operator shell without session context, inject the
+control administrator token explicitly:
+
+```sh
+env KAPY_CONTROL_TOKEN='<control-admin-token>' kapy control session list
+```
+
 `create_app` composes the actual State, RPC, Execution, Skills and Agent exports.
 Gateway owns its PostgreSQL metadata pool and HTTP client. Skills and agent payload
 storage borrow the pool; State creates and closes its own pool and Valkey client.
@@ -32,6 +73,9 @@ kapy control --session SESSION_UUID history export --output history.ndjson
 kapy control --session SESSION_UUID --machine docker-machine skill upload ./example
 kapy control --session SESSION_UUID --machine docker-machine skill download SKILL_UUID ./download
 ```
+
+`session update` replaces all settings and is allowed only while waiting. Its
+`--help` describes how omitted configuration and default-machine options clear prior values.
 
 Skills preserve expected revisions and scoped idempotency. Archives move in 64 KiB chunks
 through the existing machine file protocol, with at most two concurrent exchanges and a

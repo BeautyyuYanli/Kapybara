@@ -266,6 +266,12 @@ def update_session(
     config: Annotated[str, typer.Option()] = "{}",
     request_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
+    """Replace the session title, machines and configuration completely.
+
+    State permits updates only while the session is waiting. Omitting --config
+    submits {}, clearing prior configuration. Omitting --default-machine submits
+    None, clearing the prior default machine.
+    """
     invoke(
         ctx,
         "session.update",
