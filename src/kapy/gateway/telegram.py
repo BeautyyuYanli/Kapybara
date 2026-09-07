@@ -476,6 +476,7 @@ class TelegramFrontend:
             key = (self.bot_id, row["chat_id"], row["thread_id"], row["session_id"])
             projection = row["projection"]
             pending = projection.get("pending")
+            offset = row["item_offset"]
             if pending is None:
                 try:
                     page = await self.control.sessions.read_output(
@@ -500,15 +501,16 @@ class TelegramFrontend:
                         (page.next_cursor, Jsonb(updated), *key),
                     )
                     continue
-                pending = {"text": text, "offset": 0, "cursor": page.next_cursor, "next": updated}
+                pending = {"text": text, "cursor": page.next_cursor, "next": updated}
                 projection["pending"] = pending
+                offset = 0
                 await self.metadata.rows(
-                    "UPDATE gateway_telegram_delivery SET projection=%s "
+                    "UPDATE gateway_telegram_delivery SET projection=%s,item_offset=0 "
                     "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s AND session_id=%s",
                     (Jsonb(projection), *key),
                 )
             prefix = f"[{str(row['session_id'])[:8]}] "
-            chunk, remainder = text_chunk(pending["text"][pending["offset"] :], 4000 - len(prefix))
+            chunk, remainder = text_chunk(pending["text"][offset:], 4000 - len(prefix))
             try:
                 await self.send(row["chat_id"], row["thread_id"], prefix + chunk)
             except TelegramFailure as exc:
@@ -523,7 +525,7 @@ class TelegramFrontend:
                     ),
                 )
                 continue
-            pending["offset"] += len(chunk)
+            offset += len(chunk)
             await self.metadata.rows(
                 "UPDATE gateway_telegram_delivery SET cursor=%s,projection=%s,item_offset=%s,"
                 "next_attempt_at=NULL WHERE bot_id=%s AND chat_id=%s "
@@ -531,7 +533,7 @@ class TelegramFrontend:
                 (
                     row["cursor"] if remainder else pending["cursor"],
                     Jsonb(projection if remainder else pending["next"]),
-                    pending["offset"] if remainder else 0,
+                    offset if remainder else 0,
                     *key,
                 ),
             )

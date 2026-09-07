@@ -3,14 +3,13 @@
 import asyncio
 import json
 import logging
-from dataclasses import asdict, is_dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID, uuid5
 from weakref import WeakValueDictionary
 
 import psycopg
 from pydantic import BaseModel, ValidationError
+from pydantic_core import to_jsonable_python
 
 from kapy.agent import AgentResourceLimit
 from kapy.rpc import JsonObject, JsonValue, RpcError
@@ -43,17 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 def plain(value: Any) -> JsonValue:
-    if is_dataclass(value) and not isinstance(value, type):
-        return plain(asdict(value))
-    if isinstance(value, UUID):
-        return str(value)
-    if isinstance(value, datetime):
-        return value.isoformat().replace("+00:00", "Z")
-    if isinstance(value, dict):
-        return {key: plain(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [plain(item) for item in value]
-    return cast(JsonValue, value)
+    return cast(JsonValue, to_jsonable_python(value))
 
 
 MODELS: dict[str, type[BaseModel]] = {
@@ -148,17 +137,8 @@ class ControlService:
                 lock = self._locks.setdefault(request_id, asyncio.Lock())
                 async with lock:
                     previous = await self.metadata.request(request_id)
-                    if previous is not None:
-                        await self.metadata.reserve(
-                            request_id,
-                            principal,
-                            method,
-                            canonical,
-                            data.get("session_id"),
-                        )
-                        if previous["result"] is not None:
-                            return previous["result"]
-                    await self._authorize(method, data, principal)
+                    if previous is None:
+                        await self._authorize(method, data, principal)
                     request = await self.metadata.reserve(
                         request_id,
                         principal,
@@ -166,8 +146,14 @@ class ControlService:
                         canonical,
                         data.get("session_id"),
                     )
+                    if request["result"] is not None:
+                        return request["result"]
+                    if previous is not None:
+                        await self._authorize(method, data, principal)
                     result = await self._dispatch(method, data, principal, request)
-                    await self.metadata.finish(request_id, result)
+                    # Create adapters commit authorization and their result together.
+                    if method not in {"session.create", "skill.create"}:
+                        await self.metadata.finish(request_id, result)
                     return result
             await self._authorize(method, data, principal)
             return await self._dispatch(method, data, principal, None)
@@ -427,7 +413,8 @@ class ControlService:
                 try:
                     model = MODELS[row["method"]].model_validate_json(json.dumps(row["params"]))
                     result = await self._dispatch(row["method"], model.model_dump(), principal, row)
-                    await self.metadata.finish(row["request_id"], result)
+                    if row["method"] != "session.create":
+                        await self.metadata.finish(row["request_id"], result)
                 except StateError, RpcError:
                     logger.warning("Gateway recovery pending for %s", row["request_id"])
 
