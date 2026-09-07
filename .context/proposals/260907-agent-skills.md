@@ -1,6 +1,6 @@
 # Kapy v2：Agent Runner 与 Skills 方案
 
-本方案依据 `kapy_v2.md` 和 `docs/architecture.md`，范围为 `src/kapy/agent/`、`src/kapy/skills/` 及对应 tests。只提交方案；公共接口经总设计师统一批准后，才进入 cmd-impl。
+本方案依据 `kapy_v2.md`、`docs/architecture.md`，以及 main 提交 `61af09e` 的 `docs/acceptance.md` 和 `.context/delivery.md`，范围为 `src/kapy/agent/`、`src/kapy/skills/` 及对应 tests。验收清单描述后续需要提供的证据，不代表这些检查已通过。只提交方案；公共接口经总设计师统一批准后，才进入 cmd-impl。
 
 **1. 实现边界与实际 API**
 
@@ -327,4 +327,4 @@ skill.catalog 的 RPC limit 默认 100、范围 1–100；Gateway 向 service �
 
 对 State 的需求是上述 context/checkpoint、输入领取、attempt 事件、按 waiting 划分的历史及最终原子转换；对 Execution 的需求是精确的 process/file RPC、stdin/argv、幂等副作用和 file version；对 Gateway 的需求是注入 client/config/MachineCaller/pool、技能传输和 snapshot 接入。共享 pyproject、uv.lock、compose、README 由总设计师统一维护；请总设计师将当前锁中已存在的 tiktoken 声明为直接依赖，版本继续通过 uv 管理，本 senior 不修改共享配置。
 
-未来对应 tests 使用模型/Telegram mocks；涉及持久化时使用总设计师提供的 PostgreSQL/Valkey，每次生成独立 schema 与 key namespace。Runner 不直接依赖 Valkey。live 模型调用由总设计师单独使用主目录配置完成；本 senior 不读取主目录 `.env`，不发送真实 Telegram 消息。
+未来对应 tests 使用模型/Telegram mocks；涉及持久化时使用总设计师提供且已 healthy 的 PostgreSQL/Valkey，每次生成独立 schema、key namespace 与临时 Execution XDG 根，清理仅限本次创建的资源。禁止重启共用服务、flush 共用 Valkey 或删除其他 scope 的数据；恢复场景使用独立控制进程/schema 或专属可丢弃服务。Runner 不直接依赖 Valkey。Agent、Compression、Media、Plugins、Skills 的模块证据由本 senior 提供；跨模块负载与组合验收由总设计师组织，不编造吞吐目标。live 模型调用由总设计师单独使用主目录配置完成；本 senior 不读取主目录 `.env`，不发送真实 Telegram 消息。公共类型、RPC 名称、限额与持久化边界均由总设计师读完各 owner 方案后统一批准；直接沟通只用于澄清接口需求，不授权实现或管理其他 owner 的下级。
