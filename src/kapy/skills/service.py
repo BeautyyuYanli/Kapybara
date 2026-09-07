@@ -17,6 +17,15 @@ from psycopg_pool import AsyncConnectionPool
 from .archive import validate_archive
 from .types import SkillConflict, SkillDescription, SkillDetail, SkillInfo, SkillNotFound
 
+_INFO_COLUMNS = sql.SQL(
+    "id, name, description, revision, sha256, archive_bytes, created_at, updated_at"
+)
+
+
+def _validated_metadata(archive: bytes) -> tuple[str, str, str]:
+    parsed = validate_archive(archive)
+    return parsed.name, parsed.description, parsed.skill_md
+
 
 def _info(row: dict[str, Any]) -> SkillInfo:
     return SkillInfo(
@@ -105,7 +114,7 @@ class SkillService:
         parsed = None
         if archive is not None:
             async with self._validation_slots:
-                parsed = await asyncio.to_thread(validate_archive, archive)
+                parsed = await asyncio.to_thread(_validated_metadata, archive)
         try:
             async with self.pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
                 # Serialize identical request keys before observing their receipt.
@@ -147,9 +156,7 @@ class SkillService:
                 else:
                     assert parsed is not None and archive is not None
                     fields = (
-                        parsed.name,
-                        parsed.description,
-                        parsed.skill_md,
+                        *parsed,
                         archive,
                         digest,
                         len(archive),
@@ -158,7 +165,9 @@ class SkillService:
                         await cur.execute(
                             sql.SQL("""INSERT INTO {} (name, description, skill_md,
                             archive, sha256, archive_bytes, id, revision)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,1) RETURNING *""").format(self.skills),
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,1) RETURNING {}""").format(
+                                self.skills, _INFO_COLUMNS
+                            ),
                             (*fields, uuid4()),
                         )
                     else:
@@ -166,7 +175,7 @@ class SkillService:
                             sql.SQL("""UPDATE {} SET name=%s, description=%s,
                             skill_md=%s, archive=%s, sha256=%s, archive_bytes=%s,
                             revision=revision+1, updated_at=clock_timestamp()
-                            WHERE id=%s RETURNING *""").format(self.skills),
+                            WHERE id=%s RETURNING {}""").format(self.skills, _INFO_COLUMNS),
                             (*fields, skill_id),
                         )
                     row = await cur.fetchone()
@@ -189,10 +198,12 @@ class SkillService:
         row = await self._read(skill_id)
         return SkillDetail(_info(row), row["skill_md"])
 
-    async def _read(self, skill_id: str) -> dict[str, Any]:
+    async def _read(self, skill_id: str, *, archive: bool = False) -> dict[str, Any]:
+        columns = _INFO_COLUMNS + sql.SQL(", archive" if archive else ", skill_md")
         async with self.pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                sql.SQL("SELECT * FROM {} WHERE id=%s").format(self.skills), (UUID(skill_id),)
+                sql.SQL("SELECT {} FROM {} WHERE id=%s").format(columns, self.skills),
+                (UUID(skill_id),),
             )
             row = await cur.fetchone()
             if row is None:
@@ -226,7 +237,7 @@ class SkillService:
         *,
         expected_revision: int | None = None,
     ) -> tuple[SkillInfo, bytes]:
-        row = await self._read(skill_id)
+        row = await self._read(skill_id, archive=True)
         if expected_revision is not None and row["revision"] != expected_revision:
             raise SkillConflict("Skill revision has changed")
         return _info(row), bytes(row["archive"])
