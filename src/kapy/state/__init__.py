@@ -30,8 +30,12 @@ from .contracts import (
     Submission,
     UnsafeQuery,
 )
+from .service import SessionService
+from .store import migrate
 
 __all__ = [
+    "SessionService",
+    "migrate",
     "JsonValue",
     "JsonObject",
     "InputMode",
