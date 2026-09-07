@@ -6,6 +6,8 @@ proposal review before implementation. The initial target is Linux, one control
 server process, multiple independent sessions and execution machines. Durable
 state survives control-server restarts. No clustering framework is required.
 
+Read `docs/contracts.md` for architect decisions resolving older proposal conflicts.
+
 ## Ownership
 
 | Senior | Packages | Responsibility |
