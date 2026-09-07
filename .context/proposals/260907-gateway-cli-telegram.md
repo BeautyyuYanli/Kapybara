@@ -160,7 +160,7 @@ event.publish 的可信入口校验 publish 权；session 调用使用 `authoriz
 
 ## 4. 机器 registry 与双向代理
 
-机器连接使用 Execution 的 `RpcPeer`，Gateway 不实现第二套 JSON-RPC codec。Starlette WebSocket 的 send/receive/close 回调交给 peer，handler closure 固定连接的 machine id。机器反向请求只接受 `control.proxy`，剥离认证 envelope 后执行控制方法。控制端发往机器的方法只允许 `process.*`、`file.*`、`session.ensure`、`session.release`；每个请求都包含目标 `session_id`。
+机器连接使用 Execution 的 `RpcPeer`，Gateway 不实现第二套 JSON-RPC codec。Starlette WebSocket 的 send/receive/close 回调交给 peer，handler closure 固定连接的 machine id。机器反向请求只接受 `control.proxy`，剥离认证 envelope 后执行控制方法。控制端发往机器的方法只允许 `process.*`、`file.*`、`session.ensure`、`session.release`；每个请求都包含目标 `session_id`。即时进程输出读取采用 Execution 的 `process.wait({session_id,process_id,cursor,wait_ms:0,max_bytes:65536})`，原样使用 ProcessUpdate；不添加另一种读取方法。
 
 新机器连接的处理顺序固定为：认证及 subprotocol 检查；进入 `async with RpcPeer(...)`，使 reader/writer 就绪；注册 initializing connection；从 State.list_sessions 的当前 session-machine 关联与 Gateway access/outbox 取得活跃关联；对这些关联通过原始 peer 主动调用 session.ensure；成功后才开放该 `(connection,session_id)` 的 readiness gate。ensure 是初始化调用，不通过尚未就绪的 MachineCaller 递归调用自身。
 
@@ -222,11 +222,13 @@ State submit_input 的服务默认是 steer；CLI/Telegram 普通输入显式传
 
 update 传完整可修改字段，只允许 State 的 waiting 且无活动 run；running 时返回 Conflict。Gateway 不承诺在运行间隙自动修改配置。session.list 的授权在 Gateway 完成：从自有 access 表取得自身/直接子 session 或 Telegram route 对应的授权 id 集，再传 State.list_sessions(session_ids=...)；operator 才能使用 None 查询全量。对外只接受 after/limit，不接受调用者伪造授权 id 集；沿用 State 返回的 next_after。
 
-前端实时等待只走 `session.output` 的非消费 long-poll，after 从头重放到 next_cursor，再用 wait_seconds>0 接实时。`session.wait(session_id,request_id)` 由 Gateway 实现：先从自有 requests 校验归属并取得原始 Submission，再调用 State.read_output(after=...,wait_seconds=...)，顺序查找 kind=waiting 且 data.request_ids 包含该 UUID 的既有 Record；从其 run_id/outcome/output/cursor/created_at 装配 State 的 Completion/SubmissionStatus，不定义另一种结果 DTO。
+前端实时输出走 `session.output` 的非消费 long-poll：after 从头重放到 next_cursor，再用 wait_seconds>0 接实时。所有 cursor 原样传递给 State，不解析或重新编码。
 
-该等待只有只读 output 操作，不注册 subscriber、不消费 events、不要求 State 新增 broker、completion 表或 wait_submission 服务。可从 requests 预存的提交前 cursor 开始，未保存时从头扫描；读完已有页后才使用剩余 deadline long-poll，超时返回 completion=null。State 当前已有 wait_submission 签名仅保留在 owner 合约引用中，Gateway 不把它作为依赖。
+`session.wait(session_id,request_id,wait_seconds)` 使用总设计师已批准的 State.wait_submission：Gateway 先从自有 gateway_requests 校验可信调用者对该 request_id 和目标 session 的观察权限，再调用 `await state.wait_submission(session_id, request_id, wait_seconds=...)`，原样返回 State.SubmissionStatus。completion 属于 State 已有持久 receipt，与 waiting 状态原子提交；Gateway 不扫描 output 推断完成、不复制 completion，也不注册或消费 events。
 
-空创建的 input=null 从原始 CreatedSession 的 waiting 快照当场确定完成，无需等一次未来 run；普通成功/失败使用既有 waiting record 的 request_ids/outcome，不能只看到 session.status=waiting 就判某个排队输入已完成。删除导致 records 不可读时返回 Execution 既定 gone 错误；Gateway 仍保留请求授权和删除事实，不伪造已删记录或复制出新的 completion 存储。
+同一 receipt 可被多个获授权前端反复观察；timeout 返回 completion=null，未知请求或目标不匹配返回 NotFound。空创建当场完成，带输入的 create/input 仅在对应输入被实际接手后完成。waiting_id 可反复发布，不能代替 request_id；看到 session.status=waiting 也不能判定某个排队输入已完成。
+
+session 删除后保留 Gateway 请求归属/授权事实；仍获授权的调用者可继续用原 session_id+request_id 读取 State 保留的 receipt。未完成请求被删除时返回 outcome=deleted，已完成请求保留原 completion；不再将已删除目标的所有 receipt 统一变为 gone。来源 session token 的存活校验仍按认证规则执行，保留目标 receipt 不复活已删除的调用者身份。
 
 ### 事件与历史
 
@@ -574,7 +576,7 @@ Gateway 拥有以下 PostgreSQL 表定义和参数化查询；由 app lifespan �
 | `gateway_telegram_routes` | `(bot_id, chat_id, thread_id) PK, session_id UUID nullable, config jsonb` |
 | `gateway_telegram_delivery` | `(bot_id, chat_id, thread_id, session_id) PK, cursor text nullable, item_offset int, projection jsonb, next_attempt_at timestamptz nullable, blocked_error text nullable` |
 | `gateway_session_access` | `session_id UUID PK, owner_id text, parent_session_id UUID nullable, deleted bool`；不可变创建来源，删除后保留 |
-| `gateway_requests` | `request_id UUID PK, principal_id text, method text, params_hash text, params jsonb, target_session_id UUID nullable, start_cursor text nullable, operation jsonb, result jsonb nullable`；保存授权、原参数、传输 attempt/hash/revision 和恢复事实，operation 不存 archive bytes |
+| `gateway_requests` | `request_id UUID PK, principal_id text, method text, params_hash text, params jsonb, target_session_id UUID nullable, operation jsonb, result jsonb nullable`；保存授权、原参数、传输 attempt/hash/revision 和恢复事实，operation 不存 archive bytes |
 | `gateway_skill_access` | `skill_id UUID PK, creator_principal text, create_request_id UUID unique, deleted bool`；创建者事实只由认证入口写入，删除后保留 |
 | `gateway_channels` | `waiting_id UUID PK, creator_principal text`；仅 Gateway 的授权来源 |
 | `gateway_channel_grants` | `(waiting_id,principal_id) PK, can_publish bool, can_subscribe bool`；State 不读取该表 |
@@ -611,14 +613,14 @@ cursor 只在所覆盖文本成功发送或明确为不可见记录后推进；i
 
 ### session 删除与机器清理
 
-按 State 语义，delete 会取消 runner 并物理删除 session records；Gateway 不要求 State 保留被用户删除的历史。Gateway 删除前用自己的短事务保存 immutable session/machine 关联及授权事实到 `gateway_session_cleanup`，并暂停对应 Telegram delivery；随后调用 State.delete_session。State 返回 deleted 后终止该 session 未发送 delivery，并由 outbox 调用 AgentPayloadStore.delete_session 清理媒体/外置上下文；失败保留 payload_pending 重试，不因机器离线而延迟这项数据库清理。Telegram 已发送内容保持原状，后续等待根据保留的删除事实返回 gone，不依赖已物理删除的 output。
+按 State 语义，delete 会取消 runner 并物理删除 session records；Gateway 不要求 State 保留被用户删除的历史。Gateway 删除前用自己的短事务保存 immutable session/machine 关联及授权事实到 `gateway_session_cleanup`，并暂停对应 Telegram delivery；随后调用 State.delete_session。State 返回 deleted 后终止该 session 未发送 delivery，并由 outbox 调用 AgentPayloadStore.delete_session 清理媒体/外置上下文；失败保留 payload_pending 重试，不因机器离线而延迟这项数据库清理。Telegram 已发送内容保持原状，后续 receipt 等待使用 State.wait_submission 及保留的 Gateway 授权事实，不依赖已物理删除的 output。
 
 清理 worker 使用持久任务内的关联调用 `session.release({session_id,wait_ms:5000})`；released=false 继续观察，离线机器保留任务，重连后继续。cleanup 只允许 release，不向已删除 session 发送 process/file/ensure。每台机器释放成功后标记完成，payload_pending 清除且全部机器完成才关闭任务，所有阶段按原 request_id UUID 可恢复；启动时扫描未完成任务，不依赖 State 已删除的 session 行。该表、worker 及权限归 Gateway，不把删除机器职责塞回 State。
 
 ## 9. 持久化边界与集成约束
 
-PostgreSQL 是 session、输入、history/output、event、Skills archive、Gateway 授权和 Telegram ingress/delivery 的权威存储；前端 completion 从既有 waiting records 读取；Valkey 只提供唤醒提示，Gateway registry 是连接事实的内存映射。没有将控制状态改用 SQLite/内存的路径。Execution 的 XDG SQLite/进程资源归 Execution。
+PostgreSQL 是 session、输入、history/output、event、Skills archive、Gateway 授权和 Telegram ingress/delivery 的权威存储；前端 completion 通过 State.wait_submission 读取既有持久 receipt；Valkey 只提供唤醒提示，Gateway registry 是连接事实的内存映射。没有将控制状态改用 SQLite/内存的路径。Execution 的 XDG SQLite/进程资源归 Execution。
 
 每次集成调用使用独立 `KAPY_DATABASE_SCHEMA=gw_<uuid>`、`KAPY_VALKEY_NAMESPACE=gw:<uuid>`，使用总设计师提供的 PostgreSQL/Valkey 地址；清理只作用于自己的 schema/namespace。Gateway 与其他 senior 不共享测试路由、session ids、上传临时目录或 XDG root；涉及真实 Execution 的检查使用总设计师指定的专用 Docker 容器。Telegram send/getUpdates/setMyCommands 全部对 fake Bot API 或 MockTransport，不发送真实消息；本轮没有读取主目录 `.env`。已只读查看 main 的 `docs/acceptance.md`（61af09e），按其 Gateway 并发 polling、机器中断、Telegram 恢复场景提供对应 module tests；不重启或 flush 共用开发服务。
 
-跨模块交付要求：State 提供本方案直接采用的 DTO、UUID request_id/receipts、非消费 read_output/read_history、history.export 和独立迁移；Execution 提供 RpcPeer/dispatch_json/call_local_proxy、MachineCaller timeout、DaemonConfig/run_daemon、ensure/release、resolve_paths 与既有 file.*；Intelligence 提供 State SessionRunner 兼容的 Runner、AuthorizeWait 注入、Runner.initial_state、借用 Gateway pool 的 SkillService/AgentPayloadStore 与 pack_skill/extract_skill。Skills 的 request_key 仅为内部认证 scope + UUID 适配，外部统一 request_id:UUID；creator/直接子 session/channel grants 均由 Gateway 保存。总设计师统一剩余接口、错误码和配置示例；CLI script 与 Docker CMD 已在 main 完成。Gateway 不并行修改其他 senior 包或共享 `pyproject.toml`、`uv.lock`、`compose.yaml`、README。
+跨模块交付要求：State 提供本方案直接采用的 DTO、UUID request_id/receipts、非消费 read_output/read_history/wait_submission、snapshot export_history 和独立迁移；Execution 提供 RpcPeer/dispatch_json/call_local_proxy、MachineCaller timeout、DaemonConfig/run_daemon、ensure/release、resolve_paths 与既有 file.*；Intelligence 提供 State SessionRunner 兼容的 Runner、AuthorizeWait 注入、Runner.initial_state、借用 Gateway pool 的 SkillService/AgentPayloadStore 与 pack_skill/extract_skill。Skills 的 request_key 仅为内部认证 scope + UUID 适配，外部统一 request_id:UUID；creator/直接子 session/channel grants 均由 Gateway 保存。总设计师统一剩余接口、错误码和配置示例；CLI script 与 Docker CMD 已在 main 完成。Gateway 不并行修改其他 senior 包或共享 `pyproject.toml`、`uv.lock`、`compose.yaml`、README。
