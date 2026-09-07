@@ -1,5 +1,11 @@
+import asyncio
+import json
+import time
+from contextlib import asynccontextmanager
 from uuid import UUID
 
+import httpx2
+import psycopg
 import pytest
 
 from kapy.gateway.app import FrontendContext
@@ -126,3 +132,124 @@ async def test_projection_replaces_deltas_and_marks_failed_model_attempts():
     assert projection["failed"] == ["m1"]
     left, right = text_chunk("x" * 3999 + "😀")
     assert left == "x" * 3999 and right == "😀"
+
+
+async def test_poll_retries_uncommitted_batch_and_restarts_at_committed_offset(
+    gateway, monkeypatch
+):
+    context = FrontendContext(gateway.settings, gateway, gateway.metadata.pool)
+    bot = TelegramFrontend(context)
+    current = bot
+    batch = [update(10, "first", 7), update(11, "second", 8)]
+    offsets = []
+    fail_commit = False
+    connection = gateway.metadata.connection
+
+    @asynccontextmanager
+    async def interrupted_transaction():
+        nonlocal fail_commit
+        async with connection() as cursor:
+            yield cursor
+            if fail_commit:
+                fail_commit = False
+                # Both inbox writes and the new offset have executed, but neither commits.
+                raise psycopg.OperationalError("Injected failure before inbox commit")
+
+    monkeypatch.setattr(gateway.metadata, "connection", interrupted_transaction)
+
+    async def respond(request):
+        nonlocal fail_commit
+        assert request.url.path.endswith("/getUpdates")
+        offsets.append(json.loads(request.content)["offset"])
+        if len(offsets) == 1:
+            fail_commit = True
+            return httpx2.Response(200, json={"ok": True, "result": batch})
+        if len(offsets) == 2:
+            assert await gateway.metadata.rows("SELECT * FROM gateway_telegram_inbox") == []
+            assert await gateway.metadata.rows("SELECT * FROM gateway_telegram_poll") == []
+            current.disabled = True  # Stop this polling instance after its successful ingest.
+            return httpx2.Response(200, json={"ok": True, "result": batch})
+        current.disabled = True
+        return httpx2.Response(200, json={"ok": True, "result": []})
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+        bot.client = client
+        async with asyncio.timeout(5):
+            await bot.poll()
+        assert offsets == [0, 0]
+        inbox = await gateway.metadata.rows(
+            "SELECT payload FROM gateway_telegram_inbox ORDER BY update_id"
+        )
+        assert [row["payload"] for row in inbox] == batch
+        poll = await gateway.metadata.rows("SELECT next_update_id FROM gateway_telegram_poll")
+        assert poll[0]["next_update_id"] == 12
+
+        current = TelegramFrontend(context)
+        current.client = client
+        await current.poll()
+        assert offsets == [0, 0, 12]
+
+
+async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadline(gateway):
+    context = FrontendContext(gateway.settings, gateway, gateway.metadata.pool)
+    bot = TelegramFrontend(context)
+    content = "A" * 3990 + "😀" * 2500 + "tail"
+    attempts, delivered = [], []
+
+    def respond(request):
+        assert request.url.path.endswith("/sendMessage")
+        params = json.loads(request.content)
+        if params["text"].startswith("["):
+            attempts.append(params["text"])
+            if len(attempts) == 2:
+                return httpx2.Response(
+                    429,
+                    json={"ok": False, "error_code": 429, "parameters": {"retry_after": 2}},
+                )
+            delivered.append(params["text"])
+        return httpx2.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    async def delivery():
+        return (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+        bot.client = client
+        await bot.ingest([update(0, "/machine one", 7), update(1, content, 7)])
+        await bot.process_once()
+        await bot.process_once()
+        sid = (await bot.route(-100, 7))["session_id"]
+        await gateway.sessions.wait_submission(
+            sid, UUID(request_id(12345, 1, "message.create")), wait_seconds=5
+        )
+        await bot.deliver_once()
+        first = await delivery()
+        pending = first["projection"]["pending"]
+        assert first["item_offset"] > 0
+        assert content in pending["text"]
+
+        await bot.deliver_once()
+        failed = await delivery()
+        assert failed["cursor"] == first["cursor"]
+        assert failed["item_offset"] == first["item_offset"]
+        assert failed["projection"] == first["projection"]
+        assert failed["next_attempt_at"].timestamp() > time.time()
+        assert len(attempts) == 2 and len(delivered) == 1
+
+        restored = TelegramFrontend(context)
+        restored.client = client
+        await restored.deliver_once()
+        assert len(attempts) == 2
+        await asyncio.sleep(max(0, failed["next_attempt_at"].timestamp() - time.time()) + 0.02)
+        await restored.deliver_once()
+        assert attempts[2] == attempts[1]
+        async with asyncio.timeout(5):
+            while "pending" in (await delivery())["projection"]:
+                await restored.deliver_once()
+        final = await delivery()
+        assert final["cursor"] == pending["cursor"]
+        assert final["item_offset"] == 0 and final["next_attempt_at"] is None
+        assert "".join(text.partition("] ")[2] for text in delivered) == pending["text"]
+        assert all(len(text.encode("utf-16-le")) // 2 <= 4000 for text in delivered)
+        completed_attempts = len(attempts)
+        await restored.deliver_once()
+        assert len(attempts) == completed_attempts
