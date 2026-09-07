@@ -1,7 +1,24 @@
 # Acceptance results
 
-These are incremental measurements of committed snapshots. They do not establish
-that the complete product has passed acceptance. The inventory is in acceptance.md.
+Final main passed **262 tests in 110.74 s**, with zero failures, errors or skips,
+on the standard `kapy-v2_default` Docker bridge. The container had init, private
+process/filesystem namespaces, read-only code, 2 GiB memory and 256 PIDs. Tests
+used PostgreSQL/Valkey service URLs with isolated schemas/namespaces. Shared pytest
+configuration now explicitly includes `docker_manager_acceptance.py`; the JUnit
+report confirms all three real Agent/MachineService checks were collected.
+
+| Final check | Result |
+| --- | --- |
+| Ruff / pyrefly | PASS / 0 errors |
+| Standard Docker test suite | 262 passed, 110.74 s |
+| Real model → installed CLI → child task → parent event resume | PASS, 16.20 s |
+| Control SIGKILL during real machine work | PASS; attempts 1/2, machine command executed once |
+| Wheel, generated resource hashes, Docker images, uvx CLI | PASS |
+| Telegram | Mock Bot API coverage passed; real getMe/getChat passed; no real send/poll |
+
+The final integration and live recursive workflow are recorded below. Earlier
+sections retain measurements of their explicitly named snapshots; their pending
+items describe those earlier milestones. The inventory is in acceptance.md.
 
 ## State baseline — 2026-09-07
 
@@ -208,8 +225,9 @@ operation, not a general exactly-once guarantee for arbitrary external effects.
 ## Complete merged functional baseline
 
 Main `b003b18` passed **259 tests in 125.58 s**, with zero failures, errors or skips.
-The JUnit report contains 259 distinct test identities, including the explicitly
-collected real Agent/MachineService acceptance file. This independently combines
+The JUnit report contains 259 distinct test identities. Later report inspection
+showed that the nonstandard Agent/MachineService acceptance filename was omitted
+when passed alongside its parent directory. This baseline independently combines
 all four reviewed module deliveries and the PTY observer correction.
 
 Tests ran in one disposable Docker container with private process/filesystem
@@ -218,3 +236,32 @@ reach the development databases' published loopback ports, while the remaining
 fixture-address correction is underway. Final acceptance must also pass on the
 standard Compose bridge using environment-overridden service URLs. The two test
 files' type errors and Agent shell PATH issue remain assigned to the closeout senior.
+
+## Reviewed integration closeout and live recursive task
+
+Closeout `9515f9d` completed all five review stages and was merged as `d892d21`.
+The Agent now preserves explicitly configured PATH by invoking `sh -c`. A real
+MachineService regression executes the installed `/app/.venv/bin/kapy`; restoring
+the old login-shell invocation makes that regression fail with exit code 127.
+The affected database fixtures now honor the bridge service URLs, and local
+JsonValue narrowing removed all 79 reported type errors. Ruff passes and pyrefly
+reports zero errors (two existing suppressions and 15 warnings).
+
+The complete main image is running in the normal `kapy-v2` Compose app profile,
+with the control API at `http://127.0.0.1:8000`. Telegram is explicitly disabled.
+`scripts/check_recursive.py` passed against this image and the configured real
+model in **16.20 s**: the parent invoked the installed CLI to create a child,
+waited on its returned receipt channel, received exactly one child completion
+event, and resumed to reply with the child's unpredictable machine-generated
+marker. The parent had distinct runs before and after waiting. Both temporary
+sessions were deleted.
+
+The first recursive harness attempt supplied an unregistered random waiting ID,
+which correctly failed authorization. The harness now uses the channel returned
+by the CLI, matching the public creation workflow. This required no Gateway change.
+
+The final wheel contains all seven packages and all 12 generated apply_patch
+resource files match their manifest sizes and SHA-256 values for aarch64/x86_64.
+`uvx --from <wheel> kapy --help` installs and runs successfully inside Docker.
+The product and development Docker images build successfully. Old isolated
+acceptance stacks and their temporary data volumes have been removed.

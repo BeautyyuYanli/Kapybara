@@ -46,6 +46,7 @@ python-version = "3.14"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test_*.py", "docker_manager_acceptance.py"]
 markers = ["integration: requires local PostgreSQL and Valkey", "live: requires explicit live service credentials"]
 
 [dependency-groups]

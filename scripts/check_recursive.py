@@ -16,7 +16,6 @@ import httpx2
 async def check(machine_id: str) -> None:
     base = os.environ.get("KAPY_CONTROL_URL", "http://127.0.0.1:8000").rstrip("/")
     label = "Kapy recursive acceptance " + uuid4().hex[:12]
-    waiting_id = str(uuid4())
     async with httpx2.AsyncClient(
         headers={"Authorization": "Bearer " + os.environ["KAPY_CONTROL_TOKEN"]}, timeout=40
     ) as client:
@@ -64,8 +63,6 @@ async def check(machine_id: str) -> None:
                     label + " child",
                     "--machine",
                     machine_id,
-                    "--waiting-id",
-                    waiting_id,
                 ]
             )
             await rpc(
@@ -77,8 +74,9 @@ async def check(machine_id: str) -> None:
                     "payload": (
                         "Create one child task by executing this exact command with process_start "
                         f"in stdio mode on the default machine:\n{command}\n"
-                        "After successful creation, use your wait tool with wait_for containing "
-                        f"only {waiting_id}. Do not poll the child or wait via CLI. "
+                        "After successful creation, read waiting_id from the CLI JSON receipt "
+                        "and use your wait tool with wait_for containing only that ID. "
+                        "Do not poll the child or wait via CLI. "
                         "When its completion event arrives, reply with only the child's random "
                         "KAPY_CHILD_ marker from that event. Do not generate a marker yourself."
                     ),
@@ -101,7 +99,9 @@ async def check(machine_id: str) -> None:
                         text = record.get("text", "").strip()
                         if record["kind"] == "final" and text:
                             if not re.fullmatch(r"KAPY_CHILD_[0-9a-f]{32}", text):
-                                raise AssertionError("Parent completed without the child marker")
+                                raise AssertionError(
+                                    f"Parent completed without the child marker: {text[:2000]}"
+                                )
                             marker = text
             events = [
                 record
@@ -109,7 +109,6 @@ async def check(machine_id: str) -> None:
                 if record["kind"] == "input"
                 and isinstance(record["data"], dict)
                 and record["data"].get("type") == "event"
-                and record["data"].get("waiting_id") == waiting_id
             ]
             if len(events) != 1 or marker not in json.dumps(events[0]["data"]):
                 raise AssertionError(

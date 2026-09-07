@@ -81,6 +81,13 @@ kapy control --session <session-id> history query 'SELECT kind, text FROM histor
 创建子会话，把子任务的 waiting ID 交给 `wait` 工具；子任务进入 waiting 时发布
 完成事件，继续父会话。
 
+新任务使用创建回执返回的 `waiting_id`。`--waiting-id` 用于已有且有权访问的通道，
+不能随意生成 UUID 代替。真实父子任务验收可运行：
+
+```sh
+uv run --env-file .env python scripts/check_recursive.py --machine docker-machine
+```
+
 `queue` 在下一轮处理；`steer` 在当前模型或工具边界处理。完整历史保存在
 PostgreSQL，模型上下文压缩不会删掉原始历史。压缩依据 API 返回的单次用量。
 
@@ -125,8 +132,7 @@ uv build
 docker build -t kapy-v2:dev .
 docker build -f Dockerfile.machine -t kapy-v2-machine:dev .
 docker compose up -d postgres valkey
-docker compose --profile dev run --rm machine /app/.venv/bin/pytest -q -p no:cacheprovider \
-  tests tests/agent/docker_manager_acceptance.py
+docker compose --profile dev run --rm machine /app/.venv/bin/pytest -q -p no:cacheprovider
 ```
 
 真实进程、PTY、文件和执行机恢复检查全部在 Docker 中运行。测试使用独立
