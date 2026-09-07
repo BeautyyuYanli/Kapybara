@@ -8,4 +8,6 @@
 
 最终非 root Docker 全仓测试：327 passed，136.59 秒，零跳过。Ruff check/format、Pyrefly（0 errors，保留既有 warnings）、Git 差异和 Compose 配置检查通过。覆盖真实 PostgreSQL、Valkey、Execution、apply_patch，以及模型适配、前端隔离/恢复、插件关闭/替换、旧工具恢复和 Telegram 持久接续；模型和 Telegram API 使用模拟端点。另独立验证注入的模型 HTTP client 在 Gateway 退出后仍可用，由调用方关闭。
 
-未新增依赖或手改生成资源，未修改真实凭据。API usage 计数和既有数据语义不变；Telegram 正式 ACK 丢失仍可能重复分段。本报告记录代码审查与验收，运行服务更新另记部署结果。
+未新增依赖或手改生成资源，未修改真实凭据。API usage 计数和既有数据语义不变；Telegram 正式 ACK 丢失仍可能重复分段。
+
+部署结果（2026-09-08）：审查报告随 `edda896` 快进合入 main，构建并仅更新 Compose control/daemon。更新前没有活动输入、进程或待发回复；更新后控制 RPC 与实际 Unix socket → machine WS → Gateway 的只读 session.list 均通过。四个 session 的 instruction/skill 快照摘要一致，69 份请求记录、Telegram offset 和四份 version 1 投递状态保留，无积压或 blocked_error；启动日志无错误和警告。两应用均使用 UID 10001，执行机 CapEff=0、NoNewPrivs=1。PostgreSQL、Valkey、网络和开发容器未重建。本次未额外发送 Telegram 测试消息或调用真实模型。
