@@ -698,6 +698,12 @@ class TelegramFrontend:
             route = (row["chat_id"], row["thread_id"])
             if route in busy:
                 continue
+            if row["update_id"] is None:
+                # An old create may still be retrying its confirmation reply. Its
+                # original inbox action will restore the origin; hold this route
+                # until then instead of guessing the unknown delivery's order.
+                busy.add(route)
+                continue
             # Include blocked/backoff rows in ordering: later replies cannot overtake them.
             if row["blocked_error"] or (
                 row["next_attempt_at"] and row["next_attempt_at"].timestamp() > time.time()

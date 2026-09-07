@@ -7,17 +7,19 @@ import httpx2
 import psycopg
 import pytest
 from psycopg import sql
+from psycopg.types.json import Jsonb
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from valkey.asyncio import Valkey
 
 from kapy.agent import ModelFailure
 from kapy.gateway import FrontendContext, Principal, create_app
+from kapy.gateway.telegram import empty_projection
 from kapy.rpc import RpcError
 from kapy.settings import Settings
 
 from .conftest import DATABASE, VALKEY
 from .test_control import create
-from .test_telegram import Bot, feed, install_output, record, update
+from .test_telegram import Bot, feed, install_output, record, sent_text, update
 
 
 class Backend:
@@ -268,3 +270,66 @@ async def test_telegram_legacy_origin_uses_saved_receipt_without_creating_sessio
 
     bot.control = type("Port", (), {"call": staticmethod(no_call)})()
     await bot.restore_origins()
+
+
+@pytest.mark.asyncio
+async def test_legacy_origin_waits_for_original_inbox_retry_before_delivery(gateway):
+    bot = Bot(gateway)
+    await bot.ingest([update(1, "/machine one"), update(2, "/new"), update(3, "/new")])
+    await bot.process_once()
+    await bot.process_once()
+    bot.fail = True
+    await bot.process_once()
+    inboxes = await gateway.metadata.rows(
+        "SELECT * FROM gateway_telegram_inbox "
+        "WHERE resolved_action->>'kind'='create' ORDER BY update_id"
+    )
+    assert len(inboxes) == 2
+    assert inboxes[0]["handled"] is True
+    assert inboxes[1]["handled"] is False and inboxes[1]["next_attempt_at"] is not None
+    session_ids = [row["resolved_action"]["session_id"] for row in inboxes]
+    params = [row["resolved_action"]["params"] for row in inboxes]
+    # The old implementation saved neither origin, including the committed create
+    # whose confirmation hit Telegram backoff after its delivery row was saved.
+    await gateway.metadata.rows(
+        "UPDATE gateway_telegram_inbox SET resolved_action=resolved_action-'session_id' "
+        "WHERE resolved_action->>'kind'='create'"
+    )
+    for sid, text in zip(
+        session_ids, ("older session output", "later session output"), strict=True
+    ):
+        projection = empty_projection()
+        projection["pending"] = {"text": text, "next": empty_projection()}
+        await gateway.metadata.rows(
+            "UPDATE gateway_telegram_delivery SET projection=%s WHERE session_id=%s",
+            (Jsonb(projection), sid),
+        )
+    restored = Bot(gateway)
+    await restored.deliver_once()
+    assert restored.sent == []
+    deferred = (
+        await gateway.metadata.rows("SELECT * FROM gateway_telegram_inbox WHERE update_id=3")
+    )[0]
+    assert deferred["handled"] is False
+    assert "session_id" not in deferred["resolved_action"]
+    assert deferred["next_attempt_at"] == inboxes[1]["next_attempt_at"]
+
+    await gateway.metadata.rows(
+        "UPDATE gateway_telegram_inbox SET next_attempt_at=NULL WHERE update_id=3"
+    )
+    await restored.process_once()
+    completed = await gateway.metadata.rows(
+        "SELECT * FROM gateway_telegram_inbox "
+        "WHERE resolved_action->>'kind'='create' ORDER BY update_id"
+    )
+    assert all(row["handled"] for row in completed)
+    assert [row["resolved_action"]["session_id"] for row in completed] == session_ids
+    assert [row["resolved_action"]["params"] for row in completed] == params
+    assert len((await gateway.sessions.list_sessions()).items) == 2
+    restored.sent.clear()
+    await restored.deliver_once()
+    await restored.deliver_once()
+    assert [sent_text(payload) for _, payload in restored.sent] == [
+        "older session output",
+        "later session output",
+    ]
