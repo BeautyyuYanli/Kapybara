@@ -108,7 +108,7 @@ async def run_daemon(
 ) -> None: ...
 ```
 
-`gateway_url` 是完整机器 WebSocket URL；非回环地址必须使用 `wss://`。显式目录必须为绝对路径；idle 秒数为正数。`cgroup_root=None` 按第 5 节从专属 systemd user service 的实际委派位置发现；显式值只能固定为该发现结果，不能把任意 writable 路径当委派。Gateway settings 负责环境变量/配置文件映射，并构造 `DaemonConfig`；Execution 不自行加载 `.env`。`run_daemon` 拥有锁、数据库、socket、HTTP client、连接任务、进程/传输任务，在 stop、取消或退出时完成清理。构造配置不进行 I/O。
+`gateway_url` 是完整机器 WebSocket URL；非回环地址必须使用 `wss://`。显式目录必须为绝对路径；idle 秒数为正数。`cgroup_root` 支持显式传入当前 delegated scope 的根，或已委派 service 的根；None 按第 5 节从当前 unit 发现。Gateway 将可选环境变量 `KAPY_CGROUP_ROOT` 映射到此字段。显式路径仍需核对当前进程所属 unit、委派和实际迁移能力，不能把任意 writable 路径当委派。Gateway settings 负责环境变量/配置文件映射，并构造 `DaemonConfig`；Execution 不自行加载 `.env`。`run_daemon` 拥有锁、数据库、socket、HTTP client、连接任务、进程/传输任务，在 stop、取消或退出时完成清理。构造配置不进行 I/O。
 
 ## 3. RpcPeer 协议与 transport 所有权
 
@@ -163,29 +163,41 @@ SQLite 存机器侧状态；控制面 session/input/output/history/event 的权�
 
 ## 5. 真实进程、PTY 与恢复
 
-每个 managed process 有自己的 Linux cgroup v2，以覆盖 setsid/double-fork 后代。运行前提明确为：提供 cgroup v2 的 Linux、可用的 systemd user manager、支持 `DelegateSubgroup` 的 systemd 254+，以及 `cgroup.kill` 内核接口。普通用户通过专属 user service 获得委派，不需要修改 Lody unit 或手工 chown cgroup；仅看到挂载 rw、目录可写不能证明委派成立。systemd 的 `Delegate=yes` 建立管理边界，`DelegateSubgroup=daemon` 将管理进程放进单独叶组；Kapy 只管理 unit 根之下自己创建的 jobs 子树。[systemd delegation](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)
+每个 managed process 有自己的 Linux cgroup v2，以覆盖 setsid/double-fork 后代。运行前提为提供 cgroup v2、`cgroup.kill` 的 Linux，以及支持 `Delegate=yes` 和可验证委派标记的 systemd user manager。普通用户通过本项目专属 transient user scope 或 user service 获得委派，不需要修改 Lody unit 或手工 chown cgroup。scope 不要求 `DelegateSubgroup`，不将 systemd 254+ 作为此启动路径的额外前提；若选择 service 的 `DelegateSubgroup=daemon` 形式，则该可选形式需要 systemd 254+。仅看到挂载 rw、目录可写不能证明委派成立。Kapy 只管理已验证 unit 根之下自己创建的 jobs 子树。[systemd delegation](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)
 
-在已导出 Gateway 约定的 `KAPY_CONTROL_URL`、`KAPY_MACHINE_ID`、`KAPY_MACHINE_TOKEN`，且 Kapy wheel 已构建的条件下，普通用户的启动形式为：
+在已导出 Gateway 约定的 `KAPY_CONTROL_URL`、`KAPY_MACHINE_ID`、`KAPY_MACHINE_TOKEN`，且 Kapy wheel 已构建的条件下，普通用户先进入专属 scope 的 shell：
 
 ```sh
-systemd-run --user --unit=kapy-execution --collect --wait --pipe \
-  --service-type=exec \
-  --property=Delegate=yes \
-  --property=DelegateSubgroup=daemon \
-  --property=KillMode=control-group \
-  --property=SendSIGKILL=yes \
-  --property=TimeoutStopSec=10s \
-  --setenv=KAPY_CONTROL_URL \
-  --setenv=KAPY_MACHINE_ID \
-  --setenv=KAPY_MACHINE_TOKEN \
-  "$(command -v uvx)" --from /absolute/path/to/kapy.whl kapy server
+systemd-run --user --scope --quiet --collect \
+  --unit=kapy-execution-dev --property=Delegate=yes \
+  /bin/bash --noprofile --norc
 ```
 
-wheel 路径替换为实际产物路径；这里只按名字传入已有环境变量，token 不出现在 argv。该命令是批准后产品的启动契约，本轮不执行服务创建。`systemd-run` 创建独立的 transient user service；`--wait --pipe` 保持前台观察，`--collect` 在退出后回收 unit。Gateway 的 `kapy server` 从 control URL/machine ID 构造完整 WS URL 并调用 `run_daemon`。[systemd-run](https://raw.githubusercontent.com/systemd/systemd/v260/man/systemd-run.xml)
+然后在该 scope 的 shell 内，把当前 scope 根显式传入；以下路径形式对应本项目已确认的 `/sys/fs/cgroup` 挂载：
 
-启动时通过 `/proc/self/cgroup` 和 cgroup v2 mount 信息定位当前实际 cgroup，只接受当前 `daemon` 叶组的直接父目录为候选 unit 根；要求该根具备 `user.delegate=1`、属于当前 UID，且显式 cgroup_root 若存在必须与它一致。不会向上遍历到 user@.service、user.slice 或猜测 UID/unit 路径。daemon 保持在 `daemon` 叶组，jobs 子树与它同级，既满足 no-internal-process 规则，也避免杀命令时杀到管理进程。不新增 CPU/memory controller 管理，也不修改 systemd 所有的 unit 根资源属性。
+```sh
+kapy_scope_cgroup=$(cut -d: -f3 /proc/self/cgroup)
+export KAPY_CGROUP_ROOT="/sys/fs/cgroup${kapy_scope_cgroup}"
+uvx --from /absolute/path/to/kapy.whl kapy server
+```
 
-候选根确认后，在按 machine/state 根命名的专属 jobs 子树中创建唯一探测叶组，复用 launcher 的就绪握手，让无用户代码的探测进程迁入，验证可写 `cgroup.procs`、`cgroup.kill` 与 empty 状态，杀掉并回收该探测进程，清理叶组后才接收机器请求。验证的是自行创建的叶组，不要求写 systemd 所有的 unit 根 cgroup.kill。任何一步失败均停止启动、明确报告缺少的能力；不回退到 killpg，不先运行用户命令。专属验收 service 由总设计师创建，每次使用独立 unit/XDG 根；本 senior 不在 Lody 或其他 senior 的 cgroup 下试写。
+wheel 路径替换为实际产物路径。scope 继承调用者的环境与工作目录，token 保持在环境中，不出现在 argv；Gateway 的 `kapy server` 映射 KAPY_CGROUP_ROOT，从 control URL/machine ID 构造完整 WS URL并调用 `run_daemon`。省略 KAPY_CGROUP_ROOT 时也支持从当前 scope 自动发现。以上命令是批准后产品的启动契约，本轮不重复创建环境；总设计师已实测项目专属 `Delegate=yes` transient user scope 的 cgroup.procs/cgroup.kill 可写。该证据不替代后续对子组实际迁移、杀树与回收的检查。[systemd-run scope](https://raw.githubusercontent.com/systemd/systemd/v260/man/systemd-run.xml)
+
+启动时通过 `/proc/self/cgroup` 和 cgroup v2 mount 信息定位当前实际 cgroup。候选根是当前所属的最近 `.scope` 或 `.service` unit 边界：进程可以直接位于 scope 根，也可在该 unit 的 daemon 等子组内。候选根要求 `user.delegate=1`、属于当前 UID；显式 cgroup_root 必须是这个已验证边界且包含当前进程，不能指定其他 unit。遇到当前 unit 未委派即失败，不越过它去使用 user@.service/user.slice 的权限，也不猜测 UID/unit 路径。
+
+scope 中 daemon、启动 shell 和测试 runner 可留在当前组，只迁移新建的命令 launcher；service 中已有 daemon 子组同样支持。Kapy 不迁移父 shell、uv 或其他已有进程，不启用任何 domain controller，不修改 unit 根的资源属性；只创建独立 jobs 子树和命令叶组。no-internal-process 约束针对启用 domain controller 分配资源的组，不要求为了单纯分组/kill 清空当前 scope 根；实际迁移失败则明确停止启动，不擅自修改 controller 配置。[cgroup v2 约束](https://docs.kernel.org/admin-guide/cgroup-v2.html#no-internal-process-constraint)
+
+候选根确认后，在按 machine/state 根命名的专属 jobs 子树中创建唯一探测叶组，复用 launcher 的就绪握手，让无用户代码的探测进程迁入，验证可写 `cgroup.procs`、`cgroup.kill` 与 empty 状态，杀掉并回收该探测进程，清理叶组后才接收机器请求。验证的是自行创建的叶组，不写 unit 根的 cgroup.kill。任何一步失败均停止启动、明确报告缺少的能力；不回退到 killpg，不先运行用户命令。主分支集成验收 scope 由总设计师负责；本 senior 在批准后的模块测试阶段只创建本项目专属独立 scope，不修改 Lody service，也不在 Lody 或其他服务的 cgroup 下试写。
+
+模块测试从本 worktree 运行于独立 scope 内；每次使用新的 unit 名称，例如：
+
+```sh
+systemd-run --user --scope --quiet --collect \
+  --unit="kapy-execution-tests-$(uuidgen)" --property=Delegate=yes \
+  "$(command -v uv)" run --locked pytest tests/execution tests/rpc
+```
+
+测试 fixture 从自身 cgroup/mount 信息取得当前 delegated scope 根，并显式构造 `DaemonConfig(cgroup_root=...)`；每个 daemon 使用独立临时 XDG 根，从而得到独立 jobs 子树，所有 session/process/transfer ID 也独立。fixture 的 finally 只杀并回收自己创建的子组；不向 scope 根 cgroup.kill 写入。若测试异常留下活 scope，仅清理此次测试创建的那个 unit；`--collect` 只回收已退出的 unit，不能代替杀残留进程。scope 命令与真实进程测试均留待实现阶段执行，不能将上述环境可写探测报告为完整杀树测试已通过。
 
 正式启动命令时，先提交 starting 记录及专属 cgroup 路径并建立叶组，再启动小型 launcher：launcher 在执行任何用户代码前加入该组，经专用管道确认；daemon 持久化 running 转换后发出执行许可。许可管道 EOF 时 launcher 退出，防止半次 spawn 偷跑。恢复只清理当前已验证 unit 根内、本实例记录的 jobs 子树，不扫描或杀死任意系统 cgroup。
 
@@ -201,7 +213,9 @@ stdio 两个 drain task 每次至多 64 KiB，追加到各自磁盘 spool，不�
 
 `process.kill` 写 `cgroup.kill=1`，覆盖变更 session/process group 以及 double-fork 的后代；这与 Ctrl-C 是不同操作。直到 cgroup empty、leader 已回收且输出 drain 完成才进入终态；超过 wait_ms 则返回 killing，可继续观察。正常 leader 退出但仍有后代时保持 running，保留已知 exit_code。内核负责 kill 与 fork 的竞争。[Linux cgroup.kill](https://docs.kernel.org/admin-guide/cgroup-v2.html#core-interface-files)
 
-WebSocket 断线不影响进程。daemon 正常退出时清理全部下辖进程；专属 service 停止时 systemd 按 `KillMode=control-group` 兜底清理整个 unit，10 秒停止宽限后向仍存活进程发送 SIGKILL。daemon 异常退出后的下次启动只清理当前已验证专属子树中仍未终止的组，再把未正常完成记录标为 lost，保留 spool 和已提交 PTY 尾窗；属于旧 unit 的历史路径不能作为跨 unit 杀进程的依据。启动清理结束前不接收新请求。不依据可能复用的裸 PID 杀进程，也不伪装恢复已丢失的 PTY fd。主机重启后 cgroup 消失同样标 lost。此方案保证状态可恢复，不提供 daemon 重启后继续原终端的 attach 服务；信号尚未完成的任务不能提前宣称已清理。[systemd KillMode](https://raw.githubusercontent.com/systemd/systemd/v260/man/systemd.kill.xml)
+WebSocket 断线不影响进程。daemon 正常退出时清理全部下辖进程。scope 与 service 的停机边界不同：scope 不会仅因 daemon 退出就自动终止其他成员，异常后可在同一 scope 重启 daemon 清理自身遗留组，或停止这次专属 scope；不能把 `--collect` 当自动清理。若使用独立 service，可配置 `KillMode=control-group`、`SendSIGKILL=yes`、`TimeoutStopSec=10s`，由 systemd 在 unit 停止时兜底清理整个 unit。[systemd KillMode](https://raw.githubusercontent.com/systemd/systemd/v260/man/systemd.kill.xml)
+
+daemon 异常退出后的下次启动只清理当前已验证专属子树中仍未终止的组，再把未正常完成记录标为 lost，保留 spool 和已提交 PTY 尾窗；属于旧 unit 的历史路径不能作为跨 unit 杀进程的依据。启动清理结束前不接收新请求。不依据可能复用的裸 PID 杀进程，也不伪装恢复已丢失的 PTY fd。主机重启后 cgroup 消失同样标 lost。此方案保证状态可恢复，不提供 daemon 重启后继续原终端的 attach 服务；信号尚未完成的任务不能提前宣称已清理。
 
 默认最多 32 个活动进程、8 个传输；单进程 PTY 8 KiB、stdio 每路 64 KiB drain，加上固定 FD/协议缓冲，内存不随累计输出或文件长度增长。阻塞磁盘工作共享有界线程 limiter，不每条输出另建线程。
 
@@ -343,4 +357,4 @@ State 提供 session-machine 关联与删除状态，删除 session 前协调 ma
 
 Intelligence 调用 machine 表，选中 machine 后始终传 session_id；为 start/transfer 生成稳定 UUID，在输出中保留 process_id 与 cursors，明确 timeout 不是退出。stdio 大输出交给分块消费或 process_id 引用，不拼成无限长 tool response；PTY 的 truncated 必须展示。插件脚本走显式 argv，媒体走 file.pull 的 websocket 或 URL 路径。
 
-总设计师提供符合第 5 节契约的专属 systemd user delegation 验收环境；Gateway 接入 `cgroup_root=None` 的自动发现和明确的启动错误，产品普通用户使用同一启动方式，不要求预先拥有任意 writable cgroup。共享 pyproject.toml、uv.lock、compose.yaml、README.md 不在本 senior 的修改范围。后续对应 tests/execution、tests/rpc 由本 senior 负责，并遵循总设计师验收清单中的 16 个并发交互任务、64 MiB stdio 输出和 64 MiB 双路径文件传输场景。文件完整性由发送端与接收端计算 hash 比较，不要求 pull RPC 新增完整 SHA-256 计算。需要跨模块 PostgreSQL/Valkey 时使用已 healthy 的共用服务，每次独立随机 schema/Valkey namespace 与独立临时 XDG 根；禁止重启共用服务、flush 共用 Valkey 或删除其他 scope 的数据。重启场景使用独立控制进程/schema 或专属可丢弃服务，不发送真实 Telegram 消息。产品验收与交付台账仍由总设计师维护，最终公共接口由总设计师统一批准。
+总设计师负责主分支集成验收 scope；本 senior 负责批准后自己模块测试使用的本项目专属 scope，以及其中进程/传输的实际行为与清理。Gateway 接入 `KAPY_CGROUP_ROOT -> DaemonConfig.cgroup_root` 的显式 scope 路径、None 时的自动发现和明确的启动错误；产品普通用户使用同一启动方式，不要求修改 Lody unit 或预先拥有任意 writable cgroup。共享 pyproject.toml、uv.lock、compose.yaml、README.md 不在本 senior 的修改范围。后续对应 tests/execution、tests/rpc 由本 senior 负责，并遵循总设计师验收清单中的 16 个并发交互任务、64 MiB stdio 输出和 64 MiB 双路径文件传输场景。文件完整性由发送端与接收端计算 hash 比较，不要求 pull RPC 新增完整 SHA-256 计算。需要跨模块 PostgreSQL/Valkey 时使用已 healthy 的共用服务，每次独立随机 schema/Valkey namespace 与独立临时 XDG 根；禁止重启共用服务、flush 共用 Valkey 或删除其他 scope 的数据。重启场景使用独立控制进程/schema 或专属可丢弃服务，不发送真实 Telegram 消息。产品验收与交付台账仍由总设计师维护，最终公共接口由总设计师统一批准。
