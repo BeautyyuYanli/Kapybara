@@ -30,7 +30,7 @@ Root Lody session: 05144158-4e23-407a-ba4f-563faa33aafa.
 
 | Owner | Session ID | Branch | Current scope |
 | --- | --- | --- | --- |
-| Execution | 515746bc-f9e2-4d09-a894-65067a65f369 | feat/kapyrpc | Complete execution/rpc cmd-impl |
+| Execution replacement | 3312c3ad-b9ee-4150-928f-2bf7654b1aca | feat/kapy-execution-complete (requested) | Focused cmd-proposal for remaining daemon/process, then approve impl |
 | State | 37703573-1ccd-4f8b-a137-ba52ca9e8e60 | feat/kapy | Complete state cmd-impl including approved additions |
 | Intelligence | a88a199c-41c1-49d6-ad09-2d5b87f80b12 | feat/kapy-agentskills | Complete agent/skills cmd-impl |
 | Gateway | 0f9cff83-dff7-4881-b5a1-a6b1e761dd27 | feat/kapycli | Complete gateway/cli/settings/TG cmd-impl |
@@ -99,6 +99,20 @@ Read docs/contracts.md. It overrides older proposal drafts and cgroup assumption
 
 Main contains scaffolding, State public types, approved proposals, acceptance scripts,
 and actual RPC/XDG modules. There is still no complete runnable application.
+
+At 13:27 UTC the old Execution session515746bc was cancelled and archived. Despite
+repeated explicit corrections, old queued prompts had again made it research host
+systemd/cgroups (reported13:22). Root stopped this rather than allowing continued
+user-boundary violations. The new clean worktree senior3312c3ad was created by
+kapy-execution-replacement-proposal-20260907 at13:29. It must first run a focused
+cmd-proposal with its one simplification review, then receive one approval and run
+its own cmd-impl. It reuses verified fdf4cb6 code from main; do not take old9ec91c8
+cgroup config or subsequent old branch work. New scope is exactly ordinary process
+groups/best effort, Docker tests only, remaining process/daemon/lifecycle/reconnect.
+Gateway and Intelligence were informed through kapy-execution-owner-change-20260907;
+they should continue implementing and await the replacement owner's real exports.
+Old Execution branch remains readable for fdf4cb6, but the old session must not be
+restored/restarted or sent more tasks. New proposal approval is still outstanding.
 - State contracts original 4b42349 merged as 090c122; final proposal 3a3a10e merged.
 - Intelligence bf1f55f proposal merged as 5d052d9. Later old queued doc churn is not
   a new implementation blocker; consolidated instructions freeze final differences.

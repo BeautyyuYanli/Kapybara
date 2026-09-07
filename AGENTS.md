@@ -5,6 +5,11 @@ Never manually edit generated files; use their generator, including `uv lock` fo
 Prefer escalated commands when needed to use the local development environment.
 Never commit .env, credentials, or machine-local state.
 
+User clarifications: machine research and real process/PTY/file tests run only in
+Docker. Do not investigate the host or Lody runtime. Ordinary process groups and
+best-effort descendant cleanup suffice; do not require cgroup/systemd delegation.
+Token counts come from provider API usage, never tiktoken or local token estimates.
+
 The lead architect owns scaffolding, integration, acceptance and merging.
 Seniors implement domain logic in isolated Lody worktree sessions. Each senior must
 use cmd-proposal, wait for architect approval, then use cmd-impl. The senior owns
