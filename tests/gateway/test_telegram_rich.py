@@ -1,6 +1,7 @@
 """Raw Markdown transport and persisted fallback boundaries, using isolated PostgreSQL."""
 
 import json
+import time
 from contextlib import asynccontextmanager
 
 import httpx2
@@ -184,6 +185,15 @@ async def test_explicit_format_rejection_persists_plain_before_restart(gateway, 
             False,
         ),
         (400, {"error_code": 400, "description": "Bad Request: RICH_MESSAGE_DEPTH_INVALID"}, False),
+        (
+            400,
+            {
+                "ok": False,
+                "error_code": 503,
+                "description": "Bad Request: RICH_MESSAGE_DEPTH_INVALID",
+            },
+            False,
+        ),
         (401, {"ok": False, "error_code": 401, "description": "Unauthorized"}, False),
         (403, {"ok": False, "error_code": 403, "description": "Forbidden"}, False),
         (503, {}, True),
@@ -259,13 +269,23 @@ async def test_existing_version_one_pending_without_format_remains_plain(gateway
 async def test_oversized_fence_draft_uses_plain_but_final_can_use_rich(gateway, monkeypatch):
     records = []
     bot, _ = await install_output(gateway, monkeypatch, records)
-    source = "```python\n" + "😀" * 9000
+    preview = "```python\n" + "😀" * 1995
+    assert len(preview.encode("utf-16-le")) // 2 == 4000
     feed(records, record("text_delta"))
-    records[-1]["data"]["text"] = source
+    records[-1]["data"]["text"] = preview
     await bot.deliver_once()
+    first = bot.sent[-1]
+    assert first[0] == "sendRichMessageDraft" and sent_text(first[1]) == preview
+    sent_at = time.monotonic()
+    feed(records, record("text_delta"))
+    records[-1]["data"]["text"] = "😀" * 7005
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    assert time.monotonic() - sent_at < 20
+    assert len(bot.sent) == 2
     method, params = bot.sent[-1]
-    assert method == "sendMessageDraft" and source.startswith(params["text"])
-    assert len(params["text"].encode("utf-16-le")) // 2 <= 4000
+    assert method == "sendMessageDraft" and params["text"] == preview
+    assert params["draft_id"] == first[1]["draft_id"]
     restored = Bot(gateway)
     await restored.deliver_once()
     assert restored.sent[-1] == bot.sent[-1]
