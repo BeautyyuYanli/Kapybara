@@ -471,3 +471,23 @@ async def test_large_body_exceeds_previous_limit_without_loss(gateway, monkeypat
             break
     assert "".join(p["text"] for _, p in bot.sent) == body
     assert all(len(p["text"].encode("utf-16-le")) // 2 <= 4000 for _, p in bot.sent)
+
+
+@pytest.mark.parametrize("last, final", [("last", "last"), ("", "检查结果")])
+async def test_durable_message_order_and_empty_last_response(gateway, monkeypatch, last, final):
+    records = []
+    bot, _ = await install_output(gateway, monkeypatch, records)
+    feed(
+        records,
+        record("model_response", "正在检查", message="ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        record("model_response", last, message="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+    )
+    await bot.deliver_once()
+    assert bot.sent[-1][1]["text"] == "正在检查\n\n" + last
+    # Restart forces projection through PostgreSQL JSONB, which sorts object keys.
+    restored = Bot(gateway)
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["text"] == bot.sent[-1][1]["text"]
+    feed(records, record("final", output=final))
+    await restored.deliver_once()
+    assert [p["text"] for m, p in restored.sent if m == "sendMessage"] == ["正在检查\n\n" + final]

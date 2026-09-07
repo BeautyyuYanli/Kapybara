@@ -84,6 +84,7 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
         )
     projection = copy.deepcopy(previous or empty_projection())
     messages = projection["messages"]
+    order = projection.setdefault("message_order", [])
     for record in records:
         kind = record["kind"]
         data = record.get("data") or {}
@@ -98,6 +99,8 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
             projection["run_id"] = run
         key = record.get("message_id") or ""
         if kind in {"text_delta", "model_response"}:
+            if key not in messages:
+                order.append(key)
             message = messages.setdefault(key, {"parts": {}, "text": None})
             if kind == "model_response":
                 message["text"] = record.get("text", "")
@@ -109,12 +112,16 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
             failed = data.get("failed_message_id")
             if failed in messages and messages[failed]["text"] is None:
                 del messages[failed]
+                order.remove(failed)
         elif kind in {"interrupted", "error"}:
             for message_id in list(messages):
                 if messages[message_id]["text"] is None:
                     del messages[message_id]
+                    order.remove(message_id)
         if kind in {"final", "error"}:
-            completed = [m["text"] for m in messages.values() if m["text"]]
+            completed = [
+                messages[key]["text"] for key in order if messages[key]["text"] is not None
+            ]
             if kind == "final":
                 final = str(data.get("output", record.get("text", "")))
                 # The final result replaces the last response, preserving tool preambles.
@@ -134,7 +141,7 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
                 completed.append(
                     "Sorry, I couldn’t complete this reply." + (f" ({safe})" if safe else "")
                 )
-            text = "\n\n".join(completed)
+            text = "\n\n".join(text for text in completed if text)
             following = empty_projection()
             if "chat_type" in projection:
                 following["chat_type"] = projection["chat_type"]
@@ -148,7 +155,7 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
         m["text"]
         if m["text"] is not None
         else "".join(m["parts"][part] for part in sorted(m["parts"], key=int))
-        for m in messages.values()
+        for m in (messages[key] for key in order)
     )
     return preview, projection
 
