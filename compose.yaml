@@ -37,6 +37,7 @@ services:
     working_dir: /workspace
     environment:
       PYTHONPATH: /workspace/src
+      KAPY_DOCKER_TEST: "1"
       KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
       KAPY_VALKEY_URL: redis://valkey:6379/0
     volumes:

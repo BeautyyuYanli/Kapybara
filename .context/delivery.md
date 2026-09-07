@@ -218,6 +218,30 @@ coordination noise; latest consolidated tasks are authoritative.
 
 ## Remaining lead work
 
+Latest root update (~14:48 UTC): main bec99e5 has reviewed State and Execution,
+README and uv-managed removal of unused sqlalchemy/python-multipart. Compose control
+now uses the image's `kapy control-server` CMD. Development machine sets
+KAPY_DOCKER_TEST=1 so the senior's guarded real machine test is exercised.
+Execution later d6bce34 is a test-only Ctrl-C observer stability correction, not yet
+merged; use owner report/checks when integrating. Gateway current17bf1dd has real
+daemon/CLI/Skill transfers/reconnect test5df21f1. Intelligence3788e17 is in test review.
+Both owners still owe DB fixture env overrides; Intelligence also owes sh -lc PATH
+fix. Already assigned once each; do not keep queuing approvals/duplicate requests.
+All native machine tests remain Docker-only. Provisional product-tests-2 run:
+204pass,2fail,25error; failures/errors hardcoded localhost PG in Gateway/Skills.
+Next full run must pass KAPY_DOCKER_TEST=1 and use final owner fixture fixes.
+Independent bench_machine passed64MiBhash/stdio0.601s/RSS+256KiB,16interactivePTY
+0.388s/RSS+256KiB,tail8192,cleanup; overallRSS72948KiB. bench_gateway passed4live
+sessions/100observers identical ordered output,0errors,6.30s,inputmedian390.50ms.
+Telegram getMe/getChat HTTP200/ok and configuredprivatechatmatch; no send/poll/setup.
+Provisional wheel built from product-tests-2,7packages,botharchitecturesgenerated
+hashesmatch,uvx --from wheel kapy --help passes inDocker. All final main build/checks
+remain due after other2reviews. Sharedpool fix de51640 independently passed3rounds
+using a single PG connection. scripts/check_recursive.py ready/staticpassed but NOT
+run: wait for actual installed CLI PATH fix. Isolated acceptance stack still running
+control32771 (TGdisabled); root currently testing its control-container restart and
+then re-running check_system; record result when that exec finishes.
+
 Concrete integration defect dispatched at ~13:35 via
 kapy-shared-pool-integration-defect-20260907 to Intelligence and Gateway:
 Gateway Metadata.connection sets conn.row_factory=dict_row and returns it to the

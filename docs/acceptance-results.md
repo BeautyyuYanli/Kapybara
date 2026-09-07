@@ -152,3 +152,21 @@ no updates were consumed and no bot configuration was changed.
 Installing this wheel with `uvx --from <wheel> kapy --help` succeeded in a temporary
 Docker container and exposed `server`, `control-server` and `control`. This checks
 distribution of the committed snapshot; the final reviewed main build remains due.
+
+## Concurrent Gateway output observers
+
+The running `kapy-v2-acceptance-1` stack passed `scripts/bench_gateway.py`: four
+temporary sessions each received one short real-model prompt while 25 independent
+observers per session consumed the output stream (100 observers in total). Every
+observer saw unique cursors and the identical ordered record sequence for its
+session through the expected final reply; there were no reported request errors.
+
+Input acceptance was 390.50 ms median / 403.49 ms maximum for these four submissions.
+All observers completed in 6.30 s, including provider latency. Depending on the
+session's streamed deltas, each observer read 27–33 records. Temporary sessions were
+deleted afterward. This is a small measured workload, not a production latency SLO.
+
+The shared-pool regression was independently retested using the `product-tests-2`
+Gateway `de51640` snapshot: one PostgreSQL connection alternated Gateway dict cursors
+and immutable Agent payload reads three times without errors. The earlier row-factory
+compatibility defect is fixed in this committed Gateway implementation.
