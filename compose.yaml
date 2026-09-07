@@ -46,6 +46,87 @@ services:
       - ./pyproject.toml:/workspace/pyproject.toml:ro
     mem_limit: 2g
     pids_limit: 256
+  control:
+    profiles: ["app"]
+    image: kapy-v2:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    command:
+      - uvicorn
+      - kapy.gateway:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --loop
+      - uvloop
+      - --workers
+      - "1"
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-luna}
+      KAPY_CONTEXT_WINDOW_TOKENS: ${KAPY_CONTEXT_WINDOW_TOKENS:-1050000}
+      KAPY_MAX_OUTPUT_TOKENS: ${KAPY_MAX_OUTPUT_TOKENS:-16384}
+      KAPY_COMPRESSION_RATIO: ${KAPY_COMPRESSION_RATIO:-0.70}
+      KAPY_KEEP_RECENT_RATIO: ${KAPY_KEEP_RECENT_RATIO:-0.10}
+      KAPY_MEDIA_MAX_BYTES: ${KAPY_MEDIA_MAX_BYTES:-20971520}
+      KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
+      KAPY_DATABASE_SCHEMA: ${KAPY_DATABASE_SCHEMA:-kapy_state}
+      KAPY_VALKEY_URL: redis://valkey:6379/0
+      KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_state}
+      KAPY_CONTROL_TOKEN: ${KAPY_CONTROL_TOKEN:-}
+      KAPY_SESSION_SIGNING_KEY: ${KAPY_SESSION_SIGNING_KEY:-}
+      KAPY_MACHINE_TOKENS: ${KAPY_MACHINE_TOKENS:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ports:
+      - "127.0.0.1:${KAPY_CONTROL_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=2).close()"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+    pids_limit: 256
+  daemon:
+    profiles: ["app"]
+    image: kapy-v2:dev
+    init: true
+    command: ["kapy", "server"]
+    # Separate filesystems/PID namespaces; loopback transport for local development.
+    network_mode: service:control
+    environment:
+      KAPY_CONTROL_URL: http://127.0.0.1:8000
+      KAPY_MACHINE_ID: ${KAPY_MACHINE_ID:-docker-machine}
+      KAPY_MACHINE_TOKEN: ${KAPY_MACHINE_TOKEN:-}
+      KAPY_EXECUTION_STATE_DIR: /var/lib/kapy/state
+      KAPY_EXECUTION_DATA_DIR: /var/lib/kapy/data
+      KAPY_EXECUTION_RUNTIME_DIR: /run/kapy
+      KAPY_CHILD_ENV: '{"PATH":"/app/.venv/bin:/usr/local/bin:/usr/bin:/bin","LANG":"C.UTF-8"}'
+    volumes:
+      - machine-data:/var/lib/kapy
+    tmpfs:
+      - /run/kapy:mode=0700
+    depends_on:
+      control:
+        condition: service_healthy
+        restart: true
+    mem_limit: 2g
+    pids_limit: 256
 volumes:
   postgres-data:
   valkey-data:
+  machine-data:

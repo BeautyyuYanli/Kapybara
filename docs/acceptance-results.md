@@ -50,3 +50,19 @@ Two subsequent broadcasts each reached all 100 subscribers exactly once.
 The `1091292` source snapshot passed all 46 RPC/codec/peer/XDG tests inside Docker
 in 0.15 s. Its public modules were integrated as `8e83fe4`; main Ruff and pyrefly
 checks passed. This does not yet test the complete machine daemon or file manager.
+
+## File transfer milestone
+
+The independent `fdf4cb6` snapshot passed 71 execution/RPC tests in 4.43 s inside
+a disposable Docker container with networking disabled, 1 GiB memory and 128 PIDs.
+URL tests used a server on that container's loopback interface. Coverage includes
+SQLite crash recovery, staging cleanup, changing source files, checksums, atomic
+replacement and local proxy framing. The complete daemon/process manager is pending.
+
+| Transfer | Duration | Reported peak RSS growth |
+| --- | ---: | ---: |
+| 64 MiB WebSocket push and pull | 1.92 s | 256 KiB |
+| 64 MiB URL GET and PUT | 1.72 s | 4,224 KiB |
+
+These process RSS deltas are measurements from this test run, not memory ceilings
+for all transfer concurrency patterns.

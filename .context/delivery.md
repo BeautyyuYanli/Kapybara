@@ -41,6 +41,8 @@ Current full consolidated implementation operations (all approvals included):
 - kapy-state-consolidated-implementation-20260907T1304: State; created 13:03 UTC,
   deadline 17:03 UTC. Includes wait_submission/export_history/update-delete UUID
   requests and environment-overridable test database URLs.
+- kapy-execution-environment-answer-20260907T1317: one-sentence confirmation in
+  direct response to Execution's repeated cgroup question; no new design or scope.
 
 Important Lody scheduling behavior: session_chat appends asynchronous queued turns;
 messages are not reliable live steering. Seniors have processed old proposal-only
@@ -141,6 +143,24 @@ PYTHONPATH=/workspace/src. Rebuild images with uv when dependencies change.
   The run completed and its schema was cleaned; no running exec session remains.
 - Execution 1091292 snapshot in .local/acceptance/execution-1091292: 46 RPC/XDG tests
   pass in Docker, 0.15s. Main Ruff and pyrefly pass after integration.
+- Execution fdf4cb6 snapshot independently tested in Docker network=none/1GiB/128PID:
+  71 pass in4.43s; 64MiB WS1.92s/RSS+256KiB, URL1.72s/RSS+4224KiB. Not yet merged.
+- Both State acceptance scripts pass pyrefly against the actual e297398 snapshot.
+- Compose now has an app profile with control and daemon services (configuration
+  validated, not started). They share only a loopback network namespace; filesystems
+  and PID namespaces remain separate. Daemon gets only its machine token plus safe
+  PATH/LANG, never provider/TG/control secrets. Runtime state/data use a named volume;
+  runtime sockets use private tmpfs. Control uses kapy.gateway:create_app via uvicorn.
+  When the full app is first started for unattended acceptance, explicitly override
+  TELEGRAM_BOT_TOKEN= TELEGRAM_CHAT_ID= in the compose command environment; otherwise
+  Compose reads the user's real TG settings from .env and starts the real plugin.
+
+At 13:15 Intelligence finally confirmed persistent Elysia implementing, main8e83fe4
+merged to its branch6ee1934, no longer waiting. Gateway latestcd86e83 also fixes
+approved implementation boundaries and has imported main contracts; actual Gateway
+source was not present at the last read. State1812375 is under own review; additions
+were not yet present in contracts at the last check. Avoid generating more queued
+coordination noise; latest consolidated tasks are authoritative.
 
 ## Remaining lead work
 
