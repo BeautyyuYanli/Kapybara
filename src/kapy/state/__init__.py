@@ -2,10 +2,12 @@
 
 from .contracts import (
     CheckpointWrite,
+    Completion,
     Conflict,
     CreatedSession,
     Cursor,
     EventReceipt,
+    HistoryExportPage,
     InputMode,
     InvalidArgument,
     JsonObject,
@@ -28,10 +30,15 @@ from .contracts import (
     SessionView,
     StateError,
     Submission,
+    SubmissionStatus,
     UnsafeQuery,
 )
+from .service import SessionService
+from .store import migrate
 
 __all__ = [
+    "SessionService",
+    "migrate",
     "JsonValue",
     "JsonObject",
     "InputMode",
@@ -44,6 +51,9 @@ __all__ = [
     "SessionInput",
     "MessageWrite",
     "CheckpointWrite",
+    "Completion",
+    "SubmissionStatus",
+    "HistoryExportPage",
     "OutputDelta",
     "Record",
     "RecordPage",
