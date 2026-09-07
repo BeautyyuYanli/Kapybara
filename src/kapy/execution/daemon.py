@@ -301,7 +301,11 @@ async def run_daemon(config: DaemonConfig, *, stop: anyio.Event | None = None) -
     )
     stack = AsyncExitStack()
     try:
-        store = await stack.enter_async_context(ExecutionStore(paths, config.machine_id))
+        # Registration must be atomic with acquisition: cancellation between
+        # _open taking locks and __aenter__ returning otherwise leaves no exit
+        # callback for the outer shielded cleanup to invoke.
+        with anyio.CancelScope(shield=True):
+            store = await stack.enter_async_context(ExecutionStore(paths, config.machine_id))
         http = await stack.enter_async_context(
             httpx2.AsyncClient(trust_env=False, follow_redirects=False)
         )

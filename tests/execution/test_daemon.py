@@ -368,3 +368,55 @@ async def test_session_release_admission_is_bounded_and_reuses_id(tmp_path: Path
         finally:
             gate.set()
             await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anyio_cancel_during_store_acquisition_releases_unregistered_locks(
+    tmp_path: Path, monkeypatch
+):
+    import threading
+
+    settings = config(tmp_path, "ws://127.0.0.1:1/rpc/machines/machine")
+    paths = resolve_paths(
+        state_dir=settings.state_dir, data_dir=settings.data_dir, runtime_dir=settings.runtime_dir
+    )
+    opened = threading.Event()
+    finish_open = threading.Event()
+    original_open = ExecutionStore._open
+    stores: list[ExecutionStore] = []
+    cancelled = False
+
+    def pause_after_acquisition(self):
+        original_open(self)
+        stores.append(self)
+        opened.set()
+        if not finish_open.wait(3):
+            raise RuntimeError("test did not release startup gate")
+
+    monkeypatch.setattr(ExecutionStore, "_open", pause_after_acquisition)
+
+    async def run():
+        nonlocal cancelled
+        try:
+            await run_daemon(settings)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    async with asyncio.timeout(5):
+        async with anyio.create_task_group() as group:
+            group.start_soon(run)
+            assert await anyio.to_thread.run_sync(opened.wait, 2)
+            group.cancel_scope.cancel()
+            # Let level cancellation reach the daemon while _open still owns
+            # its resources and has not returned for exit-stack registration.
+            with anyio.CancelScope(shield=True):
+                await anyio.sleep(0.05)
+                assert stores[0]._connection is not None
+                finish_open.set()
+    assert cancelled
+    assert stores[0]._connection is None
+    assert stores[0]._lock_fds == []
+    monkeypatch.setattr(ExecutionStore, "_open", original_open)
+    async with ExecutionStore(paths, "machine"):
+        pass
