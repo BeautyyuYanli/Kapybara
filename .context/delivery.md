@@ -87,7 +87,7 @@ JUnit .local/acceptance/nonroot.xml. Live check_system PASS7.54s, session delete
 Fresh anonymous-volume/tmpfs ownership and ordinary-user writes also passed.
 No domain code or dependencies changed; normal local stack runs the updated images.
 
-## Telegram presentation follow-up (2026-09-08, in progress)
+## Telegram presentation follow-up (2026-09-08, delivered)
 
 The user requests a natural chat frontend instead of separate delta/log messages.
 New Gateway senior 94ba8801-e6f3-478b-a7f6-809ff1859b1e owns this follow-up from
@@ -101,3 +101,16 @@ Official sendMessageDraft
 supports private-chat streaming previews; completed replies require sendMessage.
 The architect owns integration and updating the running bot after review.
 This new assignment does not reactivate any 20260907 delayed operations.
+
+Final senior delivery18fd8a9 completed all five review stages and was merged.
+Independent full-suite nonroot Docker run:270passed127.50s, zero skips.
+Full-repository Ruff passed; Pyrefly zero errors (two suppressions,15 warnings).
+After stopping old control, the architect rechecked zero active runs, pending
+inputs, unhandled inbox and unread/pending output. Exactly one drained legacy
+projection was converted to version1, retaining its cursor; the previous row was
+saved privately under .local/acceptance. Sessions and history were not reset.
+The new control is healthy, docker-machine reconnected, both still UID/GID10001.
+Live production TelegramFrontend send_draft/send calls passed: two updates with
+one stable draft ID, followed by one final update notification to the configured
+user chat. This proves real Bot API draft/final transport; automated tests cover
+State projection/recovery and ordering. No claim of exactly-once final delivery.
