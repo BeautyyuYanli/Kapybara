@@ -58,3 +58,10 @@ receipts; they do not revive a deleted caller capability.
 Module checks use isolated random PostgreSQL schemas and Valkey namespaces, mocked Bot API
 and provider calls. Real execution-machine checks belong inside `kapy-v2-machine:dev`.
 No cgroup prerequisite or host/Lody process investigation is part of the gateway.
+`tests/gateway/test_machine_docker.py` runs only when `KAPY_DOCKER_TEST=1` inside a
+container. Mount `src`, `tests`, and `pyproject.toml` read-only at `/workspace`, set
+`PYTHONPATH=/workspace/src`, and run `/app/.venv/bin/pytest -p no:cacheprovider` in the
+machine image. The container needs network access to the development PostgreSQL/Valkey
+ports; process and filesystem isolation remain enabled. The regression starts the actual
+`kapy server` entry, exercises authenticated child CLI calls and multichunk skill transfers,
+checks reconnect, and waits for durable final deletion to remove the machine session.
