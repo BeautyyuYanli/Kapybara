@@ -1,6 +1,6 @@
 # Execution 与 RPC 方案
 
-本方案依据 `kapy_v2.md`、`docs/architecture.md`，以及 main 提交 `61af09e` 的 `docs/acceptance.md` 与 `.context/delivery.md`，面向 Linux、单个机器 daemon 和多个逻辑 session。Execution senior 负责 `src/kapy/execution/`、`src/kapy/rpc/` 及对应测试目录；Gateway 负责 CLI、配置读取、控制服务、远端机器 registry 与权限判定。本轮交付仅为方案，公共接口须经总设计师批准后实现。
+本方案依据 `kapy_v2.md`、`docs/architecture.md`、`docs/contracts.md` 及总设计师的 `docs/acceptance.md`，面向 Linux、单个机器 daemon 和多个逻辑 session。Execution senior 负责 `src/kapy/execution/`、`src/kapy/rpc/` 及对应测试目录；Gateway 负责 CLI、配置读取、控制服务、远端机器 registry、权限判定和持久资源清理协调。总设计师已正式批准本方案进入 cmd-impl，接口以其统一契约为准。
 
 ## 1. 实现边界与依赖
 
@@ -37,9 +37,9 @@ class RpcError(Exception):
 class RpcDisconnected(Exception): ...
 class RpcTimeout(Exception): ...
 
-async def handle_request(
-    body: bytes, *, handler: RequestHandler,
-) -> bytes | None: ...
+async def dispatch_json(
+    payload: str, handler: RequestHandler,
+) -> str | None: ...
 
 class RpcPeer:
     def __init__(
@@ -61,10 +61,11 @@ class RpcPeer:
 class MachineCaller(Protocol):
     async def call(
         self, machine_id: str, method: str, params: JsonObject,
+        *, timeout: float = 60.0,
     ) -> JsonValue: ...
 ```
 
-`MachineCaller` 是共享类型，具体 registry/caller 由 Gateway 实现，调用 deadline 由 Gateway 的实例配置控制，不增加公共 keyword 参数。Intelligence 持有该协议的实例，不直接导入 daemon。`params.session_id` 必须存在，Gateway 在路由前验证 session 与 machine 的关联。
+`MachineCaller` 是共享类型，具体 registry/caller 由 Gateway 实现，保留 `timeout=60.0` keyword 参数。Intelligence 持有该协议的实例，不直接导入 daemon。`params.session_id` 必须存在，Gateway 在路由前验证 session 与 machine 的关联。
 
 ```python
 # kapy.execution
@@ -118,7 +119,7 @@ async def run_daemon(
 
 `RpcPeer` 不另提供重复的 serve/run 启动方式。Gateway 在 `async with RpcPeer(...) as peer` 内注册已认证连接，然后 `await peer.wait_closed()` 持续服务；context 退出时注销 registry 并关闭 peer，显式 `aclose()` 可提前结束。`__aenter__` 完成后 reader/writer 已就绪，才允许 `call/notify`；重复进入或 context 外调用失败，不暗中重启已关闭连接。
 
-HTTP `POST /rpc` 由 Gateway 限长读取原始 body、处理 HTTP 认证，然后调用 `kapy.rpc.handle_request(body, handler=...)`。返回 bytes 即 UTF-8 JSON-RPC 单个或 batch 响应，Gateway 用 HTTP 200/application/json 发出；返回 None 表示有效 notification 或全 notification batch，HTTP 204 无 body。无效 JSON/UTF-8、envelope、参数和业务 RpcError 均由 rpc 包编码；HTTP 认证失败和 body 超限分别由 Gateway 返回 401/403、413。该函数只接受 request/notification，传入 response envelope 作为 Invalid Request。它与 peer 共用解析、request 校验、dispatch、error 和 batch 编码，不通过虚拟 duplex transport 模拟 HTTP。handler 仍用闭包携带认证主体；HTTP 跨请求的总并发上限由 Gateway 控制，单次处理沿用下述 rpc 限额。
+HTTP `POST /rpc` 由 Gateway 限长读取并严格解码 UTF-8、处理 HTTP 认证，然后调用 `kapy.rpc.dispatch_json(payload, handler)`。返回 str 即 JSON-RPC 单个或 batch 响应，Gateway 用 HTTP 200/application/json 发出；返回 None 表示有效 notification 或全 notification batch，HTTP 204 无 body。无效 JSON、envelope、参数和业务 RpcError 均由 rpc 包编码；无效 UTF-8 时 Gateway 交给同一 codec 的 parse-error 路径，不自行构造 envelope。HTTP 认证失败和 body 超限分别由 Gateway 返回 401/403、413。该函数只接受 request/notification，传入 response envelope 作为 Invalid Request。它与 peer 共用解析、request 校验、dispatch、error 和 batch 编码，不通过虚拟 duplex transport 模拟 HTTP，也不另导出 handle_request 兼容别名。handler 仍用闭包携带认证主体；HTTP 跨请求的总并发上限由 Gateway 控制，单次处理沿用下述 rpc 限额。
 
 JSON-RPC 2.0 支持 request、response、notification、batch、命名及位置参数；缺省 params 归一为 `{}`。业务 machine/local/control 方法只接受命名参数。发送请求用连接内唯一字符串 ID；接收端保留请求 ID 的类型和值，区分缺失 ID 与 `null`。notification 无论成功或失败都不返回响应。禁止 NaN/Infinity，拒绝畸形 response，标准错误使用 -32700/-32600/-32601/-32602/-32603。[JSON-RPC 规范](https://www.jsonrpc.org/specification)
 
@@ -351,9 +352,9 @@ Gateway caller 对暂时 offline 的机器可在配置的 deadline 内等待一�
 
 ## 10. 跨模块要求
 
-Gateway 接入 `RpcPeer` callbacks 和 `MachineCaller` 协议，实现 `control.proxy`、认证的 machine WS endpoint、connection fencing、按 session-machine 关联的 ensure/token 下发；HTTP `/rpc` 调用共享 `handle_request`，CLI 调用 Execution 导出的 `call_local_proxy`。CLI 命令参数、用户 API、Telegram 和管理员配置继续由 Gateway 拥有；Execution 不增加第二套 control dispatcher。
+Gateway 接入 `RpcPeer` callbacks 和 `MachineCaller` 协议，实现 `control.proxy`、认证的 machine WS endpoint、connection fencing、按 session-machine 关联的 ensure/token 下发；HTTP `/rpc` 调用共享 `dispatch_json`，CLI 调用 Execution 导出的 `call_local_proxy`。CLI 命令参数、用户 API、Telegram 和管理员配置继续由 Gateway 拥有；Execution 不增加第二套 control dispatcher。
 
-State 提供 session-machine 关联与删除状态，删除 session 前协调 machine `session.release`，离线机器保留待清理关联，重新连接后完成释放。控制面数据库中 session/input/history/event 不迁入 SQLite。递归 CLI 的 UUID request_id、waiting_id、权限范围和完成语义仍由 State/Gateway/Intelligence 协调。
+Gateway 在删除或解除 machine 关联时持久化清理义务，以 durable cleanup 协调 machine `session.release`；离线机器的义务在重新连接后继续执行，确认 released 后完成清理记录。Execution 负责实际且幂等的进程、传输、cwd 清理；State 不负责 daemon 资源清理或相关 outbox。控制面数据库中 session/input/history/event 不迁入 SQLite。递归 CLI 的 UUID request_id、waiting_id、权限范围和完成语义仍由 State/Gateway/Intelligence 协调。
 
 Intelligence 调用 machine 表，选中 machine 后始终传 session_id；为 start/transfer 生成稳定 UUID，在输出中保留 process_id 与 cursors，明确 timeout 不是退出。stdio 大输出交给分块消费或 process_id 引用，不拼成无限长 tool response；PTY 的 truncated 必须展示。插件脚本走显式 argv，媒体走 file.pull 的 websocket 或 URL 路径。
 
