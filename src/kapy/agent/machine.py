@@ -236,9 +236,7 @@ class MachineTools:
             if name.startswith("process_"):
                 result = await operation.rpc(name.replace("_", ".", 1), fields)
                 return operation.decode_update(result) if name == "process_wait" else result
-            data, _ = await operation.pull(
-                fields["path"], maximum=self.runtime.config.media_max_bytes
-            )
+            data = await operation.pull(fields["path"], maximum=self.runtime.config.media_max_bytes)
             media_type = mimetypes.guess_type(fields["path"])[0]
             if not media_type or not (
                 media_type.startswith(("image/", "audio/", "video/"))
@@ -474,9 +472,7 @@ class Operation:
             await self.abort(transfer_id)
             raise
 
-    async def pull(
-        self, path: str, *, offset: int = 0, limit: int | None = None, maximum: int | None = None
-    ) -> tuple[bytes, int]:
+    async def pull(self, path: str, *, maximum: int) -> bytes:
         transfer_id = self.identifier(f"pull:{self.index}:{path}")
         try:
             info = await self.rpc(
@@ -484,25 +480,23 @@ class Operation:
                 {"transfer_id": transfer_id, "path": path, "transport": {"kind": "websocket"}},
             )
             size = info["size"]
-            if maximum is not None and size > maximum:
+            if size > maximum:
                 raise ValueError(f"Media exceeds the {maximum}-byte limit")
-            if offset > size:
-                raise ValueError("Read offset is beyond end of file")
-            end = min(size, offset + limit) if limit is not None else size
             content = bytearray()
-            while offset < end:
+            offset = 0
+            while offset < size:
                 chunk = await self.rpc(
                     "file.chunk",
                     {
                         "transfer_id": transfer_id,
                         "offset": offset,
-                        "max_bytes": min(65_536, end - offset),
+                        "max_bytes": min(65_536, size - offset),
                     },
                 )
                 data = base64.b64decode(chunk["data_base64"], validate=True)
                 if (
                     not data
-                    or len(data) > min(65_536, end - offset)
+                    or len(data) > min(65_536, size - offset)
                     or (
                         chunk["start"] != offset
                         or chunk["next"] != offset + len(data)
@@ -515,7 +509,7 @@ class Operation:
             final = await self.rpc("file.finish", {"transfer_id": transfer_id})
             if final.get("state") != "complete" or final.get("size") != size:
                 raise ValueError("File changed or transfer did not complete")
-            return bytes(content), size
+            return bytes(content)
         except BaseException:
             await self.abort(transfer_id)
             raise

@@ -170,7 +170,7 @@ async def test_cancelled_transfer_begin_aborts_the_original_handle(direction: st
             if direction == "push":
                 await operation.push("/session/file", b"contents")
             else:
-                await operation.pull("/session/file")
+                await operation.pull("/session/file", maximum=1024)
     assert not caller.active
     assert [call[1] for call in caller.calls] == [f"file.{direction}", "file.abort"]
     assert caller.calls[0][2]["transfer_id"] == caller.calls[1][2]["transfer_id"]
