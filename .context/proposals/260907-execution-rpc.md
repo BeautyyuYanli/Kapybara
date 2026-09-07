@@ -1,6 +1,6 @@
 # Execution 与 RPC 方案
 
-本方案依据 `kapy_v2.md` 与 `docs/architecture.md`，面向 Linux、单个机器 daemon 和多个逻辑 session。Execution senior 负责 `src/kapy/execution/`、`src/kapy/rpc/` 及对应测试目录；Gateway 负责 CLI、配置读取、控制服务、远端机器 registry 与权限判定。本轮交付仅为方案，公共接口须经总设计师批准后实现。
+本方案依据 `kapy_v2.md`、`docs/architecture.md`、`docs/contracts.md` 及总设计师的 `docs/acceptance.md`，面向 Linux、单个机器 daemon 和多个逻辑 session。Execution senior 负责 `src/kapy/execution/`、`src/kapy/rpc/` 及对应测试目录；Gateway 负责 CLI、配置读取、控制服务、远端机器 registry、权限判定和持久资源清理协调。总设计师已正式批准本方案进入 cmd-impl，接口以其统一契约为准。
 
 ## 1. 实现边界与依赖
 
@@ -8,7 +8,7 @@
 
 `httpx2.AsyncClient.stream()` 支持 `content: AsyncIterable[bytes]`，响应支持 `aiter_raw(chunk_size=...)`，足够完成 presigned GET/PUT；本期不引入 OpenDAL。WebSocket 客户端使用实际存在的 `additional_headers`、`max_size`、`max_queue`、`write_limit` 参数。
 
-模块保持四个主要职责：`rpc/peer.py` 处理协议；`execution/daemon.py` 组织本地服务和远端连接；`execution/processes.py` 管进程；`execution/files.py` 管传输。`execution/store.py` 管 SQLite/XDG，`execution/_launcher.py` 仅负责在用户代码执行前建立进程边界和 controlling terminal。类型放各包 `types.py`，`__init__.py` 只导出下述公共接口。
+模块保持四个主要职责：`rpc/peer.py` 管 duplex 连接，`rpc/messages.py` 共用 envelope/error/batch 处理；`execution/daemon.py` 组织本地服务和远端连接；`execution/processes.py` 管进程；`execution/files.py` 管传输。`execution/store.py` 管 SQLite/XDG，`execution/client.py` 提供 CLI 可调用的本地代理客户端，`execution/_launcher.py` 仅负责在用户代码执行前建立进程边界和 controlling terminal。类型放各包 `types.py`，`__init__.py` 只导出下述公共接口。
 
 ## 2. 公共 Python 接口
 
@@ -37,6 +37,10 @@ class RpcError(Exception):
 class RpcDisconnected(Exception): ...
 class RpcTimeout(Exception): ...
 
+async def dispatch_json(
+    payload: str, handler: RequestHandler,
+) -> str | None: ...
+
 class RpcPeer:
     def __init__(
         self, *, send_text: SendText, receive_text: ReceiveText,
@@ -61,20 +65,55 @@ class MachineCaller(Protocol):
     ) -> JsonValue: ...
 ```
 
-`MachineCaller` 是共享类型，具体 registry/caller 由 Gateway 实现。Intelligence 持有该协议的实例，不直接导入 daemon。`params.session_id` 必须存在，Gateway 在路由前验证 session 与 machine 的关联。
+`MachineCaller` 是共享类型，具体 registry/caller 由 Gateway 实现，保留 `timeout=60.0` keyword 参数。Intelligence 持有该协议的实例，不直接导入 daemon。`params.session_id` 必须存在，Gateway 在路由前验证 session 与 machine 的关联。
 
 ```python
 # kapy.execution
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, TypedDict
 import anyio
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from kapy.rpc import JsonObject, JsonValue
+
+class SessionProxyAuth(TypedDict):
+    kind: Literal["session"]
+    session_id: str
+    token: str
+
+class UserProxyAuth(TypedDict):
+    kind: Literal["user"]
+    token: str
+
+type ProxyAuth = SessionProxyAuth | UserProxyAuth
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPaths:
+    state_dir: Path
+    data_dir: Path
+    runtime_dir: Path
+
+    @property
+    def socket_path(self) -> Path: ...
+
+    def session_cwd(self, session_id: str) -> Path: ...
+
+def resolve_paths(
+    *, state_dir: Path | None = None, data_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+) -> ExecutionPaths: ...
+
+async def call_local_proxy(
+    socket_path: Path, method: str, params: JsonObject, *,
+    auth: ProxyAuth, timeout: float = 60.0,
+) -> JsonValue: ...
 
 class DaemonConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     machine_id: str
     gateway_url: str
     machine_token: SecretStr
-    cgroup_root: Path
+    cgroup_root: Path | None = None
     state_dir: Path | None = None
     data_dir: Path | None = None
     runtime_dir: Path | None = None
@@ -87,13 +126,17 @@ async def run_daemon(
 ) -> None: ...
 ```
 
-`gateway_url` 是完整机器 WebSocket URL；非回环地址必须使用 `wss://`。显式目录必须为绝对路径；idle 秒数为正数。Gateway settings 负责环境变量/配置文件映射，并构造 `DaemonConfig`；Execution 不自行加载 `.env`。`run_daemon` 拥有锁、数据库、socket、HTTP client、连接任务、进程/传输任务，在 stop、取消或退出时完成清理。构造配置不进行 I/O。
+`gateway_url` 是完整机器 WebSocket URL；非回环地址必须使用 `wss://`。显式目录必须为绝对路径；idle 秒数为正数。`cgroup_root` 支持显式传入当前 delegated scope 的根，或已委派 service 的根；None 按第 5 节从当前 unit 发现。Gateway 将可选环境变量 `KAPY_CGROUP_ROOT` 映射到此字段。显式路径仍需核对当前进程所属 unit、委派和实际迁移能力，不能把任意 writable 路径当委派。Gateway settings 负责环境变量/配置文件映射，并构造 `DaemonConfig`；Execution 不自行加载 `.env`。`run_daemon` 拥有锁、数据库、socket、HTTP client、连接任务、进程/传输任务，在 stop、取消或退出时完成清理。构造配置不进行 I/O。
 
 ## 3. RpcPeer 协议与 transport 所有权
 
 已连接的 transport 由调用方交给 peer，peer 在退出时调用 `close_transport()` 一次。`receive_text()` 返回一个完整 JSON 文本，返回 `None` 表示 EOF；transport 错误也导致断线。WebSocket adapter 将非文本消息视为协议错误；Gateway 用 Starlette `receive_text/send_text/close` 包装，daemon 用 websockets `recv/send/close` 包装。handler 的闭包绑定连接的认证身份，peer 不导入业务服务，也不从 params 推断权限。
 
 进入 async context 时启动唯一 reader 和 writer；退出时清理这两个任务及当前连接的 handlers。接收循环立即处理 response，并发 dispatch request；不能等待某个业务 handler 完成才继续接收，否则 handler 内反向 `call()` 会死锁。写入统一串行。
+
+`RpcPeer` 不另提供重复的 serve/run 启动方式。Gateway 在 `async with RpcPeer(...) as peer` 内注册已认证连接，然后 `await peer.wait_closed()` 持续服务；context 退出时注销 registry 并关闭 peer，显式 `aclose()` 可提前结束。`__aenter__` 完成后 reader/writer 已就绪，才允许 `call/notify`；重复进入或 context 外调用失败，不暗中重启已关闭连接。
+
+HTTP `POST /rpc` 由 Gateway 限长读取并严格解码 UTF-8、处理 HTTP 认证，然后调用 `kapy.rpc.dispatch_json(payload, handler)`。返回 str 即 JSON-RPC 单个或 batch 响应，Gateway 用 HTTP 200/application/json 发出；返回 None 表示有效 notification 或全 notification batch，HTTP 204 无 body。无效 JSON、envelope、参数和业务 RpcError 均由 rpc 包编码；无效 UTF-8 时 Gateway 交给同一 codec 的 parse-error 路径，不自行构造 envelope。HTTP 认证失败和 body 超限分别由 Gateway 返回 401/403、413。该函数只接受 request/notification，传入 response envelope 作为 Invalid Request。它与 peer 共用解析、request 校验、dispatch、error 和 batch 编码，不通过虚拟 duplex transport 模拟 HTTP，也不另导出 handle_request 兼容别名。handler 仍用闭包携带认证主体；HTTP 跨请求的总并发上限由 Gateway 控制，单次处理沿用下述 rpc 限额。
 
 JSON-RPC 2.0 支持 request、response、notification、batch、命名及位置参数；缺省 params 归一为 `{}`。业务 machine/local/control 方法只接受命名参数。发送请求用连接内唯一字符串 ID；接收端保留请求 ID 的类型和值，区分缺失 ID 与 `null`。notification 无论成功或失败都不返回响应。禁止 NaN/Infinity，拒绝畸形 response，标准错误使用 -32700/-32600/-32601/-32602/-32603。[JSON-RPC 规范](https://www.jsonrpc.org/specification)
 
@@ -117,6 +160,8 @@ JSON-RPC 2.0 支持 request、response、notification、batch、命名及位置�
 
 默认目录由 platformdirs 计算：`$XDG_STATE_HOME/kapy` 存 `execution.sqlite3`、state lock 和 stdio spool，`$XDG_DATA_HOME/kapy/sessions/<sha256(session_id)>/cwd` 存工作目录，`$XDG_RUNTIME_DIR/kapy` 存 runtime lock 与 `daemon.sock`。XDG runtime 缺失时使用经过 UID/权限校验的临时 runtime 目录并告知调用方；不把大输出放进 runtime。新目录 0700，数据库、spool 与 socket 0600。[XDG 规范](https://specifications.freedesktop.org/basedir/latest/)
 
+`resolve_paths()` 是 CLI 和 daemon 共用的纯路径计算入口，使用 platformdirs 的 Linux 默认值与显式绝对路径覆盖，不创建目录或改变权限。`ExecutionPaths.socket_path` 返回 runtime 根下的 `daemon.sock`；`session_cwd(session_id)` 验证上述 session ID 限额，再以 UTF-8 SHA-256 十六进制摘要计算 data 根下的 session cwd。实际目录创建、UID/权限检查和独占锁由 daemon 启动负责。
+
 同一 state 根或 runtime 根只能运行一个 daemon，分别用文件锁阻止双实例；socket 只有持锁者可创建/清理。数据库绑定 machine_id，换机器身份时拒绝复用。session_id 为非空且 UTF-8 不超过 128 bytes 的不透明字符串，落盘名称由服务计算，不把外部 ID 拼进路径。process_id、transfer_id 为调用方生成的 UUID，所有查找同时带 session_id。
 
 SQLite 开启 WAL、foreign_keys、busy_timeout；一个受锁保护的连接在有界线程执行短事务。用 `PRAGMA user_version` 管理包内 schema；不添加 ORM。表结构：
@@ -138,7 +183,43 @@ SQLite 存机器侧状态；控制面 session/input/output/history/event 的权�
 
 ## 5. 真实进程、PTY 与恢复
 
-每个 managed process 有自己的 Linux cgroup v2。`cgroup_root` 必须是 daemon 可使用的 delegated subtree，具有 `cgroup.procs/cgroup.kill`；没有该能力启动失败。Execution 在其下按 machine/state 根命名专属子树，再按 session/process ID 创建叶组；daemon 自身不在被管理的叶组内。启动时先提交 starting 记录及 cgroup 路径并建立叶组，再启动小型 launcher：launcher 在执行任何用户代码前加入该组，经专用管道确认；daemon 持久化 running 转换后发出执行许可。许可管道 EOF 时 launcher 退出，防止半次 spawn 偷跑。恢复只清理本实例记录的专属组，不扫描并杀死任意系统 cgroup。
+每个 managed process 有自己的 Linux cgroup v2，以覆盖 setsid/double-fork 后代。运行前提为提供 cgroup v2、`cgroup.kill` 的 Linux，以及支持 `Delegate=yes` 和可验证委派标记的 systemd user manager。普通用户通过本项目专属 transient user scope 或 user service 获得委派，不需要修改 Lody unit 或手工 chown cgroup。scope 不要求 `DelegateSubgroup`，不将 systemd 254+ 作为此启动路径的额外前提；若选择 service 的 `DelegateSubgroup=daemon` 形式，则该可选形式需要 systemd 254+。仅看到挂载 rw、目录可写不能证明委派成立。Kapy 只管理已验证 unit 根之下自己创建的 jobs 子树。[systemd delegation](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)
+
+在已导出 Gateway 约定的 `KAPY_CONTROL_URL`、`KAPY_MACHINE_ID`、`KAPY_MACHINE_TOKEN`，且 Kapy wheel 已构建的条件下，普通用户先进入专属 scope 的 shell：
+
+```sh
+systemd-run --user --scope --quiet --collect \
+  --unit=kapy-execution-dev --property=Delegate=yes \
+  /bin/bash --noprofile --norc
+```
+
+然后在该 scope 的 shell 内，把当前 scope 根显式传入；以下路径形式对应本项目已确认的 `/sys/fs/cgroup` 挂载：
+
+```sh
+kapy_scope_cgroup=$(cut -d: -f3 /proc/self/cgroup)
+export KAPY_CGROUP_ROOT="/sys/fs/cgroup${kapy_scope_cgroup}"
+uvx --from /absolute/path/to/kapy.whl kapy server
+```
+
+wheel 路径替换为实际产物路径。scope 继承调用者的环境与工作目录，token 保持在环境中，不出现在 argv；Gateway 的 `kapy server` 映射 KAPY_CGROUP_ROOT，从 control URL/machine ID 构造完整 WS URL并调用 `run_daemon`。省略 KAPY_CGROUP_ROOT 时也支持从当前 scope 自动发现。以上命令是批准后产品的启动契约，本轮不重复创建环境；总设计师已实测项目专属 `Delegate=yes` transient user scope 的 cgroup.procs/cgroup.kill 可写。该证据不替代后续对子组实际迁移、杀树与回收的检查。[systemd-run scope](https://raw.githubusercontent.com/systemd/systemd/v260/man/systemd-run.xml)
+
+启动时通过 `/proc/self/cgroup` 和 cgroup v2 mount 信息定位当前实际 cgroup。候选根是当前所属的最近 `.scope` 或 `.service` unit 边界：进程可以直接位于 scope 根，也可在该 unit 的 daemon 等子组内。候选根要求 `user.delegate=1`、属于当前 UID；显式 cgroup_root 必须是这个已验证边界且包含当前进程，不能指定其他 unit。遇到当前 unit 未委派即失败，不越过它去使用 user@.service/user.slice 的权限，也不猜测 UID/unit 路径。
+
+scope 中 daemon、启动 shell 和测试 runner 可留在当前组，只迁移新建的命令 launcher；service 中已有 daemon 子组同样支持。Kapy 不迁移父 shell、uv 或其他已有进程，不启用任何 domain controller，不修改 unit 根的资源属性；只创建独立 jobs 子树和命令叶组。no-internal-process 约束针对启用 domain controller 分配资源的组，不要求为了单纯分组/kill 清空当前 scope 根；实际迁移失败则明确停止启动，不擅自修改 controller 配置。[cgroup v2 约束](https://docs.kernel.org/admin-guide/cgroup-v2.html#no-internal-process-constraint)
+
+候选根确认后，在按 machine/state 根命名的专属 jobs 子树中创建唯一探测叶组，复用 launcher 的就绪握手，让无用户代码的探测进程迁入，验证可写 `cgroup.procs`、`cgroup.kill` 与 empty 状态，杀掉并回收该探测进程，清理叶组后才接收机器请求。验证的是自行创建的叶组，不写 unit 根的 cgroup.kill。任何一步失败均停止启动、明确报告缺少的能力；不回退到 killpg，不先运行用户命令。主分支集成验收 scope 由总设计师负责；本 senior 在批准后的模块测试阶段只创建本项目专属独立 scope，不修改 Lody service，也不在 Lody 或其他服务的 cgroup 下试写。
+
+模块测试从本 worktree 运行于独立 scope 内；每次使用新的 unit 名称，例如：
+
+```sh
+systemd-run --user --scope --quiet --collect \
+  --unit="kapy-execution-tests-$(uuidgen)" --property=Delegate=yes \
+  "$(command -v uv)" run --locked pytest tests/execution tests/rpc
+```
+
+测试 fixture 从自身 cgroup/mount 信息取得当前 delegated scope 根，并显式构造 `DaemonConfig(cgroup_root=...)`；每个 daemon 使用独立临时 XDG 根，从而得到独立 jobs 子树，所有 session/process/transfer ID 也独立。fixture 的 finally 只杀并回收自己创建的子组；不向 scope 根 cgroup.kill 写入。若测试异常留下活 scope，仅清理此次测试创建的那个 unit；`--collect` 只回收已退出的 unit，不能代替杀残留进程。scope 命令与真实进程测试均留待实现阶段执行，不能将上述环境可写探测报告为完整杀树测试已通过。
+
+正式启动命令时，先提交 starting 记录及专属 cgroup 路径并建立叶组，再启动小型 launcher：launcher 在执行任何用户代码前加入该组，经专用管道确认；daemon 持久化 running 转换后发出执行许可。许可管道 EOF 时 launcher 退出，防止半次 spawn 偷跑。恢复只清理当前已验证 unit 根内、本实例记录的 jobs 子树，不扫描或杀死任意系统 cgroup。
 
 PTY 分配 master/slave，设置窗口大小；独立 launcher 调用 `os.login_tty(slave_fd)` 建立 session leader 和 controlling terminal，然后 exec argv。daemon 关闭自己的 slave，master 非阻塞读写，使用 anyio FD readiness。stdio 分离 stdout/stderr pipe，stdin 默认为 `/dev/null`，不增加不必要的终端模拟。shell 命令用显式 argv，例如 `["/bin/sh", "-lc", "..."]`。[Python os.login_tty](https://docs.python.org/3.14/library/os.html#os.login_tty)
 
@@ -152,7 +233,9 @@ stdio 两个 drain task 每次至多 64 KiB，追加到各自磁盘 spool，不�
 
 `process.kill` 写 `cgroup.kill=1`，覆盖变更 session/process group 以及 double-fork 的后代；这与 Ctrl-C 是不同操作。直到 cgroup empty、leader 已回收且输出 drain 完成才进入终态；超过 wait_ms 则返回 killing，可继续观察。正常 leader 退出但仍有后代时保持 running，保留已知 exit_code。内核负责 kill 与 fork 的竞争。[Linux cgroup.kill](https://docs.kernel.org/admin-guide/cgroup-v2.html#core-interface-files)
 
-WebSocket 断线不影响进程。daemon 正常退出时清理全部下辖进程；异常退出后的下次启动先清理 SQLite 所有未终止 cgroup，再把记录标为 lost，保留 spool 和已提交 PTY 尾窗。启动清理结束前不接收新请求。不依据可能复用的裸 PID 杀进程，也不伪装恢复已丢失的 PTY fd。主机重启后 cgroup 消失同样标 lost。此方案保证状态可恢复，不提供 daemon 重启后继续原终端的 attach 服务；在 daemon 停机至恢复之间，残留工作可能仍存活。
+WebSocket 断线不影响进程。daemon 正常退出时清理全部下辖进程。scope 与 service 的停机边界不同：scope 不会仅因 daemon 退出就自动终止其他成员，异常后可在同一 scope 重启 daemon 清理自身遗留组，或停止这次专属 scope；不能把 `--collect` 当自动清理。若使用独立 service，可配置 `KillMode=control-group`、`SendSIGKILL=yes`、`TimeoutStopSec=10s`，由 systemd 在 unit 停止时兜底清理整个 unit。[systemd KillMode](https://raw.githubusercontent.com/systemd/systemd/v260/man/systemd.kill.xml)
+
+daemon 异常退出后的下次启动只清理当前已验证专属子树中仍未终止的组，再把未正常完成记录标为 lost，保留 spool 和已提交 PTY 尾窗；属于旧 unit 的历史路径不能作为跨 unit 杀进程的依据。启动清理结束前不接收新请求。不依据可能复用的裸 PID 杀进程，也不伪装恢复已丢失的 PTY fd。主机重启后 cgroup 消失同样标 lost。此方案保证状态可恢复，不提供 daemon 重启后继续原终端的 attach 服务；信号尚未完成的任务不能提前宣称已清理。
 
 默认最多 32 个活动进程、8 个传输；单进程 PTY 8 KiB、stdio 每路 64 KiB drain，加上固定 FD/协议缓冲，内存不随累计输出或文件长度增长。阻塞磁盘工作共享有界线程 limiter，不每条输出另建线程。
 
@@ -229,15 +312,22 @@ URL GET 没有读完整文件后才写盘的阶段，PUT 没有预读全文件�
 
 本地 endpoint 是 `${runtime_dir}/daemon.sock`，AF_UNIX stream；每行一个 UTF-8 JSON-RPC 2.0 message，末尾一个 LF，JSON 字符串内换行必须转义。行长度含 LF 不超过 1 MiB，读入时就限长。多个请求靠 ID 关联，连接可以复用。仅相同 UID 的 peer 可连接；socket 权限和 SO_PEERCRED 检查作为本机边界。
 
+Gateway CLI 调用 `kapy.execution.call_local_proxy(socket_path, method, params, auth=...)`，不自行实现 envelope、ID、error 或 framing。该函数拥有一次调用的 Unix connection/RpcPeer，返回业务 result 或抛出 RpcError/RpcTimeout/RpcDisconnected，finally 关闭连接；timeout 覆盖连接与等待的总时限，不自动重试。Gateway CLI 负责从环境/设置解析 socket_path 和 auth，并把 domain params 原样传入；客户端只包装 `proxy.call`，不读取 `.env`，不解析 CLI 命令。原始 token 不得进入客户端日志。
+
 本地只公开 `proxy.call`，不把机器进程管理 API 暴露给任意本地 CLI。params 形状如下；session 身份与人工管理员身份二选一：
 
 ```json
 {
   "jsonrpc": "2.0", "id": "cli-1", "method": "proxy.call",
   "params": {
-    "auth": {"kind": "session", "session_id": "origin-session", "token": "<session-token>"},
+    "auth": {"kind": "session", "session_id": "a7b01c24-f912-46f4-a3d0-c6772fe3b7e1", "token": "<session-token>"},
     "method": "session.input",
-    "params": {"session_id": "target-session", "text": "...", "mode": "queue", "request_key": "..."}
+    "params": {
+      "session_id": "d3e85be7-1d58-43cb-a1e5-612f137d37ab",
+      "request_id": "3f943bbc-4777-441c-8e3b-9046c39b6c57",
+      "payload": "...",
+      "mode": "queue"
+    }
   }
 }
 ```
@@ -250,7 +340,11 @@ ProxyAuth = {kind: "session", session_id: str, token: str}
 ProxyParams = {auth: ProxyAuth, method: str, params: JsonObject}
 ```
 
-daemon 对 session auth 与内存 token 作恒时比较，拒绝尚未 ensure 或 released 的 session，然后经远端 peer 调用 **daemon → Gateway** 的 `control.proxy(ProxyParams)`。Gateway 从已鉴权 WebSocket 获取 machine_id，验证 token 与 origin session/machine 绑定及内层目标权限；内层只接受 `session.*`、`event.*`、`history.*`、`skill.*`，不能再代理 proxy/machine/process 方法。Gateway 直接返回业务 JsonValue；本地返回相同 result，保留 CLI request ID。业务 RpcError 原样映射，连接错误为 offline；不把远端 request ID 或连接认证细节当作业务结果。
+控制面 `session.input` 参数采用 `{session_id, request_id, payload, mode?, waiting_id?}`：request_id 是调用方生成并在重试时保留的 UUID；payload 是 State 接受的 JsonValue，文本输入直接作为 JSON string，不另造 text 字段。JSON-RPC envelope.id 只关联本次连接内的请求/响应，不承担幂等职责。Execution 透传 request_id 与 payload；可信 caller scope 及 receipt 语义由 Gateway/State 处理，不在 proxy 中生成第二个幂等键。
+
+daemon 对 session auth 与内存 token 作恒时比较，拒绝尚未 ensure 或 released 的 session，然后经远端 peer 调用 **daemon → Gateway** 的 `control.proxy(ProxyParams)`。`auth.session_id` 始终是调用来源；内层 `params.session_id` 若存在，是本次操作目标，两者不能混用或相互补全。Gateway 从已鉴权 WebSocket 获取 machine_id，验证 token 与 origin session/machine 绑定及内层目标权限；内层只接受 `session.*`、`event.*`、`history.*`、`skill.*`，不能再代理 proxy/machine/process 方法。Gateway 直接返回业务 JsonValue；本地返回相同 result，保留 CLI request ID。业务 RpcError 原样映射，连接错误为 offline；不把远端 request ID 或连接认证细节当作业务结果。
+
+Gateway 下发 `session.ensure` 的完整 params 是 `{"session_id":"origin-session","session_token":"<session-machine-capability>"}`，result 是 `{"session_id":"origin-session","cwd":"<absolute-XDG-session-cwd>"}`。machine_id 来自调用所用机器连接，不在 params 中另传；cwd 由 daemon 创建，不由 token 或 CLI 指定。该方法仅存在于 Gateway → daemon 方向，和控制面的 session CRUD 方法分开 dispatch。
 
 child env 固定携带：
 
@@ -267,20 +361,20 @@ session token 的签发、撤销和持久化由 Gateway 拥有；提议每个 se
 
 ## 9. Outbound reconnect 与 idle
 
-daemon 只主动连接 `gateway_url`，使用 `Authorization: Bearer <machine_token>` 与 `kapy.jsonrpc.v1` subprotocol；Gateway 决定路由路径并验证连接对应 machine_id。WebSocket ping/pong 20 秒，不作为 JSON-RPC 业务。一个 machine 只有一个 registry 中有效的 peer，重复连接 fencing/替换由 Gateway 完成。
+daemon 只主动连接 `gateway_url`，拟采用 Gateway 的 `/rpc/machines/{machine_id}` 路径，使用 `Authorization: Bearer <machine_token>` 与 `kapy.jsonrpc.v1` subprotocol；每个机器有独立 bearer，Gateway 验证凭证与路径中的 machine_id 匹配。`DaemonConfig.gateway_url` 传完整 URL，daemon 不自行追加路径。WebSocket ping/pong 20 秒，不作为 JSON-RPC 业务。一个 machine 只有一个 registry 中有效的 peer，重复连接 fencing/替换由 Gateway 完成。
 
-网络断线按带 jitter 的指数退避重连，初始 1 秒，上限 30 秒，健康连接后复位；认证拒绝、错误配置或协议版本不匹配作为终止错误，不无限重试。重连创建新 RpcPeer，Gateway 重新 ensure session；命令和传输继续运行，stdio 继续落盘，PTY 继续维护尾窗。State/Intelligence 用原 process_id/transfer_id 查询，不重新执行副作用。process.start 的业务 ID、State 的 request_key 负责各自领域的幂等。
+网络断线按带 jitter 的指数退避重连，初始 1 秒，上限 30 秒，健康连接后复位；认证拒绝、错误配置或协议版本不匹配作为终止错误，不无限重试。重连创建新 RpcPeer，Gateway 重新 ensure session；命令和传输继续运行，stdio 继续落盘，PTY 继续维护尾窗。State/Intelligence 用原 process_id/transfer_id 查询，不重新执行副作用。process.start 的业务 ID、State 的 UUID request_id 负责各自领域的幂等。
 
-默认 `idle_disconnect_after_s=None` 保持连接。启用后，仅在无活动进程、无传输、无 pending call/handler/local proxy，且达到业务空闲时间时断开。最多休眠 `idle_reconnect_after_s` 后主动重连；本地 proxy 到达可立即唤醒。没有独立唤醒通道，远端调用需要 Gateway 等待下次上线，受 MachineCaller timeout 限制；不能承诺离线瞬时可达。idle 关闭与远端请求竞争时按普通断线处理，不能隐式重放可能已执行的操作。
+默认 `idle_disconnect_after_s=None` 保持连接。启用后，仅在无活动进程、无传输、无 pending call/handler/local proxy，且达到业务空闲时间时断开。最多休眠 `idle_reconnect_after_s` 后主动重连；本地 proxy 到达可立即唤醒。没有独立唤醒通道，远端调用需要 Gateway 等待下次上线，受 Gateway 为 caller 配置的 deadline 限制；不能承诺离线瞬时可达。idle 关闭与远端请求竞争时按普通断线处理，不能隐式重放可能已执行的操作。
 
-Gateway caller 对暂时 offline 的机器可在 timeout 内等待一次可用连接；若超时返回 offline。daemon 接收本地 proxy 时唤醒连接并在 60 秒 call deadline 内等待；本地 caller 中断不撤销控制面可能已接收的写操作，request_key 必须由 CLI/State 配合保持。
+Gateway caller 对暂时 offline 的机器可在配置的 deadline 内等待一次可用连接；若超时返回 offline。daemon 接收本地 proxy 时唤醒连接并在 60 秒 call deadline 内等待；本地 caller 中断不撤销控制面可能已接收的写操作，UUID request_id 必须由 CLI/State 配合保持。
 
 ## 10. 跨模块要求
 
-Gateway 接入 `RpcPeer` callbacks 和 `MachineCaller` 协议，实现 `control.proxy`、认证的 machine WS endpoint、connection fencing、按 session-machine 关联的 ensure/token 下发，以及上述 NDJSON CLI 客户端。CLI 命令参数、用户 API、Telegram 和管理员配置继续由 Gateway 拥有；Execution 不增加第二套 control dispatcher。
+Gateway 接入 `RpcPeer` callbacks 和 `MachineCaller` 协议，实现 `control.proxy`、认证的 machine WS endpoint、connection fencing、按 session-machine 关联的 ensure/token 下发；HTTP `/rpc` 调用共享 `dispatch_json`，CLI 调用 Execution 导出的 `call_local_proxy`。CLI 命令参数、用户 API、Telegram 和管理员配置继续由 Gateway 拥有；Execution 不增加第二套 control dispatcher。
 
-State 提供 session-machine 关联与删除状态，删除 session 前协调 machine `session.release`，离线机器保留待清理关联，重新连接后完成释放。控制面数据库中 session/input/history/event 不迁入 SQLite。递归 CLI 的 request_key、waiting_id、权限范围和完成语义仍由 State/Gateway/Intelligence 协调。
+Gateway 在删除或解除 machine 关联时持久化清理义务，以 durable cleanup 协调 machine `session.release`；离线机器的义务在重新连接后继续执行，确认 released 后完成清理记录。Execution 负责实际且幂等的进程、传输、cwd 清理；State 不负责 daemon 资源清理或相关 outbox。控制面数据库中 session/input/history/event 不迁入 SQLite。递归 CLI 的 UUID request_id、waiting_id、权限范围和完成语义仍由 State/Gateway/Intelligence 协调。
 
 Intelligence 调用 machine 表，选中 machine 后始终传 session_id；为 start/transfer 生成稳定 UUID，在输出中保留 process_id 与 cursors，明确 timeout 不是退出。stdio 大输出交给分块消费或 process_id 引用，不拼成无限长 tool response；PTY 的 truncated 必须展示。插件脚本走显式 argv，媒体走 file.pull 的 websocket 或 URL 路径。
 
-本方案要求总设计师提供 Linux delegated cgroup subtree 并把配置接入 Gateway settings；共享 pyproject.toml、uv.lock、compose.yaml、README.md 不在本 senior 的修改范围。后续对应 tests/execution、tests/rpc 由本 senior 负责；需要跨模块 PostgreSQL/Valkey 时使用总设计师提供的本地服务，每次独立随机 schema/Valkey namespace 与独立临时 XDG 根，不触碰其他 senior 状态，不发送真实 Telegram 消息。
+总设计师负责主分支集成验收 scope；本 senior 负责批准后自己模块测试使用的本项目专属 scope，以及其中进程/传输的实际行为与清理。Gateway 接入 `KAPY_CGROUP_ROOT -> DaemonConfig.cgroup_root` 的显式 scope 路径、None 时的自动发现和明确的启动错误；产品普通用户使用同一启动方式，不要求修改 Lody unit 或预先拥有任意 writable cgroup。共享 pyproject.toml、uv.lock、compose.yaml、README.md 不在本 senior 的修改范围。后续对应 tests/execution、tests/rpc 由本 senior 负责，并遵循总设计师验收清单中的 16 个并发交互任务、64 MiB stdio 输出和 64 MiB 双路径文件传输场景。文件完整性由发送端与接收端计算 hash 比较，不要求 pull RPC 新增完整 SHA-256 计算。需要跨模块 PostgreSQL/Valkey 时使用已 healthy 的共用服务，每次独立随机 schema/Valkey namespace 与独立临时 XDG 根；禁止重启共用服务、flush 共用 Valkey 或删除其他 scope 的数据。重启场景使用独立控制进程/schema 或专属可丢弃服务，不发送真实 Telegram 消息。产品验收与交付台账仍由总设计师维护，最终公共接口由总设计师统一批准。
