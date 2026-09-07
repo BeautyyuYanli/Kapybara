@@ -47,8 +47,11 @@ its actual CLI receipt channel. No Gateway change was needed.
 Normal Compose project kapy-v2 runs PostgreSQL17 (localhost55432), Valkey8
 (localhost56379), stable network namespace, control (localhost8000) and Docker
 execution daemon. API preview http://127.0.0.1:8000/docs was reported to Lody.
-Real Telegram is explicitly disabled at startup. Old isolated acceptance stacks
-and their temporary volumes were removed; normal development data volumes remain.
+Real Telegram was enabled on 2026-09-08 at the user's explicit request. getMe,
+getWebhookInfo (no webhook), the installed command menu and control HTTP checks
+passed; docker-machine reconnected. The user subsequently confirmed real replies
+with a screenshot. Old isolated acceptance stacks and their temporary volumes
+were removed; normal development data volumes remain.
 
 .env contains the corrected provider/TG configuration and generated local
 control/signing/machine credentials, mode600 and ignored. Never print/commit it.
@@ -83,3 +86,18 @@ denied, application and venv unwritable. Full Compose suite262PASS116.92s, no sk
 JUnit .local/acceptance/nonroot.xml. Live check_system PASS7.54s, session deleted.
 Fresh anonymous-volume/tmpfs ownership and ordinary-user writes also passed.
 No domain code or dependencies changed; normal local stack runs the updated images.
+
+## Telegram presentation follow-up (2026-09-08, in progress)
+
+The user requests a natural chat frontend instead of separate delta/log messages.
+New Gateway senior 94ba8801-e6f3-478b-a7f6-809ff1859b1e owns this follow-up from
+main35016ec through proposal approval and cmd-impl. Proposal6c2494a was approved
+with a simpler controlled, drained upgrade instead of a legacy log replay engine.
+The architect must stop the old control process and verify no active runs,
+unhandled ingress, pending fragments or unread output before replacing only the
+legacy projection with the documented new empty shape, retaining its cursor.
+If a concurrent input prevents draining, resume the old version and retry later.
+Official sendMessageDraft
+supports private-chat streaming previews; completed replies require sendMessage.
+The architect owns integration and updating the running bot after review.
+This new assignment does not reactivate any 20260907 delayed operations.
