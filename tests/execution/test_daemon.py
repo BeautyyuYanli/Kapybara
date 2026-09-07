@@ -1,0 +1,474 @@
+"""Full daemon transport and lifecycle tests inside the isolated machine image."""
+
+import asyncio
+import base64
+import sys
+from pathlib import Path
+from typing import Any, cast
+from uuid import uuid4
+
+import anyio
+import httpx2
+import pytest
+from pydantic import SecretStr, ValidationError
+from websockets.asyncio.server import serve
+from websockets.typing import Subprotocol
+
+from kapy.execution import DaemonConfig, call_local_proxy, run_daemon
+from kapy.execution.daemon import MachineService
+from kapy.execution.paths import resolve_paths
+from kapy.execution.store import ExecutionStore
+from kapy.rpc import JsonObject, RpcError, RpcPeer
+
+
+def config(tmp_path: Path, url: str, **kwargs: Any) -> DaemonConfig:
+    return DaemonConfig(
+        machine_id="machine",
+        gateway_url=url,
+        machine_token=SecretStr("machine-only"),
+        state_dir=tmp_path / "state",
+        data_dir=tmp_path / "data",
+        runtime_dir=tmp_path / "run",
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"state_dir": Path("relative")},
+        {"gateway_url": "ws://remote/rpc/machines/m"},
+        {"idle_reconnect_after_s": float("inf")},
+        {"idle_disconnect_after_s": 0},
+        {"cgroup_root": "/sys"},
+        {"machine_token": SecretStr("x\r\ny")},
+    ],
+)
+def test_invalid_config(override):
+    with pytest.raises(ValidationError):
+        DaemonConfig.model_validate(
+            {
+                "machine_id": "m",
+                "gateway_url": "ws://127.0.0.1/rpc/machines/m",
+                "machine_token": SecretStr("token"),
+                **override,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_daemon_ws_proxy_reconnect_and_stop(tmp_path: Path):
+    peers: asyncio.Queue[RpcPeer] = asyncio.Queue()
+    calls: list[Any] = []
+
+    async def gateway(ws):
+        assert ws.request.headers["Authorization"] == "Bearer machine-only"
+        assert ws.request.path == "/rpc/machines/machine"
+
+        async def handler(method, params):
+            calls.append((method, params))
+            return {"target": params["params"]["session_id"]}
+
+        async def receive():
+            try:
+                return await ws.recv()
+            except Exception:
+                return None
+
+        async with RpcPeer(
+            send_text=ws.send, receive_text=receive, close_transport=ws.close, handler=handler
+        ) as peer:
+            await peers.put(peer)
+            await peer.wait_closed()
+
+    async with serve(
+        gateway, "127.0.0.1", 0, subprotocols=[Subprotocol("kapy.jsonrpc.v1")]
+    ) as server:
+        port = server.sockets[0].getsockname()[1]
+        settings = config(tmp_path, f"ws://127.0.0.1:{port}/rpc/machines/machine")
+        stop = anyio.Event()
+        daemon = asyncio.create_task(run_daemon(settings, stop=stop))
+        try:
+            async with asyncio.timeout(10):
+                peer = await peers.get()
+                await peer.call(
+                    "session.ensure", {"session_id": "caller", "session_token": "caller-token"}
+                )
+                response = await call_local_proxy(
+                    tmp_path / "run" / "daemon.sock",
+                    "session.read",
+                    {"session_id": "different-target"},
+                    auth={"kind": "session", "session_id": "caller", "token": "caller-token"},
+                )
+                assert response == {"target": "different-target"}
+                assert calls[0][0] == "control.proxy"
+                with pytest.raises(RpcError, match="Invalid caller"):
+                    await call_local_proxy(
+                        tmp_path / "run" / "daemon.sock",
+                        "session.read",
+                        {},
+                        auth={"kind": "session", "session_id": "caller", "token": "bad"},
+                    )
+                pid = str(uuid4())
+                params: JsonObject = {
+                    "session_id": "caller",
+                    "process_id": pid,
+                    "mode": "stdio",
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(.5); print('survived')",
+                    ],
+                    "wait_ms": 0,
+                }
+                await peer.call("process.start", params)
+                await peer.aclose()
+                new_peer = await peers.get()
+                await new_peer.call(
+                    "session.ensure", {"session_id": "caller", "session_token": "fresh"}
+                )
+                result = cast(
+                    Any,
+                    await new_peer.call(
+                        "process.wait", {"session_id": "caller", "process_id": pid, "wait_ms": 3000}
+                    ),
+                )
+                assert base64.b64decode(result["output"]["stdout"]["data_base64"]) == b"survived\n"
+                assert result["process"]["output_complete"]
+                assert await new_peer.call("session.release", {"session_id": "caller"}) == {
+                    "session_id": "caller",
+                    "released": True,
+                }
+        finally:
+            stop.set()
+            await asyncio.wait_for(daemon, 10)
+        assert not (tmp_path / "run" / "daemon.sock").exists()
+
+
+@pytest.mark.asyncio
+async def test_recovery_lost_and_finished_output(tmp_path: Path):
+    paths = resolve_paths(
+        state_dir=tmp_path / "state", data_dir=tmp_path / "data", runtime_dir=tmp_path / "run"
+    )
+    pid = str(uuid4())
+    pty_id = str(uuid4())
+    params: JsonObject = {
+        "session_id": "s",
+        "process_id": pid,
+        "mode": "stdio",
+        "argv": ["/bin/echo", "kept"],
+    }
+    async with ExecutionStore(paths, "m") as store, httpx2.AsyncClient(trust_env=False) as http:
+        service = MachineService(store, http_client=http)
+        await service.initialize()
+        await store.ensure_session("s", "secret")
+        await service.handle("process.start", params)
+        terminal = cast(
+            Any,
+            await service.handle(
+                "process.start",
+                {
+                    "session_id": "s",
+                    "process_id": pty_id,
+                    "mode": "pty",
+                    "argv": [sys.executable, "-c", "import os; os.write(1,b'z'*10000+b'TAIL')"],
+                },
+            ),
+        )
+        expected_tail = (b"z" * 10000 + b"TAIL")[-8192:]
+        assert terminal["process"]["state"] == "exited"
+        assert base64.b64decode(terminal["output"]["pty"]["data_base64"]) == expected_tail
+        await service.aclose()
+        records = await store.process_records()
+        record = next(item for item in records if cast(Any, item["info"])["process_id"] == pid)
+        info = cast(Any, record["info"])
+        meta = cast(Any, record["meta"])
+        info["process_id"] = str(uuid4())
+        info["state"] = "running"
+        meta["pid"] = 2147483647
+        await store.save_process("interrupted", info, meta)
+    async with ExecutionStore(paths, "m") as store, httpx2.AsyncClient(trust_env=False) as http:
+        service = MachineService(store, http_client=http)
+        await service.initialize()
+        try:
+            result = cast(
+                Any,
+                await service.handle(
+                    "process.wait", {"session_id": "s", "process_id": pid, "wait_ms": 0}
+                ),
+            )
+            assert base64.b64decode(result["output"]["stdout"]["data_base64"]) == b"kept\n"
+            restored = cast(
+                Any,
+                await service.handle(
+                    "process.wait",
+                    {
+                        "session_id": "s",
+                        "process_id": pty_id,
+                        "wait_ms": 0,
+                        "max_bytes": 4096,
+                    },
+                ),
+            )
+            chunk = restored["output"]["pty"]
+            assert restored["process"]["state"] == "exited"
+            assert restored["process"]["output_complete"] is True
+            assert chunk["available"] == 10004
+            assert chunk["start"] == 10004 - 8192
+            assert chunk["truncated"] is True
+            assert base64.b64decode(chunk["data_base64"]) == expected_tail[:4096]
+            remaining = cast(
+                Any,
+                await service.handle(
+                    "process.wait",
+                    {
+                        "session_id": "s",
+                        "process_id": pty_id,
+                        "wait_ms": 0,
+                        "cursor": {"pty": chunk["next"]},
+                    },
+                ),
+            )["output"]["pty"]
+            assert remaining["start"] == chunk["next"]
+            assert remaining["next"] == 10004
+            assert remaining["truncated"] is False
+            assert remaining["eof"] is True
+            assert base64.b64decode(remaining["data_base64"]) == expected_tail[4096:]
+            listed = cast(Any, await service.handle("process.list", {"session_id": "s"}))
+            assert {item["state"] for item in listed["items"]} == {"exited", "lost"}
+            with pytest.raises(RpcError, match="ensured"):
+                await service.handle("process.start", params)
+        finally:
+            await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idle_reconnect_and_local_wake(tmp_path: Path):
+    connected: asyncio.Queue[RpcPeer] = asyncio.Queue()
+
+    async def gateway(ws):
+        async def handle(method, params):
+            return "awake"
+
+        async def receive():
+            try:
+                return await ws.recv()
+            except Exception:
+                return None
+
+        async with RpcPeer(
+            send_text=ws.send, receive_text=receive, close_transport=ws.close, handler=handle
+        ) as peer:
+            await connected.put(peer)
+            await peer.wait_closed()
+
+    async with serve(
+        gateway, "127.0.0.1", 0, subprotocols=[Subprotocol("kapy.jsonrpc.v1")]
+    ) as server:
+        port = server.sockets[0].getsockname()[1]
+        settings = config(
+            tmp_path,
+            f"ws://127.0.0.1:{port}/rpc/machines/machine",
+            idle_disconnect_after_s=0.1,
+            idle_reconnect_after_s=0.3,
+        )
+        stop = anyio.Event()
+        daemon = asyncio.create_task(run_daemon(settings, stop=stop))
+        try:
+            async with asyncio.timeout(5):
+                first = await connected.get()
+                await first.wait_closed()
+                second = await connected.get()
+                await second.wait_closed()
+                response = await call_local_proxy(
+                    tmp_path / "run" / "daemon.sock",
+                    "session.list",
+                    {},
+                    auth={"kind": "user", "token": "user-token"},
+                )
+                assert response == "awake"
+        finally:
+            stop.set()
+            await asyncio.wait_for(daemon, 5)
+
+
+@pytest.mark.asyncio
+async def test_binary_machine_frame_is_fatal_without_reconnect(tmp_path: Path):
+    attempts = 0
+
+    async def gateway(ws):
+        nonlocal attempts
+        attempts += 1
+        await ws.send(b"{}")
+        await ws.wait_closed()
+
+    async with serve(
+        gateway, "127.0.0.1", 0, subprotocols=[Subprotocol("kapy.jsonrpc.v1")]
+    ) as server:
+        port = server.sockets[0].getsockname()[1]
+        settings = config(tmp_path, f"ws://127.0.0.1:{port}/rpc/machines/machine")
+        with pytest.raises(RuntimeError, match="requires text frames"):
+            await asyncio.wait_for(run_daemon(settings), 5)
+        assert attempts == 1
+        paths = resolve_paths(
+            state_dir=settings.state_dir,
+            data_dir=settings.data_dir,
+            runtime_dir=settings.runtime_dir,
+        )
+        async with ExecutionStore(paths, "machine"):
+            pass
+        assert not paths.socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_anyio_level_cancellation_closes_active_daemon_and_store(tmp_path: Path):
+    peers: asyncio.Queue[RpcPeer] = asyncio.Queue()
+    cancelled = False
+
+    async def gateway(ws):
+        async def handler(method, params):
+            return None
+
+        async def receive():
+            try:
+                return await ws.recv()
+            except Exception:
+                return None
+
+        async with RpcPeer(
+            send_text=ws.send, receive_text=receive, close_transport=ws.close, handler=handler
+        ) as peer:
+            await peers.put(peer)
+            await peer.wait_closed()
+
+    async with serve(
+        gateway, "127.0.0.1", 0, subprotocols=[Subprotocol("kapy.jsonrpc.v1")]
+    ) as server:
+        port = server.sockets[0].getsockname()[1]
+        settings = config(tmp_path, f"ws://127.0.0.1:{port}/rpc/machines/machine")
+
+        async def run():
+            nonlocal cancelled
+            try:
+                await run_daemon(settings)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+
+        async with asyncio.timeout(5):
+            async with anyio.create_task_group() as group:
+                group.start_soon(run)
+                peer = await peers.get()
+                await peer.call("session.ensure", {"session_id": "s", "session_token": "token"})
+                await peer.call(
+                    "process.start",
+                    {
+                        "session_id": "s",
+                        "process_id": str(uuid4()),
+                        "mode": "stdio",
+                        "argv": [sys.executable, "-c", "import time; time.sleep(60)"],
+                        "wait_ms": 0,
+                    },
+                )
+                group.cancel_scope.cancel()
+        assert cancelled
+        paths = resolve_paths(
+            state_dir=settings.state_dir,
+            data_dir=settings.data_dir,
+            runtime_dir=settings.runtime_dir,
+        )
+        assert not paths.socket_path.exists()
+        async with ExecutionStore(paths, "machine") as store:
+            records = await store.process_records()
+            assert cast(Any, records[0]["info"])["state"] == "killed"
+
+
+@pytest.mark.asyncio
+async def test_session_release_admission_is_bounded_and_reuses_id(tmp_path: Path, monkeypatch):
+    import kapy.execution.daemon as daemon_module
+
+    paths = resolve_paths(
+        state_dir=tmp_path / "state", data_dir=tmp_path / "data", runtime_dir=tmp_path / "run"
+    )
+    async with (
+        ExecutionStore(paths, "machine") as store,
+        httpx2.AsyncClient(trust_env=False) as http,
+    ):
+        service = MachineService(store, http_client=http)
+        await service.initialize()
+        for sid in ("a", "b", "c"):
+            await service.handle("session.ensure", {"session_id": sid, "session_token": "token"})
+        release = service._release
+        gate = asyncio.Event()
+
+        async def delayed(sid):
+            await gate.wait()
+            await release(sid)
+
+        monkeypatch.setattr(service, "_release", delayed)
+        monkeypatch.setattr(daemon_module, "MAX_RELEASES", 2)
+        try:
+            for sid in ("a", "b", "a"):
+                assert await service.handle(
+                    "session.release", {"session_id": sid, "wait_ms": 0}
+                ) == {"session_id": sid, "released": False}
+            assert len(service._releases) == 2
+            with pytest.raises(RpcError, match="Too many session releases"):
+                await service.handle("session.release", {"session_id": "c", "wait_ms": 0})
+            assert store.authenticate_session("c", "token")
+            assert await store.session_cwd("c", require_token=True) == paths.session_cwd("c")
+        finally:
+            gate.set()
+            await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anyio_cancel_during_store_acquisition_releases_unregistered_locks(
+    tmp_path: Path, monkeypatch
+):
+    import threading
+
+    settings = config(tmp_path, "ws://127.0.0.1:1/rpc/machines/machine")
+    paths = resolve_paths(
+        state_dir=settings.state_dir, data_dir=settings.data_dir, runtime_dir=settings.runtime_dir
+    )
+    opened = threading.Event()
+    finish_open = threading.Event()
+    original_open = ExecutionStore._open
+    stores: list[ExecutionStore] = []
+    cancelled = False
+
+    def pause_after_acquisition(self):
+        original_open(self)
+        stores.append(self)
+        opened.set()
+        if not finish_open.wait(3):
+            raise RuntimeError("test did not release startup gate")
+
+    monkeypatch.setattr(ExecutionStore, "_open", pause_after_acquisition)
+
+    async def run():
+        nonlocal cancelled
+        try:
+            await run_daemon(settings)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    async with asyncio.timeout(5):
+        async with anyio.create_task_group() as group:
+            group.start_soon(run)
+            assert await anyio.to_thread.run_sync(opened.wait, 2)
+            group.cancel_scope.cancel()
+            # Let level cancellation reach the daemon while _open still owns
+            # its resources and has not returned for exit-stack registration.
+            with anyio.CancelScope(shield=True):
+                await anyio.sleep(0.05)
+                assert stores[0]._connection is not None
+                finish_open.set()
+    assert cancelled
+    assert stores[0]._connection is None
+    assert stores[0]._lock_fds == []
+    monkeypatch.setattr(ExecutionStore, "_open", original_open)
+    async with ExecutionStore(paths, "machine"):
+        pass

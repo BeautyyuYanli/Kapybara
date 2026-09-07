@@ -2,6 +2,7 @@
 
 from .client import call_local_proxy
 from .config import DaemonConfig
+from .daemon import run_daemon
 from .paths import ExecutionPaths, resolve_paths
 from .types import ProxyAuth, SessionProxyAuth, UserProxyAuth
 
@@ -13,4 +14,5 @@ __all__ = [
     "UserProxyAuth",
     "call_local_proxy",
     "resolve_paths",
+    "run_daemon",
 ]

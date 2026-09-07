@@ -1,4 +1,59 @@
-# Execution storage, files and local proxy
+# Execution daemon, processes, files and local proxy
+
+`from kapy.execution import DaemonConfig, run_daemon` is the public launch API.
+`await run_daemon(config, stop=event)` owns storage, managers, the private Unix
+proxy and outbound WebSocket until the optional AnyIO event is set. Cancellation
+also closes these resources. Config takes the full Gateway machine URL, its
+independent `SecretStr` machine token and optional XDG roots, explicit child
+environment and idle intervals. Loopback `ws` is supported; remote URLs use `wss`.
+The URL is used unchanged, with Bearer auth and `kapy.jsonrpc.v1` subprotocol.
+
+For real handler integrations in the machine container, import `MachineService`
+from `kapy.execution.daemon`. Enter `ExecutionStore(paths, machine_id)` and an
+`httpx2.AsyncClient(trust_env=False, follow_redirects=False)`, construct
+`MachineService(store, http_client=client, child_env={...})`, then initialize it.
+`await service.handle(method, params)` dispatches the frozen process/file/session
+RPCs directly. Always `await service.aclose()` before closing client/store. This
+is the actual daemon service, not an alternate test implementation. Session
+ensure precedes starts; file.push/chunk/finish and ordinary chmod/shell argv are
+sufficient to install and run stdin-consuming plugins without new RPC fields.
+
+The internal `ProcessManager` admits at most 16 active processes. Stdio stdout
+and stderr stream independently to complete private disk spools; reads return
+at most 64 KiB per stream and do not retain whole outputs in memory. Stdio stdin
+is closed; interactive input uses PTY mode. The real controlling PTY supports
+write, window resizing and line-discipline Ctrl-C, retaining an 8192-byte tail.
+PTY wait returns after 200 ms of quiet output; wait deadlines and `wait_ms=0`
+only observe. A leader exiting does not truncate descendants' output or end a
+still-live process group. Complete output does not claim containment of escaped
+setsid/double-fork descendants.
+
+Kill targets the ordinary process group. Only explicit kill, shutdown and
+failure cleanup use a two-second drain bound; forced truncation is reported with
+`output_complete=false` and an error. Stdio spools are fsynced before claiming
+complete output, and terminal spool lengths are checked during recovery.
+SQLite schema v2 stores process IDs,
+startup digests and terminal output metadata, without raw argv/env/tokens.
+Restart changes interrupted records to `lost` and never relaunches them; old
+groups are killed only when both the Linux boot ID and leader start identity
+still match. Missing identity information skips killing. Released process IDs
+remain tombstones and cannot be reused; recovery retries leftover output removal.
+
+Session release revokes credentials, rejects starts, kills its processes,
+aborts transfers and deletes only its own managed directory. At most 64 release
+tasks run, and repeated release of the same session observes the existing task.
+Interrupted release
+is resumed before accepting requests. Child environments are explicit; the
+daemon adds the four KAPY machine/session/socket identity fields and does not
+inherit its environment. Session token refresh affects future children.
+
+Domain operations survive a WebSocket closing. Unexpected disconnection retries
+with 1–30 second jittered backoff; authentication/endpoint/protocol rejection is
+fatal, as are binary frames on the text-only machine transport. Optional idle
+disconnect requires no active work or local connection,
+reconnects after the configured interval, and can be woken by local proxy calls.
+The proxy preserves caller auth separately from the target params and never
+retries a call with uncertain effects. No cgroup or systemd configuration is used.
 
 `resolve_paths(*, state_dir=None, data_dir=None, runtime_dir=None)` is the shared
 CLI/daemon path calculation. It creates nothing. `ExecutionPaths.socket_path`
@@ -66,7 +121,9 @@ worktree, with the architect-provided `kapy-v2-machine:dev` image available:
 
 ```sh
 docker run --rm --init --network none --memory 1g --pids-limit 128 \
+  -e PYTHONPATH=/workspace/src -w /workspace \
   -v "$PWD/src:/workspace/src:ro" -v "$PWD/tests:/workspace/tests:ro" \
+  -v "$PWD/pyproject.toml:/workspace/pyproject.toml:ro" \
   kapy-v2-machine:dev /app/.venv/bin/python -m pytest \
   -q -s -p no:cacheprovider tests/rpc tests/execution
 ```
@@ -76,6 +133,6 @@ tests do not use or modify shared PostgreSQL/Valkey. The suite includes 64 MiB
 WebSocket and URL transfers, hash comparison, peak RSS growth, real SQLite
 restart after a process crash, cleanup failures and local socket framing.
 
-This module milestone supplies storage/files/client components. Process manager,
-daemon composition and its final launch contract are delivered in the next
-implementation stage.
+The execution suite also covers 64 MiB stdio spool hashes, real PTY input and
+Ctrl-C, delayed descendant output, 16-process limits, output recovery/tombstones,
+environment isolation, actual WebSocket reconnection and local proxy forwarding.

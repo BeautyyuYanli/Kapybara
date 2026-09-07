@@ -108,7 +108,7 @@ class ExecutionStore:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=5000")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError("Unsupported execution database version")
             with connection:
                 connection.executescript(
@@ -129,7 +129,13 @@ class ExecutionStore:
                         PRIMARY KEY(session_id, transfer_id)
                     );
                     CREATE INDEX IF NOT EXISTS transfers_active ON transfers(state);
-                    PRAGMA user_version=1;
+                    CREATE TABLE IF NOT EXISTS processes (
+                        session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                        process_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                        info_json TEXT NOT NULL, meta_json TEXT NOT NULL,
+                        PRIMARY KEY(session_id, process_id)
+                    );
+                    PRAGMA user_version=2;
                     """
                 )
                 connection.execute(
@@ -309,3 +315,44 @@ class ExecutionStore:
             return [self._transfer(row) for row in rows]
 
         return await self.transaction(get)
+
+    async def process_records(self, session_id: str | None = None) -> list[JsonObject]:
+        def get(connection: sqlite3.Connection) -> list[JsonObject]:
+            rows = connection.execute(
+                "SELECT * FROM processes" + (" WHERE session_id=?" if session_id else ""),
+                (session_id,) if session_id else (),
+            ).fetchall()
+            return [
+                {
+                    "fingerprint": row["fingerprint"],
+                    "info": json.loads(row["info_json"]),
+                    "meta": json.loads(row["meta_json"]),
+                }
+                for row in rows
+            ]
+
+        return await self.transaction(get)
+
+    async def save_process(self, signature: str, info: JsonObject, meta: JsonObject) -> None:
+        def save(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "INSERT INTO processes VALUES(?,?,?,?,?) ON CONFLICT(session_id,process_id) "
+                "DO UPDATE SET info_json=excluded.info_json,meta_json=excluded.meta_json",
+                (
+                    info["session_id"],
+                    info["process_id"],
+                    signature,
+                    json.dumps(info, separators=(",", ":")),
+                    json.dumps(meta, separators=(",", ":")),
+                ),
+            )
+
+        await self.transaction(save)
+
+    async def releasing_sessions(self) -> list[str]:
+        return await self.transaction(
+            lambda db: [
+                row[0]
+                for row in db.execute("SELECT session_id FROM sessions WHERE state='releasing'")
+            ]
+        )
