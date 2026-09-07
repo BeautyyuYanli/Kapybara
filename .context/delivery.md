@@ -165,6 +165,14 @@ PYTHONPATH=/workspace/src. Rebuild images with uv when dependencies change.
 - Execution fdf4cb6 snapshot independently tested in Docker network=none/1GiB/128PID:
   71 pass in4.43s; 64MiB WS1.92s/RSS+256KiB, URL1.72s/RSS+4224KiB. Not yet merged.
 - Both State acceptance scripts pass pyrefly against the actual e297398 snapshot.
+- Live scripts/check_runner.py passed against composed committed snapshots
+  Agent9e0190a + Statee297398 in Docker. Exact requested reply, one model response
+  replayed after reopening, real API usage input3821/output28. No machine or TG;
+  only model credentials forwarded via uv --env-file .env docker run -e variable
+  names. Unique schema cleaned. Snapshot .local/acceptance/runner-9e0190a generated
+  with git archive; never manually edit generated assets. Script now additionally
+  requires positive reported input usage. State wait_submission/export_history and
+  Completion/SubmissionStatus are present in current worktree, not yet final delivered.
 - Compose now has an app profile with control and daemon services (configuration
   validated, not started). They share only a loopback network namespace; filesystems
   and PID namespaces remain separate. Daemon gets only its machine token plus safe

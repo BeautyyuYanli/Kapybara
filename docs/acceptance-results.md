@@ -66,3 +66,16 @@ replacement and local proxy framing. The complete daemon/process manager is pend
 
 These process RSS deltas are measurements from this test run, not memory ceilings
 for all transfer concurrency patterns.
+
+## Live Runner and State
+
+The `9e0190a` Agent snapshot and `e297398` State snapshot were composed in an isolated
+Docker container with real PostgreSQL/Valkey and the configured `gpt-5.6-luna` API.
+`scripts/check_runner.py` submitted one short prompt through SessionService, checked
+the exact requested reply, closed/reopened the service, and replayed the complete
+model response with API-reported usage: **3,821 input / 28 output tokens**.
+
+This verifies the real model/Runner/checkpoint/history path. It has no execution
+machine or Telegram frontend; those remain separate end-to-end checks. Only model
+credentials were forwarded to the container, and its unique database schema was
+removed afterward.
