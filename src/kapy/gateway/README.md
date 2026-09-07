@@ -86,7 +86,8 @@ archive under the previous request ID. Download extraction uses the Skills-owned
 Telegram saves complete incoming batches before advancing its polling offset. Each topic
 has independent saved settings and active session. Resolved actions and UUID request IDs
 survive restart. Output reads durable State records, saves pending projection and send
-position, splits at 4000 UTF-16 units, and observes Telegram rate-limit delays. A send that
+position, splits rich replies conservatively and plain replies at 4000 UTF-16 units,
+and observes Telegram rate-limit delays. A send that
 succeeds remotely before its receipt is saved can be repeated after a crash; delivery is
 at least once. Only the configured chat is allowed, and existing session instructions
 remain fixed when `/instructions` changes the settings for subsequent `/new` commands.
@@ -110,15 +111,18 @@ ports; process and filesystem isolation remain enabled. The regression starts th
 `kapy server` entry, exercises authenticated child CLI calls and multichunk skill transfers,
 checks reconnect, and waits for durable final deletion to remove the machine session.
 
-Telegram replies use one stable nonzero `sendMessageDraft` ID per logical run in
+Telegram replies use one stable nonzero `sendRichMessageDraft` ID per logical run in
 private chats (including private topics), refreshing changed text and idle drafts
 about every 20 seconds. Tool calls and waiting/attempt notices are not chat messages.
 Completed model messages provide authoritative text; failed temporary attempts are
 removed. Groups and group topics receive only the final reply. Final replies are
-persisted with `sendMessage`, split at paragraph/scalar boundaries within 4000 UTF-16
-units without truncation. A draft is temporary, expires after roughly 30 seconds,
-and is never a final receipt. Restart sends the active draft again. Draft HTTP 400
-falls back to final-only delivery; errors remain natural, explicit failures without
+persisted with `sendRichMessage`, sending raw `rich_message.markdown`. Rich source
+uses a conservative 32768 UTF-8 byte budget, splitting at blank lines outside ordinary
+backtick/tilde fences. Oversized indivisible blocks fall back to plain `sendMessage`
+within 4000 UTF-16 units, without truncation or synthetic wrappers. A draft is temporary, expires after roughly 30 seconds,
+and is never a final receipt. Restart sends the active draft again. Explicit rich
+content rejection falls back to plain draft; a plain draft HTTP 400 falls back to
+final-only delivery. Errors remain natural, explicit failures without
 raw exception strings. Normal replies and implicit session creation have no session
 IDs; `/new` gives a brief confirmation.
 
@@ -138,3 +142,20 @@ exists. Only then replace projections with this empty shape while preserving cur
 If input or output raced the stop, resume the old version and drain before trying again.
 Never reset active delivery state, replay historical completed messages, or discard
 unacknowledged text. No migration runner or legacy rendering emulation is provided.
+
+Rich Markdown needs no MarkdownV2 escaping, parse_mode, or local renderer. Telegram
+validates its structural limits (500 blocks, nesting depth 16, tables up to 20 columns);
+its documented 32768 UTF-8 character limit is distinct from our conservative byte budget.
+Commands and error pending bodies always use plain text. New final pending adds
+`format: "rich"`; existing version 1 pending without that field remains plain.
+`item_offset` counts acknowledged Python characters in original source, including CRLF,
+never encoded bytes or added formatting. No migration is required.
+
+Only explicit rich HTTP/API 400 content parse/limit descriptions trigger persistent
+`format: "plain"`; raw descriptions are neither saved nor logged. Unknown/non-content
+400 stays blocked; 429, network errors, server failures, and lost acknowledgements
+keep the original format and offset. A rich prefix may be followed by plain remaining
+source if an oversized fence/table cannot be safely split. Draft format rejection or
+an oversized indivisible preview sets a run-local plain marker and clears its send cache;
+final rich formatting is attempted independently. Drafts may contain incomplete Markdown.
+See https://core.telegram.org/bots/api#rich-message-formatting-options.

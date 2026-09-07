@@ -7,6 +7,7 @@ import asyncio
 import copy
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -42,6 +43,7 @@ COMMANDS = {
 class TelegramFailure(Exception):
     code: int
     retry_after: float = 1
+    rich_content_rejected: bool = False
 
 
 def request_id(bot_id: int, update_id: int, action: str) -> str:
@@ -66,6 +68,46 @@ def text_chunk(text: str, units: int = 4000) -> tuple[str, str]:
             return text[:index], text[index:]
         count += width
     return text, ""
+
+
+def rich_chunk(text: str) -> tuple[str, str]:
+    """Conservative 32 KiB raw budget; split only on blank lines outside fences."""
+    if len(text.encode("utf-8")) <= 32768:
+        return text, ""
+    position = size = boundary = 0
+    fence = ""
+    for line in text.splitlines(keepends=True):
+        size += len(line.encode("utf-8"))
+        if size > 32768:
+            break
+        position += len(line)
+        content = line.rstrip("\r\n")
+        marker = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", content)
+        if marker:
+            run, tail = marker.groups()
+            if fence:
+                if run[0] == fence[0] and len(run) >= len(fence) and not tail.strip():
+                    fence = ""
+            elif run[0] == "~" or "`" not in tail:
+                fence = run
+        elif not fence and not content.strip():
+            boundary = position
+    return text[:boundary], text[boundary:]
+
+
+def rich_rejection(description: Any) -> bool:
+    """Recognize explicit content failures only; never retain the API description."""
+    if not isinstance(description, str):
+        return False
+    description = description.lower().removeprefix("bad request: ")
+    return description.startswith(
+        ("can't parse rich message:", "can't parse markdown:")
+    ) or description in {
+        "rich message is too long",
+        "too many blocks in rich message",
+        "rich message nesting is too deep",
+        "too many columns in rich message table",
+    }
 
 
 def empty_projection() -> dict[str, Any]:
@@ -149,6 +191,7 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
                 "text": text,
                 "cursor": projection.get("cursor"),
                 "next": following,
+                "format": "rich" if kind == "final" else "plain",
             }
             break
     preview = "\n\n".join(
@@ -191,7 +234,16 @@ class TelegramFrontend:
                 code = body.get("error_code", response.status_code)
                 if code == 401:
                     self.disabled = True
-                raise TelegramFailure(code, body.get("parameters", {}).get("retry_after", 1))
+                rejected = (
+                    method in {"sendRichMessage", "sendRichMessageDraft"}
+                    and response.status_code == 400
+                    and code == 400
+                    and body.get("ok") is False
+                    and rich_rejection(body.get("description"))
+                )
+                raise TelegramFailure(
+                    code, body.get("parameters", {}).get("retry_after", 1), rejected
+                )
             return body["result"]
         except httpx2.HTTPError, ValueError:
             raise TelegramFailure(503, random.uniform(1, 3)) from None
@@ -202,12 +254,22 @@ class TelegramFrontend:
     async def send_draft(self, chat: int, thread: int, draft_id: int, text: str) -> None:
         await self._send("sendMessageDraft", chat, thread, text, draft_id=draft_id)
 
+    async def send_rich(self, chat: int, thread: int, text: str) -> None:
+        await self._send("sendRichMessage", chat, thread, text)
+
+    async def send_rich_draft(self, chat: int, thread: int, draft_id: int, text: str) -> None:
+        await self._send("sendRichMessageDraft", chat, thread, text, draft_id=draft_id)
+
     async def _send(self, method: str, chat: int, thread: int, text: str, **extra: Any) -> None:
         lock = self._chat_locks.setdefault(chat, asyncio.Lock())
         async with lock:
             while (delay := self._chat_ready.get(chat, 0) - time.monotonic()) > 0:  # noqa: ASYNC110 - deadline
                 await asyncio.sleep(delay)
-            params: dict[str, Any] = {"chat_id": chat, "text": text, **extra}
+            params: dict[str, Any] = {"chat_id": chat, **extra}
+            if method in {"sendRichMessage", "sendRichMessageDraft"}:
+                params["rich_message"] = {"markdown": text}
+            else:
+                params["text"] = text
             if thread:
                 params["message_thread_id"] = thread
             try:
@@ -612,9 +674,26 @@ class TelegramFrontend:
             else:
                 preview = ""
             if pending is not None:
-                chunk, remainder = text_chunk(pending["text"][offset:])
+                remaining = pending["text"][offset:]
+                rich = pending.get("format") == "rich"
+                chunk, remainder = rich_chunk(remaining) if rich else text_chunk(remaining)
+                if rich and not chunk and remaining:
+                    pending["format"] = "plain"
+                    await self._save_projection(projection, key)
+                    rich = False
+                    chunk, remainder = text_chunk(remaining)
                 if chunk:
-                    await self.send(row["chat_id"], row["thread_id"], chunk)
+                    try:
+                        if rich:
+                            await self.send_rich(row["chat_id"], row["thread_id"], chunk)
+                        else:
+                            await self.send(row["chat_id"], row["thread_id"], chunk)
+                    except TelegramFailure as exc:
+                        if not rich or not exc.rich_content_rejected:
+                            raise
+                        pending["format"] = "plain"
+                        await self._save_projection(projection, key)
+                        return True
                 await self.metadata.rows(
                     "UPDATE gateway_telegram_delivery SET cursor=%s,projection=%s,item_offset=%s,"
                     "next_attempt_at=NULL WHERE bot_id=%s AND chat_id=%s "
@@ -647,18 +726,27 @@ class TelegramFrontend:
                         else (await self.api("getChat", {"chat_id": row["chat_id"]}))["type"]
                     )
                 if projection["chat_type"] == "private":
-                    text = text_chunk(preview)[0]
+                    text = rich_chunk(preview)[0]
+                    if not draft.get("plain") and not text and preview:
+                        draft["plain"] = True
+                        self._draft_sent.pop(draft["id"], None)
+                        await self._save_projection(projection, key)
+                    if draft.get("plain"):
+                        text = text_chunk(preview)[0]
                     sent = self._draft_sent.get(draft["id"])
                     if sent is None or sent[0] != text or time.monotonic() - sent[1] >= 20:
                         try:
-                            await self.send_draft(
-                                row["chat_id"], row["thread_id"], draft["id"], text
-                            )
+                            send = self.send_draft if draft.get("plain") else self.send_rich_draft
+                            await send(row["chat_id"], row["thread_id"], draft["id"], text)
                             self._draft_sent[draft["id"]] = (text, time.monotonic())
                         except TelegramFailure as exc:
-                            if exc.code != 400:
+                            if not draft.get("plain") and exc.rich_content_rejected:
+                                draft["plain"] = True
+                                self._draft_sent.pop(draft["id"], None)
+                            elif draft.get("plain") and exc.code == 400:
+                                draft["unavailable"] = True
+                            else:
                                 raise
-                            draft["unavailable"] = True
                 await self.metadata.rows(
                     "UPDATE gateway_telegram_delivery SET projection=%s WHERE bot_id=%s "
                     "AND chat_id=%s AND thread_id=%s AND session_id=%s",
@@ -676,6 +764,13 @@ class TelegramFrontend:
                 (str(exc.code) if exc.code in {400, 403} else None, retry_delay(exc), *key),
             )
             return True
+
+    async def _save_projection(self, projection: dict[str, Any], key: tuple[Any, ...]) -> None:
+        await self.metadata.rows(
+            "UPDATE gateway_telegram_delivery SET projection=%s WHERE bot_id=%s "
+            "AND chat_id=%s AND thread_id=%s AND session_id=%s",
+            (Jsonb(projection), *key),
+        )
 
     async def deliver(self) -> None:
         failures = 0
