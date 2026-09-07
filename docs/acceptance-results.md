@@ -204,3 +204,17 @@ This check passed after correcting punctuation in the harness's exact-command
 prompt; the initial harness attempt exited before creating the counter and never
 reached the crash phase. The pass is evidence for the tested recoverable process
 operation, not a general exactly-once guarantee for arbitrary external effects.
+
+## Complete merged functional baseline
+
+Main `b003b18` passed **259 tests in 125.58 s**, with zero failures, errors or skips.
+The JUnit report contains 259 distinct test identities, including the explicitly
+collected real Agent/MachineService acceptance file. This independently combines
+all four reviewed module deliveries and the PTY observer correction.
+
+Tests ran in one disposable Docker container with private process/filesystem
+namespaces, init, 2 GiB memory and 256 PIDs. This baseline used host networking to
+reach the development databases' published loopback ports, while the remaining
+fixture-address correction is underway. Final acceptance must also pass on the
+standard Compose bridge using environment-overridden service URLs. The two test
+files' type errors and Agent shell PATH issue remain assigned to the closeout senior.

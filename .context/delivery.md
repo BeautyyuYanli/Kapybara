@@ -282,6 +282,32 @@ harness had punctuation appended to exact shell command, causingchildexit1before
 counter; fixedpromptnewlines and actualcrashrunpasses. Alltempdata/sessioncleaned;
 no activeexecfromcrashtest. Check_recursive.py still awaits realCLI PATH fix.
 
+IMPORTANT CURRENT HANDOFF (~15:35 UTC): old Intelligence a88a... and Gateway0f9c...
+were cancelled+archived at15:26 after delayed old cf2962f messages again changed
+Gateway's proposal to input-only (242f4a7) and old payload work restarted (7f14cd0).
+Do NOT restore/contact/merge their later branches. Frozen main still input+output.
+Their original final baselines c334b42/ac665c6 are already merged. Root cancelled
+the four pending explicit correction operations; archive prevents old deliveries.
+New CLEAN integration senior session88b37983-bc47-40c1-88ff-2e9379136691,
+worktree samebase/<id>, branchfeat/kapy-integration-closeout. Newproposaloperation
+kapy-integration-closeout-proposal-20260907 created15:28; shortproposal60fc68f had
+exactly1fullcontextMei review and1simplification, fully read/approved byroot15:34.
+Cherrypicked to main36e92ac. ONE implementation approval operation
+kapy-integration-closeout-implementation-20260907, deadline17:34, scope ONLY:
+Agent process_start sh-c preservesexplicitPATH (actualvenvkapy+MachineService test),
+all related Agent/Skills/Gateway PG/Valkeyfixture env overrides, twoAgenttestfiles
+79JsonValue typeerrors. Same cmd-impl persistentElysia and all3Eden5stages ownedby
+senior; no newbusinessinterface/algorithm/sharedconfigchanges. Do not micromanage.
+Root rebuilt kapy-v2:dev andkapy-v2-machine:dev fromfullmain; bothdone, installed
+/app/.venv/bin/kapy nowhascompleteCLI. Baselinefulltestexec34663 is DONE:259passed
+125.58s,0errors/fail/skips,259uniqueJUnitcases .local/acceptance/complete-baseline.xml.
+Included tests/agent/docker_manager_acceptance.py explicitly. PrivateDockerPID/FS,
+2GiB/256PIDs buthostnetwork toreachhardcodedPG. Finalstandardbridge runstilldue.
+New root source scripts/check_recursive.py fixeschildcommandpunctuation andfastfails
+nonmarkerparentfinal; NOT rununtilPATHfix. Oldacceptanceproject1 hasbeenDOWN--volumes,
+onlyproject3stillruns (controlvia network32775,PG32774,Valkey32776,TGdisabled).
+No active unifiedexec process remains fromrootatthisupdate.
+
 Concrete integration defect dispatched at ~13:35 via
 kapy-shared-pool-integration-defect-20260907 to Intelligence and Gateway:
 Gateway Metadata.connection sets conn.row_factory=dict_row and returns it to the
