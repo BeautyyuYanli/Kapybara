@@ -196,7 +196,7 @@ def runner(client: httpx2.AsyncClient, caller: Caller | None = None, **kwargs: A
 
 
 @pytest.mark.asyncio
-async def test_stream_tool_roundtrip_archives_before_effect_and_final_is_uncommitted() -> None:
+async def test_stream_tool_roundtrip_archives_messages_and_final_is_uncommitted() -> None:
     requests = []
     caller = Caller()
 

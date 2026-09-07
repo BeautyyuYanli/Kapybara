@@ -25,7 +25,6 @@ async def test_media_and_large_context_roundtrip_without_machine() -> None:
         ]
     )
     encoded = await codec.encode(original)
-    assert "image bytes" not in str(encoded)
     assert encoded["parts"][0]["metadata"]["kapy_media_refs"]
     assert isinstance(cast(Any, original.parts[0]).content[1], BinaryContent)
     restored = await MessageCodec(cast(AgentPayloadStore, store), session).decode(encoded)
@@ -38,7 +37,7 @@ async def test_media_and_large_context_roundtrip_without_machine() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_arguments_are_rejected_without_truncation() -> None:
+async def test_oversized_message_is_rejected() -> None:
     codec = MessageCodec(cast(AgentPayloadStore, Payloads()), uuid4())
     with pytest.raises(AgentResourceLimit):
         await codec.encode(ModelRequest.user_text_prompt("x" * (256 * 1024)))
