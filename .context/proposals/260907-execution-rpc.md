@@ -1,6 +1,6 @@
 # Execution 与 RPC 方案
 
-本方案依据 `kapy_v2.md` 与 `docs/architecture.md`，面向 Linux、单个机器 daemon 和多个逻辑 session。Execution senior 负责 `src/kapy/execution/`、`src/kapy/rpc/` 及对应测试目录；Gateway 负责 CLI、配置读取、控制服务、远端机器 registry 与权限判定。本轮交付仅为方案，公共接口须经总设计师批准后实现。
+本方案依据 `kapy_v2.md`、`docs/architecture.md`，以及 main 提交 `61af09e` 的 `docs/acceptance.md` 与 `.context/delivery.md`，面向 Linux、单个机器 daemon 和多个逻辑 session。Execution senior 负责 `src/kapy/execution/`、`src/kapy/rpc/` 及对应测试目录；Gateway 负责 CLI、配置读取、控制服务、远端机器 registry 与权限判定。本轮交付仅为方案，公共接口须经总设计师批准后实现。
 
 ## 1. 实现边界与依赖
 
@@ -283,4 +283,4 @@ State 提供 session-machine 关联与删除状态，删除 session 前协调 ma
 
 Intelligence 调用 machine 表，选中 machine 后始终传 session_id；为 start/transfer 生成稳定 UUID，在输出中保留 process_id 与 cursors，明确 timeout 不是退出。stdio 大输出交给分块消费或 process_id 引用，不拼成无限长 tool response；PTY 的 truncated 必须展示。插件脚本走显式 argv，媒体走 file.pull 的 websocket 或 URL 路径。
 
-本方案要求总设计师提供 Linux delegated cgroup subtree 并把配置接入 Gateway settings；共享 pyproject.toml、uv.lock、compose.yaml、README.md 不在本 senior 的修改范围。后续对应 tests/execution、tests/rpc 由本 senior 负责；需要跨模块 PostgreSQL/Valkey 时使用总设计师提供的本地服务，每次独立随机 schema/Valkey namespace 与独立临时 XDG 根，不触碰其他 senior 状态，不发送真实 Telegram 消息。
+本方案要求总设计师提供 Linux delegated cgroup subtree 并把配置接入 Gateway settings；共享 pyproject.toml、uv.lock、compose.yaml、README.md 不在本 senior 的修改范围。后续对应 tests/execution、tests/rpc 由本 senior 负责，并遵循总设计师验收清单中的 16 个并发交互任务、64 MiB stdio 输出和 64 MiB 双路径文件传输场景。文件完整性由发送端与接收端计算 hash 比较，不要求 pull RPC 新增完整 SHA-256 计算。需要跨模块 PostgreSQL/Valkey 时使用已 healthy 的共用服务，每次独立随机 schema/Valkey namespace 与独立临时 XDG 根；禁止重启共用服务、flush 共用 Valkey 或删除其他 scope 的数据。重启场景使用独立控制进程/schema 或专属可丢弃服务，不发送真实 Telegram 消息。产品验收与交付台账仍由总设计师维护，最终公共接口由总设计师统一批准。
