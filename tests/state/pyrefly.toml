@@ -1,0 +1,4 @@
+# State tests are an importable package outside the src-layout import root.
+project-includes = ["**/*.py"]
+search-path = ["../../src", ".."]
+python-version = "3.14"

@@ -56,6 +56,21 @@ class CreatedSession:
 
 
 @dataclass(frozen=True, slots=True)
+class Completion:
+    run_id: UUID | None
+    outcome: Literal["completed", "failed", "deleted"]
+    output: str
+    cursor: Cursor
+    completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionStatus:
+    submission: Submission
+    completion: Completion | None
+
+
+@dataclass(frozen=True, slots=True)
 class SessionInput:
     id: UUID
     seq: int
@@ -104,6 +119,14 @@ class Record:
 class RecordPage:
     items: tuple[Record, ...]
     next_cursor: Cursor
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryExportPage:
+    items: tuple[Record, ...]
+    next_cursor: Cursor
+    snapshot_cursor: Cursor
     has_more: bool
 
 
