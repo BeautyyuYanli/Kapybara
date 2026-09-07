@@ -10,7 +10,7 @@ from uuid import UUID, uuid5
 from kapy.rpc import JsonObject, JsonValue, RpcError
 from kapy.skills import InvalidSkill, SkillConflict, SkillNotFound, SkillTooLarge
 
-from .auth import Principal
+from .auth import Principal, Rejected, denied
 from .control import plain
 
 if TYPE_CHECKING:
@@ -21,7 +21,9 @@ CHUNK = 65_536
 
 
 def fault(kind: str, message: str) -> RpcError:
-    return RpcError(
+    # Locally verified archive limits/identity differ from errors returned by machine RPCs.
+    error_type = Rejected if kind in {"resource_limit", "conflict"} else RpcError
+    return error_type(
         {"resource_limit": -32020, "conflict": -32009}.get(kind, -32021), message, {"kind": kind}
     )
 
@@ -80,11 +82,11 @@ async def dispatch_skill(
             if machine_id is None:
                 machine_id = data["machine_id"] or session.default_machine_id
                 if machine_id is None or machine_id not in session.machine_ids:
-                    raise RpcError(-32602, "An associated machine is required")
+                    raise Rejected(-32602, "An associated machine is required")
                 operation["machine_id"] = machine_id
                 await control.metadata.operation(request_id, operation)
             if machine_id not in session.machine_ids:
-                raise RpcError(-32001, "The original transfer machine association was revoked")
+                raise denied("The original transfer machine association was revoked")
             exchange = Exchange(control, data, request, scope, machine_id)
             if method == "skill.download":
                 return await exchange.download()
@@ -115,7 +117,7 @@ async def dispatch_skill(
             SkillConflict: (-32009, "conflict"),
             SkillTooLarge: (-32020, "resource_limit"),
         }[type(exc)]
-        raise RpcError(code, kind.replace("_", " "), {"kind": kind}) from None
+        raise Rejected(code, kind.replace("_", " "), {"kind": kind}) from None
 
 
 class Exchange:

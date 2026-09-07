@@ -48,7 +48,8 @@ at least once. Only the configured chat is allowed, and existing session instruc
 remain fixed when `/instructions` changes the settings for subsequent `/new` commands.
 
 Gateway records machine provisioning before ensure so removing an association cannot lose
-its cleanup obligation. Release checks serialize with association updates and re-provisioning.
+its cleanup obligation. Removing an association revokes access but does not release the
+execution session: release is permanent on the daemon, so it is reserved for final deletion.
 Deletion first records an outbox, asks State to stop its runner and delete the session,
 then deletes Intelligence payloads and releases machine resources. Offline machines leave
 recoverable cleanup obligations. Gateway authorization tombstones remain for request

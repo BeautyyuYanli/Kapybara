@@ -6,6 +6,7 @@ import psycopg
 import pytest
 
 from kapy.agent import AgentResourceLimit
+from kapy.gateway.auth import Principal
 from kapy.gateway.machines import Connection
 from kapy.gateway.params import Create
 from kapy.gateway.telegram import MESSAGE_BYTES, TelegramFailure, TelegramFrontend, project
@@ -334,3 +335,73 @@ async def test_supervisor_observes_unexpected_failure_and_preserves_cancellation
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_online_removal_preserves_daemon_session_until_final_delete(gateway):
+    sid = UUID((await create(gateway))["session"]["id"])
+    peer = Peer()
+    connection = Connection("one", cast(Any, peer))
+    await gateway.machines.register(connection)
+    await gateway.machines.ensure_task(connection, sid)
+    for machines in (["two"], ["one"]):
+        await gateway.call(
+            "session.update",
+            {
+                "session_id": str(sid),
+                "request_id": str(uuid4()),
+                "title": "test",
+                "machine_ids": machines,
+                "default_machine_id": machines[0],
+                "config": {},
+            },
+            principal=OPERATOR,
+        )
+        await gateway.cleanup_once()
+        assert not any(method == "session.release" for method, _ in peer.calls)
+    assert await gateway.machines.call("one", "process.list", {"session_id": str(sid)}) == {
+        "ok": True,
+        "released": True,
+    }
+    await gateway.call(
+        "session.delete", {"session_id": str(sid), "request_id": str(uuid4())}, principal=OPERATOR
+    )
+    await gateway.cleanup_once()
+    assert [method for method, _ in peer.calls].count("session.release") == 1
+
+
+async def test_machine_capacity_error_does_not_seal_committed_skill_recovery(gateway, monkeypatch):
+    sid = (await create(gateway))["session"]["id"]
+    principal = Principal("session", "one", UUID(sid))
+    files = Files(archive())
+    monkeypatch.setattr(gateway.machines, "call", files.call)
+    finish = gateway.metadata.finish
+
+    async def crash(*args, **kwargs):
+        raise OSError("Gateway lost before persisting creator and result")
+
+    monkeypatch.setattr(gateway.metadata, "finish", crash)
+    request_id = uuid4()
+    params = {"session_id": sid, "request_id": str(request_id), "archive_path": "/skill.zip"}
+    with pytest.raises(OSError):
+        await gateway.call("skill.create", params, principal=principal)
+    assert len(await gateway.skills.catalog()) == 1
+    monkeypatch.setattr(gateway.metadata, "finish", finish)
+
+    async def full(machine, method, params, *, timeout=60):  # noqa: ASYNC109
+        if method == "file.abort":
+            return {"aborted": False}
+        raise RpcError(-32020, "RPC queue or transfer capacity is full")
+
+    monkeypatch.setattr(gateway.machines, "call", full)
+    with pytest.raises(RpcError) as error:
+        await gateway.call("skill.create", params, principal=principal)
+    assert error.value.code == -32020
+    pending = await gateway.metadata.request(request_id)
+    assert pending["error"] is None and pending["result"] is None
+    monkeypatch.setattr(gateway.machines, "call", files.call)
+    result = await gateway.call("skill.create", params, principal=principal)
+    assert len(await gateway.skills.catalog()) == 1
+    assert (await gateway.metadata.request(request_id))["result"] == result
+    assert (await gateway.metadata.rows("SELECT * FROM gateway_skill_access"))[0][
+        "creator_principal"
+    ] == principal.id

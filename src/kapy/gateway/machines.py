@@ -242,23 +242,6 @@ class MachineRegistry:
         self.current(connection)
         return await control.call(target, arguments, principal=principal)
 
-    async def release_unused(self, machine_id: str, session_id: UUID) -> None:
-        async with self.session_lock(session_id):
-            cleanup = await self.metadata.rows(
-                "SELECT session_id FROM gateway_session_cleanup WHERE session_id=%s",
-                (session_id,),
-            )
-            if cleanup:
-                return  # The deletion outbox owns cleanup after State has stopped its runner.
-            try:
-                session = await self.sessions().get_session(session_id)
-            except NotFound:
-                pass
-            else:
-                if machine_id in session.machine_ids:
-                    return
-            await self.release(machine_id, session_id)
-
     async def release(self, machine_id: str, session_id: UUID) -> bool:
         connection = self.connections.get(machine_id)
         if connection is None:

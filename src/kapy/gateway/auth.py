@@ -10,8 +10,12 @@ from kapy.rpc import RpcError
 from kapy.settings import Settings
 
 
-def denied(message: str = "Permission denied") -> RpcError:
-    return RpcError(-32001, message, {"kind": "unauthorized", "retryable": False})
+class Rejected(RpcError):
+    """A definite business rejection, distinguished from transport errors by its source."""
+
+
+def denied(message: str = "Permission denied") -> Rejected:
+    return Rejected(-32001, message, {"kind": "unauthorized", "retryable": False})
 
 
 @dataclass(frozen=True, slots=True)

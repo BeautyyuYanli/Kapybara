@@ -29,7 +29,7 @@ from kapy.state import (
 )
 
 from . import params as p
-from .auth import Principal, denied
+from .auth import Principal, Rejected, denied
 from .storage import Metadata
 
 if TYPE_CHECKING:
@@ -93,15 +93,25 @@ def request_error(exc: StateError | AgentResourceLimit | RpcError) -> RpcError:
     if isinstance(exc, RpcError):
         return exc
     if isinstance(exc, AgentResourceLimit):
-        return RpcError(
+        return Rejected(
             -32020, "Initial session state exceeds its limit", {"kind": "resource_limit"}
         )
     code, kind = ERRORS.get(type(exc), (-32030, "unavailable"))
-    return RpcError(code, kind.replace("_", " "), {"kind": kind})
-
-
-def definite(error: RpcError) -> bool:
-    return error.code in {-32602, -32001, -32004, -32009, -32020, -32040, -32041}
+    error_type = (
+        Rejected
+        if isinstance(
+            exc,
+            (
+                NotFound,
+                Conflict,
+                InvalidArgument,
+                UnsafeQuery,
+                QueryLimitExceeded,
+            ),
+        )
+        else RpcError
+    )
+    return error_type(code, kind.replace("_", " "), {"kind": kind})
 
 
 class ControlService:
@@ -176,7 +186,7 @@ class ControlService:
                         return result
                     except (StateError, AgentResourceLimit, RpcError) as exc:
                         error = request_error(exc)
-                        if definite(error):
+                        if isinstance(error, Rejected):
                             await self.metadata.reject(request_id, error)
                         raise error from None
             await self._authorize(method, data, principal)
@@ -451,17 +461,12 @@ class ControlService:
                         await self.metadata.finish(row["request_id"], result)
                 except (StateError, RpcError, AgentResourceLimit) as exc:
                     error = request_error(exc)
-                    if definite(error):
+                    if isinstance(error, Rejected):
                         await self.metadata.reject(row["request_id"], error)
                     else:
                         logger.warning("Gateway recovery pending for %s", row["request_id"])
 
     async def cleanup_once(self) -> None:
-        for resource in await self.metadata.rows("SELECT * FROM gateway_machine_resources"):
-            try:
-                await self.machines.release_unused(resource["machine_id"], resource["session_id"])
-            except StateError, RpcError, OSError, psycopg.Error:
-                logger.warning("Machine resource cleanup remains pending")
         for row in await self.metadata.rows(
             "SELECT * FROM gateway_session_cleanup WHERE state <> 'complete'"
         ):
