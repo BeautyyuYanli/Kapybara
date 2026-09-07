@@ -164,3 +164,25 @@ authorized to implement, each managing its own complete cmd-impl review workflow
 No full service is merged yet. At ~12:49, State has about 2,150 Python lines in its
 worktree and Execution about 890; these are unreviewed implementation progress,
 not completed deliveries or acceptance evidence.
+
+## Lead checkpoint at 12:55 UTC
+
+- Intelligence final proposal bf1f55f was read and merged to main (use git log for the merge SHA), then explicitly approved by SHA through
+  kapy-intelligence-bf1f55-approved-20260907. Only deterministic amendment: use the
+  latest response input_tokens + output_tokens as frozen in docs/contracts.md.
+- scripts/check_system.py is an independent live end-to-end acceptance client. It
+  creates a session, replays creation to verify idempotency, asks the model to run
+  a command that generates an unpredictable marker on the Docker machine, waits
+  for the receipt and compares the final reply with durable tool results. It
+  deletes its temporary session. Ruff and pyrefly pass; NOT executed against the
+  system yet. Check actual Completion/history encoding after modules land.
+- .env now also holds generated local control token, stable signing key and
+  docker-machine token/mapping, without overwriting existing nonempty values.
+  No secrets printed or committed. Mode 600, ignored. .env.example has blank
+  secrets and documented variable names.
+- No new real-user steering in current Lody inbox through 12:49:47; that last
+  message was Intelligence's proposal delivery, already approved.
+- Four senior implementation operations remain active. Wait for their deliveries;
+  lead should not implement their business code or manage grandchildren. Gateway
+  may still have old doc-only messages queued; its 12:39 cmd-impl approval and
+  12:46 final dependency instructions are authoritative.
