@@ -179,7 +179,7 @@ class MachineTools:
                     command = ProcessCommand((binary,), stdin=command.stdin, cwd=command.cwd)
                 return await operation.script(command)
             if name == "process_start":
-                fields["argv"] = ["/bin/sh", "-lc", fields.pop("command")]
+                fields["argv"] = ["/bin/sh", "-c", fields.pop("command")]
                 fields["process_id"] = operation.identifier("start")
                 result = await operation.rpc("process.start", fields)
                 return operation.decode_update(result)

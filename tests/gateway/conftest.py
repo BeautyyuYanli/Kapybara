@@ -1,3 +1,4 @@
+import os
 from collections.abc import AsyncIterator
 from typing import Any, cast
 from uuid import uuid4
@@ -18,8 +19,8 @@ from kapy.skills import SkillService
 from kapy.state import CheckpointWrite, RunnerState, RunResult, SessionService
 from kapy.state import migrate as migrate_state
 
-DATABASE = "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
-VALKEY = "redis://127.0.0.1:56379/0"
+DATABASE = os.environ.get("KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy")
+VALKEY = os.environ.get("KAPY_VALKEY_URL", "redis://127.0.0.1:56379/0")
 
 
 class EchoRunner:

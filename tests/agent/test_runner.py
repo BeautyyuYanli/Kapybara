@@ -14,6 +14,7 @@ from pydantic import SecretStr
 
 from kapy.agent import AgentPayloadStore, ContextBudgetExceeded, PayloadRef, Runner, RunnerConfig
 from kapy.agent.codec import DELTA_LIMIT, json_bytes
+from kapy.rpc import MachineCaller
 from kapy.state import (
     CheckpointWrite,
     OutputDelta,
@@ -184,7 +185,9 @@ def process_update(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def runner(client: httpx2.AsyncClient, caller: Caller | None = None, **kwargs: Any) -> Runner:
+def runner(
+    client: httpx2.AsyncClient, caller: Caller | MachineCaller | None = None, **kwargs: Any
+) -> Runner:
     return Runner(
         RunnerConfig("https://model.invalid/v1", SecretStr("dummy-key"), 1_000_000),
         caller or Caller(),

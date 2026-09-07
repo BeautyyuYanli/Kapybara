@@ -15,11 +15,26 @@ from kapy.agent.codec import MessageCodec
 from kapy.execution.daemon import MachineService  # type: ignore[missing-import]
 from kapy.execution.paths import resolve_paths
 from kapy.execution.store import ExecutionStore  # type: ignore[missing-import]
+from kapy.rpc import JsonObject
+from kapy.rpc import JsonValue as RpcJsonValue
 from kapy.skills import extract_skill
+from kapy.state import JsonValue
 
 from .test_runner import Context, response, runner  # type: ignore[missing-import]
 
 pytestmark = pytest.mark.skipif(not Path("/.dockerenv").exists(), reason="Docker only")
+
+
+def archived_parts(ctx: Context) -> list[dict[str, JsonValue]]:
+    parts: list[dict[str, JsonValue]] = []
+    for write in ctx.writes:
+        for message in write.messages:
+            message_parts = message.data["parts"]
+            assert isinstance(message_parts, list)
+            for part in message_parts:
+                assert isinstance(part, dict)
+                parts.append(part)
+    return parts
 
 
 @pytest.mark.asyncio
@@ -42,11 +57,9 @@ async def test_real_manager_patch_and_checkpoint_order(tmp_path: Path) -> None:
         if requests:
             expected = f"tool-{requests}"
             # At the actual next provider request, the preceding tool result is durable.
-            archived = [m.data for w in ctx.writes for m in w.messages]
             assert any(
                 p.get("tool_call_id") == expected and p["part_kind"] == "tool-return"
-                for m in archived
-                for p in m["parts"]
+                for p in archived_parts(ctx)
             )
             returned = next(m for m in body["messages"] if m.get("tool_call_id") == expected)
             if requests == 3:
@@ -81,14 +94,14 @@ async def test_real_manager_patch_and_checkpoint_order(tmp_path: Path) -> None:
                 data = await MessageCodec(agent.payload_store, ctx.session.id).load(ctx.state)
                 pending = data["pending_tools"][-1]
                 assert (pending["name"], pending["args"]) == tools[requests - 1]
-                archived = [m.data for w in ctx.writes for m in w.messages]
-                assert any(
-                    p.get("tool_call_id") == pending["tool_call_id"]
+                call = next(
+                    p for p in archived_parts(ctx)
+                    if p.get("tool_call_id") == pending["tool_call_id"]
                     and p["part_kind"] == "tool-call"
-                    and json.loads(p["args"]) == pending["args"]
-                    for m in archived
-                    for p in m["parts"]
                 )
+                call_args = call["args"]
+                assert isinstance(call_args, str)
+                assert json.loads(call_args) == pending["args"]
                 step = pending["steps"][-1]
                 saved = dict(step["params"])
                 if "kapy_chunk_payload" in saved:
@@ -119,9 +132,11 @@ async def test_real_manager_patch_and_checkpoint_order(tmp_path: Path) -> None:
             assert all(Path(p["argv"][3]).is_absolute() for p in scripts)
             assert len([p for p in starts if p["argv"][0] == "chmod"]) == 1
             records = await store.process_records(str(ctx.session.id))
-            assert records and all(
-                p["info"]["state"] == "exited" and p["info"]["exit_code"] == 0 for p in records
-            )
+            assert records
+            for record in records:
+                info = record["info"]
+                assert isinstance(info, dict)
+                assert info["state"] == "exited" and info["exit_code"] == 0
             pushes = [p for m, p, _ in dispatched if m == "file.push"]
             pulls = [p for m, p, _ in dispatched if m == "file.pull"]
             assert len(pushes) >= 3 and len(pulls) == 1
@@ -169,3 +184,77 @@ def test_extract_write_failure_does_not_publish_or_touch_existing(
         extract_skill(source, existing)
     assert (existing / "keep.txt").read_text() == "keep me"
     assert list(existing.iterdir()) == [existing / "keep.txt"]
+
+
+@pytest.mark.asyncio
+async def test_process_start_preserves_installed_cli_path(tmp_path: Path) -> None:
+    paths = resolve_paths(
+        state_dir=tmp_path / "state", data_dir=tmp_path / "data", runtime_dir=tmp_path / "run"
+    )
+    cli = Path("/app/.venv/bin/kapy")
+    requests = 0
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return response(
+                name="process_start",
+                args={
+                    "command": "command -v kapy && kapy --help",
+                    "mode": "stdio",
+                    "wait_ms": 30_000,
+                },
+            )
+        body = json.loads(request.content)
+        returned = next(m for m in body["messages"] if m.get("tool_call_id") == "call1")
+        assert str(cli) in returned["content"] and "Usage" in returned["content"]
+        return response(text="Installed CLI ran")
+
+    async with (
+        ExecutionStore(paths, "machine") as store,
+        httpx2.AsyncClient(transport=httpx2.MockTransport(handle), trust_env=False) as client,
+    ):
+        service = MachineService(
+            store,
+            http_client=client,
+            child_env={"PATH": f"{cli.parent}:/usr/bin:/bin", "PYTHONPATH": "/workspace/src"},
+        )
+        await service.initialize()
+
+        class Dispatch:
+            async def call(
+                self,
+                machine_id: str,
+                method: str,
+                params: JsonObject,
+                *,
+                timeout: float = 60.0,  # noqa: ASYNC109
+            ) -> RpcJsonValue:
+                assert machine_id == "machine" and method == "process.start"
+                value = await service.handle(method, params)
+                assert isinstance(value, dict)
+                process = value["process"]
+                assert isinstance(process, dict)
+                assert process["state"] == "exited" and process["exit_code"] == 0
+                output = value["output"]
+                assert isinstance(output, dict)
+                stdout = output["stdout"]
+                assert isinstance(stdout, dict)
+                encoded = stdout["data_base64"]
+                assert isinstance(encoded, str)
+                text = base64.b64decode(encoded).decode()
+                assert text.splitlines()[0] == str(cli)
+                assert "Usage" in text and "kapy" in text
+                return value
+
+        agent = runner(client, Dispatch())
+        ctx = Context(agent.initial_state(instructions="Check CLI installation", skills=[]))
+        try:
+            await service.handle(
+                "session.ensure", {"session_id": str(ctx.session.id), "session_token": "test-token"}
+            )
+            result = await agent(ctx)
+            assert result.output == "Installed CLI ran" and requests == 2
+        finally:
+            await service.aclose()

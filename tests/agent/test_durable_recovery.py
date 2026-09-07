@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 from dataclasses import asdict
 from typing import Any
 from uuid import uuid4
@@ -30,7 +31,7 @@ from .test_runner import Caller, Context, authorize, response  # type: ignore[mi
 @pytest.mark.asyncio
 async def test_postgres_media_and_external_context_survive_full_resource_restart() -> None:
     schema = f"test_agent_restart_{uuid4().hex}"
-    dsn = "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
+    dsn = os.environ.get("KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy")
     config = RunnerConfig("https://model.invalid/v1", SecretStr("dummy-key"), 1_000_000)
     original_bytes = b"\x89PNG\r\n\x1a\noriginal durable image"
     caller = Caller(original_bytes)

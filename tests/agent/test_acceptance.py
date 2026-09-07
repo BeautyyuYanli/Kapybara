@@ -14,7 +14,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from kapy.agent import AgentResourceLimit
 from kapy.agent import runner as runner_module
 from kapy.skills import SkillDescription
-from kapy.state import SessionInput
+from kapy.state import JsonValue, SessionInput
 
 from .test_runner import Caller, Context, response, runner  # type: ignore[missing-import]
 
@@ -92,7 +92,11 @@ async def test_one_runner_overlapping_sessions_keep_creation_snapshots() -> None
         assert result.output == f"output-{name}" and result.wait_for == (channels[name],)
         assert (ctx.session.id, (channels[name],)) in authorized
         assert {i for w in ctx.writes for i in w.consumed_input_ids} == {ctx.inputs[0].id}
-        assert all(c["turn_id"] == str(ctx.run_id) for c in result.checkpoint.state.data["cycles"])
+        cycles = result.checkpoint.state.data["cycles"]
+        assert isinstance(cycles, list) and cycles
+        for cycle in cycles:
+            assert isinstance(cycle, dict)
+            assert cycle["turn_id"] == str(ctx.run_id)
         archived = json.dumps([m.data for w in ctx.writes for m in w.messages])
         assert f"input-{name}" in archived and f"input-{other}" not in archived
         assert f"wait-{name}" in archived and f"wait-{other}" not in archived
@@ -148,16 +152,26 @@ async def test_provider_usage_controls_next_projection_once_across_restart(
         result = await restarted(ctx)
     assert result.output == "restored final"
     assert requests[3]["messages"] == requests[4]["messages"]
-    assert result.checkpoint.state.data["cycles"][0]["level"] == level
+    cycles = result.checkpoint.state.data["cycles"]
+    assert isinstance(cycles, list) and cycles
+    first_cycle = cycles[0]
+    assert isinstance(first_cycle, dict)
+    assert first_cycle["level"] == level
     for projected in requests[3:]:
         assert "latest-input-survives" in json.dumps(projected["messages"])
         old = next(m for m in projected["messages"] if m.get("tool_call_id") == "old-call")
         assert ("original-result-evidence" in old["content"]) is (fresh_tokens == 300)
     archived = [m.data for w in ctx.writes for m in w.messages]
+    parts: list[dict[str, JsonValue]] = []
+    for message in archived:
+        message_parts = message["parts"]
+        assert isinstance(message_parts, list)
+        for part in message_parts:
+            assert isinstance(part, dict)
+            parts.append(part)
     original = next(
         p
-        for m in archived
-        for p in m["parts"]
+        for p in parts
         if p.get("tool_call_id") == "old-call" and p["part_kind"] == "tool-return"
     )
     assert "original-result-evidence" in json.dumps(original["content"])
