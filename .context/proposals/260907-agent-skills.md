@@ -1,6 +1,6 @@
 # Kapy v2：Agent Runner 与 Skills 方案
 
-本方案依据 `kapy_v2.md`、`docs/architecture.md`、main 的 `docs/contracts.md`、`docs/acceptance.md`、`.context/delivery.md` 及总设计师最新统一裁决，范围为 `src/kapy/agent/`、`src/kapy/skills/` 及对应 tests。验收清单描述后续需要提供的证据，不代表这些检查已通过。只提交方案；总设计师审阅本修订稿并批准后才进入 cmd-impl。
+本方案依据 `kapy_v2.md`、`docs/architecture.md`、main 的 `docs/contracts.md`、`docs/acceptance.md`、`.context/delivery.md` 及总设计师最新统一裁决，范围为 `src/kapy/agent/`、`src/kapy/skills/` 及对应 tests。总设计师已正式批准按本方案进入 cmd-impl；验收清单描述实现阶段需要提供的证据，不代表这些检查已通过。
 
 **1. 实现边界与实际 API**
 
@@ -315,7 +315,7 @@ HTTP 400/422 必须带媒体字段/类型/解码相关错误证据才归入此�
 
 压缩仅改变 Runner 的模型上下文投影。State 原始 PostgreSQL 历史完整保留，基础 instruction 说明可用 `kapy control history` 查找旧记录；不引入向量库、LLM 总结、摘要树或独立检索系统。[Pydantic 消息历史说明](https://pydantic.dev/docs/ai/core-concepts/message-history/)
 
-窗口 C 来自配置。每次完整模型响应保存该响应自身的 `ModelResponse.usage`（RequestUsage），按用户最新最高优先级规则使用 `input_tokens >= 0.70 * C` 决定在下一次请求前进行一次压缩。input_tokens 是该次完整请求的 API 实报值，按 provider 定义包含 cached input，不减去 cache_read_tokens，也不重复加上它；output_tokens 可保留用于记录，但不加入这一压缩判据。不能用整个 AgentRunResult.usage 的累加值判断单次上下文；result.usage 仍是可用于报告的属性。实际 Chat 适配器为流式请求设置 include_usage；未收到有效 usage 或适配器仅有缺省全零值时，计数视为未知。
+窗口 C 来自配置。每次完整模型响应保存该响应自身的 `ModelResponse.usage`（RequestUsage），采用总设计师实施批准中的 `input_tokens + output_tokens >= 0.70 * C` 判据，在下一次请求前进行一次压缩。两项都必须是该次响应的 API 实报值；input_tokens 按 provider 定义包含 cached input，不减去 cache_read_tokens，也不重复加上它。不能用整个 AgentRunResult.usage 的累加值判断单次上下文，不本地估算下一请求；result.usage 仍是可用于报告的属性。实际 Chat 适配器为流式请求设置 include_usage；未收到有效 usage 或适配器仅有缺省全零值时，计数视为未知。
 
 不调用 tiktoken，不按字节、字符或媒体大小换算 tokens，不给媒体添加估算 reserve。第一次请求没有历史 usage，不能在创建 session 时虚构 token 计数；initial_state 只校验配置和持久化大小。max_output_tokens 作为发送给模型的输出上限配置，不声称仅凭前一次请求的 usage 能精确预测下一次请求大小。
 
@@ -441,4 +441,4 @@ Settings 显式映射：OPENAI_BASE_URL→RunnerConfig.base_url、OPENAI_API_KEY
 
 对 State 直接使用其 RunContext/RunResult/checkpoint，媒体 metadata 与外置上下文引用均放既有 opaque JSON，不增加 State API。对 Execution 采用第 3 节完整 RPC、稳定 process/transfer UUID、file.finish 一致性检查及文件重定向 stdin；不需要额外扩展。对 Gateway 的需求是注入 client/config/MachineCaller/借用 metadata pool/AgentPayloadStore/authorize_wait、技能传输和 snapshot 接入，并在 State 完成 session 删除后持久重试 delete_session 清理。共享 pyproject、uv.lock、compose、README 由总设计师维护；本模块不新增 tiktoken 依赖，也不使用已存在的传递依赖计数。
 
-未来对应 tests 使用模型/Telegram mocks；machine 调研和进程/文件测试只在专用 Docker 容器执行，按用户要求采用 best effort 后代清理，无 cgroup 前提。涉及持久化时使用总设计师提供且已 healthy 的 PostgreSQL/Valkey，每次生成独立 schema、key namespace 与临时 Execution XDG 根，清理仅限本次创建的资源。禁止重启共用服务、flush 共用 Valkey 或删除其他 scope 的数据；恢复场景使用独立控制进程/schema 或专属可丢弃服务。Runner 不直接依赖 Valkey。Agent、Compression、Media、Plugins、Skills 的模块证据由本 senior 提供；跨模块组合验收由总设计师组织。已读取主分支 scripts/check_provider.py，确认其使用 result.usage.requests；live 结果由总设计师提供，本 senior 不读取主目录 `.env`，不发送真实 Telegram 消息。此次只交最终修订方案，保留原先已完成的单次简化审查，不再开新 review；等待总设计师批准后才由本 senior 负责 cmd-impl 和自己的分阶段 review 子代理。
+对应 tests 使用模型/Telegram mocks；machine 调研和进程/文件测试只在专用 Docker 容器执行，按用户要求采用 best effort 后代清理，无 cgroup 前提。涉及持久化时使用总设计师提供且已 healthy 的 PostgreSQL/Valkey，每次生成独立 schema、key namespace 与临时 Execution XDG 根，清理仅限本次创建的资源。禁止重启共用服务、flush 共用 Valkey 或删除其他 scope 的数据；恢复场景使用独立控制进程/schema 或专属可丢弃服务。Runner 不直接依赖 Valkey。Agent、Compression、Media、Plugins、Skills 的模块证据由本 senior 提供；跨模块组合验收由总设计师组织。已读取主分支 scripts/check_provider.py，确认其使用 result.usage.requests；live 结果由总设计师提供，本 senior 不读取主目录 `.env`，不发送真实 Telegram 消息。此前单次简化审查已完成；本 senior 按已批准 cmd-impl 管理同一 persistent Elysia 的实现和返工，以及 Eden 五阶段审查，不重新开启 proposal review 或等待重复批准。
