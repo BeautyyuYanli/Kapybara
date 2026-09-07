@@ -369,18 +369,25 @@ class ProcessManager:
             await self._save(entry)
             entry.task = asyncio.create_task(self._collect(entry), name="process-collect")
         except Exception:
-            if entry.child is not None:
-                _kill_group(entry.child.pid)
-                transport = getattr(entry.child, "_transport", None)
-                if transport is not None:
-                    transport.close()
-                await entry.child.wait()
-            entry.info.update(
-                state="failed", error={"kind": "io_error", "message": "Process startup failed"}
-            )
-            self._close_fds(entry)
-            await self._save(entry)
-            entry.done.set()
+            try:
+                if entry.child is not None:
+                    _kill_group(entry.child.pid)
+                    transport = getattr(entry.child, "_transport", None)
+                    if transport is not None:
+                        transport.close()
+                    await entry.child.wait()
+            finally:
+                entry.info.update(
+                    state="failed", error={"kind": "io_error", "message": "Process startup failed"}
+                )
+                try:
+                    self._close_fds(entry)
+                    await self._save(entry)
+                finally:
+                    # A broken database must not strand an entry without a
+                    # collector: shutdown/release still need a terminal event.
+                    entry.done.set()
+                    entry.changed.set()
         finally:
             if slave >= 0:
                 os.close(slave)

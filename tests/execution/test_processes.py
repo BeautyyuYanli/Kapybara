@@ -220,3 +220,35 @@ async def test_start_failure_and_invalid_cursor_leave_service_usable(service: Ma
         )
     assert service.processes.active_count == 0
     await service.handle("process.release", {"session_id": "s", "process_id": params["process_id"]})
+
+
+@pytest.mark.asyncio
+async def test_startup_database_failure_still_reaps_and_unblocks_cleanup(
+    service: MachineService, monkeypatch
+):
+    original_save = service.store.save_process
+    saves = 0
+
+    async def fail_after_intent(*args, **kwargs):
+        nonlocal saves
+        saves += 1
+        if saves >= 2:
+            raise OSError("database write failed")
+        return await original_save(*args, **kwargs)
+
+    monkeypatch.setattr(service.store, "save_process", fail_after_intent)
+    params = start("import time; time.sleep(60)", wait_ms=0)
+    async with asyncio.timeout(3):
+        with pytest.raises(OSError, match="database write failed"):
+            await service.handle("process.start", params)
+        assert saves == 3  # Running write and failure write both failed after spawn.
+        assert service.processes.active_count == 0
+        entry = service.processes._entries["s", params["process_id"]]
+        assert entry.child is not None and entry.child.returncode is not None
+        assert entry.info["state"] == "failed"
+        assert entry.info["error"] is not None
+        assert not entry.fds and entry.master == -1
+        await service.processes.aclose()
+        monkeypatch.setattr(service.store, "save_process", original_save)
+        released = await service.handle("session.release", {"session_id": "s"})
+        assert released == {"session_id": "s", "released": True}
