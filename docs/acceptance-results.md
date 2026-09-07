@@ -116,3 +116,26 @@ This is an early end-to-end result. A separate check found that the Agent's logi
 shell resets the configured PATH and hides the installed `kapy` CLI; Intelligence
 owns its correction and recursive-control regression verification. Final component
 reviews and the remaining product acceptance scenarios are still in progress.
+
+## Reviewed Execution and independent load measurement
+
+Execution `52746c8` (final code `8cbbfd8`) completed all five review stages and was
+merged into main as `cb895c0`. Its 100 Execution/RPC tests also passed within the
+lead's composed test run. That run had 204 passing tests overall; 2 failures and
+25 setup errors were traced to Gateway/Skills fixtures using hardcoded host database
+addresses. Those fixture corrections remain with their owners.
+
+The independent `scripts/bench_machine.py` uses the real MachineService, SQLite,
+process manager and filesystem inside a disposable Docker container: no network,
+1 GiB memory, 128 PIDs, private PID namespace/init, read-only code mounts.
+
+| Scenario | Result | Time | Peak RSS growth |
+| --- | --- | ---: | ---: |
+| stdio production and paged consumption | 67,108,864 bytes, exact SHA-256 and stderr | 0.601 s | 256 KiB |
+| 16 simultaneously open interactive PTYs | Every distinct reply matched its job; all exited successfully | 0.388 s | 256 KiB |
+
+Each PTY produced over 20,000 bytes before reading input; all retained exactly the
+last 8,192 bytes and reported truncation. Process release and session directory
+cleanup succeeded. The Python benchmark process peaked at 72,948 KiB RSS. These
+are sequential peak-RSS deltas, not total container/child memory or concurrency
+ceilings; the measurements do not claim complete cleanup of escaped descendants.
