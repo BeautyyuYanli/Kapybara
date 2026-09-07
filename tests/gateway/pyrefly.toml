@@ -1,0 +1,4 @@
+# Gateway test helpers live outside the src-layout root.
+project-includes = ["**/*.py"]
+search-path = ["../../src", ".."]
+python-version = "3.14"
