@@ -429,17 +429,17 @@ class Operation:
 
     async def push(self, path: str, data: bytes) -> None:
         transfer_id = self.identifier(f"push:{self.index}:{path}")
-        await self.rpc(
-            "file.push",
-            {
-                "transfer_id": transfer_id,
-                "path": path,
-                "size": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "transport": {"kind": "websocket"},
-            },
-        )
         try:
+            await self.rpc(
+                "file.push",
+                {
+                    "transfer_id": transfer_id,
+                    "path": path,
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "transport": {"kind": "websocket"},
+                },
+            )
             for offset in range(0, len(data), 65_536):
                 chunk = data[offset : offset + 65_536]
                 result = await self.rpc(
@@ -467,11 +467,11 @@ class Operation:
         self, path: str, *, offset: int = 0, limit: int | None = None, maximum: int | None = None
     ) -> tuple[bytes, int]:
         transfer_id = self.identifier(f"pull:{self.index}:{path}")
-        info = await self.rpc(
-            "file.pull",
-            {"transfer_id": transfer_id, "path": path, "transport": {"kind": "websocket"}},
-        )
         try:
+            info = await self.rpc(
+                "file.pull",
+                {"transfer_id": transfer_id, "path": path, "transport": {"kind": "websocket"}},
+            )
             size = info["size"]
             if maximum is not None and size > maximum:
                 raise ValueError(f"Media exceeds the {maximum}-byte limit")

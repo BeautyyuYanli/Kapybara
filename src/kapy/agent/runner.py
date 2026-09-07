@@ -131,6 +131,10 @@ class Runner:
         await runtime.initialize()
         machine = MachineTools(runtime, self.machine_caller, self.plugins)
         await runtime.recover_tools(machine)
+        if runtime.current.get("pending_final") is not None:
+            recovered_result = await runtime.finish_pending()
+            if recovered_result is not None:
+                return recovered_result
 
         async def wait(wait_for: list[str]) -> WaitRequest:
             """Finish this turn and wait for these event channel IDs, at most 128 UUIDs."""
@@ -173,20 +177,16 @@ class Runner:
                     "input_tokens": result.usage.input_tokens,
                     "output_tokens": result.usage.output_tokens,
                 }
-                await runtime.reserve()
-                if runtime.data["reserved_inputs"]:
-                    continue
                 output = result.output
                 if isinstance(output, WaitRequest):
                     wait_for = output.wait_for
                     text = runtime.current["output"]
                 else:
                     wait_for, text = (), str(output)
-                runtime.current["closed"] = True
-                runtime.current["output"] = text
-                runtime.data["wait_for"] = [str(i) for i in wait_for]
-                final = await runtime.make_checkpoint()
-                return RunResult(text, wait_for, final)
+                runtime.set_pending_final(text, wait_for)
+                final = await runtime.finish_pending()
+                if final is not None:
+                    return final
             except Exception as exc:
                 if not await runtime.repair(exc):
                     raise
@@ -263,6 +263,8 @@ class Runtime:
 
     async def inject_reserved(self) -> None:
         while self.data["reserved_inputs"]:
+            # Newly accepted input needs a fresh final result from the model.
+            self.current.pop("pending_final", None)
             item = self.data["reserved_inputs"][0]
             request = ModelRequest(
                 [UserPromptPart(item["content"])], metadata={"kapy_input_id": item["id"]}
@@ -273,6 +275,24 @@ class Runtime:
             self.consumed.append(UUID(item["id"]))
             self.data["reserved_inputs"].pop(0)
             await self.checkpoint()
+
+    def set_pending_final(self, output: str, wait_for: tuple[UUID, ...]) -> None:
+        self.current["pending_final"] = {
+            "output": output,
+            "wait_for": [str(channel) for channel in wait_for],
+        }
+
+    async def finish_pending(self) -> RunResult | None:
+        # Call only after the response's complete tool batch has been settled.
+        await self.reserve()
+        if self.data["reserved_inputs"]:
+            return None
+        pending = self.current["pending_final"]
+        self.current["closed"] = True
+        self.current["output"] = pending["output"]
+        self.data["wait_for"] = list(pending["wait_for"])
+        wait_for = tuple(UUID(channel) for channel in pending["wait_for"])
+        return RunResult(pending["output"], wait_for, await self.make_checkpoint())
 
     async def record(self, message: ModelMessage, *, commit: bool = True) -> None:
         metadata = message.metadata or {}
@@ -323,6 +343,9 @@ class Runtime:
                 and (not p.tool_call_id or p.tool_call_id not in returned)
             ]
             if parts:
+                if any(isinstance(part, RetryPromptPart) for part in parts):
+                    # Pydantic's exhaustive strategy lets a tool retry supersede final output.
+                    self.current.pop("pending_final", None)
                 finished_ids = {p.tool_call_id for p in parts}
                 self.data["pending_tools"] = [
                     p for p in self.data["pending_tools"] if p["tool_call_id"] not in finished_ids
@@ -377,6 +400,8 @@ class Runtime:
         except (ValueError, PermissionError) as exc:
             raise ModelRetry(str(exc)) from exc
         self.data["wait_for"] = [str(i) for i in ids]
+        if self.current.get("pending_final") is None:
+            self.set_pending_final(self.current["output"], ids)
         return WaitRequest(ids)
 
     async def tool_result(self, name: str, call_id: str, result: Any) -> None:
@@ -414,6 +439,7 @@ class Runtime:
                         )
                     await self.tool_result(part.tool_name, part.tool_call_id, result)
                 except (ModelRetry, KeyError) as exc:
+                    self.current.pop("pending_final", None)
                     await self.record(
                         ModelRequest(
                             [
@@ -551,6 +577,12 @@ class Boundaries(AbstractCapability):
         text = "\n".join(part.content for part in response.parts if isinstance(part, TextPart))
         if text:
             runtime.current["output"] = text
+        if (
+            response.state == "complete"
+            and any(isinstance(part, TextPart) for part in response.parts)
+            and not any(isinstance(part, ToolCallPart) for part in response.parts)
+        ):
+            runtime.set_pending_final(text, ())
         await runtime.record(response)
         for part in response.parts:
             if isinstance(part, ToolCallPart):

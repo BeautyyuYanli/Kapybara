@@ -114,7 +114,21 @@ class SkillService:
         parsed = None
         if archive is not None:
             async with self._validation_slots:
-                parsed = await asyncio.to_thread(_validated_metadata, archive)
+                validation = asyncio.create_task(asyncio.to_thread(_validated_metadata, archive))
+                try:
+                    parsed = await asyncio.shield(validation)
+                except asyncio.CancelledError as cancelled:
+                    # A cancelled await cannot stop its thread; retain the slot until it exits.
+                    while not validation.done():
+                        try:
+                            await asyncio.shield(validation)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not validation.cancelled():
+                        validation.exception()
+                    raise cancelled
         try:
             async with self.pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
                 # Serialize identical request keys before observing their receipt.

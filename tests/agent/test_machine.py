@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -130,3 +131,46 @@ def test_generated_manifest_matches_exact_installed_resource_bytes() -> None:
         source[source.index("## Formal grammar") :]
         == description[description.index("## Formal grammar") :]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["push", "pull"])
+async def test_cancelled_transfer_begin_aborts_the_original_handle(direction: str) -> None:
+    class InterruptedBegin(Caller):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active: set[str] = set()
+
+        async def call(
+            self,
+            machine_id: str,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float = 60.0,  # noqa: ASYNC109
+        ) -> Any:
+            self.calls.append((machine_id, method, params, timeout))
+            if method == f"file.{direction}":
+                self.active.add(params["transfer_id"])
+                raise asyncio.CancelledError
+            if method == "file.abort":
+                assert params["transfer_id"] in self.active
+                self.active.remove(params["transfer_id"])
+                return {"aborted": True}
+            raise AssertionError(method)
+
+    caller = InterruptedBegin()
+    async with httpx2.AsyncClient() as client:
+        agent = runner(client, caller)
+        ctx = Context(agent.initial_state(instructions="", skills=[]))
+        runtime = Runtime(agent, ctx, "test")
+        await runtime.initialize()
+        operation = Operation(runtime, caller, "machine", "begin-cancel", "custom", {})
+        with pytest.raises(asyncio.CancelledError):
+            if direction == "push":
+                await operation.push("/session/file", b"contents")
+            else:
+                await operation.pull("/session/file")
+    assert not caller.active
+    assert [call[1] for call in caller.calls] == [f"file.{direction}", "file.abort"]
+    assert caller.calls[0][2]["transfer_id"] == caller.calls[1][2]["transfer_id"]

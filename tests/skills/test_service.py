@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import weakref
 from typing import cast
 from uuid import uuid4
@@ -95,3 +96,60 @@ async def test_expanded_archive_is_released_before_waiting_for_database(
     service = SkillService(cast(AsyncConnectionPool, WaitingPool()))
     with pytest.raises(PoolUnavailable):
         await service.create(archive(), request_key="release-before-pool-wait")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_validation_keeps_thread_slot_until_work_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = [asyncio.Event() for _ in range(3)]
+    release = threading.Event()
+    lock = threading.Lock()
+    active = maximum = entered = 0
+    original = skill_service._validated_metadata
+
+    def blocked_validation(data: bytes) -> tuple[str, str, str]:
+        nonlocal active, maximum, entered
+        with lock:
+            index = entered
+            entered += 1
+            active += 1
+            maximum = max(maximum, active)
+        loop.call_soon_threadsafe(started[index].set)
+        try:
+            release.wait()
+            return original(data)
+        finally:
+            with lock:
+                active -= 1
+
+    class PoolUnavailable(Exception):
+        pass
+
+    class NoDatabase:
+        def connection(self) -> None:
+            raise PoolUnavailable
+
+    monkeypatch.setattr(skill_service, "_validated_metadata", blocked_validation)
+    service = SkillService(cast(AsyncConnectionPool, NoDatabase()))
+    data = archive()
+    tasks = [asyncio.create_task(service.create(data, request_key=f"cancel-{i}")) for i in range(2)]
+    try:
+        await asyncio.wait_for(asyncio.gather(started[0].wait(), started[1].wait()), 2)
+        for task in tasks:
+            task.cancel()
+        await asyncio.sleep(0)
+        for task in tasks:
+            task.cancel()
+        tasks.append(asyncio.create_task(service.create(data, request_key="third")))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(started[2].wait(), 0.05)
+        assert not tasks[0].done() and not tasks[1].done()
+    finally:
+        release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert isinstance(results[1], asyncio.CancelledError)
+    assert isinstance(results[2], PoolUnavailable)
+    assert maximum == 2
