@@ -178,6 +178,16 @@ coordination noise; latest consolidated tasks are authoritative.
 
 ## Remaining lead work
 
+Concrete integration defect dispatched at ~13:35 via
+kapy-shared-pool-integration-defect-20260907 to Intelligence and Gateway:
+Gateway Metadata.connection sets conn.row_factory=dict_row and returns it to the
+shared pool. Intelligence96f8cbd AgentPayloadStore.get indexes rows as tuples.
+Root reproduced with real PG in Docker, pool min=max1: initial put/get succeeds,
+borrow connection/set dict_row/SELECT1/release, then same get raises KeyError('1').
+Intelligence must fix borrowed-pool compatibility; Gateway checks config side effects.
+Do not personally patch either domain. Require a meaningful shared-pool regression
+check in their implementation workflow. Unique reproduction schema was cleaned.
+
 Wait for actual domain deliveries and senior five-stage reports. Keep current
 consolidated scope while queued old messages drain. Integrate reviewed commits,
 compose the control server and Docker daemon, wire environment/startup and README.
