@@ -41,7 +41,8 @@ docker compose --profile app ps
 ```
 
 控制接口位于 `http://127.0.0.1:8000/rpc`，API 文档位于 `/docs`。控制面和
-daemon 使用独立文件系统与 PID 空间，共享本地回环网络；PostgreSQL、Valkey 和
+daemon 使用独立文件系统与 PID 空间，由常驻 `network` 服务提供稳定的本地回环
+网络，使控制容器重启不改变 daemon 的网络空间；PostgreSQL、Valkey 和
 机器数据使用命名卷。`docker compose --profile app down` 停止栈并保留这些卷。
 
 执行一条真实模型和机器工具验收任务：

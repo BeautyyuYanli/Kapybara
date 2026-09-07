@@ -47,6 +47,16 @@ services:
       - ./pyproject.toml:/workspace/pyproject.toml:ro
     mem_limit: 2g
     pids_limit: 256
+  network:
+    profiles: ["app"]
+    image: python:3.14-slim
+    init: true
+    command: ["sleep", "infinity"]
+    # Keep loopback stable while either application container restarts.
+    ports:
+      - "127.0.0.1:${KAPY_CONTROL_PORT:-8000}:8000"
+    mem_limit: 32m
+    pids_limit: 16
   control:
     profiles: ["app"]
     image: kapy-v2:dev
@@ -54,6 +64,7 @@ services:
       context: .
       dockerfile: Dockerfile
     init: true
+    network_mode: service:network
     environment:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -72,9 +83,9 @@ services:
       KAPY_MACHINE_TOKENS: ${KAPY_MACHINE_TOKENS:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-    ports:
-      - "127.0.0.1:${KAPY_CONTROL_PORT:-8000}:8000"
     depends_on:
+      network:
+        condition: service_started
       postgres:
         condition: service_healthy
       valkey:
@@ -96,7 +107,7 @@ services:
     init: true
     command: ["kapy", "server"]
     # Separate filesystems/PID namespaces; loopback transport for local development.
-    network_mode: service:control
+    network_mode: service:network
     environment:
       KAPY_CONTROL_URL: http://127.0.0.1:8000
       KAPY_MACHINE_ID: ${KAPY_MACHINE_ID:-docker-machine}
@@ -112,7 +123,6 @@ services:
     depends_on:
       control:
         condition: service_healthy
-        restart: true
     mem_limit: 2g
     pids_limit: 256
 volumes:

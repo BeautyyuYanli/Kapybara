@@ -170,3 +170,19 @@ The shared-pool regression was independently retested using the `product-tests-2
 Gateway `de51640` snapshot: one PostgreSQL connection alternated Gateway dict cursors
 and immutable Agent payload reads three times without errors. The earlier row-factory
 compatibility defect is fixed in this committed Gateway implementation.
+
+## Control-container restart
+
+Restarting the original development composition exposed a scaffold defect: the
+daemon borrowed the control container's network namespace, which was replaced on
+restart. The control service became healthy while the daemon's loopback connection
+was refused. A small, persistent `network` service now owns the loopback namespace
+and published port; both application containers join it independently.
+
+The same isolated acceptance stack then passed a control-only restart. The daemon's
+Docker start timestamp did not change, the published address remained stable, and
+the daemon could reach the restarted service. The full live `check_system.py` task
+passed afterward: stable creation replay, exact random machine marker in final and
+durable history, eight history records, 18.09 ms acceptance / 5.99 s completion.
+The temporary task was deleted. This check establishes transport recovery after
+control-container restart; interrupted model-run recovery remains a separate test.

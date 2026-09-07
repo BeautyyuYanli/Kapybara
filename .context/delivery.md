@@ -242,6 +242,20 @@ run: wait for actual installed CLI PATH fix. Isolated acceptance stack still run
 control32771 (TGdisabled); root currently testing its control-container restart and
 then re-running check_system; record result when that exec finishes.
 
+Follow-up: root found/fixed an actual Compose network lifecycle defect. Borrowing
+control's namespace lost daemon loopback access when control restarted. compose.yaml
+now adds a tiny persistent network service (python:3.14-slim sleep infinity,32MiB,
+16PID) owning published8000, with BOTH control and daemon network_mode:service:network.
+Removed daemon depends_on.control.restart; control restart must not restart daemon.
+Provisional stack was recreated retaining PG/Valkey/machine volumes and TGdisabled.
+Port is now32773 (discover with docker port kapy-v2-acceptance-1-network-1 8000/tcp;
+NOT control). Preview re-reported /docs, user told Browser button. Control-only
+restart now PASSED: daemon StartedAt unchanged, publishedport stable, TCP reachable,
+check_system realmodel+machine marker PASS5.99s/accept18.09ms/history8/delete. This
+does not yet test interrupted model-run recovery. No associated exec remains active.
+Execution later4258267 report reviewed: d6bce34 test-only Ctrl-C cursor correction,
+stages3/4/5 rerunPASS plus100tests; merged as28a6648. No production change.
+
 Concrete integration defect dispatched at ~13:35 via
 kapy-shared-pool-integration-defect-20260907 to Intelligence and Gateway:
 Gateway Metadata.connection sets conn.row_factory=dict_row and returns it to the
