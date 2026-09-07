@@ -65,6 +65,11 @@ aliases for discarded draft names.
 - User clarification: token counts come from provider API usage. Do not calculate
   a second token count with tiktoken or byte-length heuristics. Preserve reported
   usage for compression decisions; before the first report the count is unknown.
+  Use the latest response's input_tokens + output_tokens, not cumulative RunUsage.
+  Each fresh usage observation permits one sweep; stale usage cannot repeatedly
+  degrade history. The latest approximately 10% may be selected by complete
+  interaction blocks, without claiming that block counts measure tokens. Only an
+  explicit context-length rejection permits bounded additional compression retries.
 - Intelligence exports an explicit session initialization function returning
   RunnerState with the creation-time skill-description snapshot. Gateway invokes it.
 - wait_for authorization uses an injected Gateway capability; UUID knowledge is
@@ -75,3 +80,28 @@ aliases for discarded draft names.
 - Skill archive pack/extract helpers are owned by Intelligence and reused by CLI.
   Gateway owns caller/creator authorization metadata. Services must not silently
   retry an unknown mutation as a fresh operation.
+
+### Approved Python exports
+
+- Runner(config, machine_caller, *, http_client, payload_store, authorize_wait,
+  plugins=()) borrows its dependencies; initial_state(*, instructions, skills)
+  returns State.RunnerState. Its async call takes State.RunContext and returns
+  State.RunResult. Construction has no I/O or background tasks.
+- AuthorizeWait accepts a session UUID and tuple of channel UUIDs, returns None
+  asynchronously on success, and raises PermissionError on rejection. Gateway
+  supplies it; State remains responsible for subscribing and publishing completion.
+- AgentPayloadStore(pool, *, schema="kapy_agent") borrows Gateway's metadata pool
+  and exposes initialize, put(session_id, bytes), get(session_id, ref), and
+  delete_session(session_id). Immutable bytes are keyed by session UUID and SHA-256.
+  There is no foreign key to State's private tables or state_schema parameter.
+  Gateway's durable cleanup calls delete_session after State has stopped the runner
+  and deleted the session. Store bytes before committing references. A payload is
+  at most 64 MiB; contexts above 2 MiB can use a stored reference.
+- SkillService(pool, *, schema) borrows the same Gateway-owned pool and exposes
+  initialize, create/update/delete, get, catalog, download. Mutations have a stable
+  internal request_key scoped by Gateway; update/delete also use expected_revision.
+  SkillDescription contains id and description. pack_skill(source_dir, archive_path)
+  and extract_skill(archive_path, destination) are shared by CLI. ZIPs are at most
+  16 MiB; transport reuses Execution's file operations.
+- Skills/AgentPayloadStore have no separate resource factory, start/aclose or pool
+  ownership. Gateway owns initialization and shutdown ordering.

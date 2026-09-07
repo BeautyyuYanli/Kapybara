@@ -19,6 +19,7 @@ from kapy.state import (
     RunResult,
     SessionService,
     SessionSpec,
+    migrate,
 )
 
 
@@ -91,6 +92,7 @@ async def benchmark(session_count: int, inputs_per_session: int) -> None:
         return completed & expected[session_id]
 
     try:
+        await migrate(database_url, schema=schema)
         async with service() as state:
             for index in range(session_count):
                 created = await state.create_session(
