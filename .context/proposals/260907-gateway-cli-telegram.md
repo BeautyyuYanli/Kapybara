@@ -513,6 +513,8 @@ class Runner:
 
 OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL 分别映射 RunnerConfig.base_url/api_key/model；其余映射 KAPY_CONTEXT_WINDOW_TOKENS、KAPY_MAX_OUTPUT_TOKENS、KAPY_COMPRESSION_RATIO、KAPY_KEEP_RECENT_RATIO、KAPY_MEDIA_MAX_BYTES，类型与默认值遵循 RunnerConfig。context_window_tokens 没有库默认值，control-server 要求显式提供可信窗口配置。Runner 每次调用从 context.session.config 的可选 model 读取模型名称，缺失则用 RunnerConfig.model；非法类型或空串拒绝，运行内使用启动快照。instructions 仅在新 session 的 initial_state 中注入。API key 始终仅来自注入的 SecretStr，不进入 session config。
 
+token 数只取 provider API 最新一次响应报告的 input_tokens + output_tokens，首次报告前保持未知；不使用累计 RunUsage 代替本次上下文量。Gateway 仅传配置、展示 Intelligence 提供的 usage，不使用 tiktoken、字符/字节换算或媒体 reserve 另算 token。压缩归 Intelligence，遵循 docs/contracts.md 的新 usage 观测及有限重试规则；State JSON/RPC 字节限额与 token 数分别处理。
+
 Intelligence 拥有媒体 durable blob、reference 编码、codec 替换与 hydration；下列 AgentPayloadStore 借用 Gateway metadata pool 和显式受控 schema。State 仅存既有 checkpoint/history 中的 opaque reference JSON，Gateway 只装配初始化和清理入口：
 
 ```python
@@ -618,6 +620,8 @@ cursor 只在所覆盖文本成功发送或明确为不可见记录后推进；i
 清理 worker 使用持久任务内的关联调用 `session.release({session_id,wait_ms:5000})`；released=false 继续观察，离线机器保留任务，重连后继续。cleanup 只允许 release，不向已删除 session 发送 process/file/ensure。每台机器释放成功后标记完成，payload_pending 清除且全部机器完成才关闭任务，所有阶段按原 request_id UUID 可恢复；启动时扫描未完成任务，不依赖 State 已删除的 session 行。该表、worker 及权限归 Gateway，不把删除机器职责塞回 State。
 
 ## 9. 持久化边界与集成约束
+
+machine 调研与验收只在本项目专用 Docker 容器进行；Lody 仅用于派遣协调，不以宿主/Lody 环境探测建立机器启动前提。Gateway settings/CLI 不要求 cgroup_root 或委派；执行端采用普通进程组与尽力清理后代，不要求完美清理逃逸进程。
 
 PostgreSQL 是 session、输入、history/output、event、Skills archive、Gateway 授权和 Telegram ingress/delivery 的权威存储；前端 completion 通过 State.wait_submission 读取既有持久 receipt；Valkey 只提供唤醒提示，Gateway registry 是连接事实的内存映射。没有将控制状态改用 SQLite/内存的路径。Execution 的 XDG SQLite/进程资源归 Execution。
 
