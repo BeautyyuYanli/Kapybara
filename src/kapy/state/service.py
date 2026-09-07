@@ -192,7 +192,6 @@ class SessionService:
         self._background: list[asyncio.Task[None]] = []
         self._available = False
         self._entered = False
-        self._closing = False
 
     async def __aenter__(self) -> SessionService:
         if self._entered:
@@ -221,7 +220,6 @@ class SessionService:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._closing = True
         self._available = False
         self._local_signal()
         tasks = [*self._background, *self._tasks.values()]

@@ -150,13 +150,6 @@ class _Compiler:
 
     def render(self, node: exp.Expression, depth: int = 0) -> sql.Composable:
         kind = type(node)
-        if kind not in _ALLOWED:
-            raise UnsafeQuery(f"unsupported SQL node: {kind.__name__}")
-        if any(
-            value is not None and value is not False and value != [] and key not in _ALLOWED[kind]
-            for key, value in node.args.items()
-        ):
-            raise UnsafeQuery(f"unsupported SQL option on {kind.__name__}")
 
         def emit(child: exp.Expression) -> sql.Composable:
             return self.render(child, depth)
