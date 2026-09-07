@@ -29,3 +29,24 @@ The harness checks exact input sequences, duplicates, omissions, overlapping run
 within one session, durable completion records and replay after reopening. It does
 not simulate an abrupt process crash or external tool recovery; those remain
 separate checks. The observed submission latency is a baseline, not a promised SLO.
+
+## Event broadcast baseline
+
+Source and container limits are the same State snapshot as above. The independent
+`scripts/bench_events.py` harness uses a new schema and observes durable waiting
+records after each delivery. Event identity and exact payload sequence are checked.
+
+An event published before any subscriber was retained and delivered to the first
+later subscriber. Later subscribers did not receive that already delivered backlog.
+Two subsequent broadcasts each reached all 100 subscribers exactly once.
+
+| Round | Deliveries | Publish latency | All subscribers finished |
+| --- | ---: | ---: | ---: |
+| 1 | 100 | 33.63 ms | 1,016.36 ms |
+| 2 | 100 | 34.79 ms | 1,077.33 ms |
+
+## Shared RPC and XDG paths
+
+The `1091292` source snapshot passed all 46 RPC/codec/peer/XDG tests inside Docker
+in 0.15 s. Its public modules were integrated as `8e83fe4`; main Ruff and pyrefly
+checks passed. This does not yet test the complete machine daemon or file manager.
