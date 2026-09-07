@@ -124,5 +124,21 @@ Official InputRichMessage.markdown and sendRichMessage/sendRichMessageDraft were
 verified against the current API. Architect live preflight sent two rich drafts
 with one stable ID and one final preview to the configured user chat. Both methods
 succeeded; returned rich_message blocks were heading,paragraph,list,table,pre.
-This verifies transport/rendering support only; normal reply integration remains
-pending proposal approval, implementation and deployment.
+Proposal215b5b3 was approved and implementation1b97e019 reached review. Stage2
+correctly rejected guessed English error descriptions. Architect then obtained
+real content-limit rejection evidence from the configured Bot API. Each of the
+following samples returned HTTP400, ok=false and error_code400 from both
+sendRichMessageDraft and sendRichMessage; all requests were rejected, so no
+oversized final messages were published:
+
+| Raw Markdown sample | Exact description |
+| --- | --- |
+| 32769 ASCII x characters | Bad Request: RICH_MESSAGE_TEXT_TOO_LONG |
+| 501 x paragraphs separated by two newlines | Bad Request: RICH_MESSAGE_BLOCKS_TOO_MANY |
+| Markdown table with 21 columns | Bad Request: RICH_MESSAGE_TABLE_COLS_TOO_MANY |
+| 17 nested block quotations (`> ` repeated17 then x) | Bad Request: RICH_MESSAGE_DEPTH_INVALID |
+
+Only these verified descriptions may drive the new narrow content-rejection
+fallback. The guessed English parsing/limit patterns must be removed; unknown400,
+auth/rate/network/server errors remain on the existing failure/retry path.
+Remaining senior review, integration and deployment are pending.
