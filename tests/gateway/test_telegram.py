@@ -282,14 +282,21 @@ def feed(records, *items):
 async def test_private_drafts_restart_refresh_and_final(gateway, monkeypatch):
     records = []
     bot, _ = await install_output(gateway, monkeypatch, records, thread=7)
-    feed(records, record("text_delta", text="ignored", part_index=0))
-    records[-1]["data"]["text"] = "Hel"
+    feed(records, record("text_delta", part_index=10))
+    records[-1]["data"]["text"] = "o"
     await bot.deliver_once()
     first = bot.sent[-1][1]
     assert bot.sent[-1][0] == "sendMessageDraft"
-    assert first["text"] == "Hel" and first["draft_id"] != 0 and first["message_thread_id"] == 7
+    assert first["text"] == "o" and first["draft_id"] != 0 and first["message_thread_id"] == 7
+    feed(records, record("text_delta", part_index=2))
+    records[-1]["data"]["text"] = "l"
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    assert bot.sent[-1][1]["text"] == "lo"
     feed(records, record("text_delta", part_index=0))
-    records[-1]["data"]["text"] = "lo"
+    records[-1]["data"]["text"] = "He"
+    feed(records, record("text_delta", part_index=2))
+    records[-1]["data"]["text"] = "l"
     bot._chat_ready.clear()
     await bot.deliver_once()
     assert bot.sent[-1][1]["text"] == "Hello"
@@ -311,12 +318,14 @@ async def test_private_drafts_restart_refresh_and_final(gateway, monkeypatch):
 
 async def test_pages_runs_many_messages_retry_and_interrupted(gateway, monkeypatch):
     records = []
-    bot, _ = await install_output(gateway, monkeypatch, records, private=False, thread=9)
-    feed(records, *(record("tool_call") for _ in range(199)))
+    bot, _ = await install_output(gateway, monkeypatch, records, thread=9)
+    feed(records, record("model_response", "checking", message="preamble"))
+    feed(records, *(record("tool_call") for _ in range(198)))
     feed(records, record("text_delta"))
     records[-1]["data"]["text"] = "bad"
     await bot.deliver_once()
-    assert bot.sent == []
+    first_draft = bot.sent[-1][1]
+    assert first_draft["text"] == "checking\n\nbad"
     feed(
         records,
         {
@@ -325,12 +334,31 @@ async def test_pages_runs_many_messages_retry_and_interrupted(gateway, monkeypat
             "run_id": "r",
         },
     )
-    feed(records, *(record("model_response", f"part{i}", message=f"m{i}") for i in range(12)))
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    assert bot.sent[-1][1]["text"] == "checking"
+    assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
     feed(records, record("text_delta", message="unfinished"))
     records[-1]["data"]["text"] = "do not retain"
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    assert bot.sent[-1][1]["text"] == "checking\n\ndo not retain"
+    feed(records, record("interrupted"))
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    assert bot.sent[-1][1]["text"] == "checking"
+    assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
+    feed(records, *(record("model_response", f"part{i}", message=f"m{i}") for i in range(12)))
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    body = "\n\n".join(["checking", *(f"part{i}" for i in range(12))])
+    assert bot.sent[-1][1]["text"] == body
+    bot = Bot(gateway)
+    await bot.deliver_once()
+    assert bot.sent[-1][1]["text"] == body
+    assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
     feed(
         records,
-        record("interrupted"),
         record("model_response", "last", message="last"),
         record("final", output="corrected"),
     )
@@ -344,10 +372,11 @@ async def test_pages_runs_many_messages_retry_and_interrupted(gateway, monkeypat
     await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
     assert row["cursor"] == terminal
-    assert bot.sent[0][1]["text"] == "\n\n".join([*(f"part{i}" for i in range(12)), "corrected"])
+    assert bot.sent[-1][0] == "sendMessage"
+    assert bot.sent[-1][1]["text"] == body + "\n\ncorrected"
     await bot.deliver_once()
     assert [p["text"] for _, p in bot.sent][-1] == "corrected"
-    assert all(m == "sendMessage" and p["message_thread_id"] == 9 for m, p in bot.sent)
+    assert all(p["message_thread_id"] == 9 for _, p in bot.sent)
 
 
 async def test_draft_400_falls_back_and_error_is_safe(gateway, monkeypatch):
