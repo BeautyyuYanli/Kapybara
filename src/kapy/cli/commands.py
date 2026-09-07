@@ -51,7 +51,9 @@ class Client:
 
     async def call(self, method: str, params: JsonObject, *, timeout: float = 60) -> JsonValue:  # noqa: ASYNC109
         settings = self.settings
-        if not self.admin and settings.session_id and settings.session_token:
+        if settings.session_id or settings.session_token:
+            if not settings.session_id or not settings.session_token:
+                raise typer.BadParameter("Session context requires both ID and capability token")
             auth: ProxyAuth = {
                 "kind": "session",
                 "session_id": settings.session_id,
@@ -68,6 +70,11 @@ class Client:
             data_dir=settings.execution_data_dir,
             runtime_dir=settings.execution_runtime_dir,
         )
+        if "request_id" in params and method != "session.wait":
+            typer.echo(f"Request ID: {params['request_id']}", err=True)
+            if method.startswith("skill.") and "archive_path" in params:
+                typer.echo(f"Archive: {params['archive_path']}", err=True)
+            sys.stderr.flush()
         return await call_local_proxy(
             settings.daemon_socket or paths.socket_path,
             method,
@@ -87,6 +94,24 @@ def display(result: JsonValue) -> None:
 
 def invoke(ctx: typer.Context, method: str, params: JsonObject) -> None:
     display(asyncio.run(client(ctx).call(method, params)))
+
+
+def input_text(
+    value: str | None,
+    source: Path | None,
+    stdin: bool,
+    *,
+    required: bool = True,
+) -> str | None:
+    if sum((value is not None, source is not None, stdin)) > 1:
+        raise typer.BadParameter("Provide text, --file or --stdin exclusively")
+    if source is not None:
+        return source.read_text(encoding="utf-8")
+    if stdin or value == "-":
+        return sys.stdin.read()
+    if value is None and required:
+        raise typer.BadParameter("Provide text, --file or --stdin")
+    return value
 
 
 def rid(request_id: UUID | None) -> str:
@@ -177,6 +202,8 @@ def raw_call(ctx: typer.Context, method: str, params: str = "{}") -> None:
 def create_session(
     ctx: typer.Context,
     text: Annotated[str | None, typer.Argument()] = None,
+    file: Annotated[Path | None, typer.Option("--file")] = None,
+    stdin: Annotated[bool, typer.Option("--stdin")] = False,
     title: Annotated[str, typer.Option()] = "",
     machine: Annotated[list[str] | None, typer.Option("--machine")] = None,
     default_machine: Annotated[str | None, typer.Option()] = None,
@@ -185,6 +212,7 @@ def create_session(
     request_id: Annotated[UUID | None, typer.Option()] = None,
     waiting_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
+    text = input_text(text, file, stdin, required=False)
     machines = machine or ([client(ctx).machine_id] if client(ctx).machine_id else [])
     config: JsonObject = {"instructions": instructions}
     if model:
@@ -259,11 +287,14 @@ def update_session(
 @session.command("input")
 def input_session(
     ctx: typer.Context,
-    text: str,
+    text: Annotated[str | None, typer.Argument()] = None,
+    file: Annotated[Path | None, typer.Option("--file")] = None,
+    stdin: Annotated[bool, typer.Option("--stdin")] = False,
     steer: Annotated[bool, typer.Option()] = False,
     request_id: Annotated[UUID | None, typer.Option()] = None,
     waiting_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
+    text = input_text(text, file, stdin)
     invoke(
         ctx,
         "session.input",
@@ -297,7 +328,8 @@ def output_session(
                     },
                 ),
             )
-            display(result)
+            for record in result["items"]:
+                display(record)
             cursor = result["next_cursor"]
             if not follow and not result["has_more"]:
                 return
@@ -308,9 +340,14 @@ def output_session(
 @session.command("wait")
 def wait_session(
     ctx: typer.Context,
-    request_id: UUID,
+    receipt: Annotated[UUID | None, typer.Argument()] = None,
+    request_id: Annotated[UUID | None, typer.Option("--request-id")] = None,
     timeout: Annotated[float, typer.Option(min=0)] = 60,
 ) -> None:
+    if (receipt is None) == (request_id is None):
+        raise typer.BadParameter("Provide a request UUID or --request-id, exclusively")
+    request_id = request_id or receipt
+
     async def wait() -> None:
         deadline = time.monotonic() + timeout
         while True:
@@ -354,7 +391,14 @@ def search_history(ctx: typer.Context, query: str, substring: bool = False) -> N
 
 
 @history.command("query")
-def query_history(ctx: typer.Context, sql: str, params: str = "{}") -> None:
+def query_history(
+    ctx: typer.Context,
+    sql: Annotated[str | None, typer.Argument()] = None,
+    file: Annotated[Path | None, typer.Option("--file")] = None,
+    stdin: Annotated[bool, typer.Option("--stdin")] = False,
+    params: str = "{}",
+) -> None:
+    sql = input_text(sql, file, stdin)
     invoke(
         ctx,
         "history.query",

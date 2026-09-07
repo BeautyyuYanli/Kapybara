@@ -1,7 +1,8 @@
 """FastAPI composition with explicit resource and background-task ownership."""
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
@@ -19,6 +20,21 @@ from .machines import Connection, MachineRegistry
 from .storage import Metadata, migrate
 
 MAX_FRAME = 1_048_576
+
+
+async def supervise(name: str, run: Callable[[], Awaitable[None]]) -> None:
+    logger = logging.getLogger(__name__)
+    failures = 0
+    while True:
+        try:
+            await run()
+        except Exception as exc:
+            logger.error("%s exited unexpectedly (%s); restarting", name, type(exc).__name__)
+            await asyncio.sleep(min(30, 2 ** min(failures, 5)))
+            failures += 1
+        else:
+            logger.info("%s stopped", name)
+            return
 
 
 class Frontend(Protocol):
@@ -118,8 +134,18 @@ def create_app(
                 from .telegram import TelegramFrontend
 
                 factories = (TelegramFrontend,) if config.telegram_bot_token else ()
-            tasks = [asyncio.create_task(control.background(), name="gateway-recovery")]
-            tasks.extend(asyncio.create_task(factory(context).run()) for factory in factories)
+            tasks = [
+                asyncio.create_task(
+                    supervise("gateway-recovery", control.background),
+                    name="gateway-recovery",
+                )
+            ]
+            tasks.extend(
+                asyncio.create_task(
+                    supervise(type(frontend).__name__, frontend.run),
+                )
+                for frontend in (factory(context) for factory in factories)
+            )
             try:
                 yield
             finally:

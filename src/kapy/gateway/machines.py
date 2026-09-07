@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
+from weakref import WeakValueDictionary
 
 from kapy.rpc import (
     JsonObject,
@@ -50,6 +51,10 @@ class MachineRegistry:
         self.sessions = sessions
         self.connections: dict[str, Connection] = {}
         self._changed = asyncio.Condition()
+        self._session_locks: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
+
+    def session_lock(self, session_id: UUID) -> asyncio.Lock:
+        return self._session_locks.setdefault(session_id, asyncio.Lock())
 
     def current(self, connection: Connection) -> None:
         if self.connections.get(connection.machine_id) is not connection:
@@ -92,28 +97,33 @@ class MachineRegistry:
         while await self.metadata.access(session_id) is None:
             self.current(connection)
             await asyncio.sleep(0.05)
-        session = await self.sessions().get_session(session_id)
-        if connection.machine_id not in session.machine_ids:
-            raise denied("Machine is not associated with this session")
-        cleanup = await self.metadata.rows(
-            "SELECT session_id FROM gateway_session_cleanup WHERE session_id=%s",
-            (session_id,),
-        )
-        if cleanup:
-            raise denied("Session is being deleted")
-        self.current(connection)
-        await connection.peer.call(
-            "session.ensure",
-            {
-                "session_id": str(session_id),
-                "session_token": self.auth.token(session_id, connection.machine_id),
-            },
-        )
-        self.current(connection)
+        async with self.session_lock(session_id):
+            session = await self.sessions().get_session(session_id)
+            if connection.machine_id not in session.machine_ids:
+                raise denied("Machine is not associated with this session")
+            cleanup = await self.metadata.rows(
+                "SELECT session_id FROM gateway_session_cleanup WHERE session_id=%s",
+                (session_id,),
+            )
+            if cleanup:
+                raise denied("Session is being deleted")
+            self.current(connection)
+            await self.metadata.rows(
+                "INSERT INTO gateway_machine_resources VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                (session_id, connection.machine_id),
+            )
+            await connection.peer.call(
+                "session.ensure",
+                {
+                    "session_id": str(session_id),
+                    "session_token": self.auth.token(session_id, connection.machine_id),
+                },
+            )
+            self.current(connection)
 
     def ensure_task(self, connection: Connection, session_id: UUID) -> asyncio.Task[None]:
         task = connection.associations.get(session_id)
-        if task is None:
+        if task is None or task.done() and (task.cancelled() or task.exception() is not None):
             task = asyncio.create_task(self._ensure(connection, session_id))
             connection.associations[session_id] = task
             task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
@@ -136,6 +146,7 @@ class MachineRegistry:
         except ValueError, TypeError, AttributeError:
             raise RpcError(-32602, "A target session_id is required") from None
         deadline = time.monotonic() + timeout
+        sent = False
         try:
             async with asyncio.timeout(timeout):
                 session = await self.sessions().get_session(session_id)
@@ -160,6 +171,7 @@ class MachineRegistry:
                 ):
                     raise denied("Session association has been revoked")
                 self.current(connection)
+                sent = True
                 return await connection.peer.call(
                     method,
                     params,
@@ -168,6 +180,16 @@ class MachineRegistry:
         except NotFound:
             raise RpcError(-32004, "Session not found", {"kind": "not_found"}) from None
         except TimeoutError, RpcTimeout:
+            if sent:
+                raise RpcError(
+                    -32022,
+                    "Call timed out; operation result is unknown",
+                    {
+                        "kind": "offline",
+                        "retryable": False,
+                        "unknown": True,
+                    },
+                ) from None
             raise offline() from None
         except RpcDisconnected:
             raise RpcError(
@@ -220,6 +242,23 @@ class MachineRegistry:
         self.current(connection)
         return await control.call(target, arguments, principal=principal)
 
+    async def release_unused(self, machine_id: str, session_id: UUID) -> None:
+        async with self.session_lock(session_id):
+            cleanup = await self.metadata.rows(
+                "SELECT session_id FROM gateway_session_cleanup WHERE session_id=%s",
+                (session_id,),
+            )
+            if cleanup:
+                return  # The deletion outbox owns cleanup after State has stopped its runner.
+            try:
+                session = await self.sessions().get_session(session_id)
+            except NotFound:
+                pass
+            else:
+                if machine_id in session.machine_ids:
+                    return
+            await self.release(machine_id, session_id)
+
     async def release(self, machine_id: str, session_id: UUID) -> bool:
         connection = self.connections.get(machine_id)
         if connection is None:
@@ -235,7 +274,17 @@ class MachineRegistry:
             )
         except RpcDisconnected, RpcTimeout:
             return False
-        return isinstance(result, dict) and result.get("released") is True
+        released = isinstance(result, dict) and result.get("released") is True
+        if released:
+            await self.metadata.rows(
+                "DELETE FROM gateway_machine_resources WHERE session_id=%s AND machine_id=%s",
+                (session_id, machine_id),
+            )
+            task = connection.associations.pop(session_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        return released
 
     async def aclose(self) -> None:
         for connection in tuple(self.connections.values()):

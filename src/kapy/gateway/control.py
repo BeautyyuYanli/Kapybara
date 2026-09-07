@@ -20,6 +20,7 @@ from kapy.state import (
     NotFound,
     QueryLimitExceeded,
     RunContext,
+    RunnerState,
     RunResult,
     ServiceUnavailable,
     SessionSpec,
@@ -88,6 +89,21 @@ ERRORS: dict[type[StateError], tuple[int, str]] = {
 }
 
 
+def request_error(exc: StateError | AgentResourceLimit | RpcError) -> RpcError:
+    if isinstance(exc, RpcError):
+        return exc
+    if isinstance(exc, AgentResourceLimit):
+        return RpcError(
+            -32020, "Initial session state exceeds its limit", {"kind": "resource_limit"}
+        )
+    code, kind = ERRORS.get(type(exc), (-32030, "unavailable"))
+    return RpcError(code, kind.replace("_", " "), {"kind": kind})
+
+
+def definite(error: RpcError) -> bool:
+    return error.code in {-32602, -32001, -32004, -32009, -32020, -32040, -32041}
+
+
 class ControlService:
     def __init__(
         self,
@@ -146,28 +162,27 @@ class ControlService:
                         canonical,
                         data.get("session_id"),
                     )
+                    if request["error"] is not None:
+                        raise RpcError(**request["error"])
                     if request["result"] is not None:
                         return request["result"]
-                    if previous is not None:
-                        await self._authorize(method, data, principal)
-                    result = await self._dispatch(method, data, principal, request)
-                    # Create adapters commit authorization and their result together.
-                    if method not in {"session.create", "skill.create"}:
-                        await self.metadata.finish(request_id, result)
-                    return result
+                    try:
+                        if previous is not None:
+                            await self._authorize(method, data, principal)
+                        result = await self._dispatch(method, data, principal, request)
+                        # Create adapters commit authorization and their result together.
+                        if method not in {"session.create", "skill.create"}:
+                            await self.metadata.finish(request_id, result)
+                        return result
+                    except (StateError, AgentResourceLimit, RpcError) as exc:
+                        error = request_error(exc)
+                        if definite(error):
+                            await self.metadata.reject(request_id, error)
+                        raise error from None
             await self._authorize(method, data, principal)
             return await self._dispatch(method, data, principal, None)
-        except AgentResourceLimit:
-            raise RpcError(
-                -32020,
-                "Initial session state exceeds its limit",
-                {
-                    "kind": "resource_limit",
-                },
-            ) from None
-        except StateError as exc:
-            code, kind = ERRORS.get(type(exc), (-32030, "unavailable"))
-            raise RpcError(code, kind.replace("_", " "), {"kind": kind}) from None
+        except (AgentResourceLimit, StateError) as exc:
+            raise request_error(exc) from None
 
     async def _authorize(self, method: str, data: dict[str, Any], principal: Principal) -> None:
         session_id = data.get("session_id")
@@ -241,10 +256,17 @@ class ControlService:
                 data["waiting_id"],
                 principal,
             )
-            initial = self.runner.initial_state(
-                instructions=data["config"].get("instructions", ""),
-                skills=await self.skills.catalog(),
-            )
+            assert request is not None
+            operation = request["operation"]
+            if "initial_state" not in operation:
+                initial = self.runner.initial_state(
+                    instructions=data["config"].get("instructions", ""),
+                    skills=await self.skills.catalog(),
+                )
+                operation["initial_state"] = plain(initial)
+                await self.metadata.operation(data["request_id"], operation)
+            snapshot = operation["initial_state"]
+            initial = RunnerState(codec=snapshot["codec"], data=snapshot["data"])
             spec = SessionSpec(
                 data["title"],
                 data["machine_ids"],
@@ -287,9 +309,10 @@ class ControlService:
                 )
             )
         if method == "session.update":
-            session = await self.sessions.update_session(**data)
-            self.machines.prepare(session.id, session.machine_ids)
-            return plain(session)
+            async with self.machines.session_lock(sid):
+                session = await self.sessions.update_session(**data)
+                self.machines.prepare(session.id, session.machine_ids)
+                return plain(session)
         if method == "session.delete":
             return {"deleted": await self._delete(sid, data["request_id"])}
         if method == "session.input":
@@ -322,15 +345,23 @@ class ControlService:
         raise RpcError(-32601, "Method not found")
 
     async def _delete(self, session_id: UUID, request_id: UUID) -> bool:
-        rows = await self.metadata.rows(
-            "SELECT * FROM gateway_session_cleanup WHERE session_id=%s", (session_id,)
-        )
-        if not rows:
-            session = await self.sessions.get_session(session_id)
-            await self.metadata.begin_cleanup(session_id, request_id, session.machine_ids)
-        deleted = await self.sessions.delete_session(session_id, request_id=request_id)
-        await self.metadata.mark_deleted(session_id)
-        return deleted
+        async with self.machines.session_lock(session_id):
+            rows = await self.metadata.rows(
+                "SELECT * FROM gateway_session_cleanup WHERE session_id=%s", (session_id,)
+            )
+            if not rows:
+                session = await self.sessions.get_session(session_id)
+                resources = await self.metadata.rows(
+                    "SELECT machine_id FROM gateway_machine_resources WHERE session_id=%s",
+                    (session_id,),
+                )
+                machines = sorted(
+                    set(session.machine_ids) | {row["machine_id"] for row in resources}
+                )
+                await self.metadata.begin_cleanup(session_id, request_id, machines)
+            deleted = await self.sessions.delete_session(session_id, request_id=request_id)
+            await self.metadata.mark_deleted(session_id)
+            return deleted
 
     async def authorize_channels(
         self,
@@ -389,7 +420,8 @@ class ControlService:
     async def recover(self) -> None:
         """Replay only fixed State mutations; machine side effects are never retried here."""
         rows = await self.metadata.rows(
-            "SELECT * FROM gateway_requests WHERE result IS NULL AND left(method,8)='session.'"
+            "SELECT * FROM gateway_requests WHERE result IS NULL AND error IS NULL "
+            "AND left(method,8)='session.'"
         )
         for row in rows:
             principal_id = row["principal_id"]
@@ -408,17 +440,28 @@ class ControlService:
             lock = self._locks.setdefault(row["request_id"], asyncio.Lock())
             async with lock:
                 current = await self.metadata.request(row["request_id"])
-                if current is None or current["result"] is not None:
+                if current is None or current["result"] is not None or current["error"] is not None:
                     continue
                 try:
                     model = MODELS[row["method"]].model_validate_json(json.dumps(row["params"]))
-                    result = await self._dispatch(row["method"], model.model_dump(), principal, row)
+                    result = await self._dispatch(
+                        row["method"], model.model_dump(), principal, current
+                    )
                     if row["method"] != "session.create":
                         await self.metadata.finish(row["request_id"], result)
-                except StateError, RpcError:
-                    logger.warning("Gateway recovery pending for %s", row["request_id"])
+                except (StateError, RpcError, AgentResourceLimit) as exc:
+                    error = request_error(exc)
+                    if definite(error):
+                        await self.metadata.reject(row["request_id"], error)
+                    else:
+                        logger.warning("Gateway recovery pending for %s", row["request_id"])
 
     async def cleanup_once(self) -> None:
+        for resource in await self.metadata.rows("SELECT * FROM gateway_machine_resources"):
+            try:
+                await self.machines.release_unused(resource["machine_id"], resource["session_id"])
+            except StateError, RpcError, OSError, psycopg.Error:
+                logger.warning("Machine resource cleanup remains pending")
         for row in await self.metadata.rows(
             "SELECT * FROM gateway_session_cleanup WHERE state <> 'complete'"
         ):

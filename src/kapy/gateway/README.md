@@ -11,16 +11,23 @@ POST `/rpc` requires the configured administrator bearer and uses `dispatch_json
 Machines connect to `/rpc/machines/{machine_id}` with an independent configured bearer
 and `kapy.jsonrpc.v1`. Session capabilities bind the session and machine. Replacing a
 connection fences the previous connection, and associations are ensured before calls.
-`session.wait` delegates to State's non-consuming durable request receipt.
+`session.wait` delegates to State's non-consuming durable request receipt. Deterministic
+mutation rejections have durable error receipts and never become deferred work. Session-create
+intents save their initial Runner snapshot before calling State, so catalog changes cannot
+block recovery of an already committed creation.
 
 The local CLI uses Execution's authenticated Unix proxy. The inherited session identifies
 the caller; `kapy control --session UUID ...` selects the target independently. An explicit
-administrator bearer permits `--user`. Examples:
+administrator bearer permits `--user` outside a session context. A session capability always
+keeps its session identity; an incomplete session context is rejected. Mutation request IDs
+and skill archive paths are printed to stderr before transport begins; stdout contains results.
+Prompt and SQL commands accept `--file PATH` or `--stdin`, and `session output` emits one JSON
+record per line. Examples:
 
 ```sh
 kapy control session create --machine docker-machine 'Inspect the project'
 kapy control --session SESSION_UUID session input 'Continue'
-kapy control --session SESSION_UUID session wait REQUEST_UUID
+kapy control --session SESSION_UUID session wait --request-id REQUEST_UUID
 kapy control --session SESSION_UUID history export --output history.ndjson
 kapy control --session SESSION_UUID --machine docker-machine skill upload ./example
 kapy control --session SESSION_UUID --machine docker-machine skill download SKILL_UUID ./download
@@ -40,6 +47,8 @@ succeeds remotely before its receipt is saved can be repeated after a crash; del
 at least once. Only the configured chat is allowed, and existing session instructions
 remain fixed when `/instructions` changes the settings for subsequent `/new` commands.
 
+Gateway records machine provisioning before ensure so removing an association cannot lose
+its cleanup obligation. Release checks serialize with association updates and re-provisioning.
 Deletion first records an outbox, asks State to stop its runner and delete the session,
 then deletes Intelligence payloads and releases machine resources. Offline machines leave
 recoverable cleanup obligations. Gateway authorization tombstones remain for request

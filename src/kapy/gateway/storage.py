@@ -22,7 +22,7 @@ TABLES = (
     "parent_session_id uuid, deleted boolean NOT NULL DEFAULT false)",
     "gateway_requests (request_id uuid PRIMARY KEY, principal_id text NOT NULL, "
     "method text NOT NULL, params_hash text NOT NULL, params jsonb NOT NULL, "
-    "target_session_id uuid, operation jsonb NOT NULL DEFAULT '{}', result jsonb)",
+    "target_session_id uuid, operation jsonb NOT NULL DEFAULT '{}', result jsonb, error jsonb)",
     "gateway_skill_access (skill_id uuid PRIMARY KEY, creator_principal text NOT NULL, "
     "create_request_id uuid NOT NULL UNIQUE, deleted boolean NOT NULL DEFAULT false)",
     "gateway_channels (waiting_id uuid PRIMARY KEY, creator_principal text NOT NULL)",
@@ -32,6 +32,8 @@ TABLES = (
     "gateway_session_cleanup (session_id uuid PRIMARY KEY, request_id uuid NOT NULL, "
     "pending_machine_ids jsonb NOT NULL, payload_pending boolean NOT NULL DEFAULT true, "
     "state text NOT NULL DEFAULT 'deleting')",
+    "gateway_machine_resources (session_id uuid NOT NULL, machine_id text NOT NULL, "
+    "PRIMARY KEY(session_id,machine_id))",
     "gateway_telegram_poll (bot_id bigint PRIMARY KEY, next_update_id bigint NOT NULL)",
     "gateway_telegram_inbox (bot_id bigint NOT NULL, update_id bigint NOT NULL, "
     "chat_id bigint NOT NULL, thread_id bigint NOT NULL, payload jsonb NOT NULL, "
@@ -54,6 +56,7 @@ async def migrate(database_url: str, *, schema: str = "kapy_state") -> None:
         await conn.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(schema)))
         for definition in TABLES:
             await conn.execute(sql.SQL("CREATE TABLE IF NOT EXISTS " + definition))
+        await conn.execute("ALTER TABLE gateway_requests ADD COLUMN IF NOT EXISTS error jsonb")
 
 
 class Metadata:
@@ -137,6 +140,12 @@ class Metadata:
                 "target_session_id=COALESCE(%s,target_session_id) WHERE request_id=%s",
                 (Jsonb(result), target, request_id),
             )
+
+    async def reject(self, request_id: UUID, error: RpcError) -> None:
+        await self.rows(
+            "UPDATE gateway_requests SET error=%s WHERE request_id=%s AND result IS NULL",
+            (Jsonb({"code": error.code, "message": error.message, "data": error.data}), request_id),
+        )
 
     async def operation(self, request_id: UUID, operation: JsonObject) -> None:
         await self.rows(

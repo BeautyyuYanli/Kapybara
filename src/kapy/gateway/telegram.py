@@ -5,6 +5,7 @@ Bot API calls are injectable for tests. Production never logs token-bearing URLs
 
 import asyncio
 import copy
+import logging
 import random
 import time
 from dataclasses import dataclass
@@ -12,14 +13,25 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx2
+import psycopg
 from psycopg.types.json import Jsonb
 
 from kapy.rpc import JsonObject, RpcError
+from kapy.state import ServiceUnavailable
 
 from .auth import Principal
 
 if TYPE_CHECKING:
     from .app import FrontendContext
+
+logger = logging.getLogger(__name__)
+MESSAGE_BYTES = 256 * 1024
+
+
+def bounded_text(text: str, budget: int = MESSAGE_BYTES) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    return encoded[:budget].decode("utf-8", errors="ignore"), len(encoded) > budget
+
 
 COMMANDS = {
     "new": "Create a session using saved settings",
@@ -64,6 +76,7 @@ def text_chunk(text: str, units: int = 4000) -> tuple[str, str]:
 def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     projection = copy.deepcopy(previous)
     messages = projection.setdefault("messages", {})
+    limited = projection.setdefault("limited", [])
     output: list[str] = []
     for record in records:
         kind = record["kind"]
@@ -73,10 +86,21 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
         key = record.get("message_id") or ""
         text = record.get("text", "")
         if kind == "text_delta":
+            if key in limited:
+                continue
             text = str(data.get("text", text))
-            messages[key] = messages.get(key, "") + text
+            old = messages.get(key, "")
+            text, overflow = bounded_text(text, MESSAGE_BYTES - len(old.encode("utf-8")))
+            messages[key] = old + text
             output.append(text)
+            if overflow:
+                limited.append(key)
+                output.append("\n[Response exceeded 256 KiB; further text omitted]\n")
         elif kind == "model_response":
+            text, overflow = bounded_text(text)
+            if overflow and key not in limited:
+                limited.append(key)
+                output.append("\n[Response exceeded 256 KiB; further text omitted]\n")
             old = messages.get(key, "")
             if text.startswith(old):
                 output.append(text[len(old) :])
@@ -85,7 +109,9 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
             messages[key] = text
             projection["last_response"] = text
         elif kind == "final":
-            final = data.get("output", text)
+            final, overflow = bounded_text(str(data.get("output", text)))
+            if overflow:
+                output.append("\n[Final response exceeded 256 KiB; further text omitted]\n")
             if final and final != projection.get("last_response"):
                 output.append("\n" + final)
             projection["last_response"] = final
@@ -101,7 +127,10 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
         elif kind == "notice" and text:
             output.append("\n" + text + "\n")
         while len(messages) > 8:
-            del messages[next(iter(messages))]
+            oldest = next(iter(messages))
+            del messages[oldest]
+            if oldest in limited:
+                limited.remove(oldest)
     return "".join(output), projection
 
 
@@ -122,6 +151,7 @@ class TelegramFrontend:
         self.client: httpx2.AsyncClient
         self.disabled = False
         self._chat_ready: dict[int, float] = {}
+        self._chat_locks: dict[int, asyncio.Lock] = {}
 
     async def api(self, method: str, params: dict[str, Any]) -> Any:
         try:
@@ -140,18 +170,19 @@ class TelegramFrontend:
             raise TelegramFailure(503, random.uniform(1, 3)) from None
 
     async def send(self, chat: int, thread: int, text: str) -> None:
-        delay = self._chat_ready.get(chat, 0) - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        params: dict[str, Any] = {"chat_id": chat, "text": text}
-        if thread:
-            params["message_thread_id"] = thread
-        try:
-            await self.api("sendMessage", params)
-        except TelegramFailure as exc:
-            self._chat_ready[chat] = time.monotonic() + max(1, exc.retry_after)
-            raise
-        self._chat_ready[chat] = time.monotonic() + 1
+        lock = self._chat_locks.setdefault(chat, asyncio.Lock())
+        async with lock:
+            while (delay := self._chat_ready.get(chat, 0) - time.monotonic()) > 0:  # noqa: ASYNC110 - deadline
+                await asyncio.sleep(delay)
+            params: dict[str, Any] = {"chat_id": chat, "text": text}
+            if thread:
+                params["message_thread_id"] = thread
+            try:
+                await self.api("sendMessage", params)
+            except TelegramFailure as exc:
+                self._chat_ready[chat] = time.monotonic() + retry_delay(exc)
+                raise
+            self._chat_ready[chat] = time.monotonic() + 1
 
     async def run(self) -> None:
         async with httpx2.AsyncClient(timeout=40, trust_env=False) as self.client:
@@ -198,12 +229,12 @@ class TelegramFrontend:
     async def poll(self) -> None:
         failures = 0
         while not self.disabled:
-            rows = await self.metadata.rows(
-                "SELECT next_update_id FROM gateway_telegram_poll WHERE bot_id=%s",
-                (self.bot_id,),
-            )
-            offset = rows[0]["next_update_id"] if rows else 0
             try:
+                rows = await self.metadata.rows(
+                    "SELECT next_update_id FROM gateway_telegram_poll WHERE bot_id=%s",
+                    (self.bot_id,),
+                )
+                offset = rows[0]["next_update_id"] if rows else 0
                 updates = await self.api(
                     "getUpdates",
                     {
@@ -217,6 +248,10 @@ class TelegramFrontend:
                 failures = 0
             except TelegramFailure as exc:
                 await asyncio.sleep(retry_delay(exc, failures))
+                failures += 1
+            except psycopg.Error, OSError, ServiceUnavailable:
+                logger.warning("Telegram inbox storage unavailable; polling will retry")
+                await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
                 failures += 1
 
     async def route(self, chat: int, thread: int) -> dict[str, Any]:
@@ -284,7 +319,7 @@ class TelegramFrontend:
             update = False
             if sid and command != "/instructions":
                 view = await self.control.sessions.get_session(UUID(sid))
-                update = view.status == "waiting" and view.run_id is None
+                update = view.status == "waiting"
             return {
                 "kind": "config",
                 "config": config,
@@ -442,7 +477,7 @@ class TelegramFrontend:
                         (retry_delay(exc), self.bot_id, inbox["update_id"]),
                     )
             except RpcError as exc:
-                if exc.code in {-32602, -32001, -32004, -32009}:
+                if exc.code in {-32602, -32001, -32004, -32009, -32020}:
                     # Persist a safe reply action, then resume its normal send/retry path.
                     await self.metadata.rows(
                         "UPDATE gateway_telegram_inbox SET resolved_action=%s "
@@ -462,8 +497,15 @@ class TelegramFrontend:
                     )
 
     async def process(self) -> None:
+        failures = 0
         while not self.disabled:
-            await self.process_once()
+            try:
+                await self.process_once()
+                failures = 0
+            except psycopg.Error, OSError, ServiceUnavailable:
+                logger.warning("Telegram processing storage unavailable; processing will retry")
+                await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
+                failures += 1
             await asyncio.sleep(0.25)
 
     async def deliver_once(self) -> None:
@@ -539,6 +581,13 @@ class TelegramFrontend:
             )
 
     async def deliver(self) -> None:
+        failures = 0
         while not self.disabled:
-            await self.deliver_once()
+            try:
+                await self.deliver_once()
+                failures = 0
+            except psycopg.Error, OSError, ServiceUnavailable:
+                logger.warning("Telegram delivery storage unavailable; delivery will retry")
+                await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
+                failures += 1
             await asyncio.sleep(1)

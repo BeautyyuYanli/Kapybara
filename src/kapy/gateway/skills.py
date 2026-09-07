@@ -75,9 +75,16 @@ async def dispatch_skill(
         assert request is not None
         async with control.skill_slots:
             session = await control.sessions.get_session(data["session_id"])
-            machine_id = data["machine_id"] or session.default_machine_id
-            if machine_id is None or machine_id not in session.machine_ids:
-                raise RpcError(-32602, "An associated machine is required")
+            operation = request["operation"]
+            machine_id = operation.get("machine_id")
+            if machine_id is None:
+                machine_id = data["machine_id"] or session.default_machine_id
+                if machine_id is None or machine_id not in session.machine_ids:
+                    raise RpcError(-32602, "An associated machine is required")
+                operation["machine_id"] = machine_id
+                await control.metadata.operation(request_id, operation)
+            if machine_id not in session.machine_ids:
+                raise RpcError(-32001, "The original transfer machine association was revoked")
             exchange = Exchange(control, data, request, scope, machine_id)
             if method == "skill.download":
                 return await exchange.download()
