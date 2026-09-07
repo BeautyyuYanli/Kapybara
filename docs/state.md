@@ -3,7 +3,8 @@
 `kapy.state` owns PostgreSQL sessions, the injected runner lifecycle, inputs, output/history,
 subscriptions and sticky events. Public dataclasses and runner methods are in
 `src/kapy/state/contracts.py`; `SessionService` and `migrate` are exported from the package.
-The implementation uses the approved `1fbe9a5` interfaces with a 512 KiB page amendment.
+The implementation uses the approved `1fbe9a5` interfaces, the later
+`docs/contracts.md` receipt/idempotency/export additions, and the 512 KiB page amendment.
 Gateway owns authentication, caller/target separation, session authorization and channel grants.
 State has no owner, parent, scope, grants or authentication token DTO.
 
@@ -37,13 +38,20 @@ ServiceUnavailable when the service closes.
 
 ## Transactions, input and recovery
 
-create/input/publish take a UUID `request_id`. Matching retries return the first durable receipt;
+create/input/publish/update/delete take a UUID `request_id`. Matching retries return the first durable receipt;
 different operation/parameters under the same UUID raise Conflict. Initial runner state is
 excluded from create's retry fingerprint: the first successful initialization wins. Update is
-a full replacement of mutable settings while waiting, and delete is naturally idempotent by
-session id. The frozen initial proposal does not expose `wait_submission`, `export_history`,
-or request-id-bearing update/delete overloads. Gateway can observe waiting output without
-joining the event subscription system; a completion is also persisted internally on its request.
+a full replacement of mutable settings while waiting. Update/delete check their durable receipt
+before the current session state, so an old retry returns its original result even after newer
+settings or deletion. Deletion commits an intent before cancellation and atomically stores its
+original boolean result with final cleanup; interrupted intents resume at startup.
+
+`wait_submission(session_id, request_id, wait_seconds=0)` observes the persisted create/input
+receipt as `SubmissionStatus(submission, completion)`. Completion contains run id, outcome, output,
+cursor and completion timestamp. It never registers a subscription or consumes an event/input.
+Multiple observers and restart retries see the same completion, including after session deletion.
+A timeout returns `completion=None`; unknown or wrong-target requests raise NotFound. Shutdown
+wakes pending observers with ServiceUnavailable.
 
 Starting a run reserves up to 64 pending inputs ordered by the session sequence. `poll_steer`
 reserves up to 64 new steer inputs while queue inputs remain pending until waiting. Reservations
@@ -54,7 +62,13 @@ with a next-number final checkpoint that acknowledges every outstanding reservat
 
 Successful finish atomically commits final state/output, enters waiting, replaces external
 subscriptions, drains eligible backlog, and publishes completion for requests consumed by the
-run plus the default channel. An early child completion waits durably until the parent subscribes.
+run plus the default channel. Completion request ids are grouped into batches of at most 64:
+each batch has a waiting record/default-channel event, while every request retains its own
+receipt and notification to its requested channel. This preserves the existing payload shape.
+For runs or deletions with more than 64 requests, default-channel observers receive multiple
+terminal notifications for that same run; this is the bounded-payload amendment from review.
+All batches still commit in the same waiting/deletion transaction, with no lost or early receipts.
+An early child completion waits durably until the parent subscribes.
 A late steer or queue input is not completed by an earlier run. Natural completion uses an empty
 external wait set. Subscriptions persist while the runner works and through process restarts;
 a later successful wait result replaces them. Removing a subscription does not retract inputs
@@ -67,8 +81,10 @@ that durable handoff do not retroactively receive it. Handoff creates durable in
 transaction and marks the event delivered. This is the event acknowledgement; frontends read
 output and never consume agent subscriber queues.
 
-A normal runner exception produces a sanitized error and failed completion for its accepted
-inputs, then permits queued work to run. Shutdown/cancellation/abrupt process exit leave the run
+A normal runner exception, including a runner-raised NotFound or ServiceUnavailable, produces
+a sanitized error and failed completion for its accepted inputs, then permits queued work to run.
+Failure completion first verifies that the service still runs and the durable attempt is active;
+actual deletion, lease loss and cancellation cannot produce a spurious failed completion. Shutdown/cancellation/abrupt process exit leave the run
 recoverable: the next owner keeps its run id, increments attempt, appends interrupted output and
 supplies the last checkpoint plus unacknowledged reservations. Previously consumed inputs remain
 in Intelligence's saved state. State does not repeat external commands or claim exactly-once
@@ -87,8 +103,17 @@ same API's bounded long poll for live output. Full message records and their del
 message id for frontend replacement. Raw history is append-only, unaffected by model compression.
 Database read rows are assembled into dataclasses without ORM or Pydantic validation.
 
+`export_history` returns `HistoryExportPage(items, next_cursor, snapshot_cursor, has_more)`.
+Its first page captures the current history upper cursor; supply that same `snapshot` and the
+previous `next_cursor` for each next page. Later appends are excluded. Cursor/session mismatches,
+positions beyond the snapshot, and snapshots beyond the current session are rejected. Deleting
+a session removes its records, so subsequent export calls return NotFound; this API does not
+freeze a session or retain deleted history.
+
 Output, history/search and SQL pages have a **512 KiB** encoded JSON cap including DTO/pagination
-fields. Size calculation includes actual UTF-8 bytes and JSON escaping, using conservative
+fields. Page budgeting includes the longest snapshot/next cursor and the larger terminal
+`has_more=false` representation, including export metadata. Size calculation includes actual
+UTF-8 bytes and JSON escaping, using conservative
 ASCII escaping and normal JSON separators. Server cursors stop before collecting an oversized
 page; a single oversized SQL row is rejected after fetching it. Record pages continue at complete
 record boundaries. Limits: 200 rows/page; 256 KiB per input, event or complete message; 16 KiB per

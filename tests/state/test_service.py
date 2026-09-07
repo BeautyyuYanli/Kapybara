@@ -51,6 +51,7 @@ async def test_crud_receipts_and_migration(database: Database) -> None:
         await service.create_session(spec("changed"), request_id=key)
     changed = await service.update_session(
         created.session.id,
+        request_id=uuid4(),
         title="renamed",
         machine_ids=("b",),
         default_machine_id="b",
@@ -62,10 +63,15 @@ async def test_crud_receipts_and_migration(database: Database) -> None:
     assert len((await service.list_sessions(session_ids=(changed.id,))).items) == 1
     with pytest.raises(InvalidArgument):
         await service.update_session(
-            changed.id, title="x", machine_ids=(), default_machine_id="missing", config={}
+            changed.id,
+            request_id=uuid4(),
+            title="x",
+            machine_ids=(),
+            default_machine_id="missing",
+            config={},
         )
-    assert await service.delete_session(changed.id)
-    assert not await service.delete_session(changed.id)
+    assert await service.delete_session(changed.id, request_id=uuid4())
+    assert not await service.delete_session(changed.id, request_id=uuid4())
     with pytest.raises(NotFound):
         await service.get_session(changed.id)
     assert await service.create_session(spec(), request_id=key) == created
@@ -246,7 +252,7 @@ async def test_failed_runner_and_delete_release_pending_work(database: Database)
     started.clear()
     blocked = await service.create_session(spec(), request_id=uuid4(), input="block")
     await asyncio.wait_for(started.wait(), 5)
-    assert await service.delete_session(blocked.session.id)
+    assert await service.delete_session(blocked.session.id, request_id=uuid4())
     assert (await database.completed(blocked.submission.request_id))["outcome"] == "deleted"
     assert not await database.rows(
         "SELECT * FROM subscriptions WHERE session_id=%s", (blocked.session.id,)

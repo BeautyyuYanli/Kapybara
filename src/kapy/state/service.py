@@ -17,10 +17,12 @@ from valkey.exceptions import ValkeyError
 
 from .contracts import (
     CheckpointWrite,
+    Completion,
     Conflict,
     CreatedSession,
     Cursor,
     EventReceipt,
+    HistoryExportPage,
     InputMode,
     InvalidArgument,
     JsonObject,
@@ -40,6 +42,7 @@ from .contracts import (
     SessionSpec,
     SessionView,
     Submission,
+    SubmissionStatus,
 )
 from .encoding import (
     CHECKPOINT_BYTES,
@@ -156,7 +159,7 @@ def _check_record(
         text,
         datetime.now(UTC),
     )
-    bounded(RecordPage((prototype,), prototype.cursor, True), PAGE_BYTES)
+    bounded(HistoryExportPage((prototype,), prototype.cursor, prototype.cursor, False), PAGE_BYTES)
 
 
 def _mode(mode: InputMode) -> None:
@@ -609,21 +612,36 @@ class SessionService:
         self,
         session_id: UUID,
         *,
+        request_id: UUID,
         title: str,
         machine_ids: tuple[str, ...],
         default_machine_id: str | None,
         config: JsonObject,
     ) -> SessionView:
         self._ensure_open()
-        self._validate_spec(title, machine_ids, default_machine_id, config)
         async with self._store.write() as conn:
+            prior, digest = await self._request(
+                conn,
+                request_id,
+                "update",
+                {
+                    "session_id": session_id,
+                    "title": title,
+                    "machine_ids": machine_ids,
+                    "default_machine_id": default_machine_id,
+                    "config": config,
+                },
+            )
+            if prior:
+                return _saved_view(prior["receipt"])
+            self._validate_spec(title, machine_ids, default_machine_id, config)
             row = await self._session(conn, session_id)
             if row["status"] != "waiting":
                 raise Conflict("session settings can only change while waiting")
             row = await (
                 await conn.execute(
                     "UPDATE sessions SET title=%s,machine_ids=%s,default_machine_id=%s,config=%s,"
-                    "updated_at=now() WHERE id=%s RETURNING *",
+                    "updated_at=now() WHERE id=%s RETURNING " + _SESSION_COLUMNS,
                     (
                         title,
                         Jsonb(list(machine_ids)),
@@ -634,19 +652,42 @@ class SessionService:
                 )
             ).fetchone()
             assert row is not None
+            result = _view(row)
+            await conn.execute(
+                "INSERT INTO requests(id,operation,fingerprint,receipt,target_session_id) "
+                "VALUES (%s,'update',%s,%s,%s)",
+                (request_id, digest, Jsonb(plain(result)), session_id),
+            )
         self._signal()
-        return _view(row)
+        return result
 
-    async def delete_session(self, session_id: UUID) -> bool:
+    async def delete_session(self, session_id: UUID, *, request_id: UUID) -> bool:
         self._ensure_open()
         async with self._store.write() as conn:
+            prior, digest = await self._request(
+                conn, request_id, "delete", {"session_id": session_id}
+            )
+            if prior and prior["receipt"] is not None:
+                return cast(bool, prior["receipt"])
             row = await (
                 await conn.execute(
-                    "UPDATE sessions SET status='deleting' WHERE id=%s RETURNING id", (session_id,)
+                    "UPDATE sessions SET status='deleting' WHERE id=%s RETURNING id",
+                    (session_id,),
                 )
             ).fetchone()
+            if not prior:
+                await conn.execute(
+                    "INSERT INTO requests(id,operation,fingerprint,receipt,target_session_id) "
+                    "VALUES (%s,'delete',%s,%s,%s)",
+                    (request_id, digest, Jsonb(False) if not row else None, session_id),
+                )
             if not row:
-                return False
+                if prior:
+                    # A persisted intent proves this deletion targeted an existing session.
+                    await conn.execute(
+                        "UPDATE requests SET receipt=%s WHERE id=%s", (Jsonb(True), request_id)
+                    )
+                return prior is not None
         task = self._tasks.get(session_id)
         if task and task is not asyncio.current_task():
             task.cancel()
@@ -658,7 +699,10 @@ class SessionService:
     async def _finish_delete(self, session_id: UUID) -> None:
         async with self._store.write() as conn:
             row = await (
-                await conn.execute("SELECT * FROM sessions WHERE id=%s", (session_id,))
+                await conn.execute(
+                    "SELECT id,status,latest_run_id FROM sessions WHERE id=%s",
+                    (session_id,),
+                )
             ).fetchone()
             if not row:
                 return
@@ -667,7 +711,7 @@ class SessionService:
             requests = await (
                 await conn.execute(
                     "SELECT id FROM requests WHERE target_session_id=%s AND completion IS NULL "
-                    "AND operation IN ('create','input')",
+                    "AND operation IN ('create','input') ORDER BY id",
                     (session_id,),
                 )
             ).fetchall()
@@ -680,6 +724,11 @@ class SessionService:
                 [request["id"] for request in requests],
             )
             await conn.execute("DELETE FROM sessions WHERE id=%s", (session_id,))
+            await conn.execute(
+                "UPDATE requests SET receipt=%s WHERE target_session_id=%s "
+                "AND operation='delete' AND receipt IS NULL",
+                (Jsonb(True), session_id),
+            )
 
     async def submit_input(
         self,
@@ -775,53 +824,57 @@ class SessionService:
         output: str,
         request_ids: list[UUID],
     ) -> None:
-        session = await self._session(conn, session_id)
-        position = cursor(session_id, session["next_seq"] + 1)
-        payload = cast(
-            JsonObject,
-            {
-                "type": "session.waiting",
-                "session_id": str(session_id),
-                "run_id": str(run_id) if run_id else None,
-                "request_ids": [str(value) for value in request_ids],
-                "outcome": outcome,
-                "output": output,
-                "cursor": position,
-            },
-        )
-        await self._append(conn, session_id, "waiting", payload, run_id=run_id)
-        await self._event(conn, session_id, payload, session_id, "steer")
         completed_at = datetime.now(UTC)
-        for request_id in request_ids:
-            request = await (
-                await conn.execute(
-                    "SELECT waiting_id FROM requests WHERE id=%s AND completion IS NULL",
-                    (request_id,),
-                )
-            ).fetchone()
-            if not request:
-                continue
-            completion = plain(
+        # A run can consume arbitrarily many requests through repeated steer polls. Keep every
+        # receipt, but never aggregate its entire request set into one unbounded channel payload.
+        for start in range(0, max(1, len(request_ids)), 64):
+            batch = request_ids[start : start + 64]
+            session = await self._session(conn, session_id)
+            position = cursor(session_id, session["next_seq"] + 1)
+            payload = cast(
+                JsonObject,
                 {
-                    "run_id": run_id,
+                    "type": "session.waiting",
+                    "session_id": str(session_id),
+                    "run_id": str(run_id) if run_id else None,
+                    "request_ids": [str(value) for value in batch],
                     "outcome": outcome,
                     "output": output,
                     "cursor": position,
-                    "completed_at": completed_at,
-                }
+                },
             )
-            await conn.execute(
-                "UPDATE requests SET completed_run_id=%s,completion=%s WHERE id=%s",
-                (run_id, Jsonb(completion), request_id),
-            )
-            if request["waiting_id"] != session_id:
-                await self._event(
-                    conn,
-                    request["waiting_id"],
-                    {**payload, "request_ids": [str(request_id)]},
-                    session_id,
-                    "steer",
+            await self._append(conn, session_id, "waiting", payload, run_id=run_id)
+            await self._event(conn, session_id, payload, session_id, "steer")
+            for request_id in batch:
+                request = await (
+                    await conn.execute(
+                        "SELECT waiting_id FROM requests WHERE id=%s AND completion IS NULL",
+                        (request_id,),
+                    )
+                ).fetchone()
+                if not request:
+                    continue
+                completion = plain(
+                    {
+                        "run_id": run_id,
+                        "outcome": outcome,
+                        "output": output,
+                        "cursor": position,
+                        "completed_at": completed_at,
+                    }
                 )
+                await conn.execute(
+                    "UPDATE requests SET completed_run_id=%s,completion=%s WHERE id=%s",
+                    (run_id, Jsonb(completion), request_id),
+                )
+                if request["waiting_id"] != session_id:
+                    await self._event(
+                        conn,
+                        request["waiting_id"],
+                        {**payload, "request_ids": [str(request_id)]},
+                        session_id,
+                        "steer",
+                    )
 
     async def _prepare(self, session_id: UUID) -> _Context | None:
         async with self._store.write() as conn:
@@ -1102,6 +1155,7 @@ class SessionService:
         self._signal()
 
     async def _fail(self, context: _Context, error: Exception) -> None:
+        self._ensure_open()
         async with self._store.write() as conn:
             await self._attempt(conn, context)
             # Do not persist raw exception strings, which may contain provider secrets or prompts.
@@ -1142,30 +1196,29 @@ class SessionService:
         self._signal()
 
     async def _run_session(self, session_id: UUID) -> None:
-        context: _Context | None = None
         try:
             session = await self.get_session(session_id)
             if session.status == "deleting":
                 await self._finish_delete(session_id)
                 return
             context = await self._prepare(session_id)
-            if context:
-                result = await self._runner(context)
-                await self._finish(context, result)
+        except NotFound, ServiceUnavailable:
+            return
+        if context is None:
+            return
+        try:
+            result = await self._runner(context)
+            await self._finish(context, result)
         except asyncio.CancelledError:
             # Leaving status=running is intentional: the next owner reuses run_id and checkpoint.
             raise
-        except NotFound, ServiceUnavailable:
-            return
         except Exception as exc:
-            if context:
-                try:
-                    await self._fail(context, exc)
-                except Conflict, NotFound, ServiceUnavailable:
-                    # Deletion or lease loss invalidated the attempt before it could finish.
-                    pass
-            else:
-                raise
+            # Runner exceptions use the failure path even if they happen to be StateError types.
+            # Only the durable attempt/lease checks below decide whether completion is still valid.
+            try:
+                await self._fail(context, exc)
+            except Conflict, NotFound, ServiceUnavailable:
+                pass
 
     async def _read_page(
         self,
@@ -1176,16 +1229,30 @@ class SessionService:
         history: bool = False,
         search: str | None = None,
         mode: Literal["substring", "fulltext"] = "fulltext",
-    ) -> RecordPage:
+        snapshot: Cursor | None = None,
+        export: bool = False,
+    ) -> RecordPage | HistoryExportPage:
         self._ensure_open()
         page_limit(limit)
         seq = sequence(session_id, after)
         async with self._store.pool.connection() as conn, conn.transaction():
             session = await self._session(conn, session_id)
-            if seq > session["next_seq"]:
-                raise InvalidArgument("cursor is ahead of this session")
+            upper = session["next_seq"] if snapshot is None else sequence(session_id, snapshot)
+            if seq > upper or upper > session["next_seq"]:
+                raise InvalidArgument("cursor is outside this session snapshot")
+            snapshot_cursor = cursor(session_id, upper)
+
+            def page(
+                items: tuple[Record, ...],
+                position: Cursor,
+                has_more: bool,
+            ) -> RecordPage | HistoryExportPage:
+                if export:
+                    return HistoryExportPage(items, position, snapshot_cursor, has_more)
+                return RecordPage(items, position, has_more)
+
             conditions: list[LiteralString] = ["session_id=%s", "seq>%s", "seq<=%s"]
-            values: list[Any] = [session_id, seq, session["next_seq"]]
+            values: list[Any] = [session_id, seq, upper]
             if history:
                 conditions.append("kind=ANY(%s)")
                 values.append(list(HISTORY_KINDS))
@@ -1198,7 +1265,7 @@ class SessionService:
                 elif mode == "fulltext":
                     terms, verify = search_terms(search)
                     if not terms:
-                        return RecordPage((), cursor(session_id, session["next_seq"]), False)
+                        return page((), snapshot_cursor, False)
                     conditions.append("search_vector @@ plainto_tsquery('pg_catalog.simple',%s)")
                     values.append(terms)
                     for word in verify:
@@ -1221,7 +1288,7 @@ class SessionService:
                     item = _record_view(row)
                     if (
                         len(items) == limit
-                        or len(encode(RecordPage(tuple([*items, item]), item.cursor, True)))
+                        or len(encode(page(tuple([*items, item]), snapshot_cursor, False)))
                         > PAGE_BYTES
                     ):
                         if not items:
@@ -1232,8 +1299,8 @@ class SessionService:
                     position = item.cursor
             if not has_more:
                 # Only advance through the bound snapshot, never across concurrent new records.
-                position = cursor(session_id, session["next_seq"])
-            return RecordPage(tuple(items), position, has_more)
+                position = snapshot_cursor
+            return page(tuple(items), position, has_more)
 
     async def read_output(
         self,
@@ -1247,7 +1314,7 @@ class SessionService:
         deadline = asyncio.get_running_loop().time() + wait_seconds
         while True:
             changed = self._changed
-            page = await self._read_page(session_id, after, limit)
+            page = cast(RecordPage, await self._read_page(session_id, after, limit))
             remaining = deadline - asyncio.get_running_loop().time()
             if page.items or remaining <= 0:
                 return page
@@ -1260,7 +1327,7 @@ class SessionService:
         after: Cursor | None = None,
         limit: int = 200,
     ) -> RecordPage:
-        return await self._read_page(session_id, after, limit, history=True)
+        return cast(RecordPage, await self._read_page(session_id, after, limit, history=True))
 
     async def search_history(
         self,
@@ -1271,9 +1338,73 @@ class SessionService:
         after: Cursor | None = None,
         limit: int = 100,
     ) -> RecordPage:
-        return await self._read_page(
-            session_id, after, limit, history=True, search=query, mode=mode
+        return cast(
+            RecordPage,
+            await self._read_page(session_id, after, limit, history=True, search=query, mode=mode),
         )
+
+    async def export_history(
+        self,
+        session_id: UUID,
+        *,
+        after: Cursor | None = None,
+        snapshot: Cursor | None = None,
+        limit: int = 200,
+    ) -> HistoryExportPage:
+        return cast(
+            HistoryExportPage,
+            await self._read_page(
+                session_id,
+                after,
+                limit,
+                history=True,
+                snapshot=snapshot,
+                export=True,
+            ),
+        )
+
+    async def wait_submission(
+        self,
+        session_id: UUID,
+        request_id: UUID,
+        *,
+        wait_seconds: float = 0,
+    ) -> SubmissionStatus:
+        _wait(wait_seconds)
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        while True:
+            self._ensure_open()
+            changed = self._changed
+            async with self._store.pool.connection() as conn:
+                row = await (
+                    await conn.execute(
+                        "SELECT operation,receipt,completion FROM requests WHERE id=%s "
+                        "AND target_session_id=%s AND operation IN ('create','input')",
+                        (request_id, session_id),
+                    )
+                ).fetchone()
+            if not row:
+                raise NotFound("submission does not exist in this session")
+            receipt = row["receipt"]
+            submission = _submission(
+                receipt["submission"] if row["operation"] == "create" else receipt
+            )
+            saved = row["completion"]
+            completion = (
+                None
+                if saved is None
+                else Completion(
+                    UUID(saved["run_id"]) if saved["run_id"] else None,
+                    saved["outcome"],
+                    saved["output"],
+                    saved["cursor"],
+                    datetime.fromisoformat(saved["completed_at"]),
+                )
+            )
+            remaining = deadline - asyncio.get_running_loop().time()
+            if completion is not None or remaining <= 0:
+                return SubmissionStatus(submission, completion)
+            await self._pause(changed, min(1, remaining))
 
     async def query_history(
         self,
