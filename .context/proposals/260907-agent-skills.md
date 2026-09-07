@@ -21,12 +21,16 @@ State 管理 session、运行串行性、输入领取、事件订阅、waiting �
 
 **2. Runner 导出与 State 契约**
 
-以下是待总设计师统一批准的精确接口建议。`Runner`、`RunnerConfig` 从 `kapy.agent` 导出；运行 DTO 使用 State 方案的 `RunContext`、`RunnerState`、`RunResult`，不再定义重复的 runner context。MachineCaller 使用 `kapy.rpc` 的协议，由 Gateway 实现。State 的 Python ID 使用 UUID，转换到 RPC/Runner JSON 时使用字符串。
+`Runner`、`RunnerConfig`、`initialize_session` 从 `kapy.agent` 导出。Runner 直接满足 State 已发布的 `SessionRunner = Callable[[RunContext], Awaitable[RunResult]]`；所有运行 DTO 从 kapy.state 导入，不在 agent 包定义或重导出另一套类型。MachineCaller 使用 kapy.rpc 的共享协议，由 Gateway 实现。State 的 Python ID 使用 UUID，转换到 RPC/Runner JSON 时使用字符串。
 
 ```python
 from kapy.rpc import MachineCaller
 from kapy.skills import SkillDescription
-from kapy.state import RunContext, RunnerState, RunResult
+from kapy.state import (
+    CheckpointWrite, Cursor, JsonObject, JsonValue, MessageWrite,
+    OutputDelta, RecordPage, RunContext, RunResult, RunnerState,
+    SessionInput, SessionRunner, SessionView,
+)
 
 type AuthorizeWait = Callable[[UUID, tuple[UUID, ...]], Awaitable[None]]
 
@@ -41,6 +45,11 @@ class RunnerConfig:
     keep_recent_ratio: float = 0.10
     media_max_bytes: int = 20 * 1024 * 1024
 
+def initialize_session(
+    config: RunnerConfig, *, instructions: str,
+    catalog: Sequence[SkillDescription],
+) -> RunnerState: ...
+
 class Runner:
     def __init__(
         self, config: RunnerConfig, machine_caller: MachineCaller, *,
@@ -50,70 +59,27 @@ class Runner:
         plugins: Sequence[ScriptTool] = (),
     ) -> None: ...
 
-    def initial_state(
-        self, *, instructions: str, skills: Sequence[SkillDescription],
-    ) -> RunnerState: ...
-
     async def __call__(self, context: RunContext) -> RunResult: ...
 ```
 
 `Runner(...)` 构造器即 factory，不额外增加 create_runner。构造不启动 I/O、后台任务或 session；无 start/aclose 生命周期。Runner 必含内置工具与 apply_patch；plugins 只添加自定义工具，重名立即报错。Gateway 持有并关闭共享 HTTP client；Runner 借用它，绝不关闭注入资源。Pydantic Agent、capabilities 和每次运行的可变数据在 `__call__` 内创建，避免多个 session 共享可变消息、媒体修复标记或等待结果。Gateway 将该实例直接作为 SessionRunner 注入 State，State 负责串行调用、取消和恢复。
 
-Gateway 创建 session 时先 `await skills.catalog()`，再调用 `runner.initial_state(instructions=用户配置, skills=完整目录)`，把结果交给 `SessionSpec.initial_state`。initial_state 将基础 prompt、用户 instruction 和全量 descriptions 固定到 `RunnerState(codec="kapy.agent.v1", data=...)`，检查实际 JSON 序列化大小满足 State 存储限制；不查数据库、不调用模型，也不估算 token。首次模型输入 token 数尚未知。Runner 不持有 SkillService，也不每轮刷新 catalog。恢复使用 State 已保存的 instruction；输入和上下文分别来自 `context.inputs`、`context.state`。机器存在性与关联鉴权统一由 Gateway 的 MachineCaller 处理，Runner 将未关联/不存在错误反馈为可纠正的 tool response。没有默认机器时，工具省略 machine_id 会得到可纠正的参数错误。
+Gateway 创建 session 时先 `await skills.catalog()`，再调用 `initialize_session(runner_config, instructions=用户配置, catalog=完整目录)`，把结果交给 `SessionSpec.initial_state`。该同步函数是唯一 session 上下文初始化入口，不另外保留 Runner.initial_state 别名。它将基础 prompt、用户 instruction 和全量 descriptions 固定到 `RunnerState(codec="kapy.agent.v1", data=...)`，检查 config 与实际 JSON 大小满足持久化限制；config 中的 API key/base 等连接配置不写入 RunnerState。该函数不查数据库、不调用模型，也不估算 token。首次模型输入 token 数尚未知。Runner 不持有 SkillService，也不每轮刷新 catalog。恢复使用 State 已保存的 instruction；输入和上下文分别来自 context.inputs、context.state。
 
-State worktree 的 `kapy.state.contracts` 是类型来源，以下摘录用于对齐，不在 agent 包重定义。JsonValue/JsonObject/SessionView/SessionInput/RecordPage 也直接使用 State 导出。SessionView 提供 id、machine_ids、default_machine_id、config；SessionInput 具有 id、seq、mode、payload、event_id，payload 是 JsonValue，不能假设只有 text 字段；字符串直接作为文本，其他 JSON 保留完整结构编码后交给模型。
+RunnerConfig 提供服务默认值；每次运行从 context.session.config 的可选 model 字段选用模型名称，缺失时使用 RunnerConfig.model，非法类型/空串明确拒绝。Gateway/State 仅允许在 waiting 且无活动 run 时更新 config；本轮使用启动快照，不在模型重试中热切换模型。用户 instructions 与 skill catalog 是创建时快照，后续 /instructions 只更新 Gateway 的 saved config，供下一次 /new 使用，不改写既有 session instruction 或 codec。机器存在性与关联鉴权统一由 Gateway 的 MachineCaller 处理，Runner 将未关联/不存在错误反馈为可纠正的 tool response。没有默认机器时，工具省略 machine_id 会得到可纠正的参数错误。
 
-```python
-@dataclass(frozen=True, slots=True)
-class RunnerState:
-    codec: str
-    data: JsonObject
+State worktree 已发布的 kapy.state.contracts 是唯一类型定义。以下仅列使用方式与字段，不复制类定义：
 
-@dataclass(frozen=True, slots=True)
-class MessageWrite:
-    message_id: UUID
-    kind: Literal["model_request", "model_response"]
-    text: str
-    data: JsonObject
+| State 导出 | Runner 使用的既定形状 |
+| --- | --- |
+| RunnerState | codec:str、data:JsonObject |
+| MessageWrite | message_id:UUID、kind:model_request/model_response、text:str、data:JsonObject |
+| CheckpointWrite | number:int、state:RunnerState、messages:tuple[MessageWrite,...]、consumed_input_ids:tuple[UUID,...] |
+| OutputDelta | emission_id:UUID、message_id:UUID、kind:text_delta/tool_call/tool_result/notice、data:JsonValue |
+| RunResult | output:str、wait_for:tuple[UUID,...]、checkpoint:CheckpointWrite |
+| RunContext | session:SessionView、run_id:UUID、attempt:int、recovered:bool、inputs:tuple[SessionInput,...]、state:RunnerState、checkpoint_number:int |
 
-@dataclass(frozen=True, slots=True)
-class CheckpointWrite:
-    number: int
-    state: RunnerState
-    messages: tuple[MessageWrite, ...]
-    consumed_input_ids: tuple[UUID, ...]
-
-@dataclass(frozen=True, slots=True)
-class OutputDelta:
-    emission_id: UUID
-    message_id: UUID
-    kind: Literal["text_delta", "tool_call", "tool_result", "notice"]
-    data: JsonValue
-
-class RunContext(Protocol):
-    session: SessionView
-    run_id: UUID
-    attempt: int
-    recovered: bool
-    inputs: tuple[SessionInput, ...]
-    state: RunnerState
-    checkpoint_number: int
-
-    async def poll_steer(self, *, limit: int = 64) -> tuple[SessionInput, ...]: ...
-    async def emit(self, delta: OutputDelta) -> Cursor: ...
-    async def checkpoint(self, write: CheckpointWrite) -> Cursor: ...
-    async def read_history(
-        self, *, after: Cursor | None = None, limit: int = 200,
-    ) -> RecordPage: ...
-
-@dataclass(frozen=True, slots=True)
-class RunResult:
-    output: str
-    wait_for: tuple[UUID, ...]
-    checkpoint: CheckpointWrite
-
-type SessionRunner = Callable[[RunContext], Awaitable[RunResult]]
-```
+RunContext 的既有方法为 `poll_steer(*, limit=64) -> tuple[SessionInput,...]`、`emit(delta:OutputDelta) -> Cursor`、`checkpoint(write:CheckpointWrite) -> Cursor`、`read_history(*, after:Cursor|None=None, limit=200) -> RecordPage`，均为 async。Runner 不再定义 emit envelope；下文仅规定 OutputDelta.data 的 agent 私有内容。SessionInput 保留 id、seq、mode、payload、event_id；payload 是 JsonValue，字符串直接作为文本，其他 JSON 保留完整结构编码后交模型。
 
 `context.inputs` 是本轮已 reserved 的至多 64 条输入，按 seq 处理；`context.poll_steer(limit=64)` 领取新 steer，同一运行不重复返回。reserved 不等于 consumed；只有包含该输入的 checkpoint 成功才确认消费。Runner 在模型节点前、工具节点前后、准备结束前领取并 enqueue；queue 由 State 留到下次唤醒。大批输入按预算逐条注入和 checkpoint，不无条件拼成一个超大 ModelRequest。结束前必须处理完自己已经领取的全部输入；框架自然结束也不能跳过尚未注入的 reserved 输入。最后一次轮询后才到的输入保留给下一轮，不由本轮提前完成。
 
@@ -352,9 +318,9 @@ HTTP 400/422 必须带媒体字段/类型/解码相关错误证据才归入此�
 
 窗口 C 来自配置。每次完整模型响应保存该响应自身的 `ModelResponse.usage`（RequestUsage），使用 `input_tokens >= 0.70 * C` 决定在下一次请求前进行一次压缩。input_tokens 按 provider 定义包含 cached input，不减去 cache_read_tokens，也不重复加上它。不能用整个 `AgentRunResult.usage` 的累加输入判断单次上下文；`result.usage` 仍是可用于报告的属性。实际 Chat 适配器为流式请求设置 include_usage；未收到有效 usage 或适配器仅有缺省全零值时，计数视为未知。
 
-不调用 tiktoken，不按字节、字符或媒体大小换算 tokens，不给媒体添加估算 reserve。第一次请求没有历史 usage，不能在创建 session 时虚构 token 计数；initial_state 只校验配置和持久化大小。max_output_tokens 作为发送给模型的输出上限配置，不声称仅凭前一次请求的 usage 能精确预测下一次请求大小。
+不调用 tiktoken，不按字节、字符或媒体大小换算 tokens，不给媒体添加估算 reserve。第一次请求没有历史 usage，不能在创建 session 时虚构 token 计数；initialize_session 只校验配置和持久化大小。max_output_tokens 作为发送给模型的输出上限配置，不声称仅凭前一次请求的 usage 能精确预测下一次请求大小。
 
-RunnerState 保存 `last_usage={response_id,input_tokens,output_tokens,cache_read_tokens,sweep_applied}`；response_id 是 Runner 已持久化的模型 message_id，不依赖 provider 一定返回 ID。没有有效观测时 last_usage 为 null。响应落定后在 checkpoint 保存 usage；下一次模型请求前达到阈值且 sweep_applied=false 才执行一轮，压缩结果与 sweep_applied=true 一起 checkpoint。恢复不因同一旧 usage 再降一级；等待下一次实际响应的全新 usage 后才重新判断。
+RunnerState 保存 `last_usage={response_id,model,input_tokens,output_tokens,cache_read_tokens,sweep_applied}`；response_id 是 Runner 已持久化的模型 message_id，不依赖 provider 一定返回 ID。没有有效观测时 last_usage 为 null；session 切换模型后也先视为未知，不把另一模型的 usage 当作新模型的计数。响应落定后在 checkpoint 保存 usage；下一次模型请求前达到阈值且 sweep_applied=false 才执行一轮，压缩结果与 sweep_applied=true 一起 checkpoint。恢复不因同一旧 usage 再降一级；等待下一次实际响应的全新 usage 后才重新判断。
 
 最新约 10% 按完整交互块数量近似：保护最新 ceil(总块数×keep_recent_ratio) 块，至少一块；这不是 token 百分比。再向前扩展以保护完整 user/model/tool 配对、当前输入和尚未配对完成的工具链。固定 instruction 和创建时 catalog 不降级。closed cycle 跨过保护边界时整段保护，允许超过 10%；当前未关闭 cycle 只有旧的完整交互块可降到 level 1。
 
@@ -462,13 +428,13 @@ request_id/session_id/skill_id 均为 UUID 字符串。Python 与 RPC 不要求�
 
 传输采用 Execution 当前草案的 `file.pull/push/chunk/finish/abort`，不额外要求 Skills 的流式或 transfer_id 服务。upload：Gateway 发起 pull，检查声明 size≤16 MiB，逐个接收 decoded≤65,536 bytes 的 chunk，同时检查累计大小、连续 offset 和 hash；仅当 finish 确认完整成功后，调用 SkillService.create/update。download：先调用 SkillService.download 获取同一次读取的 info/bytes，再以 size 和 sha256 创建 push，逐个发送 decoded≤65,536 bytes 的 chunk，finish 验证成功后返回 RPC 结果。base64 后约 88 KiB 的单块消息满足 1 MiB RPC 上限；ZIP 完整内容从不作为单条 RPC params/result。
 
-传输失败或取消时调用 file.abort 并清理自有临时资源，不能返回成功或发布半包。Gateway 从可信主体、request_id 和步骤稳定派生 Execution transfer_id；下载把实际 revision/hash 与传输绑定，同一 request_id 遇到已变更内容应明确冲突，不伪装重放首次成功结果。Skills 的只读 download 不额外接收 request_id 或 request_key。CLI 验证完整 ZIP hash 后用 extract_skill 安全提取，成功与失败均清理自己的临时归档。Gateway 不复制归档解析或 storage 逻辑。
+传输失败或取消时调用 file.abort 收束仍活动的传输，不能返回成功或发布半包。Gateway 从可信主体、request_id 和步骤稳定派生 Execution transfer_id；下载把实际 revision/hash 与传输绑定，同一 request_id 遇到已变更内容应明确冲突，不伪装重放首次成功结果。Skills 的只读 download 不额外接收 request_id 或 request_key。下载由 CLI 验证完整 ZIP hash 后用 extract_skill 安全提取，成功与失败均清理下载临时归档。上传只有确认成功才清理临时 ZIP；失败/未知结果保留同一 ZIP 和 request_id，使 CLI 可用同一请求重试，避免 create 已成功而 Gateway 尚未持久化 creator 时失去重放材料。放弃重试时由 CLI 明确清理。Gateway 不复制归档解析或 storage 逻辑。
 
 skill.list 的 RPC limit 默认 100、范围 1–100；Gateway 向 service 多读一条判断是否有下一页，并可按 RPC frame 预算缩小本页，next_after_id 是本页最后一条 ID，有下一页才返回。它是实时目录遍历，不承诺跨页冻结并发修改。创建时目录直接调用 Python catalog，不分页、不截断；snapshot 超出 State JSON 大小限制时明确报告创建失败，首次 token 数未知。read 返回完整 SKILL.md，无需正文分页。
 
 建议统一业务异常：InvalidSkill、SkillNotFound、SkillConflict、SkillTooLarge；Gateway 分别映射 JSON-RPC `-32602`、`-32004`、`-32009`、`-32020`，data.kind 分别为 invalid_skill、not_found、conflict、resource_limit，message 为安全的可读说明。编号最终由总设计师统一到共享 RPC 错误表。Execution 的 disconnect/unknown-operation 由其 RPC 错误类型透传成可读工具失败；取消不转换为普通错误。
 
-创建 session 时，Gateway 将完整 catalog 交 `Runner.initial_state`，再把结果写入 State 的 SessionSpec.initial_state。State 创建事务保存实际使用的 snapshot 和 instruction；重复创建请求返回首次持久化结果，不使用重试时变化的目录。创建与 skill 更新并发时，以该次 catalog 查询读到的版本为准；无需锁住整个 skill 表。后续 CLI 的 list/get/read/download/upload 获取最新资源，输出作为当前 session 工具结果进入上下文，不改写旧 instruction，也不每轮热刷新所有 descriptions。
+创建 session 时，Gateway 调用 `initialize_session(config, instructions=..., catalog=await skill_service.catalog())`，再把返回的 State.RunnerState 写入 SessionSpec.initial_state。State 创建事务保存实际使用的 snapshot 和 instruction；重复创建请求返回首次持久化结果，不使用重试时变化的目录。创建与 skill 更新并发时，以该次 catalog 查询读到的版本为准；无需锁住整个 skill 表。后续 CLI 的 list/get/read/download/upload 获取最新资源，输出作为当前 session 工具结果进入上下文，不改写旧 instruction，也不每轮热刷新所有 descriptions。
 
 Settings 显式映射：OPENAI_BASE_URL→RunnerConfig.base_url、OPENAI_API_KEY→api_key、OPENAI_MODEL→model；其余配置使用 KAPY_CONTEXT_WINDOW_TOKENS、KAPY_MAX_OUTPUT_TOKENS、KAPY_COMPRESSION_RATIO、KAPY_KEEP_RECENT_RATIO、KAPY_MEDIA_MAX_BYTES。模块自身不读取环境。Gateway 打开自有 HTTP client 与借给 Skills/AgentPayloadStore 的 metadata pool；app lifespan 分别调用各模块自己的迁移/initialize，构造服务并提供 authorize_wait，再启动 State，不引入集中迁移框架。State 单独拥有自己的 pool、Valkey 和迁移；schema 由总设计师统一映射，不假设 State 使用 public。关闭先停止并等待 State 的 runner 调用，再关闭 Gateway 自有资源。
 
