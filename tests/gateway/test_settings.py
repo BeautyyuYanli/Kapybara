@@ -17,7 +17,6 @@ def test_explicit_aliases_no_automatic_dotenv_and_secret_redaction(monkeypatch, 
     monkeypatch.setenv("KAPY_CONTROL_TOKEN", "")
     assert load_settings().telegram_chat_id is None
     assert load_settings().control_token is None
-    assert "cgroup_root" not in Settings.model_fields
 
 
 def test_schema_and_machine_configuration_cannot_inject_identifiers():

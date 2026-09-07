@@ -137,7 +137,7 @@ async def test_delete_outbox_cleans_payload_before_offline_machine(gateway):
     assert rows[0]["state"] == "releasing"
 
 
-async def test_output_export_isolation_and_parallel_waiters(gateway):
+async def test_history_export_pagination_and_parallel_waiters(gateway):
     created = await create(gateway, input="visible")
     sid = created["session"]["id"]
     waits = await asyncio.gather(
