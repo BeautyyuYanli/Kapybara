@@ -49,8 +49,8 @@ async def check(machine_id: str) -> None:
         started = time.perf_counter()
         try:
             child_prompt = (
-                "Use a process tool to execute exactly once: "
-                "python -c 'import secrets; print(\"KAPY_CHILD_\" + secrets.token_hex(16))'. "
+                "Use a process tool to execute exactly once:\n"
+                "python -c 'import secrets; print(\"KAPY_CHILD_\" + secrets.token_hex(16))'\n"
                 "Reply with only the random marker actually printed by the process."
             )
             command = shlex.join(
@@ -99,9 +99,9 @@ async def check(machine_id: str) -> None:
                         if record["kind"] == "error":
                             raise AssertionError("Recursive parent run failed; inspect its history")
                         text = record.get("text", "").strip()
-                        if record["kind"] == "final" and re.fullmatch(
-                            r"KAPY_CHILD_[0-9a-f]{32}", text
-                        ):
+                        if record["kind"] == "final" and text:
+                            if not re.fullmatch(r"KAPY_CHILD_[0-9a-f]{32}", text):
+                                raise AssertionError("Parent completed without the child marker")
                             marker = text
             events = [
                 record
