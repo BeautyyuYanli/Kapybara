@@ -69,6 +69,7 @@ class MachineCaller(Protocol):
 
 ```python
 # kapy.execution
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict
 import anyio
@@ -85,6 +86,22 @@ class UserProxyAuth(TypedDict):
     token: str
 
 type ProxyAuth = SessionProxyAuth | UserProxyAuth
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPaths:
+    state_dir: Path
+    data_dir: Path
+    runtime_dir: Path
+
+    @property
+    def socket_path(self) -> Path: ...
+
+    def session_cwd(self, session_id: str) -> Path: ...
+
+def resolve_paths(
+    *, state_dir: Path | None = None, data_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+) -> ExecutionPaths: ...
 
 async def call_local_proxy(
     socket_path: Path, method: str, params: JsonObject, *,
@@ -142,6 +159,8 @@ JSON-RPC 2.0 支持 request、response、notification、batch、命名及位置�
 ## 4. XDG、持久化与 session 生命周期
 
 默认目录由 platformdirs 计算：`$XDG_STATE_HOME/kapy` 存 `execution.sqlite3`、state lock 和 stdio spool，`$XDG_DATA_HOME/kapy/sessions/<sha256(session_id)>/cwd` 存工作目录，`$XDG_RUNTIME_DIR/kapy` 存 runtime lock 与 `daemon.sock`。XDG runtime 缺失时使用经过 UID/权限校验的临时 runtime 目录并告知调用方；不把大输出放进 runtime。新目录 0700，数据库、spool 与 socket 0600。[XDG 规范](https://specifications.freedesktop.org/basedir/latest/)
+
+`resolve_paths()` 是 CLI 和 daemon 共用的纯路径计算入口，使用 platformdirs 的 Linux 默认值与显式绝对路径覆盖，不创建目录或改变权限。`ExecutionPaths.socket_path` 返回 runtime 根下的 `daemon.sock`；`session_cwd(session_id)` 验证上述 session ID 限额，再以 UTF-8 SHA-256 十六进制摘要计算 data 根下的 session cwd。实际目录创建、UID/权限检查和独占锁由 daemon 启动负责。
 
 同一 state 根或 runtime 根只能运行一个 daemon，分别用文件锁阻止双实例；socket 只有持锁者可创建/清理。数据库绑定 machine_id，换机器身份时拒绝复用。session_id 为非空且 UTF-8 不超过 128 bytes 的不透明字符串，落盘名称由服务计算，不把外部 ID 拼进路径。process_id、transfer_id 为调用方生成的 UUID，所有查找同时带 session_id。
 
