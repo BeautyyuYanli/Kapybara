@@ -180,3 +180,69 @@ async def test_batch_retry_blocks_later_wait_but_new_response_can_finish(
     assert result.output == "Corrected final output"
     assert result.wait_for == (corrected_channel,)
     assert result.checkpoint.number == ctx.checkpoint_number + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid_first", [False, True])
+@pytest.mark.parametrize("recovery", ["normal", "before_tools", "after_results"])
+async def test_output_retry_preserves_same_batch_successful_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    valid_first: bool,
+    recovery: str,
+) -> None:
+    requests: list[list[ModelMessage]] = []
+    channel = uuid4()
+
+    async def stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[Any]:
+        requests.append(messages)
+        if len(requests) > 1:
+            yield "Unexpected extra inference"
+            return
+        yield "Chosen wait output"
+        good = DeltaToolCall(
+            name="wait",
+            json_args=json.dumps({"wait_for": [str(channel)]}),
+            tool_call_id="valid-wait",
+        )
+        bad = DeltaToolCall(
+            name="wait", json_args='{"wait_for":["not-a-uuid"]}', tool_call_id="invalid-wait"
+        )
+        calls = [good, bad] if valid_first else [bad, good]
+        yield dict(enumerate(calls))
+
+    class CancelBeforeOutputTools(Context):
+        interrupted = False
+
+        async def checkpoint(self, write: CheckpointWrite) -> str:
+            cursor = await super().checkpoint(write)
+            if not self.interrupted and any(
+                message.kind == "model_response" for message in write.messages
+            ):
+                self.interrupted = True
+                raise asyncio.CancelledError
+            return cursor
+
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAIChatModel",
+        lambda *args, **kwargs: FunctionModel(stream_function=stream),
+    )
+    async with httpx2.AsyncClient() as client:
+        agent = runner(client)
+        initial = agent.initial_state(instructions="", skills=[])
+        if recovery == "before_tools":
+            ctx = CancelBeforeOutputTools(initial)
+        elif recovery == "after_results":
+            ctx = CancelAfterFinalCheckpoint(initial)
+        else:
+            ctx = Context(initial)
+        if recovery != "normal":
+            with pytest.raises(asyncio.CancelledError):
+                await agent(ctx)
+            ctx.attempt, ctx.recovered = 2, True
+        result = await agent(ctx)
+
+    assert len(requests) == 1
+    assert result.output == "Chosen wait output"
+    assert result.wait_for == (channel,)
+    assert result.checkpoint.number == ctx.checkpoint_number + 1

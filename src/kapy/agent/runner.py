@@ -203,6 +203,7 @@ class Runtime:
         self.consumed: list[UUID] = []
         self.attempt_id = str(uuid4())
         self.message_id = uuid4()
+        self.function_tool_names = set(BUILTINS) | {plugin.name for plugin in runner.plugins}
 
     async def initialize(self) -> None:
         self.data = await self.codec.load(self.context.state)
@@ -277,7 +278,7 @@ class Runtime:
             await self.checkpoint()
 
     def set_pending_final(self, output: str, wait_for: tuple[UUID, ...]) -> None:
-        if self.batch_has_retry():
+        if self.batch_has_function_retry():
             self.current.pop("pending_final", None)
             return
         self.current["pending_final"] = {
@@ -285,20 +286,21 @@ class Runtime:
             "wait_for": [str(channel) for channel in wait_for],
         }
 
-    def batch_has_retry(self) -> bool:
+    def batch_has_function_retry(self) -> bool:
         messages = self.current["messages"]
         for index in range(len(messages) - 1, -1, -1):
             response = messages[index]
             if response["kind"] != "response":
                 continue
-            call_ids = {
+            function_call_ids = {
                 part["tool_call_id"]
                 for part in response["parts"]
                 if part["part_kind"] == "tool-call"
+                and part["tool_name"] in self.function_tool_names
             }
             return any(
                 part["part_kind"] == "retry-prompt"
-                and (part.get("tool_call_id") is None or part["tool_call_id"] in call_ids)
+                and part.get("tool_call_id") in function_call_ids
                 for message in messages[index + 1 :]
                 for part in message["parts"]
             )
@@ -306,7 +308,7 @@ class Runtime:
 
     async def finish_pending(self) -> RunResult | None:
         # Call only after the response's complete tool batch has been settled.
-        if self.batch_has_retry():
+        if self.batch_has_function_retry():
             self.current.pop("pending_final", None)
             return None
         await self.reserve()
@@ -368,8 +370,11 @@ class Runtime:
                 and (not p.tool_call_id or p.tool_call_id not in returned)
             ]
             if parts:
-                if any(isinstance(part, RetryPromptPart) for part in parts):
-                    # Pydantic's exhaustive strategy lets a tool retry supersede final output.
+                if any(
+                    isinstance(part, RetryPromptPart) and part.tool_name in self.function_tool_names
+                    for part in parts
+                ):
+                    # Only function-tool retries supersede a successful output tool.
                     self.current.pop("pending_final", None)
                 finished_ids = {p.tool_call_id for p in parts}
                 self.data["pending_tools"] = [
@@ -464,7 +469,8 @@ class Runtime:
                         )
                     await self.tool_result(part.tool_name, part.tool_call_id, result)
                 except (ModelRetry, KeyError) as exc:
-                    self.current.pop("pending_final", None)
+                    if part.tool_name in self.function_tool_names:
+                        self.current.pop("pending_final", None)
                     await self.record(
                         ModelRequest(
                             [
