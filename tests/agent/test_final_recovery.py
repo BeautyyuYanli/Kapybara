@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 import httpx2
 import pytest
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, RetryPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from kapy.agent import runner as runner_module
@@ -99,3 +99,84 @@ async def test_recovered_final_keeps_result_and_finishes_batch_before_new_input(
     assert result.checkpoint.number == ctx.checkpoint_number + 1
     assert result.checkpoint not in ctx.writes
     assert UUID(cast(Any, result.checkpoint.state.data["cycles"])[-1]["turn_id"]) == ctx.run_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["normal", "new_retry", "saved_retry"])
+async def test_batch_retry_blocks_later_wait_but_new_response_can_finish(
+    monkeypatch: pytest.MonkeyPatch,
+    recovery: str,
+) -> None:
+    requests: list[list[ModelMessage]] = []
+    first_channel, corrected_channel = uuid4(), uuid4()
+
+    async def stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[Any]:
+        requests.append(messages)
+        if len(requests) == 1:
+            yield {
+                0: DeltaToolCall(name="process_list", json_args='{"limit":0}', tool_call_id="bad"),
+                1: DeltaToolCall(
+                    name="wait",
+                    json_args=json.dumps({"wait_for": [str(first_channel)]}),
+                    tool_call_id="blocked-wait",
+                ),
+                2: DeltaToolCall(name="process_list", json_args="{}", tool_call_id="last-tool"),
+            }
+        else:
+            assert len(requests) == 2
+            yield "Corrected final output"
+            yield {
+                0: DeltaToolCall(
+                    name="wait",
+                    json_args=json.dumps({"wait_for": [str(corrected_channel)]}),
+                    tool_call_id="corrected-wait",
+                )
+            }
+
+    class CancelAtBatchBoundary(Context):
+        interruption = 0
+
+        async def checkpoint(self, write: CheckpointWrite) -> str:
+            cursor = await super().checkpoint(write)
+            current = cast(Any, write.state.data["cycles"])[-1]
+            retry_saved = any(
+                part["part_kind"] == "retry-prompt" and part.get("tool_call_id") == "bad"
+                for message in write.messages
+                for part in cast(Any, message.data["parts"])
+            )
+            if self.interruption == 0 and current.get("pending_final"):
+                self.interruption = 1
+                raise asyncio.CancelledError
+            if recovery == "saved_retry" and self.interruption == 1 and retry_saved:
+                self.interruption = 2
+                raise asyncio.CancelledError
+            return cursor
+
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAIChatModel",
+        lambda *args, **kwargs: FunctionModel(stream_function=stream),
+    )
+    async with httpx2.AsyncClient() as client:
+        agent = runner(client)
+        initial = agent.initial_state(instructions="", skills=[])
+        ctx = Context(initial) if recovery == "normal" else CancelAtBatchBoundary(initial)
+        if recovery != "normal":
+            with pytest.raises(asyncio.CancelledError):
+                await agent(ctx)
+            ctx.attempt, ctx.recovered = 2, True
+            if recovery == "saved_retry":
+                with pytest.raises(asyncio.CancelledError):
+                    await agent(ctx)
+                ctx.attempt = 3
+        result = await agent(ctx)
+
+    assert len(requests) == 2
+    assert any(
+        isinstance(part, RetryPromptPart) and part.tool_call_id == "bad"
+        for message in requests[1]
+        for part in message.parts
+    )
+    assert result.output == "Corrected final output"
+    assert result.wait_for == (corrected_channel,)
+    assert result.checkpoint.number == ctx.checkpoint_number + 1

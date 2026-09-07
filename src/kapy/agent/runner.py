@@ -277,13 +277,38 @@ class Runtime:
             await self.checkpoint()
 
     def set_pending_final(self, output: str, wait_for: tuple[UUID, ...]) -> None:
+        if self.batch_has_retry():
+            self.current.pop("pending_final", None)
+            return
         self.current["pending_final"] = {
             "output": output,
             "wait_for": [str(channel) for channel in wait_for],
         }
 
+    def batch_has_retry(self) -> bool:
+        messages = self.current["messages"]
+        for index in range(len(messages) - 1, -1, -1):
+            response = messages[index]
+            if response["kind"] != "response":
+                continue
+            call_ids = {
+                part["tool_call_id"]
+                for part in response["parts"]
+                if part["part_kind"] == "tool-call"
+            }
+            return any(
+                part["part_kind"] == "retry-prompt"
+                and (part.get("tool_call_id") is None or part["tool_call_id"] in call_ids)
+                for message in messages[index + 1 :]
+                for part in message["parts"]
+            )
+        return False
+
     async def finish_pending(self) -> RunResult | None:
         # Call only after the response's complete tool batch has been settled.
+        if self.batch_has_retry():
+            self.current.pop("pending_final", None)
+            return None
         await self.reserve()
         if self.data["reserved_inputs"]:
             return None
@@ -577,13 +602,15 @@ class Boundaries(AbstractCapability):
         text = "\n".join(part.content for part in response.parts if isinstance(part, TextPart))
         if text:
             runtime.current["output"] = text
+        runtime.current.pop("pending_final", None)
+        await runtime.record(response, commit=False)
         if (
             response.state == "complete"
             and any(isinstance(part, TextPart) for part in response.parts)
             and not any(isinstance(part, ToolCallPart) for part in response.parts)
         ):
             runtime.set_pending_final(text, ())
-        await runtime.record(response)
+        await runtime.checkpoint()
         for part in response.parts:
             if isinstance(part, ToolCallPart):
                 try:
