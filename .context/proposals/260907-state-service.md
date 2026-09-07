@@ -1,12 +1,12 @@
 # State：持久 Session、事件与隔离历史查询
 
-本方案以 `kapy_v2.md` 和 `docs/architecture.md` 为准，范围是 `src/kapy/state/`、`tests/state/` 及 State 文档。当前只提交设计；公共契约经总设计师批准后，才进入 cmd-impl。模型运行、工具、压缩和技能属于 Intelligence；认证、机器 registry、前端与应用装配属于 Gateway。
+本方案以 `kapy_v2.md` 和 `docs/architecture.md` 为准，并对齐 main 提交 `61af09e` 的 `docs/acceptance.md` 与 `.context/delivery.md`，范围是 `src/kapy/state/`、`tests/state/` 及 State 文档。当前只提交设计；公共契约经总设计师批准后，才进入 cmd-impl。模型运行、工具、压缩和技能属于 Intelligence；认证、机器 registry、前端与应用装配属于 Gateway。
 
 ## 1. 已确认的技术基础
 
 2026-09-07 在本 worktree 执行 `uv sync --locked` 成功：Python 3.14.4、psycopg 3.3.5、psycopg-pool 3.3.1、valkey 6.1.1、sqlglot 30.18.0、pydantic-ai-slim 2.40.0。代码仓库只有初始脚手架，尚无 State 实现。
 
-只读探测确认指定开发 PostgreSQL 为 17.11，仅安装 plpgsql，开发角色为 superuser；指定 Valkey 的 PING 成功。没有读取 `.env`。后续 State 集成使用每次随机的 PostgreSQL schema 和同名 Valkey 前缀，不共享表、频道、迁移锁或清理范围。
+只读探测确认指定开发 PostgreSQL 为 17.11，仅安装 plpgsql，开发角色为 superuser；指定 Valkey 的 PING 成功。没有读取 `.env`。后续 State 集成使用每次随机的 PostgreSQL schema 和同名 Valkey 前缀，不共享表、频道、迁移锁或清理范围。恢复场景只重启隔离的 control process，或使用专属可丢弃服务；禁止重启共享 PostgreSQL/Valkey，禁止 FLUSHDB/FLUSHALL 或删除其他 owner 的数据，清理只针对本次创建的 schema 和精确 namespace。
 
 直接使用 psycopg 异步连接池、参数 SQL 和 `dict_row`，数据库读出只做 TypedDict/cast 或无校验 dataclass 装配，不经过 Pydantic/ORM validation。Gateway 校验外部参数，State 检查业务约束。pool 使用 `open=False` 并显式 `await open()`；连接和事务由 State 所有。[psycopg 连接 API](https://www.psycopg.org/psycopg3/docs/api/connections.html)
 
@@ -34,6 +34,8 @@
 ## 3. 运行与资源所有权
 
 Gateway 在应用 lifespan 中创建并进入 `SessionService`，退出时关闭它。State 拥有 pool、一个 Valkey 客户端及 PubSub、后台协调任务和每 session 至多一个 runner task；runner 回调由 Intelligence 注入。不同 session 的模型/机器 I/O 并行；同一 session 的 runner 永不重叠。状态写入使用短事务串行提交，不把模型、机器 RPC、等待 hint 或用户 long-poll 放进数据库事务。
+
+总设计师的验收负载为 100 个 fake-runner session、每个 20 条输入，以及向 100 个 listener 广播。实现保留上述并发模型，按该负载记录 accepted/completed/replayed 数量、session 内顺序、耗时、吞吐和事件完成延迟；不把 Valkey hint 计作实际投递，也不凭空承诺吞吐门槛。这些是批准后需要提供的证据，当前尚未执行。
 
 启动取得 schema 专属的 PostgreSQL session advisory lock，拒绝同 schema 的第二个 control process，更新 service epoch 后恢复持久任务。独立锁连接断开即停止接收变更并取消本地 runner；每个写事务再核对 epoch，每个 runner 写入还核对 run_id/attempt，拒绝旧进程或旧 attempt 的迟到结果。
 
