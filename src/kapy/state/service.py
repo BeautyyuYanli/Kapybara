@@ -682,12 +682,7 @@ class SessionService:
                     (request_id, digest, Jsonb(False) if not row else None, session_id),
                 )
             if not row:
-                if prior:
-                    # A persisted intent proves this deletion targeted an existing session.
-                    await conn.execute(
-                        "UPDATE requests SET receipt=%s WHERE id=%s", (Jsonb(True), request_id)
-                    )
-                return prior is not None
+                return False
         task = self._tasks.get(session_id)
         if task and task is not asyncio.current_task():
             task.cancel()
