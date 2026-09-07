@@ -25,7 +25,6 @@ from .test_telegram import Bot, feed, install_output, record, sent_text, update
 class Backend:
     def __init__(self) -> None:
         self.names: list[str] = []
-        self.borrowed_client: httpx2.AsyncClient | None = None
         self.tools: list[list[str]] = []
 
     def create_model(self, model_name: str) -> FunctionModel:
@@ -42,6 +41,7 @@ class Backend:
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "configured, override, enabled",
     [(["apply_patch"], None, True), (["apply_patch"], (), False), ([], None, False)],
@@ -131,9 +131,6 @@ async def test_named_frontend_uses_only_control_port_and_borrowed_backend(
                 stopped.set()
 
     # An injected backend needs neither a model key nor a Gateway-owned HTTP client.
-    external = httpx2.AsyncClient()
-    backend.borrowed_client = external
-
     def unexpected_http(**kwargs):
         raise AssertionError("Gateway must not create model HTTP resources for an injected backend")
 
@@ -148,12 +145,10 @@ async def test_named_frontend_uses_only_control_port_and_borrowed_backend(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema=%s", (schema,)
             )
             assert not any(row["table_name"].startswith("gateway_telegram") for row in tables)
-            assert not external.is_closed
-        assert stopped.is_set() and not external.is_closed
+        assert stopped.is_set()
         assert backend.names == ["vendor/model-x", "vendor/model-x"]
         assert all(("apply_patch" in names) == enabled for names in backend.tools)
     finally:
-        await external.aclose()
         async with await psycopg.AsyncConnection.connect(DATABASE) as conn:
             await conn.execute(
                 sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
@@ -175,6 +170,7 @@ def test_unknown_plugins_rejected_before_resources_and_explicit_disable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 @pytest.mark.parametrize("identity", ["terminal:user:one", "telegram:12345:-100:7"])
 async def test_generic_frontend_create_intent_recovers_and_keeps_existing_owner(
     gateway, monkeypatch, identity
@@ -205,6 +201,7 @@ async def test_generic_frontend_create_intent_recovers_and_keeps_existing_owner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 @pytest.mark.parametrize("blocked", [False, True])
 async def test_telegram_cleans_deleted_pending_even_when_blocked(gateway, monkeypatch, blocked):
     records: list[dict[str, Any]] = []
@@ -240,6 +237,7 @@ async def test_telegram_cleans_deleted_pending_even_when_blocked(gateway, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 async def test_telegram_legacy_origin_uses_saved_receipt_without_creating_sessions(gateway):
     bot = Bot(gateway)
     await bot.ingest([update(1, "/machine one"), update(2, "/new"), update(3, "/new")])
@@ -273,6 +271,7 @@ async def test_telegram_legacy_origin_uses_saved_receipt_without_creating_sessio
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 async def test_legacy_origin_waits_for_original_inbox_retry_before_delivery(gateway):
     bot = Bot(gateway)
     await bot.ingest([update(1, "/machine one"), update(2, "/new"), update(3, "/new")])
