@@ -39,7 +39,7 @@ Initial scaffold: a715b926c1f7da46be82b2afc26f31e330d9bf94.
 | Execution | 515746bc-f9e2-4d09-a894-65067a65f369 | feat/kapyrpc | cmd-impl approved |
 | State | 37703573-1ccd-4f8b-a137-ba52ca9e8e60 | feat/kapy | cmd-impl approved |
 | Intelligence | a88a199c-41c1-49d6-ad09-2d5b87f80b12 | feat/kapy-agentskills | Proposal in progress |
-| Gateway | 0f9cff83-dff7-4881-b5a1-a6b1e761dd27 | feat/kapycli | Proposal in progress |
+| Gateway | 0f9cff83-dff7-4881-b5a1-a6b1e761dd27 | feat/kapycli | cmd-impl approved |
 
 Initial asynchronous operation: kapy-v2-initial-proposals-20260907.
 Lody delivers completion automatically. Do not poll operation_get in a loop.
@@ -118,6 +118,28 @@ not reasons to poll operation_get. Inspect final commits/proposals as delivered.
   codec reuse. Ask for early rpc/types/DaemonConfig commit then full cmd-impl.
 - These two doc branches were merged into main. Future implementation merges must
   be reviewed and tested separately. Intelligence/Gateway are not approved yet.
+
+## Later approvals and coordination
+
+- Gateway approved via kapy-gateway-impl-approval-20260907 at ~12:39 UTC after
+  full revised proposal read. Required same-turn corrections: no cgroup, use
+  dispatch_json, directly use approved State.wait_submission (not duplicate scan),
+  lend metadata pool to Skills/AgentPayloadStore, adapt Intelligence's exports and
+  expected_revision, own skill creator metadata, wire media cleanup after runner
+  stops, API usage only. Then run its own complete cmd-impl; no further approval
+  needed for these specified corrections. Intelligence remains proposal-only.
+- Execution old turn was cancelled at 12:34 UTC to stop obsolete host/cgroup
+  research. `kapy-execution-docker-impl-resume-20260907` sent a consolidated full
+  implementation approval with Docker-only machine tests and best-effort cleanup.
+  Reuse persistent Elysia if already spawned. Dedicated machine image is built and
+  Compose machine is running; container imports State contract and reaches PG/Valkey.
+- AgentPayloadStore design (Intelligence owns session-scoped stable bytes and
+  delete_session, borrows Gateway pool) and authorize_wait callback approved in
+  kapy-intelligence-final-decisions-20260907. Requested final revised proposal before
+  implementation; token compression must use per-response usage only, one sweep
+  per fresh usage observation, no stale-usage repeated degradation/local counting.
+- Last current-session inbox read includes messages through 12:34:58 UTC. Keep
+  reading the current Lody history occasionally to catch queued real user steering.
 
 ## Remaining lead work
 
