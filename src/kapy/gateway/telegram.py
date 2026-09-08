@@ -5,6 +5,7 @@ Bot API calls are injectable for tests. Production never logs token-bearing URLs
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import random
@@ -118,7 +119,7 @@ def rich_rejection(description: Any) -> bool:
 
 def empty_projection() -> dict[str, Any]:
     """Only install over a legacy row after an offline, verified drain."""
-    return {"version": 1, "messages": {}}
+    return {"version": 2}
 
 
 class ProjectionMigrationRequired(ValueError):
@@ -126,13 +127,11 @@ class ProjectionMigrationRequired(ValueError):
 
 
 def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    if previous and previous.get("version") != 1:
+    if previous and previous.get("version") != 2:
         raise ProjectionMigrationRequired(
             "Telegram projection requires offline drain and migration"
         )
     projection = copy.deepcopy(previous or empty_projection())
-    messages = projection["messages"]
-    order = projection.setdefault("message_order", [])
     for record in records:
         kind = record["kind"]
         data = record.get("data") or {}
@@ -140,45 +139,65 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
             data = {}
         if record.get("cursor") is not None:
             projection["cursor"] = record["cursor"]
-        if kind not in {"text_delta", "model_response", "final", "error", "interrupted", "notice"}:
+        if kind not in {
+            "text_delta",
+            "model_response",
+            "tool_call",
+            "tool_result",
+            "final",
+            "error",
+            "interrupted",
+            "notice",
+        }:
+            continue
+        if kind == "notice" and data.get("kind") != "attempt_failed":
             continue
         run = record.get("run_id")
         if run is not None:
+            if run != projection.get("run_id"):
+                for field in ("message", "progress", "last_response"):
+                    projection.pop(field, None)
             projection["run_id"] = run
         key = record.get("message_id") or ""
-        if kind in {"text_delta", "model_response"}:
-            if key not in messages:
-                order.append(key)
-            message = messages.setdefault(key, {"parts": {}, "text": None})
+        if kind == "text_delta":
+            text = data.get("text", "")
+            if not text:
+                continue
+            message: dict[str, Any] | None = projection.get("message")
+            if message is None or message["id"] != key:
+                message = dict[str, Any](id=key, parts={})
+                projection["message"] = message
+            projection.pop("progress", None)
+            part = str(data.get("part_index", 0))
+            message["parts"][part] = message["parts"].get(part, "") + text
+        elif kind in {"tool_call", "tool_result", "notice", "interrupted"}:
+            if kind == "notice":
+                message = projection.get("message")
+                if message is not None and message["id"] != data.get("failed_message_id"):
+                    continue
+            projection.pop("message", None)
+            projection["progress"] = progress_text(kind, data)
+        elif kind in {"model_response", "final", "error"}:
+            following = empty_projection()
+            if "chat_type" in projection:
+                following["chat_type"] = projection["chat_type"]
             if kind == "model_response":
-                message["text"] = record.get("text", "")
-                message["parts"] = {}
-            elif message["text"] is None:
-                part = str(data.get("part_index", 0))
-                message["parts"][part] = message["parts"].get(part, "") + str(data.get("text", ""))
-        elif kind == "notice" and data.get("kind") == "attempt_failed":
-            failed = data.get("failed_message_id")
-            if failed in messages and messages[failed]["text"] is None:
-                del messages[failed]
-                order.remove(failed)
-        elif kind in {"interrupted", "error"}:
-            for message_id in list(messages):
-                if messages[message_id]["text"] is None:
-                    del messages[message_id]
-                    order.remove(message_id)
-        if kind in {"final", "error"}:
-            completed = [
-                messages[key]["text"] for key in order if messages[key]["text"] is not None
-            ]
-            if kind == "final":
+                text = record.get("text", "")
+                projection.pop("message", None)
+                if not text:
+                    continue
+                if "run_id" in projection:
+                    following["run_id"] = projection["run_id"]
+                following["last_response"] = {
+                    "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                }
+            elif kind == "final":
                 output = data.get("output", record.get("text", ""))
-                final = output if isinstance(output, str) else ""
-                # The final result replaces the last response, preserving tool preambles.
-                if final:
-                    if completed:
-                        completed[-1] = final
-                    else:
-                        completed.append(final)
+                text = output if isinstance(output, str) else ""
+                if hashlib.sha256(text.encode()).hexdigest() == projection.get(
+                    "last_response", {}
+                ).get("sha256"):
+                    text = ""
             else:
                 category = data.get("kind", "")
                 # Unknown failures expose only their exception category; trusted
@@ -189,29 +208,39 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
                     else ""
                 )
                 explanation = data.get("public_message")
-                completed.append(
+                text = (
                     "Sorry, I couldn’t complete this reply. " + explanation
                     if isinstance(explanation, str) and 0 < len(explanation) <= 1024
                     else "Sorry, I couldn’t complete this reply." + (f" ({safe})" if safe else "")
                 )
-            text = "\n\n".join(text for text in completed if text)
-            following = empty_projection()
-            if "chat_type" in projection:
-                following["chat_type"] = projection["chat_type"]
             projection["pending"] = {
                 "text": text,
                 "cursor": projection.get("cursor"),
                 "next": following,
-                "format": "rich" if kind == "final" else "plain",
+                "format": "plain" if kind == "error" else "rich",
             }
             break
-    preview = "\n\n".join(
-        m["text"]
-        if m["text"] is not None
-        else "".join(m["parts"][part] for part in sorted(m["parts"], key=int))
-        for m in (messages[key] for key in order)
+    message = projection.get("message")
+    preview = (
+        "".join(message["parts"][part] for part in sorted(message["parts"], key=int))
+        if message is not None
+        else projection.get("progress", "")
     )
     return preview, projection
+
+
+def progress_text(kind: str, data: dict[str, Any]) -> str:
+    """Only the latest, bounded progress preview; never persist it as a chat message."""
+    if kind == "notice":
+        return "Retrying this reply…"
+    if kind == "interrupted":
+        return "Resuming this reply…"
+    label = f"Using {data.get('name') or 'tool'}" if kind == "tool_call" else "Tool returned"
+    content = data.get("summary", data.get("args" if kind == "tool_call" else "result", ""))
+    detail = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    text = label + (f"\n{detail}" if detail else "…")
+    suffix = "… [truncated]"
+    return text if len(text) <= 2000 else text[: 2000 - len(suffix)] + suffix
 
 
 class TelegramFrontend:
@@ -232,7 +261,7 @@ class TelegramFrontend:
         self.disabled = False
         self._chat_ready: dict[int, float] = {}
         self._chat_locks: dict[int, asyncio.Lock] = {}
-        self._draft_sent: dict[int, tuple[str, float]] = {}
+        self._draft_sent: dict[int, tuple[str, bool, float]] = {}
 
     def principal(self, chat: int, thread: int) -> Principal:
         return Principal(
@@ -887,7 +916,7 @@ class TelegramFrontend:
     async def _deliver_row(self, row: dict[str, Any]) -> bool:
         key = (self.bot_id, row["chat_id"], row["thread_id"], row["session_id"])
         projection = row["projection"]
-        if projection and projection.get("version") != 1:
+        if projection and projection.get("version") != 2:
             raise ProjectionMigrationRequired(
                 "Telegram projection requires offline drain and migration"
             )
@@ -984,24 +1013,26 @@ class TelegramFrontend:
                         else (await self.api("getChat", {"chat_id": row["chat_id"]}))["type"]
                     )
                 if projection["chat_type"] == "private":
-                    text = rich_chunk(preview)[0]
-                    if not draft.get("plain") and not text and preview:
-                        draft["plain"] = True
-                        self._draft_sent.pop(draft["id"], None)
+                    message = projection.get("message")
+                    rich = message is not None and not message.get("plain")
+                    text = rich_chunk(preview)[0] if rich else text_chunk(preview)[0]
+                    if rich and not text and preview:
+                        assert message is not None
+                        message["plain"] = True
                         await self._save_projection(projection, key)
-                    if draft.get("plain"):
+                        rich = False
                         text = text_chunk(preview)[0]
                     sent = self._draft_sent.get(draft["id"])
-                    if sent is None or sent[0] != text or time.monotonic() - sent[1] >= 20:
+                    if sent is None or sent[:2] != (text, rich) or time.monotonic() - sent[2] >= 20:
                         try:
-                            send = self.send_draft if draft.get("plain") else self.send_rich_draft
+                            send = self.send_rich_draft if rich else self.send_draft
                             await send(row["chat_id"], row["thread_id"], draft["id"], text)
-                            self._draft_sent[draft["id"]] = (text, time.monotonic())
+                            self._draft_sent[draft["id"]] = (text, rich, time.monotonic())
                         except TelegramFailure as exc:
-                            if not draft.get("plain") and exc.rich_content_rejected:
-                                draft["plain"] = True
-                                self._draft_sent.pop(draft["id"], None)
-                            elif draft.get("plain") and exc.code == 400:
+                            if rich and exc.rich_content_rejected:
+                                assert message is not None
+                                message["plain"] = True
+                            elif not rich and exc.code == 400:
                                 draft["unavailable"] = True
                             else:
                                 raise

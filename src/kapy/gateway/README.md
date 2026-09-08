@@ -123,53 +123,68 @@ ports; process and filesystem isolation remain enabled. The regression starts th
 `kapy server` entry, exercises authenticated child CLI calls and multichunk skill transfers,
 checks reconnect, and waits for durable final deletion to remove the machine session.
 
-Telegram replies use one stable nonzero `sendRichMessageDraft` ID per logical run in
-private chats (including private topics), refreshing changed text and idle drafts
-about every 20 seconds. Tool calls and waiting/attempt notices are not chat messages.
-Completed model messages provide authoritative text; failed temporary attempts are
-removed. Groups and group topics receive only the final reply. Final replies are
-persisted with `sendRichMessage`, sending raw `rich_message.markdown`. Rich source
-uses a conservative 32768 UTF-8 byte budget, splitting at blank lines outside ordinary
-backtick/tilde fences. Oversized indivisible blocks fall back to plain `sendMessage`
-within 4000 UTF-16 units, without truncation or synthetic wrappers. A draft is temporary, expires after roughly 30 seconds,
-and is never a final receipt. Restart sends the active draft again. Explicit rich
-content rejection falls back to plain draft; a plain draft HTTP 400 falls back to
-final-only delivery. Errors remain natural, explicit failures without
-raw exception strings. Normal replies and implicit session creation have no session
-IDs; `/new` gives a brief confirmation.
+Telegram gives each message its own draft lifecycle in private chats (including
+private topics). The latest tool call/result, retry or recovery status appears as a
+plain temporary preview, limited to 2000 characters with an explicit truncation marker.
+The first nonempty text delta replaces that progress with the new message's Rich
+Markdown; subsequent parts accumulate in numeric order. An empty delta leaves progress
+visible. The draft ID stays stable during this preview, with roughly 20-second refreshes.
+Every complete model response with text is sent immediately using `sendRichMessage`,
+without waiting for the whole run to finish. Formal acknowledgement ends that draft;
+the next progress or message uses a new ID. Groups and group topics send each complete
+message without drafts. Progress never becomes a permanent log message.
 
-Delivery projection version 1 reuses the existing cursor, pending text, and acknowledged
-character offset. Terminal processing stops at the terminal record's cursor, leaving
-later runs for another read. Same-route sessions follow their creating inbox update
-order; pending or running replies block later sessions, while drained waiting sessions
-do not. HTTP retry deadlines survive restart. A successful send with a lost response
-or database acknowledgement may repeat the unacknowledged segment (at least once).
+Rich source uses a conservative 32768 UTF-8 byte budget, splitting at blank lines
+outside ordinary backtick/tilde fences. Oversized indivisible blocks fall back to plain
+`sendMessage` within 4000 UTF-16 units, without truncation or synthetic wrappers. A draft
+expires after roughly 30 seconds and is never a formal receipt. Restart sends the active
+draft again. Explicit rich content rejection falls back to plain for the current message's
+draft; later messages try rich again. A plain draft HTTP 400 disables that draft, while
+formal delivery continues. Failed partial messages are replaced by a recovery notice;
+already sent messages remain. Terminal errors are separate natural failure messages,
+without raw exception strings or repeated earlier body text. Normal replies and implicit
+session creation have no session IDs; `/new` gives a brief confirmation.
 
-Upgrade contract: `empty_projection()` returns exactly `{"version": 1, "messages": {}}`.
-A newly empty `{}` initializes normally. Any nonempty unversioned projection requires
-operator migration and is left untouched; Gateway logs the required offline drain.
-For the controlled upgrade, stop old control, verify every session has no active run,
-every delivery cursor has reached output end, and no pending text or nonzero offset
-exists. Only then replace projections with this empty shape while preserving cursors.
-If input or output raced the stop, resume the old version and drain before trying again.
-Never reset active delivery state, replay historical completed messages, or discard
-unacknowledged text. No migration runner or legacy rendering emulation is provided.
+Delivery projection version 2 reuses the existing cursor, single pending body, and
+acknowledged raw-character offset. Reading stops at every nonempty complete message;
+its pending text is persisted before sending and fully acknowledged before reading
+later records. Only the active message, latest progress and last acknowledged response
+fingerprint are retained; there is no accumulated run message list. An identical final
+result is omitted, while a different result or one without a preceding response is sent.
+Repeated text in distinct messages or runs is still delivered. Structured reply/wait
+outputs and waiting records are not rendered as diagnostics. Same-route sessions follow
+their creating inbox order; pending or running replies block later sessions, while drained
+waiting sessions do not. HTTP retry deadlines survive restart. A successful send with a
+lost response or database acknowledgement may repeat the unacknowledged segment
+(at least once).
+
+Upgrade contract: `empty_projection()` returns exactly `{"version": 2}`. A newly empty
+`{}` initializes normally. Any nonempty older projection, including version 1 pending
+text, requires operator migration and is left untouched; Gateway logs the required
+offline drain. Stop old control, verify every session has no active run, every delivery
+cursor has reached output end, and no pending text or nonzero offset exists. Only then
+replace projections with this empty shape while preserving cursors. If input or output
+raced the stop, resume the old version and drain before trying again. Never reset active
+delivery state, replay historical completed messages, or discard unacknowledged text.
+No migration runner or legacy rendering emulation is provided.
 
 Rich Markdown needs no MarkdownV2 escaping, parse_mode, or local renderer. Telegram
 validates its structural limits (500 blocks, nesting depth 16, tables up to 20 columns);
 its documented 32768 UTF-8 character limit is distinct from our conservative byte budget.
-Commands and error pending bodies always use plain text. New final pending adds
-`format: "rich"`; existing version 1 pending without that field remains plain.
+Commands and error pending bodies always use plain text. Model message pending uses
+`format: "rich"`; content rejection persists its switch to `format: "plain"`.
 `item_offset` counts acknowledged Python characters in original source, including CRLF,
-never encoded bytes or added formatting. No migration is required.
+never encoded bytes or added formatting. No database table migration is required;
+the projection upgrade still requires the verified drain described above.
 
 Only the four verified rich HTTP/API 400 content-limit descriptions trigger persistent
 `format: "plain"`; raw descriptions are neither saved nor logged. Unknown/non-content
 400 stays blocked; 429, network errors, server failures, and lost acknowledgements
 keep the original format and offset. A rich prefix may be followed by plain remaining
 source if an oversized fence/table cannot be safely split. Draft format rejection or
-an oversized indivisible preview sets a run-local plain marker and clears its send cache;
-final rich formatting is attempted independently. Drafts may contain incomplete Markdown.
+an oversized indivisible preview sets a plain marker on the current message. The send
+cache compares both text and format; each complete message attempts rich delivery
+independently. Drafts may contain incomplete Markdown.
 See https://core.telegram.org/bots/api#rich-message-formatting-options.
 
 Content rejection evidence is recorded in `.context/delivery.md` at architect commit

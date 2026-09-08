@@ -240,14 +240,14 @@ async def test_model_command_updates_waiting_session_with_persistent_run_id(gate
     assert (await gateway.sessions.get_session(sid)).config["model"]["max_output_tokens"] == 1000
 
 
-async def test_terminal_projection_releases_accumulated_messages():
+async def test_terminal_projection_releases_temporary_message():
     preview, projection = project(
         [{"kind": "text_delta", "message_id": "same", "data": {"text": "Hello"}}], {}
     )
     assert preview == "Hello"
     _, projection = project([{"kind": "final", "data": {"output": "Hello"}}], projection)
     assert projection["pending"]["text"] == "Hello"
-    assert projection["pending"]["next"] == {"version": 1, "messages": {}}
+    assert projection["pending"]["next"] == {"version": 2}
 
 
 @pytest.mark.parametrize("loop", ["poll", "process", "deliver"])
