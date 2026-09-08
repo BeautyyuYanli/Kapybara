@@ -398,7 +398,6 @@ async def test_running_session_freezes_connection_and_next_run_uses_current_defa
         return result["completion"]
 
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
-        gateway.runner = None
         gateway.http_client = http
         made = await create(gateway, input="first", machine_ids=[], default_machine_id=None)
         sid = made["session"]["id"]

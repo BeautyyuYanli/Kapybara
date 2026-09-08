@@ -303,7 +303,7 @@ async def test_model_snapshot_and_reserved_steer_at_natural_end() -> None:
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
         agent = runner(client)
         ctx = Context(agent.initial_state(instructions="Original instruction", skills=[]))
-        ctx.session = replace(ctx.session, config={"model": "custom-model"})
+        agent.config = replace(agent.config, model="custom-model")
         result = await agent(ctx)
     assert len(requests) == 2
     assert requests[0]["model"] == requests[1]["model"] == "custom-model"

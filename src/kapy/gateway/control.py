@@ -43,7 +43,7 @@ from .models import Providers, invalid, parse_session_model, public_provider
 from .storage import Metadata
 
 if TYPE_CHECKING:
-    from kapy.agent import AgentPayloadStore, Runner
+    from kapy.agent import AgentPayloadStore
     from kapy.skills import SkillService
     from kapy.state import SessionService
 
@@ -142,7 +142,6 @@ class ControlService:
         metadata: Metadata,
         sessions: SessionService,
         skills: SkillService,
-        runner: Runner | None = None,
         http_client: httpx2.AsyncClient,
         model_backend_factory: ModelBackendFactory = create_model_backend,
         plugins: Sequence[ScriptTool] = (),
@@ -153,7 +152,6 @@ class ControlService:
         self.metadata = metadata
         self.sessions = sessions
         self.skills = skills
-        self.runner = runner
         self.http_client = http_client
         self.model_backend_factory = model_backend_factory
         self.plugins = tuple(plugins)
@@ -550,47 +548,44 @@ class ControlService:
     async def run(self, context: RunContext) -> RunResult:
         while await self.metadata.access(context.session.id) is None:  # noqa: ASYNC110 - durable gate
             await asyncio.sleep(0.05)
-        if self.runner is not None:
-            result = await self.runner(context)
-        else:
-            try:
-                selected = parse_session_model(context.session.config.get("model"))
-                provider, model, window, output = await self.providers.effective(selected)
-                identity = json.dumps(
-                    [
-                        str(provider["id"]),
-                        provider["revision"],
-                        provider["type"],
-                        provider["base_url"],
-                        str(model["id"]),
-                        model["name"],
-                    ]
-                )
-                runner = Runner(
-                    RunnerConfig(
-                        model=model["name"],
-                        context_window_tokens=window,
-                        max_output_tokens=output,
-                        compression_ratio=self.settings.compression_ratio,
-                        keep_recent_ratio=self.settings.keep_recent_ratio,
-                        media_max_bytes=self.settings.media_max_bytes,
-                    ),
-                    self.machines,
-                    model_backend=self.model_backend_factory(
-                        self.providers.connection(provider), self.http_client
-                    ),
-                    payload_store=self.payload_store,
-                    authorize_wait=self.authorize_wait,
-                    plugins=self.plugins,
-                    model_identity=identity,
-                )
-                result = await runner(context)
-            except RpcError as exc:
-                raise RuntimeError(exc.message) from None
-            except Exception:
-                raise RuntimeError(
-                    "Model execution failed; check model configuration or retry"
-                ) from None
+        try:
+            selected = parse_session_model(context.session.config.get("model"))
+            provider, model, window, output = await self.providers.effective(selected)
+            identity = json.dumps(
+                [
+                    str(provider["id"]),
+                    provider["revision"],
+                    provider["type"],
+                    provider["base_url"],
+                    str(model["id"]),
+                    model["name"],
+                ]
+            )
+            runner = Runner(
+                RunnerConfig(
+                    model=model["name"],
+                    context_window_tokens=window,
+                    max_output_tokens=output,
+                    compression_ratio=self.settings.compression_ratio,
+                    keep_recent_ratio=self.settings.keep_recent_ratio,
+                    media_max_bytes=self.settings.media_max_bytes,
+                ),
+                self.machines,
+                model_backend=self.model_backend_factory(
+                    self.providers.connection(provider), self.http_client
+                ),
+                payload_store=self.payload_store,
+                authorize_wait=self.authorize_wait,
+                plugins=self.plugins,
+                model_identity=identity,
+            )
+            result = await runner(context)
+        except RpcError as exc:
+            raise RuntimeError(exc.message) from None
+        except Exception:
+            raise RuntimeError(
+                "Model execution failed; check model configuration or retry"
+            ) from None
         await self.authorize_wait(context.session.id, result.wait_for)
         return result
 

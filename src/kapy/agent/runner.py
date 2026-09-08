@@ -177,11 +177,7 @@ class Runner:
         return RunnerState(CODEC, cast(JsonObject, data))
 
     async def __call__(self, context: RunContext) -> RunResult:
-        model = context.session.config.get("model", self.config.model)
-        if isinstance(model, dict):
-            model = self.config.model
-        if not isinstance(model, str) or not model.strip():
-            raise ValueError("Session model must be a nonempty string")
+        model = self.config.model
         runtime = Runtime(self, context, model)
         await runtime.initialize()
         machine = MachineTools(runtime, self.machine_caller, self.plugins)
@@ -493,9 +489,10 @@ class Runtime:
         await self.context.emit(OutputDelta(uuid4(), self.message_id, cast(Any, kind), envelope))
 
     async def stream_text(self, index: int, value: str) -> None:
-        # Bound JSON-escaped bytes, including multibyte characters and control characters.
+        # State records use ASCII-escaped JSON: one scalar can occupy 12 bytes.
+        # Leave room for the record envelope under its 16 KiB transport limit.
         while value:
-            count = min(len(value), 2048)
+            count = min(len(value), 1024)
             await self.emit("text_delta", {"part_index": index, "text": value[:count]})
             value = value[count:]
 

@@ -23,14 +23,14 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 async def test_rejected_running_update_stays_rejected_after_run_completes(gateway, monkeypatch):
     entered, finish = asyncio.Event(), asyncio.Event()
-    original = type(gateway.runner).__call__
+    original = gateway.http_client.send
 
-    async def blocked(self, context):
+    async def blocked(*args, **kwargs):
         entered.set()
         await finish.wait()
-        return await original(self, context)
+        return await original(*args, **kwargs)
 
-    monkeypatch.setattr(type(gateway.runner), "__call__", blocked)
+    monkeypatch.setattr(gateway.http_client, "send", blocked)
     created = await create(gateway, input="running")
     await asyncio.wait_for(entered.wait(), 1)
     sid = created["session"]["id"]

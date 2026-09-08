@@ -129,13 +129,17 @@ async def test_delivery_resume_partial_unicode_output(gateway):
     await bot.process_once()
     await bot.process_once()
     sid = (await bot.route(-100, 7))["session_id"]
-    await gateway.sessions.wait_submission(
+    status = await gateway.sessions.wait_submission(
         sid, UUID(request_id(12345, 2, "message.create")), wait_seconds=5
     )
+    assert status.completion is not None and status.completion.outcome == "completed"
     bot.sent.clear()
-    await bot.deliver_once()
-    row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
-    assert row["item_offset"] > 0
+    async with asyncio.timeout(5):
+        while True:
+            await bot.deliver_once()
+            row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
+            if row["item_offset"] > 0:
+                break
     first = sent_text(bot.sent[0][1])
     bot = Bot(gateway)
     for _ in range(12):
@@ -240,11 +244,16 @@ async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadlin
         await bot.process_once()
         await bot.process_once()
         sid = (await bot.route(-100, 7))["session_id"]
-        await gateway.sessions.wait_submission(
+        status = await gateway.sessions.wait_submission(
             sid, UUID(request_id(12345, 1, "message.create")), wait_seconds=5
         )
-        await bot.deliver_once()
-        first = await delivery()
+        assert status.completion is not None and status.completion.outcome == "completed"
+        async with asyncio.timeout(5):
+            while True:
+                await bot.deliver_once()
+                first = await delivery()
+                if first["item_offset"] > 0:
+                    break
         pending = first["projection"]["pending"]
         assert first["item_offset"] > 0
         assert content in pending["text"]

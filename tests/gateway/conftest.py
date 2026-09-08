@@ -1,6 +1,7 @@
+import json
 import os
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx2
@@ -19,7 +20,7 @@ from kapy.gateway.telegram_storage import migrate as migrate_telegram
 from kapy.rpc import JsonObject
 from kapy.settings import Settings
 from kapy.skills import SkillService
-from kapy.state import CheckpointWrite, RunnerState, RunResult, SessionService
+from kapy.state import SessionService
 from kapy.state import migrate as migrate_state
 
 MODEL_ID = "667bb0e0-0843-4690-a081-d39d0510a553"
@@ -30,23 +31,12 @@ DATABASE = os.environ.get("KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127
 VALKEY = os.environ.get("KAPY_VALKEY_URL", "redis://127.0.0.1:56379/0")
 
 
-class EchoRunner:
-    def initial_state(self, *, instructions, skills):
-        return RunnerState(
-            "gateway.test", {"instructions": instructions, "skills": [s.id for s in skills]}
-        )
+def echo_model(request):
+    from agent.test_runner import response
 
-    async def __call__(self, context):
-        return RunResult(
-            output=" ".join(str(item.payload) for item in context.inputs),
-            wait_for=(),
-            checkpoint=CheckpointWrite(
-                context.checkpoint_number + 1,
-                context.state,
-                (),
-                tuple(i.id for i in context.inputs),
-            ),
-        )
+    messages = json.loads(request.content)["messages"]
+    prompt = next(item["content"] for item in reversed(messages) if item["role"] == "user")
+    return response(text=prompt)
 
 
 @pytest_asyncio.fixture
@@ -66,7 +56,10 @@ async def gateway() -> AsyncIterator[Any]:
     await migrate(DATABASE, schema=schema)
     await migrate_state(DATABASE, schema=schema)
     try:
-        async with AsyncConnectionPool(DATABASE, open=False) as pool, httpx2.AsyncClient() as http:
+        async with (
+            AsyncConnectionPool(DATABASE, open=False) as pool,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(echo_model)) as http,
+        ):
             await pool.wait()
             await migrate_telegram(pool, schema=schema)
             metadata = Metadata(pool, schema=schema)
@@ -91,7 +84,6 @@ async def gateway() -> AsyncIterator[Any]:
                 metadata=metadata,
                 sessions=sessions,
                 skills=skills,
-                runner=cast(Any, EchoRunner()),
                 http_client=http,
                 machines=registry,
                 payload_store=payloads,
