@@ -20,6 +20,17 @@ remain replaceable interfaces. Runner never closes the shared HTTP client. Provi
 are sanitized by Gateway before State persists them. Detailed resource and budget precedence
 is in [models](models.md).
 
+Thinking display uses only Pydantic AI `ThinkingPart.content` and
+`ThinkingPartDelta.content_delta`, emitted through existing notice records with
+`kind="thinking_delta"`, `part_index` and text. Signatures, encrypted content and
+provider metadata remain in the message codec and never enter these display events.
+For SDK profiles advertising support, Responses requests native reasoning summary
+`auto` and Google requests `include_thoughts=true`; neither sets effort or a thinking
+budget. Chat accepts thinking already parsed by the SDK without extra request fields.
+Unknown profiles or providers returning no text have no artificial thinking fallback.
+Tool-result display events include the known tool name, including the existing large
+content fallback; full results continue to use the normal history/checkpoint path.
+
 ## Persistence and recovery
 
 Runner snapshots use `kapy.agent.v2` and state version 2. Older snapshots are rejected without

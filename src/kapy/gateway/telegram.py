@@ -150,16 +150,24 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
             "notice",
         }:
             continue
-        if kind == "notice" and data.get("kind") != "attempt_failed":
+        if kind == "notice" and data.get("kind") not in {"attempt_failed", "thinking_delta"}:
             continue
         run = record.get("run_id")
         if run is not None:
             if run != projection.get("run_id"):
-                for field in ("message", "progress", "last_response"):
+                for field in ("message", "progress", "thinking", "last_response"):
                     projection.pop(field, None)
             projection["run_id"] = run
         key = record.get("message_id") or ""
-        if kind == "text_delta":
+        if kind == "notice" and data.get("kind") == "thinking_delta":
+            text = data.get("text", "")
+            if not isinstance(text, str) or not text or projection.get("message") is not None:
+                continue
+            marker = {"message_id": key, "part_index": data.get("part_index", 0)}
+            prior = projection.get("progress", "") if projection.get("thinking") == marker else ""
+            projection["progress"] = (prior + text)[-2000:]
+            projection["thinking"] = marker
+        elif kind == "text_delta":
             text = data.get("text", "")
             if not text:
                 continue
@@ -168,14 +176,21 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
                 message = dict[str, Any](id=key, parts={})
                 projection["message"] = message
             projection.pop("progress", None)
+            projection.pop("thinking", None)
             part = str(data.get("part_index", 0))
             message["parts"][part] = message["parts"].get(part, "") + text
         elif kind in {"tool_call", "tool_result", "notice", "interrupted"}:
             if kind == "notice":
                 message = projection.get("message")
-                if message is not None and message["id"] != data.get("failed_message_id"):
+                active_id = (
+                    message["id"]
+                    if message is not None
+                    else projection.get("thinking", {}).get("message_id")
+                )
+                if active_id is not None and active_id != data.get("failed_message_id"):
                     continue
             projection.pop("message", None)
+            projection.pop("thinking", None)
             projection["progress"] = progress_text(kind, data)
         elif kind in {"model_response", "final", "error"}:
             following = empty_projection()
@@ -184,6 +199,8 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
             if kind == "model_response":
                 text = record.get("text", "")
                 projection.pop("message", None)
+                projection.pop("progress", None)
+                projection.pop("thinking", None)
                 if not text:
                     continue
                 if "run_id" in projection:
@@ -235,12 +252,80 @@ def progress_text(kind: str, data: dict[str, Any]) -> str:
         return "Retrying this reply…"
     if kind == "interrupted":
         return "Resuming this reply…"
-    label = f"Using {data.get('name') or 'tool'}" if kind == "tool_call" else "Tool returned"
+    name = data.get("name")
+    label = name if isinstance(name, str) and name else "Tool"
+    label += " · calling" if kind == "tool_call" else " · returned"
     content = data.get("summary", data.get("args" if kind == "tool_call" else "result", ""))
-    detail = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-    text = label + (f"\n{detail}" if detail else "…")
+    detail = tool_summary(content, calling=kind == "tool_call")
+    return short_progress(label + (f" · {detail}" if detail else ""))
+
+
+def short_progress(text: str) -> str:
+    """At most three lines/300 characters; never silently truncate a preview."""
     suffix = "… [truncated]"
-    return text if len(text) <= 2000 else text[: 2000 - len(suffix)] + suffix
+    lines = text.splitlines()
+    clipped = "\n".join(lines[:3])
+    if len(lines) > 3 or len(clipped) > 300:
+        return clipped[: 300 - len(suffix)] + suffix
+    return clipped
+
+
+def tool_summary(value: Any, *, calling: bool = False) -> str:
+    """Select only direct fields and known process output; no arbitrary JSON rendering."""
+    if isinstance(value, str):
+        if re.search(r"[A-Za-z0-9+/=_-]{100,}", value):
+            return "Long encoded content omitted"
+        if calling and ("\n" in value or "\r" in value):
+            return f"{len(value.splitlines())} lines, {len(value)} characters"
+        return short_progress(value)
+    if isinstance(value, list):
+        return f"{len(value)} items"
+    if not isinstance(value, dict):
+        return "No content" if value is None else str(value)
+    if calling:
+        details = []
+        for key in ("command", "path", "query", "pattern", "patch", "script", "input", "content"):
+            field = value.get(key)
+            if isinstance(field, str) and field:
+                if key in {"patch", "script", "input", "content"}:
+                    details.append(
+                        f"{key}: {len(field.splitlines())} lines, {len(field)} characters"
+                    )
+                else:
+                    details.append(tool_summary(field, calling=True))
+                if len(details) == 2:
+                    break
+        return " · ".join(details) if details else f"{len(value)} parameters"
+    if value.get("error"):
+        # Keep the error category, not an unbounded provider/transport exception.
+        error = value["error"]
+        return "Error · " + (short_progress(error) if isinstance(error, str) else "reported")
+    process = value.get("process", value)
+    details = []
+    if isinstance(process, dict):
+        state = process.get("state")
+        if isinstance(state, str):
+            details.append(state)
+        code = process.get("exit_code")
+        if isinstance(code, int):
+            details.append(f"exit {code}")
+    reason = value.get("reason")
+    if isinstance(reason, str) and reason not in details:
+        details.append(reason)
+    output = value.get("output")
+    if isinstance(output, dict):
+        for stream in ("stderr", "stdout", "pty"):
+            chunk = output.get(stream)
+            if isinstance(chunk, dict) and isinstance(chunk.get("text"), str) and chunk["text"]:
+                details.append(f"{stream}: {tool_summary(chunk['text'])}")
+                if chunk.get("truncated") or chunk.get("display_truncated"):
+                    details.append("Output truncated")
+                break
+    if details:
+        return " · ".join(details)
+    if isinstance(value.get("items"), list):
+        return f"{len(value['items'])} items"
+    return f"Result with {len(value)} fields"
 
 
 class TelegramFrontend:

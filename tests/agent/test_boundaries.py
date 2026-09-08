@@ -146,6 +146,23 @@ async def test_removed_tool_recovery_records_unknown_without_machine_action():
 
 
 @pytest.mark.asyncio
+async def test_large_tool_display_keeps_name_and_complete_history():
+    async with httpx2.AsyncClient() as client:
+        agent = runner(client, plugins=())
+        ctx = Context(agent.initial_state(instructions="", skills=[]))
+        runtime = Runtime(agent, ctx, "test")
+        await runtime.initialize()
+        result = "Complete output line\n" * 2000
+        await runtime.record(ModelResponse([ToolCallPart("custom_report", {}, "call-large")]))
+        await runtime.tool_result("custom_report", "call-large", result)
+        event = ctx.deltas[-1]
+        assert event.kind == "tool_result" and isinstance(event.data, dict)
+        assert event.data["name"] == "custom_report" and "summary" in event.data
+        assert "result" not in event.data
+        assert runtime.current["messages"][-1]["parts"][0]["content"] == result
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["custom_prepare", "apply_patch"])
 async def test_generic_prepare_can_replace_argv_and_transfer_without_name_dispatch(name):
     caller = FilesCaller()

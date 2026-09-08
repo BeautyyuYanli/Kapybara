@@ -19,6 +19,8 @@ from pydantic_ai.messages import (
     RetryPromptPart,
     TextPart,
     TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -544,17 +546,21 @@ class Runtime:
             envelope = {
                 "attempt_id": self.attempt_id,
                 "tool_call_id": data.get("tool_call_id"),
+                "name": data.get("name"),
                 "summary": "Large content is available in the complete history message",
                 "message_id": str(self.message_id),
             }
         await self.context.emit(OutputDelta(uuid4(), self.message_id, cast(Any, kind), envelope))
 
-    async def stream_text(self, index: int, value: str) -> None:
+    async def stream_text(self, index: int, value: str, *, thinking: bool = False) -> None:
         # State records use ASCII-escaped JSON: one scalar can occupy 12 bytes.
         # Leave room for the record envelope under its 16 KiB transport limit.
         while value:
             count = min(len(value), 1024)
-            await self.emit("text_delta", {"part_index": index, "text": value[:count]})
+            data: dict[str, Any] = {"part_index": index, "text": value[:count]}
+            if thinking:
+                data["kind"] = "thinking_delta"
+            await self.emit("notice" if thinking else "text_delta", data)
             value = value[count:]
 
     async def authorize(self, values: list[UUID]) -> WaitFor:
@@ -582,7 +588,9 @@ class Runtime:
         ]
         await self.record(ModelRequest([part]))
         encoded = self.current["messages"][-1]["parts"][0]
-        await self.emit("tool_result", {"tool_call_id": call_id, "result": encoded["content"]})
+        await self.emit(
+            "tool_result", {"tool_call_id": call_id, "name": name, "result": encoded["content"]}
+        )
 
     async def recover_tools(
         self, tools: MachineTools, outputs: dict[str, ObjectOutputProcessor[Any]]
@@ -812,4 +820,10 @@ class Boundaries(AbstractCapability):
                 await self.runtime.stream_text(event.index, event.part.content)
             elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                 await self.runtime.stream_text(event.index, event.delta.content_delta)
+            elif isinstance(event, PartStartEvent) and isinstance(event.part, ThinkingPart):
+                await self.runtime.stream_text(event.index, event.part.content, thinking=True)
+            elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, ThinkingPartDelta):
+                await self.runtime.stream_text(
+                    event.index, event.delta.content_delta or "", thinking=True
+                )
             yield event

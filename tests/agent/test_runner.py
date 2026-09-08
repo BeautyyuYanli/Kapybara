@@ -258,6 +258,8 @@ async def test_stream_tool_roundtrip_archives_messages_and_final_is_uncommitted(
     assert usage["output_tokens"] == 10
     assert usage["cache_read_tokens"] == 20
     assert any(delta.kind == "text_delta" for delta in ctx.deltas)
+    result_delta = next(delta for delta in ctx.deltas if delta.kind == "tool_result")
+    assert isinstance(result_delta.data, dict) and result_delta.data["name"] == "process_list"
 
 
 @pytest.mark.asyncio

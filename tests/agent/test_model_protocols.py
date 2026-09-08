@@ -11,6 +11,7 @@ import pytest
 from pydantic import SecretStr
 
 from kapy.agent import ModelConnection, create_model_backend
+from kapy.agent.codec import DELTA_LIMIT
 from kapy.state import CheckpointWrite, RunnerState, SessionInput
 
 from .test_runner import Caller, Context, response, runner
@@ -20,7 +21,7 @@ def event(kind, **data):
     return f"event: {kind}\ndata: {json.dumps({'type': kind, **data})}\n\n"
 
 
-def responses_stream(text=None, tool=None, args=None):
+def responses_stream(text=None, tool=None, args=None, *, thoughts=None):
     item = (
         {
             "type": "function_call",
@@ -48,6 +49,37 @@ def responses_stream(text=None, tool=None, args=None):
         "output": [],
     }
     body = event("response.created", response=base, sequence_number=0)
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": "private-encrypted-state",
+    }
+    if thoughts is not None:
+        body += event(
+            "response.output_item.added", output_index=1, item=reasoning, sequence_number=1
+        )
+        for index, thought in enumerate(thoughts):
+            body += event(
+                "response.reasoning_summary_part.added",
+                item_id="rs_1",
+                output_index=1,
+                summary_index=index,
+                part={"type": "summary_text", "text": thought[:4]},
+                sequence_number=2,
+            )
+            body += event(
+                "response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                output_index=1,
+                summary_index=index,
+                delta=thought[4:],
+                sequence_number=3,
+            )
+        reasoning["summary"] = [{"type": "summary_text", "text": t} for t in thoughts]
+        body += event(
+            "response.output_item.done", output_index=1, item=reasoning, sequence_number=4
+        )
     body += event("response.output_item.added", output_index=0, item=item, sequence_number=1)
     if text is not None:
         body += event(
@@ -73,7 +105,7 @@ def responses_stream(text=None, tool=None, args=None):
         response={
             **base,
             "status": "completed",
-            "output": [item],
+            "output": [reasoning, item] if thoughts is not None else [item],
             "usage": {
                 "input_tokens": 100,
                 "output_tokens": 10,
@@ -87,15 +119,19 @@ def responses_stream(text=None, tool=None, args=None):
     return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body)
 
 
-def google_stream(text=None, tool=None, args=None, *, tokens=100):
+def google_stream(text=None, tool=None, args=None, *, tokens=100, thoughts=None):
     part = (
         {"functionCall": {"name": tool, "args": args or {}}, "thoughtSignature": "c2ln"}
         if tool
         else {"text": text}
     )
+    parts = [
+        {"text": thought, "thought": True, "thoughtSignature": "cHJpdmF0ZS1zaWduYXR1cmU="}
+        for thought in thoughts or ()
+    ] + [part]
     content = {
         "candidates": [
-            {"content": {"role": "model", "parts": [part]}, "finishReason": "STOP", "index": 0}
+            {"content": {"role": "model", "parts": parts}, "finishReason": "STOP", "index": 0}
         ],
         "usageMetadata": {
             "promptTokenCount": tokens,
@@ -149,9 +185,11 @@ async def test_real_sdk_tool_loop_usage_and_borrowed_client(protocol):
             call = next(item for item in bodies[1]["input"] if item.get("type") == "function_call")
             assert call["id"] == "fc_1" and call["call_id"] == "call_1"
             assert bodies[0]["truncation"] == "disabled"
+            assert "reasoning" not in bodies[0]
         elif protocol == "google_ai_studio":
             assert requests[0].url.path == "/base/v1beta/models/test:streamGenerateContent"
             assert requests[0].headers["x-goog-api-key"] == "dummy-key"
+            assert "thinkingConfig" not in bodies[0].get("generationConfig", {})
             assert any(
                 "functionResponse" in part
                 for item in bodies[1]["contents"]
@@ -165,6 +203,68 @@ async def test_real_sdk_tool_loop_usage_and_borrowed_client(protocol):
         else:
             assert requests[0].url.path == "/base/chat/completions"
             assert any(item.get("role") == "tool" for item in bodies[1]["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protocol", "model"),
+    [
+        ("openai_responses", "gpt-5"),
+        ("google_ai_studio", "gemini-2.5-flash"),
+        ("openai_chat", "compatible-chat"),
+    ],
+)
+@pytest.mark.parametrize("visible", [False, True])
+async def test_native_thinking_stream_only_exposes_content(protocol, model, visible):
+    requests = []
+    # One provider chunk exceeds the State delta budget even before ASCII escaping.
+    thought = "😀" * 5000 + " END_OF_VISIBLE_THOUGHT" if visible else ""
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        if protocol == "openai_responses":
+            return responses_stream(text="Answer", thoughts=(thought,))
+        if protocol == "google_ai_studio":
+            return google_stream(text="Answer", thoughts=(thought,))
+        original = response(text="Answer")
+        chunks = original.text.split("\n\n")
+        first = json.loads(chunks[0].removeprefix("data: "))
+        first["choices"][0]["delta"]["reasoning_content"] = thought
+        first["choices"][0]["delta"]["provider_details"] = {"private": "signature"}
+        chunks[0] = "data: " + json.dumps(first)
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content="\n\n".join(chunks)
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
+        agent = runner(client, plugins=())
+        agent.config = replace(agent.config, model=model)
+        agent.model_backend = create_model_backend(
+            ModelConnection(protocol, "https://model.invalid", SecretStr("dummy")), client
+        )
+        ctx = Context(agent.initial_state(instructions="", skills=[]))
+        result = await agent(ctx)
+    assert result.output == "Answer"
+    notices = [d for d in ctx.deltas if d.kind == "notice"]
+    content = []
+    for delta in notices:
+        assert isinstance(delta.data, dict)
+        assert set(delta.data) == {"kind", "part_index", "text", "attempt_id"}
+        assert delta.data["kind"] == "thinking_delta"
+        assert isinstance(delta.data["text"], str)
+        assert len(json.dumps(delta.data).encode()) < DELTA_LIMIT
+        content.append(delta.data["text"])
+    assert "".join(content) == thought
+    assert all(d.message_id == ctx.deltas[-1].message_id for d in notices)
+    assert bool(notices) is visible
+    assert "private" not in json.dumps([d.data for d in ctx.deltas])
+    body = requests[0]
+    if protocol == "openai_responses":
+        assert body["reasoning"] == {"summary": "auto"}
+    elif protocol == "google_ai_studio":
+        assert body["generationConfig"]["thinkingConfig"] == {"include_thoughts": True}
+    else:
+        assert "reasoning" not in body and "reasoning_effort" not in body
 
 
 @pytest.mark.asyncio

@@ -125,7 +125,15 @@ checks reconnect, and waits for durable final deletion to remove the machine ses
 
 Telegram gives each message its own draft lifecycle in private chats (including
 private topics). The latest tool call/result, retry or recovery status appears as a
-plain temporary preview, limited to 2000 characters with an explicit truncation marker.
+plain temporary preview. Tool previews give the tool name, a few primary arguments or
+process state/exit code and a short decoded output excerpt, at most 300 characters and
+three lines with an explicit truncation marker. Multiline inputs and patches show their
+size; unknown objects and media lists show their shape/count instead of JSON or base64.
+Quiet, running and timed-out observations remain distinct from exited commands.
+SDK-provided thinking text is also temporary: only the latest part's last 2000 characters
+are retained across restart. Empty/signature-only events do not replace the preview;
+tools, retry/recovery and complete responses end it. Late thinking cannot cover an
+already-started body. Providers that do not return visible thinking produce no such preview.
 The first nonempty text delta replaces that progress with the new message's Rich
 Markdown; subsequent parts accumulate in numeric order. An empty delta leaves progress
 visible. The draft ID stays stable during this preview, with roughly 20-second refreshes.

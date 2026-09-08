@@ -10,7 +10,13 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from kapy.gateway.frontends import FrontendContext
-from kapy.gateway.telegram import TelegramFailure, TelegramFrontend, request_id
+from kapy.gateway.telegram import (
+    TelegramFailure,
+    TelegramFrontend,
+    progress_text,
+    project,
+    request_id,
+)
 
 from .conftest import MODEL_CONFIG, PROVIDER_ID
 
@@ -377,13 +383,13 @@ async def test_progress_replaced_by_first_delta_and_each_message_ends_draft(gate
     await bot.deliver_once()
     first = bot.sent[-1]
     assert first[0] == "sendMessageDraft"
-    assert "process_start" in sent_text(first[1]) and '"command": "pwd"' in sent_text(first[1])
+    assert sent_text(first[1]) == "process_start · calling · pwd"
     assert "private-" not in sent_text(first[1])
     feed(records, record("tool_result", result="/workspace"))
     bot._chat_ready.clear()
     await bot.deliver_once()
     progress = sent_text(bot.sent[-1][1])
-    assert progress == "Tool returned\n/workspace"
+    assert progress == "Tool · returned · /workspace"
     assert bot.sent[-1][1]["draft_id"] == first[1]["draft_id"]
     # An empty delta preserves progress; identical nonempty text still switches to rich.
     feed(records, record("text_delta"))
@@ -439,9 +445,9 @@ async def test_pages_message_boundaries_retries_and_repeated_answers(gateway, mo
         "cursor"
     ] == "1"
     await bot.deliver_once()
-    assert sent_text(bot.sent[-1][1]) == "Tool returned\n199"
+    assert sent_text(bot.sent[-1][1]) == "Tool · returned · 199"
     await bot.deliver_once()
-    assert sent_text(bot.sent[-1][1]) == "Tool returned\n200"
+    assert sent_text(bot.sent[-1][1]) == "Tool · returned · 200"
     first_draft = bot.sent[-1][1]["draft_id"]
     feed(records, record("text_delta"))
     records[-1]["data"]["text"] = "bad partial"
@@ -586,7 +592,7 @@ async def test_progress_preview_is_bounded_and_restored(gateway, monkeypatch):
     await bot.deliver_once()
     method, params = bot.sent[-1]
     assert method == "sendMessageDraft"
-    assert len(params["text"]) == 2000 and params["text"].endswith("… [truncated]")
+    assert len(params["text"]) == 300 and params["text"].endswith("… [truncated]")
     assert "private-call" not in params["text"]
     restored = Bot(gateway)
     await restored.deliver_once()
@@ -595,9 +601,132 @@ async def test_progress_preview_is_bounded_and_restored(gateway, monkeypatch):
     restored._chat_ready.clear()
     await restored.deliver_once()
     assert restored.sent[-1][1]["draft_id"] == params["draft_id"]
-    assert sent_text(restored.sent[-1][1]) == "Using tool\nLarge content is available in history"
+    assert (
+        sent_text(restored.sent[-1][1]) == "Tool · calling · Large content is available in history"
+    )
     row = (await gateway.metadata.rows("SELECT projection FROM gateway_telegram_delivery"))[0]
     assert "😀" not in json.dumps(row["projection"], ensure_ascii=False)
+
+
+async def test_thinking_preview_survives_restart_and_yields_to_text_tools_and_recovery(
+    gateway, monkeypatch
+):
+    records = []
+    bot, _ = await install_output(gateway, monkeypatch, records)
+
+    def thinking(text, part=0, message="m"):
+        item = record("notice", message=message, part_index=part)
+        item["data"].update(kind="thinking_delta", text=text)
+        return item
+
+    feed(records, thinking("Initial plan. " + "x" * 1990))
+    await bot.deliver_once()
+    method, first = bot.sent[-1]
+    assert method == "sendMessageDraft" and len(first["text"]) == 2000
+    restored = Bot(gateway)
+    feed(records, thinking(" Next step."))
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["draft_id"] == first["draft_id"]
+    assert restored.sent[-1][1]["text"] == (first["text"] + " Next step.")[-2000:]
+    feed(records, thinking("New part", part=1), thinking("", part=2))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["text"] == "New part"
+    feed(records, record("text_delta"))
+    records[-1]["data"]["text"] = "Answer"
+    feed(records, thinking("Late thought", part=1))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert restored.sent[-1][0] == "sendRichMessageDraft"
+    assert sent_text(restored.sent[-1][1]) == "Answer"
+    feed(records, record("model_response", "Answer"))
+    await restored.deliver_once()
+    feed(records, thinking("Another thought", message="second"))
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["draft_id"] != first["draft_id"]
+    feed(records, record("tool_call", name="read_media", args={"path": "./plot.png"}))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert sent_text(restored.sent[-1][1]) == "read_media · calling · ./plot.png"
+    feed(records, thinking("Will be interrupted", message="third"), record("interrupted"))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert sent_text(restored.sent[-1][1]) == "Resuming this reply…"
+    feed(records, thinking("Will retry", message="fourth"))
+    notice = record("notice", failed_message_id="fourth")
+    notice["data"]["kind"] = "attempt_failed"
+    feed(records, notice)
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert sent_text(restored.sent[-1][1]) == "Retrying this reply…"
+    preview, projection = project([thinking("Empty response"), record("model_response")], {})
+    assert preview == "" and "thinking" not in projection
+    assert [sent_text(p) for m, p in restored.sent if m == "sendRichMessage"] == ["Answer"]
+
+
+async def test_tool_summaries_show_actions_and_results_without_payload_dumps():
+    call = progress_text(
+        "tool_call",
+        {
+            "name": "custom_edit",
+            "args": {
+                "path": "file.py",
+                "patch": "secret code\n" * 200,
+                "session_token": "hidden-token",
+                "process_id": "hidden-id",
+            },
+        },
+    )
+    assert "custom_edit · calling · file.py" in call and "200 lines" in call
+    assert "secret" not in call and "hidden" not in call
+    for state, reason, code in [
+        ("running", "quiet", None),
+        ("running", "timeout", None),
+        ("exited", "exited", 1),
+        ("exited", "exited", 0),
+    ]:
+        result = progress_text(
+            "tool_result",
+            {
+                "name": "process_start",
+                "result": {
+                    "process": {"state": state, "exit_code": code, "process_id": "hidden"},
+                    "reason": reason,
+                    "output": {
+                        "stdout": {
+                            "text": "working tree clean\n" + "detail\n" * 100,
+                            "reference": {"session_id": "hidden"},
+                        }
+                    },
+                },
+            },
+        )
+        assert state in result and reason in result and "working tree clean" in result
+        assert "hidden" not in result and len(result) <= 300 and len(result.splitlines()) <= 3
+        assert result.endswith("… [truncated]")
+        if code is not None:
+            assert f"exit {code}" in result
+        else:
+            assert "exit " not in result and "success" not in result
+    assert "outcome_unknown" in progress_text(
+        "tool_result",
+        {
+            "name": "custom",
+            "result": {"error": "outcome_unknown", "message": "private exception"},
+        },
+    )
+    assert "private" not in progress_text(
+        "tool_result", {"result": {"error": "machine_error", "message": "private exception"}}
+    )
+    assert (
+        progress_text("tool_result", {"result": ["media payload", "base64"]})
+        == "Tool · returned · 2 items"
+    )
+    assert (
+        progress_text("tool_result", {"result": {"data_base64": "secret"}})
+        == "Tool · returned · Result with 1 fields"
+    )
+    assert "encoded content omitted" in progress_text("tool_result", {"result": "A" * 400})
 
 
 async def test_route_order_backoff_and_waiting_session_release(gateway, monkeypatch):

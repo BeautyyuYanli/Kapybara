@@ -8,7 +8,7 @@ from typing import Literal, Protocol
 import httpx2
 from pydantic import SecretStr
 from pydantic_ai.models import Model
-from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.models.openai import (
     OpenAIChatModel,
     OpenAIResponsesModel,
@@ -92,14 +92,18 @@ class OpenAIResponsesBackend(OpenAICompatibleBackend):
     # The SDK needs reasoning item IDs to replay encrypted_content with full local
     # history. IDs identify supplied items; store=False forbids server-history reliance.
     def create_model(self, model_name: str) -> Model:
-        return OpenAIResponsesModel(
+        settings = OpenAIResponsesModelSettings(
+            openai_store=False, openai_send_reasoning_ids=True, openai_truncation="disabled"
+        )
+        model = OpenAIResponsesModel(
             model_name,
             provider=self.provider,
             profile=OpenAIModelProfile(openai_supports_encrypted_reasoning_content=True),
-            settings=OpenAIResponsesModelSettings(
-                openai_store=False, openai_send_reasoning_ids=True, openai_truncation="disabled"
-            ),
+            settings=settings,
         )
+        if model.profile.get("openai_supports_reasoning", False):
+            settings["openai_reasoning_summary"] = "auto"
+        return model
 
 
 class GoogleStudioBackend:
@@ -112,7 +116,11 @@ class GoogleStudioBackend:
         )
 
     def create_model(self, model_name: str) -> Model:
-        return GoogleModel(model_name, provider=self.provider)
+        settings = GoogleModelSettings()
+        model = GoogleModel(model_name, provider=self.provider, settings=settings)
+        if model.profile.get("supports_thinking", False):
+            settings["google_thinking_config"] = {"include_thoughts": True}
+        return model
 
     def classify_error(self, error: Exception) -> ModelFailure | None:
         # google-genai APIError carries .code/.message; Pydantic ModelHTTPError
