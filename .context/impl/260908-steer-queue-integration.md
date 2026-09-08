@@ -30,3 +30,43 @@ explicitly reject legacy business state. Existing `kapy_state` remains archived 
 there is no v1 session conversion. Standalone providers/models/defaults, skills and saved
 Telegram settings/poll offset are copied. Telegram route session bindings are cleared so the
 next input creates a v2 session. Deployment verification and backup information follow below.
+
+## Deployment and live acceptance
+
+Integrated code commit: `7995d4f`. Built image manifest:
+`sha256:6d5837c41bc9090ba01f794550b2df5175ab45ada54c12fbe410cc6615a3726a`.
+Control and daemon were recreated; shared PostgreSQL, Valkey and network were not restarted.
+Both processes run as UID 10001; daemon has zero capabilities and no-new-privileges enabled.
+All 72 tracked source files match main in both deployed containers. Control is healthy,
+daemon is running, and neither container logged a traceback.
+
+Old schema dump (5,940,149 bytes), private prior environment and before/after table digests are
+in `/tmp/kapy-interaction-deploy-txgu1fa9` (private directory; environment/dump mode 0600).
+Rollback image: `kapy-v2:before-session-interaction`. `kapy_state` retains 11 sessions,
+11,728 history records, 110 State requests and 91 Telegram inbox entries. Counts and content
+digests for every old table matched after configuration copy and after live acceptance.
+The archive also remains in the existing persistent PostgreSQL volume.
+
+Copied one provider, all 67 models including observed metadata/revisions/user defaults, the
+empty skills catalog, completed provider receipts, Telegram poll offset and saved route config.
+Only route session bindings were cleared; the next message creates a new v2 session.
+The local ignored .env now selects schema/namespace `kapy_interaction_v2`. Bot identity is
+`@yanli_test1_bot`; no synthetic Telegram messages were sent.
+
+Real-model acceptance used the unchanged configured Responses model with only test instructions
+and random markers, never workspace/file/attachment content. The first recursive command was
+rejected by automatic approval for an unspecified-payload concern; after inspecting its complete
+payload and empty catalog, the exact command was approved and executed.
+
+- `scripts/check_recursive.py`: real parent → non-root Docker CLI child → one completion event
+  → parent resumption; generated marker matched, 19.82s. Temporary sessions were deleted.
+- Explicit reply_to: empty creation returns null submission; repeated input uses the same
+  address; full ReplyTo(kind, being_waited_ids, payload) reaches the receipt; repeated wait
+  returns the same result without consumption. Real model passed in 5.07s; session deleted.
+- Final running sessions, pending inputs, unhandled Telegram inbox, pending delivery and cleanup
+  counts were all zero. No old protocol state was converted, deleted or replayed.
+
+Rollback, if necessary, must first preserve any new-protocol activity: stop only control/daemon,
+restore the previous local schema/namespace settings and rollback image, then restart those two
+services. Do not overwrite either schema or replay the old poll offset after new updates without
+reconciling Telegram ingress. This is an incompatible protocol cutover, not an in-place upgrade.
