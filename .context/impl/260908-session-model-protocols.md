@@ -14,4 +14,12 @@ Agent 使用说明补齐 history 关系的完整 schema、受限 SQL、参数和
 
 最终独立非 root Docker 全仓测试在 `edda36d` 为 **361 passed、0 failed，142.13 秒**，仅一条 Google SDK 弃用警告；随后 `9451ec7` 只修 CLI docstring 与 README，实际 Docker `session update --help` 检查通过。Ruff/format、Pyrefly（0 errors）及 Git 差异检查通过。测试使用实际 PostgreSQL/Valkey、随机 schema/namespace、真实 SDK 和 mock provider/Telegram；未调用真实模型或 Telegram、未读取主 .env、未重启或 flush 共享服务。
 
-本轮代码尚未部署到运行中的 Compose。旧 session 历史保持兼容，但继续运行前必须登记 provider/model 并通过 session update 明确选择 model_id；旧部署模型环境变量不再作为运行时兜底。模型探测是显式、有界分页观察，不保证第三方端点提供窗口或完整目录。真实供应商可用性与线上凭据迁移不属于上述 mock/SDK 测试结论。
+代码交付时尚未部署；后续在用户明确授权下完成以下升级。旧部署模型环境变量不再作为运行时兜底。模型探测是显式、有界分页观察，不保证第三方端点提供窗口或完整目录；默认值与实际 API usage 仍是不同概念。
+
+部署记录（2026-09-08）：先构建新镜像及基于 `a58ea93` 的回退镜像，确认无活动 run、输入、待发正文或机器进程，再备份本项目 schema。使用非 root 临时容器和真实控制 API 登记 Primary provider（OpenAI Responses），探测并持久保存 67 个模型。将原服务端的 1050000 context / 16384 output 设置保存为现用 gpt-5.6-luna、gpt-5.6-sol、gpt-6-astra 的用户默认值；10 个已有 session 与一个 Telegram route 改为对应稳定模型 ID，保留其他设置、模型选择、instruction/skill 快照及聊天绑定。没有重新创建用户 session。
+
+真实部署验收发现旧机器代理方法白名单遗漏 `provider.*`；最小修复提交为 `23a06e3`，继续交由统一 ControlService 鉴权，不放宽 provider 权限。扩展现有真实 CLI/Unix/WS Docker 用例，验证管理员与 session 的目录读取，以及 session 修改共享默认值仍被拒绝。相关 19 项测试通过；最终类型收窄后再跑真实机器专项 1 passed，Ruff/format、Pyrefly 0 errors。此项为部署验收后的直接修复，不计入此前五阶段审查结论。
+
+控制面和 daemon 已更新，最后的 Gateway 修复仅再次替换控制容器，daemon 自动重连。真实 Responses 模型（gpt-6-astra）→ State → Docker 进程工具验收通过：创建幂等、随机机器输出与最终回复及持久历史一致，9.11 秒完成，临时会话随后删除。最终 HTTP provider RPC 和真实 Unix socket → machine WS → Gateway 模型目录查询均成功。10 个原 session、11264 条历史及其摘要、Telegram poll offset/5 份 delivery cursor 与 projection 校验一致；当前无输入、run、inbox 或 cleanup 积压。Bot `yanli_test1_bot` 的 provider/model 命令已注册，没有发送额外 Telegram 测试消息。
+
+运行源码校验与仓库一致；两应用使用 UID10001，daemon 的 CapEff=0、NoNewPrivs=1。PostgreSQL、Valkey 和 network 容器未重建，机器持久卷保留。模型密钥已写入 provider 私有配置，部署临时凭据副本完成后删除，未修改或提交 .env。
