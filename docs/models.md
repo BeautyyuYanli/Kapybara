@@ -87,13 +87,16 @@ provider response; fallback budgets are policy, not token estimates.
 
 Responses uses `store:false`, full local history, and no previous-response chaining
 or automatic truncation. Responses keeps SDK-supported item IDs because its mapper
-requires reasoning IDs to replay encrypted content. These IDs accompany complete local
+requires reasoning IDs to replay encrypted content. A public OpenAIModelProfile enables
+this Responses capability for registered aliases too; it does not depend on a GPT name prefix. These IDs accompany complete local
 items; they do not substitute for history stored on the server. Compression preserves
 entire reasoning/tool blocks or removes them together. Same-provider recovery retains encrypted reasoning/thought
 signatures and completed tool returns. Changing provider revision, protocol, endpoint
 or model removes provider-specific state only from the model projection; raw history
 is preserved. Effective budget changes invalidate previous compression usage without
-removing signatures. Unknown model failures are persisted as safe errors without SDK
+removing signatures. Known unavailable-provider or invalid-budget failures carry a bounded
+public explanation in the error record and failed completion, also shown by Telegram.
+Unknown model failures are persisted as safe errors without SDK
 request details or credentials.
 
 ## CLI and Telegram
@@ -117,7 +120,10 @@ reads the whole session config object; `--model` always means a registered UUID.
 Telegram `/providers` lists connections. `/provider ID` selects one; `/provider JSON`
 creates one, or updates it when `provider_id` and `expected_revision` are supplied.
 `/discover` refreshes the selected provider (an optional argument continues a page);
-`/models` reads its catalog. Only a unique catalog model is selected automatically.
+`/models` reads its catalog. Failed explicit discovery produces a safe reply and leaves
+the topic free for repair commands; use `/discover` to retry. Only a unique catalog model
+is selected automatically when no model is already selected. Discovery preserves saved
+session overrides.
 `/model ID` or `/model JSON` saves the model and optional budgets. `/modeldefaults JSON`
 updates the selected shared model defaults with the current revision. Shared connection
 and defaults changes affect later runs of all referencing sessions.

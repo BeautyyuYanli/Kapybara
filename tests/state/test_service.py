@@ -275,3 +275,57 @@ async def test_lease_and_lost_valkey_hints(database: Database) -> None:
             await asyncio.sleep(0.02)
     with pytest.raises(ServiceUnavailable):
         await service.create_session(spec(), request_id=uuid4())
+
+
+@pytest.mark.parametrize("public", [False, True])
+async def test_explicit_public_runner_failure_is_persisted_but_unknown_exception_is_private(
+    database: Database,
+    public: bool,
+) -> None:
+    from kapy.state import RunFailure
+
+    async def fail(ctx: RunContext) -> RunResult:
+        if public:
+            raise RunFailure("configuration_needed", "Choose a configured model before continuing.")
+        raise RuntimeError("api_key=private-runner-secret https://provider.invalid/?key=private")
+
+    service = await database.start(fail)
+    created = await service.create_session(spec(), request_id=uuid4(), input="run")
+    completed = await service.wait_submission(
+        created.session.id,
+        created.submission.request_id,
+        wait_seconds=5,
+    )
+    assert completed.completion is not None and completed.completion.outcome == "failed"
+    errors = [
+        record
+        for record in (await service.read_output(created.session.id)).items
+        if record.kind == "error"
+    ]
+    assert len(errors) == 1
+    if public:
+        assert errors[0].data == {
+            "kind": "configuration_needed",
+            "public_message": "Choose a configured model before continuing.",
+        }
+        assert (
+            completed.completion.output
+            == errors[0].text
+            == "Choose a configured model before continuing."
+        )
+    else:
+        assert completed.completion.output == ""
+        assert "private-runner-secret" not in str(errors) and "provider.invalid" not in str(errors)
+
+
+async def test_public_runner_failure_bounds() -> None:
+    from kapy.state import RunFailure
+
+    for code, message in [
+        ("unsafe code", "fine"),
+        ("a" * 65, "fine"),
+        ("code", "😀" * 257),
+        ("code", "\0"),
+    ]:
+        with pytest.raises(ValueError):
+            RunFailure(code, message)

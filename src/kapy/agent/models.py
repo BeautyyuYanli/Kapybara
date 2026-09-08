@@ -14,6 +14,7 @@ from pydantic_ai.models.openai import (
     OpenAIResponsesModel,
     OpenAIResponsesModelSettings,
 )
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -94,6 +95,7 @@ class OpenAIResponsesBackend(OpenAICompatibleBackend):
         return OpenAIResponsesModel(
             model_name,
             provider=self.provider,
+            profile=OpenAIModelProfile(openai_supports_encrypted_reasoning_content=True),
             settings=OpenAIResponsesModelSettings(
                 openai_store=False, openai_send_reasoning_ids=True, openai_truncation="disabled"
             ),

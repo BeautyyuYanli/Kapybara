@@ -29,6 +29,7 @@ from kapy.state import (
     NotFound,
     QueryLimitExceeded,
     RunContext,
+    RunFailure,
     RunnerState,
     RunResult,
     ServiceUnavailable,
@@ -551,6 +552,12 @@ class ControlService:
         try:
             selected = parse_session_model(context.session.config.get("model"))
             provider, model, window, output = await self.providers.effective(selected)
+        except Rejected as exc:
+            code = "model_unavailable" if exc.code == -32004 else "model_configuration"
+            raise RunFailure(code, exc.message) from None
+        except Exception:
+            raise RuntimeError("Model configuration is unavailable; retry later") from None
+        try:
             identity = json.dumps(
                 [
                     str(provider["id"]),
@@ -580,8 +587,6 @@ class ControlService:
                 model_identity=identity,
             )
             result = await runner(context)
-        except RpcError as exc:
-            raise RuntimeError(exc.message) from None
         except Exception:
             raise RuntimeError(
                 "Model execution failed; check model configuration or retry"

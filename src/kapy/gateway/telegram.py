@@ -180,14 +180,18 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
                         completed.append(final)
             else:
                 category = data.get("kind", "")
-                # State persists an exception class, never its raw message.
+                # Unknown failures expose only their exception category; trusted
+                # RunFailure records carry a separately bounded public explanation.
                 safe = (
                     category
                     if isinstance(category, str) and category.isidentifier() and len(category) <= 80
                     else ""
                 )
+                explanation = data.get("public_message")
                 completed.append(
-                    "Sorry, I couldn’t complete this reply." + (f" ({safe})" if safe else "")
+                    "Sorry, I couldn’t complete this reply. " + explanation
+                    if isinstance(explanation, str) and 0 < len(explanation) <= 1024
+                    else "Sorry, I couldn’t complete this reply." + (f" ({safe})" if safe else "")
                 )
             text = "\n\n".join(text for text in completed if text)
             following = empty_projection()
@@ -663,7 +667,7 @@ class TelegramFrontend:
                         principal=principal,
                     ),
                 )
-                if listing["default_model_id"] is not None:
+                if listing["default_model_id"] is not None and not config["config"].get("model"):
                     config["config"]["model"] = {"model_id": listing["default_model_id"]}
                 await self.metadata.rows(
                     "UPDATE gateway_telegram_routes SET config=%s "
@@ -766,13 +770,28 @@ class TelegramFrontend:
                         (retry_delay(exc), self.bot_id, inbox["update_id"]),
                     )
             except RpcError as exc:
-                if exc.code in {-32602, -32001, -32004, -32009, -32020}:
-                    # Persist a safe reply action, then resume its normal send/retry path.
+                discovery_failed = (
+                    message_command(inbox.get("payload", {})) == "/discover" and exc.code == -32030
+                )
+                if discovery_failed or exc.code in {-32602, -32001, -32004, -32009, -32020}:
+                    # Explicit discovery is a user command: report failure without
+                    # retrying its network request ahead of repair commands in this topic.
+                    # The saved reply still uses normal Telegram send/ACK retries.
                     await self.metadata.rows(
                         "UPDATE gateway_telegram_inbox SET resolved_action=%s "
                         "WHERE bot_id=%s AND update_id=%s",
                         (
-                            Jsonb({"kind": "reply", "text": exc.message}),
+                            Jsonb(
+                                {
+                                    "kind": "reply",
+                                    "text": (
+                                        "Model discovery failed. Check provider settings "
+                                        "and use /discover to retry."
+                                        if discovery_failed
+                                        else exc.message
+                                    ),
+                                }
+                            ),
                             self.bot_id,
                             inbox["update_id"],
                         ),

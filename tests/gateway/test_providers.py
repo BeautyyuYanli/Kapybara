@@ -445,6 +445,7 @@ async def test_running_session_freezes_connection_and_next_run_uses_current_defa
         )
         failed = await completion(sid, request_id)
         assert failed["outcome"] == "failed" and len(requests) == 2
+        assert "select another model" in failed["output"]
         history = await gateway.sessions.read_history(UUID(sid))
         assert "rotated-private-key" not in str(history)
         assert not http.is_closed
@@ -463,3 +464,114 @@ async def test_provider_command_terminal_delivery_failure_discards_private_ingre
     inbox = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_inbox"))[0]
     assert inbox["handled"] and "secret-ingress" not in json.dumps(inbox, default=str)
     assert len(await gateway.metadata.rows("SELECT * FROM gateway_providers WHERE name='New'")) == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 503])
+async def test_discovery_error_is_acknowledged_and_does_not_block_topic_repairs(gateway, status):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx2.Response(status, json={"error": "api_key=private-discovery-response"})
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
+        gateway.providers.http = http
+        bot = Bot(gateway)
+        await bot.ingest([update(1, "/discover"), update(2, "/providers")])
+        await bot.process_once()
+        first = (
+            await gateway.metadata.rows("SELECT * FROM gateway_telegram_inbox WHERE update_id=1")
+        )[0]
+        assert first["resolved_action"]["kind"] == "reply" and not first["handled"]
+        assert "private-discovery-response" not in json.dumps(first, default=str)
+        # A lost Telegram acknowledgement can replay the safe reply, never discovery.
+        bot.fail = True
+        await bot.process_once()
+        assert len(requests) == 1
+        bot.fail = False
+        await gateway.metadata.rows("UPDATE gateway_telegram_inbox SET next_attempt_at=NULL")
+        await bot.process_once()
+        await bot.process_once()
+        rows = await gateway.metadata.rows(
+            "SELECT handled FROM gateway_telegram_inbox ORDER BY update_id"
+        )
+        assert rows == [{"handled": True}, {"handled": True}]
+        assert len(requests) == 1
+        assert "private-discovery-response" not in json.dumps(bot.sent)
+        assert any("use /discover to retry" in item[1].get("text", "") for item in bot.sent)
+
+
+async def test_discovery_preserves_saved_selection_and_overrides(gateway):
+    bot = Bot(gateway)
+    selected = {"model_id": MODEL_ID, "context_window_tokens": 65536, "max_output_tokens": 1024}
+    await bot.ingest([update(1, "/model " + json.dumps(selected))])
+    await bot.process_once()
+    before = await bot.route(-100, 0)
+
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(200, json={"data": [{"id": "test"}]})
+        )
+    ) as http:
+        gateway.providers.http = http
+        await bot.ingest([update(2, "/discover")])
+        await bot.process_once()
+    after = await bot.route(-100, 0)
+    assert after["config"]["config"]["model"] == before["config"]["config"]["model"] == selected
+    assert after["session_id"] == before["session_id"]
+
+
+@pytest.mark.parametrize("known_configuration_failure", [True, False])
+async def test_model_configuration_error_reaches_receipt_and_telegram_but_sdk_error_stays_private(
+    gateway,
+    known_configuration_failure,
+):
+    from pydantic_core import to_jsonable_python
+
+    from kapy.gateway.telegram import project
+
+    made = await create(gateway)
+    sid = made["session"]["id"]
+    if known_configuration_failure:
+        await call(
+            gateway,
+            "provider.model.update",
+            model_id=MODEL_ID,
+            expected_revision=1,
+            defaults={"context_window_tokens": 1000, "max_output_tokens": 2000},
+        )
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                401,
+                json={
+                    "error": {
+                        "message": "secret-provider-message https://private.invalid/?key=dummy"
+                    }
+                },
+            )
+        )
+    ) as http:
+        gateway.http_client = http
+        request = str(uuid4())
+        await gateway.call(
+            "session.input",
+            {"session_id": sid, "request_id": request, "payload": "run"},
+            principal=OPERATOR,
+        )
+        result = await gateway.call(
+            "session.wait",
+            {"session_id": sid, "request_id": request, "wait_seconds": 5},
+            principal=OPERATOR,
+        )
+    assert result["completion"]["outcome"] == "failed"
+    records = to_jsonable_python((await gateway.sessions.read_output(UUID(sid))).items)
+    _, rendered = project(records, {})
+    text = rendered["pending"]["text"]
+    if known_configuration_failure:
+        assert "max_output_tokens must be smaller" in result["completion"]["output"]
+        assert result["completion"]["output"] in text
+    else:
+        assert result["completion"]["output"] == ""
+        assert "secret-provider-message" not in str(records) + text
+        assert "private.invalid" not in str(records) + text

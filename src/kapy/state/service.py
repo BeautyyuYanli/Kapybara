@@ -33,6 +33,7 @@ from .contracts import (
     QueryResult,
     Record,
     RecordPage,
+    RunFailure,
     RunnerState,
     RunResult,
     ServiceUnavailable,
@@ -1153,13 +1154,20 @@ class SessionService:
         self._ensure_open()
         async with self._store.write() as conn:
             await self._attempt(conn, context)
-            # Do not persist raw exception strings, which may contain provider secrets or prompts.
+            # Only an explicitly trusted RunFailure can expose a public explanation.
+            # Other exception strings may contain provider secrets or prompts.
+            public_message = error.public_message if isinstance(error, RunFailure) else ""
+            detail: JsonObject = (
+                {"kind": error.code, "public_message": public_message}
+                if isinstance(error, RunFailure)
+                else {"kind": type(error).__name__, "message": "runner failed"}
+            )
             await self._append(
                 conn,
                 context.session.id,
                 "error",
-                {"kind": type(error).__name__, "message": "runner failed"},
-                "runner failed",
+                detail,
+                public_message or "runner failed",
                 run_id=context.run_id,
                 attempt=context.attempt,
             )
@@ -1185,7 +1193,7 @@ class SessionService:
                 context.session.id,
                 context.run_id,
                 "failed",
-                "",
+                public_message,
                 [request["id"] for request in requests],
             )
         self._signal()

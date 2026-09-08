@@ -179,6 +179,23 @@ class RunResult:
 type SessionRunner = Callable[[RunContext], Awaitable[RunResult]]
 
 
+class RunFailure(Exception):
+    """Explicitly safe runner failure, suitable for public history and completion output.
+
+    Callers must supply a nonsecret explanation, never an arbitrary exception string.
+    """
+
+    def __init__(self, code: str, public_message: str) -> None:
+        if not code.isascii() or not code.isidentifier() or len(code) > 64:
+            raise ValueError("RunFailure code must be an ASCII identifier of at most 64 characters")
+        if not public_message or "\0" in public_message or len(public_message.encode()) > 1024:
+            raise ValueError(
+                "RunFailure public_message must contain 1–1024 UTF-8 bytes without NUL"
+            )
+        self.code, self.public_message = code, public_message
+        super().__init__(public_message)
+
+
 class StateError(Exception):
     """Base class for State failures safe to map at an API boundary."""
 

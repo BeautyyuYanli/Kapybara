@@ -282,7 +282,8 @@ async def test_model_identity_change_scrubs_only_projection_and_preserves_tool_p
 
 
 @pytest.mark.asyncio
-async def test_responses_full_replay_and_compression_preserve_reasoning_protocol_block():
+@pytest.mark.parametrize("model_name", ["gpt-5", "company-reasoner"])
+async def test_responses_full_replay_and_compression_preserve_reasoning_protocol_block(model_name):
     from typing import cast
     from uuid import uuid4
 
@@ -373,7 +374,7 @@ async def test_responses_full_replay_and_compression_preserve_reasoning_protocol
             ModelConnection("openai_responses", "https://model.invalid/v1", SecretStr("dummy")),
             client,
         )
-        agent = Agent(backend.create_model("gpt-5"))
+        agent = Agent(backend.create_model(model_name))
         for level in range(3):
             # Use the same checkpoint codec used by resumed runs, then apply actual compression.
             recovered = await codec.load(await codec.state(data))
