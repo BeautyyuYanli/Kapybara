@@ -4,7 +4,7 @@
 
 ## Provider API 与生命周期
 
-新增独立的 `provider.create/get/list/update/delete/models` 控制 API，全部经过既有 ControlAPI；不把 provider 凭据塞进 session。
+新增独立的 `provider.create/get/list/update/delete，以及下述模型目录 API` 控制 API，全部经过既有 ControlAPI；不把 provider 凭据塞进 session。
 
 ```python
 type ModelType = Literal["openai_responses", "openai_chat", "google_ai_studio"]
@@ -23,9 +23,6 @@ provider.list({after_id?, limit?}) -> {items, next_after_id}
 provider.update({provider_id, request_id, expected_revision,
                  name, type, base_url, api_key?}) -> ProviderView
 provider.delete({provider_id, request_id, expected_revision}) -> {deleted: true}
-provider.models({provider_id, page_token?, limit?}) ->
-  {items: [{name, context_window_tokens: int|null, max_output_tokens: int|null}],
-   next_page_token: str|null}
 ProviderView = {id, name, type, base_url, has_api_key, revision, created_at, updated_at}
 ```
 
@@ -39,25 +36,47 @@ Gateway 自有单表 `gateway_providers` 保存当前连接、私有 key、revis
 
 普通 provider/session 查询、State 历史、模型提示、错误和日志均无 key。参数以 SecretStr 校验，验证错误不回显原始输入。移除未完成的 session secret revision 方案，不增加 State 与 provider 的跨包 FK 或额外绑定表。
 
-## Session 模型配置与发现
+## Provider 模型目录与默认配置
 
-`session.create/update` 的 `config.model` 为非秘密结构化对象，`config.instructions` 保持字符串；其他 session 字段与 UUID 幂等语义不变。
+provider 持久保存探测到的模型，每个模型拥有稳定 UUID。Gateway 自有 `gateway_provider_models` 表保存 id、provider_id、name、discovered JSONB、defaults JSONB、revision、discovered_at/created_at/updated_at，UNIQUE(provider_id,name)。name 是供应商实际模型名，不可通过 update 改名；同一 provider/name 重复探测始终更新同一行，保留 id。
+
+```text
+provider.discover({provider_id, request_id, page_token?, limit?}) ->
+  {items: ModelView[], next_page_token: str|null}
+provider.models({provider_id, after_id?, limit?}) ->
+  {items: ModelView[], next_after_id: UUID|null, default_model_id: UUID|null}
+provider.model.create({provider_id, request_id, name, defaults?}) -> ModelView
+provider.model.get({model_id}) -> ModelView
+provider.model.update({model_id, request_id, expected_revision, defaults}) -> ModelView
+ModelView = {id, provider_id, name, discovered, defaults, revision,
+             discovered_at, created_at, updated_at}
+ModelDefaults = {context_window_tokens?: int|null, max_output_tokens?: int|null}
+```
+
+provider.models 只读本地目录，default_model_id 仅在该 provider 的完整目录只有一个模型时返回，否则为 null。provider.discover 是显式网络动作：OpenAI 请求 models，Google 使用原生 models list/get 并筛选 generateContent。每个调用只处理一个有界页面，返回供应商 next_page_token；结果与 request receipt 一次提交。provider 在网络调用期间改变时拒绝提交过时观察值。同 UUID 重试返回第一次已确认结果；刷新不覆盖 defaults，不因为某一页缺少某个模型就删除旧行或假称它已不可用。
+
+只保存有界的模型描述和预算 metadata，discovered 表达观察到的信息，不代表用户配置。provider 改协议或地址时清除旧端点的 discovered 值/时间，保留模型 ID 和用户 defaults；同名模型在新端点是否可用需要重新探测或由用户确认。不保存探测历史、不建立同步任务或失效调度框架。
+
+provider.model.create 支持手工登记模型，不依赖端点开放 models。相同 provider/name 已存在则明确冲突，调用者用 get/update 修改默认值。model.update 的 defaults 是完整替换，缺省或 null 表示移除手工覆盖；revision CAS 防止并发覆盖。model mutations 与 receipt 复用 Gateway 同一数据库事务。目录读取权限沿 provider；只有 operator/可信前端可探测和管理目录，session capability 只能读当前已绑定 provider 的目录。
+
+## Session 模型选择
+
+session.create/update 的 config.model 只保存 model_id 与可选预算覆盖；config.instructions 保持字符串，其他 session 字段和 UUID 幂等语义不变。
 
 ```python
 class SessionModelConfig(BaseModel):
-    provider_id: UUID
-    name: str | None = None
+    model_id: UUID
     context_window_tokens: int | None = None
     max_output_tokens: int | None = None
 ```
 
-调用协议完全由 provider 决定；session 不覆盖 type、base_url 或 key。Google 使用原生 Gemini API，不走 OpenAI-compatible 转译。
+provider 由 model_id 解析，调用协议完全来自 provider；session 不接收端点、key、协议或任意原始模型名。session 身份递归创建时默认继承当前调用者的 model_id 和显式覆盖，可选择同一已授权 provider 的其他已登记模型；不能仅凭一个 UUID 使用另一连接。更换 model_id 时未明确提供的预算重新继承，不带上另一模型的覆盖。前端/operator 从目录选择稳定模型 ID；只有唯一候选时可以采用 provider.models 返回的 default_model_id。
 
-session 身份创建子 session 时默认继承调用者的模型配置，显式字段覆盖继承值；前端与 operator 提交选择，没有服务端默认连接。更新 session 仍要求 waiting，公开配置按完整替换语义处理。更换 provider 或模型名而未明确提供预算时重新解析，不沿用另一模型的数值。无完整模型配置的旧 session 保留历史，可经 session.update 配置后继续；不持续读取旧部署模型变量作为兜底。
+预算取值顺序为 session 显式覆盖 → 模型 defaults → 模型 discovered metadata → 固定兜底。context window 兜底 256 * 1024 = 262144，max output 兜底 16 * 1024 = 16384。OpenAI metadata 没有窗口则保留未知，Google 对应 inputTokenLimit/outputTokenLimit；不从模型名猜测。最终输出预算须为正且小于窗口，并遵守已知供应商硬上限，冲突明确报配置错误。固定默认值是用户指定策略；实际用量仍只读 API usage。
 
-规范化、继承和发现由 Gateway 同一个解析入口完成；前端调用 provider.models 展示候选，Runner 只接收已解析的配置。OpenAI 查询 `/models`，Google 使用 models list/get，并筛选支持 generateContent 的模型。分页、响应体和超时有界；名称缺失时，只有唯一候选且没有未读页才自动选择，否则明确要求指定模型名。名称和预算均明确时不强制探测，兼容不开放 models 接口的端点。仅缺预算时可以探测；明确不支持 models 的端点或缺少预算字段时使用下面的固定默认值，鉴权、限流和临时网络错误不伪装成成功探测。
+State 保存 model_id 和用户显式覆盖，不把派生值写成永久 session 覆盖。Gateway 的一个解析入口负责授权、继承和计算有效设置；创建/更新时验证选择，每次 Runner 调用从当前目录计算并冻结该次配置，期间不重新探测或热刷新。provider/defaults 更新影响下一次运行（包括重启恢复），不影响已开始的实例。session.update 仍要求 waiting，普通查询返回保存的选择和覆盖；完整模型默认值通过 provider.model.get 查询。
 
-预算依次取用户显式值、对应模型返回的 metadata、固定默认值。context window 最终兜底为 256 * 1024 = 262144，max output 最终兜底为 16 * 1024 = 16384。OpenAI 标准 models 不提供窗口，不从模型名猜测；Google 对应 inputTokenLimit/outputTokenLimit。输出预算必须为正且小于窗口；已获知的供应商输出硬上限也需要遵守。固定默认值是用户明确给出的配置策略，不是 token 估计，运行中的 token 用量仍只读 API usage。首次已解析的 session 写入结果保存到既有 request.operation，恢复同 UUID 不因目录变化重新选择模型；provider 更新、删除等操作使用自身明确的生命周期。
+旧 session 保留历史，可经 session.update 指定已登记 model_id 后继续；不持续读取旧部署模型变量兜底。session 删除不删除共享目录或 provider。
 
 ## 模型适配与运行
 
@@ -81,7 +100,7 @@ def create_model_backend(
 
 Responses 使用 store=False、完整本地历史，不启用 previous_response_id/conversation 或供应商自动截断。禁用依赖原始 Responses item ID 的历史回放，保留需要的 reasoning 加密内容与工具调用配对。Google 保留 thought signature 及对应工具协议。同一连接恢复不得重做已完成工具。
 
-投影持久保存 provider_id/revision、协议、端点及模型身份。身份变化时，只在待发送投影中清除原供应商专有 ID、签名与不透明推理项，保留用户/assistant 正文、媒体和成对工具记录；原始历史不变。恢复若读到已更新 provider，同样按该规则处理；清掉旧 usage 的压缩触发依据，不把旧模型计数当成新窗口输入。无需增加转换注册框架或旧 key 保留机制。
+投影持久保存 provider_id/revision、协议、端点、模型 ID/名称和有效预算。连接或模型身份变化时，只在待发送投影中清除原供应商专有 ID、签名与不透明推理项，保留用户/assistant 正文、媒体和成对工具记录；原始历史不变。恢复若读到已更新 provider，同样处理。模型身份或有效预算改变时清掉旧 usage 的压缩触发依据；仅调整窗口不必删除供应商签名。无需转换注册框架或旧 key 保留机制。
 
 三种协议的实际 usage 归一到现有计数，继续仅用 provider API 最新单次响应，不添加本地 tokenizer。context/media 错误分类使用真实 SDK 字段；鉴权、限流等其他错误安全地交 State，不伪装媒体拒绝。工具集合保持既定进程工具、read_media、wait 和注入 ScriptTool；apply_patch 走普通插件入口。
 
@@ -89,11 +108,11 @@ Responses 使用 store=False、完整本地历史，不启用 previous_response_
 
 ## CLI 与 Telegram
 
-CLI 新增 provider 子命令对应六个 API，create/update 接受 JSON 配置文件和 key-file/key-env；key 放请求，不打印。session create/update 使用模型 JSON 配置文件，保留 --model 名称快捷参数，不为每个字段重复增加旗标；递归创建默认继承当前 session。
+CLI 新增 provider 子命令对应连接 CRUD、discover/models 和 model create/get/update。provider create/update 接受 JSON 配置文件和 key-file/key-env；key 放请求，不打印。session create/update 接受模型 JSON 配置文件，--model 使用稳定模型 ID，不保留名称/ID猜测双语义；递归创建默认继承当前 session。默认值通过 provider model update 配置，不在 CLI 内另写预算解析算法。
 
-Telegram 新增 /providers 列出连接，/provider ID 选择已有连接；/provider JSON 创建连接并选择它，JSON 带 provider_id/expected_revision 时更新该连接。/model JSON 或 /model NAME 保存模型名称、窗口和输出上限；/models 调 provider.models。/new 使用 chat/topic 保存设置。修改 provider 资源会影响该连接后续运行，命令回执明确这一点；忙碌 session 的模型设置保存供下一 /new，已有运行不热改。
+Telegram /providers 列出连接，/provider ID 选择已有连接；/provider JSON 创建并选择，JSON 带 provider_id/expected_revision 时更新。/discover 显式探测当前 provider，/models 读取持久目录。/model ID 或 /model JSON 保存模型 ID 与预算覆盖；/modeldefaults JSON 更新所选模型的默认值，使用已读取 revision。只有目录唯一候选时自动选择 default_model_id，否则提示选 ID。/new 使用 chat/topic 保存设置。
 
-配置命令不作为普通 prompt 输入；/settings、回执和错误隐藏 key。待处理 provider 配置命令属于 Telegram 私有 ingress，完成后保存设置只需 provider_id 和非秘密模型字段；key 不进入 delivery projection 或 session 历史。Telegram 和其他前端经 ControlAPI 操作 provider/session，Runner 不读取前端表。
+更新 provider 或模型 defaults 会影响引用它的后续运行，命令回执明确该行为；忙碌 session 的选择/覆盖保存供下一 /new，不热改运行。配置命令不作为普通 prompt；/settings、回执和错误隐藏 key。待处理 provider 配置属于 Telegram 私有 ingress；已保存设置仅含 provider_id、model_id 和非秘密覆盖，key 不进入 delivery projection 或 session 历史。Telegram 和其他前端经 ControlAPI 操作 provider/session，Runner 不读取前端表。
 
 ## Agent 提示与 history 契约
 
