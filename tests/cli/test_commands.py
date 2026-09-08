@@ -211,3 +211,60 @@ def test_stdin_file_request_option_and_record_jsonl(monkeypatch, tmp_path):
         {"cursor": "one", "text": "a"},
         {"cursor": "two", "text": "b"},
     ]
+
+
+def test_provider_keys_and_registered_model_selection_share_control_api(monkeypatch, tmp_path):
+    _, _, calls = configured(monkeypatch)
+    config = tmp_path / "provider.json"
+    config.write_text('{"name":"test","type":"openai_responses"}')
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "cli-private-key")
+    result = CliRunner().invoke(
+        commands.app,
+        [
+            "control",
+            "provider",
+            "create",
+            "--config-file",
+            str(config),
+            "--key-env",
+            "TEST_PROVIDER_KEY",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[-1][0] == "provider.create" and calls[-1][1]["api_key"] == "cli-private-key"
+    assert "cli-private-key" not in result.output
+    model_id = str(uuid4())
+    config.write_text(json.dumps({"model": {"model_id": model_id, "max_output_tokens": 2048}}))
+    result = CliRunner().invoke(
+        commands.app,
+        [
+            "control",
+            "session",
+            "create",
+            "hello",
+            "--config-file",
+            str(config),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[-1][0] == "session.create"
+    assert calls[-1][1]["config"] == {
+        "model": {"model_id": model_id, "max_output_tokens": 2048},
+    }
+    result = CliRunner().invoke(
+        commands.app,
+        [
+            "control",
+            "provider",
+            "model",
+            "update",
+            model_id,
+            "--expected-revision",
+            "2",
+            "--defaults",
+            '{"max_output_tokens":1024}',
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[-1][0] == "provider.model.update"
+    assert calls[-1][1]["defaults"] == {"max_output_tokens": 1024}

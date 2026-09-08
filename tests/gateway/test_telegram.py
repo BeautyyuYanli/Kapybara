@@ -7,9 +7,12 @@ from uuid import UUID
 import httpx2
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
 from kapy.gateway.frontends import FrontendContext
 from kapy.gateway.telegram import TelegramFailure, TelegramFrontend, request_id
+
+from .conftest import MODEL_CONFIG, PROVIDER_ID
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -23,6 +26,19 @@ class Bot(TelegramFrontend):
         )
         self.sent = []
         self.fail = False
+
+    async def route(self, chat, thread):
+        """Legacy delivery tests use an explicitly preconfigured fixture route."""
+        route = await super().route(chat, thread)
+        if "provider_id" not in route["config"]:
+            route["config"]["provider_id"] = PROVIDER_ID
+            route["config"]["config"].update(MODEL_CONFIG)
+            await self.metadata.rows(
+                "UPDATE gateway_telegram_routes SET config=%s "
+                "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s",
+                (Jsonb(route["config"]), self.bot_id, chat, thread),
+            )
+        return route
 
     async def api(self, method, params):
         if self.fail and method == "sendMessage":
@@ -194,6 +210,11 @@ async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadlin
         gateway.settings, gateway, gateway.metadata.pool, gateway.metadata.schema
     )
     bot = TelegramFrontend(context)
+    route = await bot.route(-100, 7)
+    route["config"]["config"].update(MODEL_CONFIG)
+    await gateway.metadata.rows(
+        "UPDATE gateway_telegram_routes SET config=%s WHERE thread_id=7", (Jsonb(route["config"]),)
+    )
     content = "A" * 3990 + "😀" * 10000 + "tail"
     attempts, delivered = [], []
 

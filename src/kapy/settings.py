@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Self
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,14 +16,6 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    model_base_url: str = Field(
-        "https://api.openai.com/v1",
-        validation_alias=AliasChoices("KAPY_MODEL_BASE_URL", "OPENAI_BASE_URL"),
-    )
-    model_api_key: SecretStr | None = Field(
-        None, validation_alias=AliasChoices("KAPY_MODEL_API_KEY", "OPENAI_API_KEY")
-    )
-    model: str = Field("gpt-5.6-luna", validation_alias=AliasChoices("KAPY_MODEL", "OPENAI_MODEL"))
     frontends: list[str] | None = None
     tool_plugins: list[str] = Field(default_factory=lambda: ["apply_patch"])
     telegram_bot_token: SecretStr | None = Field(None, validation_alias="TELEGRAM_BOT_TOKEN")
@@ -48,14 +40,11 @@ class Settings(BaseSettings):
     idle_disconnect_after_s: float | None = Field(None, gt=0)
     idle_reconnect_after_s: float = Field(30.0, gt=0)
     telegram_api_base: str = "https://api.telegram.org"
-    context_window_tokens: int | None = Field(None, gt=0)
-    max_output_tokens: int = Field(16_384, gt=0)
     compression_ratio: float = Field(0.70, gt=0, lt=1)
     keep_recent_ratio: float = Field(0.10, gt=0, lt=1)
     media_max_bytes: int = Field(20 * 1024 * 1024, gt=0)
 
     @field_validator(
-        "model_api_key",
         "telegram_bot_token",
         "telegram_chat_id",
         "control_token",
@@ -84,14 +73,10 @@ class Settings(BaseSettings):
                 raise ValueError("machine tokens must not be empty")
         return self
 
-    def require_control(self, *, model_backend_supplied: bool = False) -> None:
+    def require_control(self) -> None:
         for name in ("control_token", "session_signing_key"):
             if not getattr(self, name):
                 raise ValueError(f"{name} is required for control-server")
-        if self.context_window_tokens is None:
-            raise ValueError("KAPY_CONTEXT_WINDOW_TOKENS is required for control-server")
-        if not model_backend_supplied and not self.model_api_key:
-            raise ValueError("KAPY_MODEL_API_KEY is required for the default model backend")
 
     def enabled_frontends(self) -> tuple[str, ...]:
         if self.frontends is None:

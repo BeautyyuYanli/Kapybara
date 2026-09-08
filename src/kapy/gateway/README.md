@@ -1,26 +1,13 @@
 # Gateway, CLI and Telegram
 
-For a first start, inject environment variables explicitly: the CLI and Settings do not
-automatically load `.env` or `.env.example`. Replace the placeholders below and set the
-model's actual context window. The control server requires `KAPY_MODEL_API_KEY`,
-`KAPY_CONTEXT_WINDOW_TOKENS`, `KAPY_CONTROL_TOKEN`, and `KAPY_SESSION_SIGNING_KEY`:
+Control-server requires `KAPY_CONTROL_TOKEN` and `KAPY_SESSION_SIGNING_KEY`, plus reachable
+PostgreSQL/Valkey. It does not require model environment variables. Configure independent
+providers, discover or manually register models, then select their stable IDs on sessions.
+See [full provider/model API and CLI examples](../../../docs/models.md).
 
-```sh
-env KAPY_MODEL_API_KEY='<provider-api-key>' \
-  KAPY_MODEL_BASE_URL='https://api.openai.com/v1' KAPY_MODEL='gpt-5.6-luna' \
-  KAPY_CONTEXT_WINDOW_TOKENS=100000 \
-  KAPY_CONTROL_TOKEN='<control-admin-token>' \
-  KAPY_SESSION_SIGNING_KEY='<random-signing-key>' \
-  KAPY_MACHINE_TOKENS='{"docker-machine":"<machine-bearer>"}' \
-  kapy control-server
-```
-
-PostgreSQL and Valkey must be reachable. Set `KAPY_DATABASE_URL` and `KAPY_VALKEY_URL`
-for your network; development defaults use `127.0.0.1:55432` and `127.0.0.1:56379`.
-`KAPY_MODEL_BASE_URL` and `KAPY_MODEL` select the provider endpoint and model; other
-settings use `KAPY_`. Telegram is optional: enabling `TELEGRAM_BOT_TOKEN` also requires
-the allowed numeric `TELEGRAM_CHAT_ID`. An explicit `KAPY_FRONTENDS='[]'` disables
-frontends, including Telegram, without requiring or validating leftover Telegram configuration.
+Settings do not discover `.env`; pass it explicitly through the shell/uv when desired.
+`TELEGRAM_BOT_TOKEN` requires an allowed numeric `TELEGRAM_CHAT_ID`; explicit
+`KAPY_FRONTENDS='[]'` disables frontends even when unused Telegram configuration exists.
 
 In the project machine container, start its daemon using the exact machine ID and bearer
 from the control server's JSON mapping. This bearer is separate from the administrator
@@ -45,14 +32,11 @@ env KAPY_CONTROL_TOKEN='<control-admin-token>' kapy control session list
 `create_app` composes the actual State, RPC, Execution, Skills and Agent exports.
 Gateway owns its PostgreSQL metadata pool and HTTP client. Skills and agent payload
 storage borrow the pool; State creates and closes its own pool and Valkey client.
-No module reads `.env` implicitly. Settings accept legacy `OPENAI_*` and existing `TELEGRAM_*` aliases;
-other environment names start with `KAPY_`. Secrets are not stored in route configuration.
-
-`create_app(settings=None, *, model_backend=None, frontend_factories=None, plugins=None)`
-accepts borrowed adapters. An injected ModelBackend removes the model-key requirement;
-Gateway creates/closes model HTTP resources only for its default OpenAI-compatible backend.
-`KAPY_MODEL_BASE_URL`, `KAPY_MODEL_API_KEY` and `KAPY_MODEL` override legacy `OPENAI_*` aliases.
-Model names have no vendor whitelist. The configured context window remains required.
+No module reads `.env` implicitly. Model key/base/type belong to current provider rows,
+not Settings or saved session config. `create_app(settings=None, *,
+model_backend_factory=create_model_backend, frontend_factories=None, plugins=None)`
+borrows a per-call ModelBackend from the factory and owns its shared HTTP client.
+The factory receives an immutable ModelConnection selected from the current provider.
 
 `Frontend`, `FrontendFactory`, `FrontendContext` and `ControlAPI` are exported by Gateway.
 The context exposes settings, a borrowed metadata pool/schema, and the single async
@@ -76,7 +60,7 @@ Machines connect to `/rpc/machines/{machine_id}` with an independent configured 
 and `kapy.jsonrpc.v1`. Session capabilities bind the session and machine. Replacing a
 connection fences the previous connection, and associations are ensured before calls.
 `session.wait` delegates to State's non-consuming durable request receipt. Deterministic
-mutation rejections have durable error receipts and never become deferred work. Session-create
+session mutation rejections have durable error receipts and never become deferred work. Session-create
 intents save their initial Runner snapshot before calling State, so catalog changes cannot
 block recovery of an already committed creation.
 
@@ -89,7 +73,7 @@ Prompt and SQL commands accept `--file PATH` or `--stdin`, and `session output` 
 record per line. Examples:
 
 ```sh
-kapy control session create --machine docker-machine 'Inspect the project'
+kapy control session create --machine docker-machine --model MODEL_UUID 'Inspect the project'
 kapy control --session SESSION_UUID session input 'Continue'
 kapy control --session SESSION_UUID session wait --request-id REQUEST_UUID
 kapy control --session SESSION_UUID history export --output history.ndjson

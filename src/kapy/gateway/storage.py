@@ -18,6 +18,16 @@ from .auth import Principal, denied
 
 # Source migration, deliberately owned here rather than in State's table registry.
 TABLES = (
+    "gateway_providers (id uuid PRIMARY KEY, name text NOT NULL, type text NOT NULL, base_url "
+    "text NOT NULL, "
+    "api_key text, revision bigint NOT NULL DEFAULT 1, deleted boolean NOT NULL DEFAULT false, "
+    "created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now())",
+    "gateway_provider_models (id uuid PRIMARY KEY, provider_id uuid NOT NULL, name text NOT NULL, "
+    "discovered jsonb NOT NULL DEFAULT '{}', defaults jsonb NOT NULL DEFAULT '{}', revision "
+    "bigint NOT NULL DEFAULT 1, "
+    "discovered_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(), updated_at "
+    "timestamptz NOT NULL DEFAULT now(), "
+    "UNIQUE(provider_id,name))",
     "gateway_session_access (session_id uuid PRIMARY KEY, owner_id text NOT NULL, "
     "parent_session_id uuid, deleted boolean NOT NULL DEFAULT false)",
     "gateway_requests (request_id uuid PRIMARY KEY, principal_id text NOT NULL, "

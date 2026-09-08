@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -26,11 +27,15 @@ session = typer.Typer(no_args_is_help=True)
 history = typer.Typer(no_args_is_help=True)
 skill = typer.Typer(no_args_is_help=True)
 event = typer.Typer(no_args_is_help=True)
+provider = typer.Typer(no_args_is_help=True)
+provider_model = typer.Typer(no_args_is_help=True)
 app.add_typer(control, name="control")
 control.add_typer(session, name="session")
 control.add_typer(history, name="history")
 control.add_typer(skill, name="skill")
 control.add_typer(event, name="event")
+control.add_typer(provider, name="provider")
+provider.add_typer(provider_model, name="model")
 
 
 @dataclass
@@ -203,16 +208,19 @@ def create_session(
     title: Annotated[str, typer.Option()] = "",
     machine: Annotated[list[str] | None, typer.Option("--machine")] = None,
     default_machine: Annotated[str | None, typer.Option()] = None,
-    model: Annotated[str | None, typer.Option()] = None,
+    model: Annotated[str | None, typer.Option(help="Registered model UUID")] = None,
+    config_file: Annotated[Path | None, typer.Option()] = None,
     instructions: Annotated[str, typer.Option()] = "",
     request_id: Annotated[UUID | None, typer.Option()] = None,
     waiting_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
     text = input_text(text, file, stdin, required=False)
     machines = machine or ([client(ctx).machine_id] if client(ctx).machine_id else [])
-    config: JsonObject = {"instructions": instructions}
+    config: JsonObject = read_json_file(config_file) if config_file else {}
+    if instructions:
+        config["instructions"] = instructions
     if model:
-        config["model"] = model
+        config["model"] = {**cast(dict, config.get("model", {})), "model_id": model}
     invoke(
         ctx,
         "session.create",
@@ -264,6 +272,8 @@ def update_session(
     machine: Annotated[list[str], typer.Option("--machine")],
     default_machine: Annotated[str | None, typer.Option()] = None,
     config: Annotated[str, typer.Option()] = "{}",
+    config_file: Annotated[Path | None, typer.Option()] = None,
+    model: Annotated[str | None, typer.Option(help="Registered model UUID")] = None,
     request_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
     """Replace the session title, machines and configuration completely.
@@ -272,6 +282,9 @@ def update_session(
     submits {}, clearing prior configuration. Omitting --default-machine submits
     None, clearing the prior default machine.
     """
+    configuration = read_json_file(config_file) if config_file else json.loads(config)
+    if model:
+        configuration["model"] = {**cast(dict, configuration.get("model", {})), "model_id": model}
     invoke(
         ctx,
         "session.update",
@@ -281,7 +294,7 @@ def update_session(
             "title": title,
             "machine_ids": cast(list[JsonValue], machine),
             "default_machine_id": default_machine,
-            "config": json.loads(config),
+            "config": configuration,
         },
     )
 
@@ -582,3 +595,171 @@ def main() -> None:
             "Connection failed; a mutation may have completed. Reuse its request ID.", err=True
         )
         raise SystemExit(1) from None
+
+
+def read_json_file(path: Path) -> JsonObject:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError
+        return value
+    except OSError, ValueError:
+        raise typer.BadParameter("Configuration file must contain a JSON object") from None
+
+
+def provider_config(path: Path, key_file: Path | None, key_env: str | None) -> JsonObject:
+    config = read_json_file(path)
+    if key_file is not None and key_env is not None:
+        raise typer.BadParameter("Use --key-file or --key-env exclusively")
+    try:
+        key = (
+            key_file.read_text(encoding="utf-8").strip()
+            if key_file
+            else os.environ[key_env]
+            if key_env
+            else None
+        )
+    except OSError, KeyError:
+        raise typer.BadParameter("The selected key source is unavailable") from None
+    if key is not None:
+        config["api_key"] = key
+    return config
+
+
+@provider.command("create")
+def create_provider(
+    ctx: typer.Context,
+    config_file: Annotated[Path, typer.Option()],
+    key_file: Annotated[Path | None, typer.Option()] = None,
+    key_env: Annotated[str | None, typer.Option()] = None,
+    request_id: Annotated[UUID | None, typer.Option()] = None,
+) -> None:
+    invoke(
+        ctx,
+        "provider.create",
+        {**provider_config(config_file, key_file, key_env), "request_id": rid(request_id)},
+    )
+
+
+@provider.command("update")
+def update_provider(
+    ctx: typer.Context,
+    provider_id: str,
+    expected_revision: Annotated[int, typer.Option(min=1)],
+    config_file: Annotated[Path, typer.Option()],
+    key_file: Annotated[Path | None, typer.Option()] = None,
+    key_env: Annotated[str | None, typer.Option()] = None,
+    request_id: Annotated[UUID | None, typer.Option()] = None,
+) -> None:
+    invoke(
+        ctx,
+        "provider.update",
+        {
+            **provider_config(config_file, key_file, key_env),
+            "provider_id": provider_id,
+            "expected_revision": expected_revision,
+            "request_id": rid(request_id),
+        },
+    )
+
+
+@provider.command("get")
+def get_provider(ctx: typer.Context, provider_id: str) -> None:
+    invoke(ctx, "provider.get", {"provider_id": provider_id})
+
+
+@provider.command("list")
+def list_providers(ctx: typer.Context, after_id: str | None = None, limit: int = 100) -> None:
+    invoke(ctx, "provider.list", {"after_id": after_id, "limit": limit})
+
+
+@provider.command("delete")
+def delete_provider(
+    ctx: typer.Context,
+    provider_id: str,
+    expected_revision: Annotated[int, typer.Option(min=1)],
+    request_id: Annotated[UUID | None, typer.Option()] = None,
+) -> None:
+    invoke(
+        ctx,
+        "provider.delete",
+        {
+            "provider_id": provider_id,
+            "expected_revision": expected_revision,
+            "request_id": rid(request_id),
+        },
+    )
+
+
+@provider.command("discover")
+def discover_models(
+    ctx: typer.Context,
+    provider_id: str,
+    page_token: str | None = None,
+    limit: int = 100,
+    request_id: Annotated[UUID | None, typer.Option()] = None,
+) -> None:
+    invoke(
+        ctx,
+        "provider.discover",
+        {
+            "provider_id": provider_id,
+            "page_token": page_token,
+            "limit": limit,
+            "request_id": rid(request_id),
+        },
+    )
+
+
+@provider.command("models")
+def provider_models(
+    ctx: typer.Context, provider_id: str, after_id: str | None = None, limit: int = 100
+) -> None:
+    invoke(
+        ctx, "provider.models", {"provider_id": provider_id, "after_id": after_id, "limit": limit}
+    )
+
+
+@provider_model.command("create")
+def create_model(
+    ctx: typer.Context,
+    provider_id: str,
+    name: str,
+    defaults: str = "{}",
+    request_id: Annotated[UUID | None, typer.Option()] = None,
+) -> None:
+    invoke(
+        ctx,
+        "provider.model.create",
+        {
+            "provider_id": provider_id,
+            "name": name,
+            "defaults": json.loads(defaults),
+            "request_id": rid(request_id),
+        },
+    )
+
+
+@provider_model.command("get")
+def get_model(ctx: typer.Context, model_id: str) -> None:
+    invoke(ctx, "provider.model.get", {"model_id": model_id})
+
+
+@provider_model.command("update")
+def update_model(
+    ctx: typer.Context,
+    model_id: str,
+    expected_revision: Annotated[int, typer.Option(min=1)],
+    defaults: str = "{}",
+    request_id: Annotated[UUID | None, typer.Option()] = None,
+) -> None:
+    invoke(
+        ctx,
+        "provider.model.update",
+        {
+            "model_id": model_id,
+            "expected_revision": expected_revision,
+            "defaults": json.loads(defaults),
+            "request_id": rid(request_id),
+        },
+    )

@@ -6,11 +6,15 @@ import pytest
 from kapy.gateway.auth import Principal
 from kapy.rpc import RpcError
 
+from .conftest import MODEL_CONFIG
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+
 OPERATOR = Principal("operator")
 
 
 async def create(gateway, principal=OPERATOR, **extra):
+    extra = {**extra, "config": {**MODEL_CONFIG, **extra.get("config", {})}}
     return await gateway.call(
         "session.create",
         {
@@ -18,7 +22,7 @@ async def create(gateway, principal=OPERATOR, **extra):
             "title": "test",
             "machine_ids": ["one"],
             "default_machine_id": "one",
-            "config": {},
+            "config": MODEL_CONFIG,
             **extra,
         },
         principal=principal,
@@ -27,7 +31,12 @@ async def create(gateway, principal=OPERATOR, **extra):
 
 async def test_receipt_idempotency_owner_and_deleted_wait(gateway):
     request_id = str(uuid4())
-    params = {"request_id": request_id, "machine_ids": ["one"], "input": "hello"}
+    params = {
+        "request_id": request_id,
+        "machine_ids": ["one"],
+        "input": "hello",
+        "config": MODEL_CONFIG,
+    }
     created = await gateway.call("session.create", params, principal=OPERATOR)
     assert await gateway.call("session.create", params, principal=OPERATOR) == created
     sid = created["session"]["id"]

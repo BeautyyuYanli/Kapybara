@@ -5,19 +5,20 @@
 `AgentPayloadStore`, and Gateway's `AuthorizeWait` callback. Construction starts no
 I/O. The agent does not load environment files or own these resources.
 
-At session creation, call `runner.initial_state(instructions=..., skills=await
+At session creation, call `Runner.initial_state(instructions=..., skills=await
 skills.catalog())`. Store that snapshot in State's `SessionSpec.initial_state`.
-Instructions and the catalog remain fixed for the session. Each run selects the
-optional `session.config.model`, falling back to `RunnerConfig.model`. Current session ID,
-associated machine IDs and default machine are appended for each run without rewriting
-the instruction/skill snapshot. Association does not claim that a machine is online.
+User instructions and the catalog remain fixed for the session. Current behavior instructions,
+including the history view schema, session ID and machine selection, are supplied each run.
+A recognized old base prompt is replaced without rewriting the stored user/skill snapshot.
 
-`RunnerConfig` contains model name, window/output limits and compression/media settings,
-not credentials. `OpenAICompatibleBackend(base_url=..., api_key=SecretStr(...),
-http_client=...)` implements the `ModelBackend` protocol: `create_model(model_name)` and
-`classify_error(error) -> ModelFailure | None`. The immutable failure contains `kind`
-(`context_length` or `media`) and a safe message. Unknown errors remain errors. Backend
-clients are borrowed and never closed by Runner; application composition owns their lifetime.
+`RunnerConfig` contains the resolved model name/window/output and compression/media settings,
+not credentials. Gateway derives it from the session model ID and current provider catalog.
+`ModelConnection(type, base_url, api_key)` is an immutable borrowed connection;
+`create_model_backend(connection, http_client)` selects native Pydantic OpenAI Responses,
+Chat, or Google adapters. `ModelBackend.create_model(name)` and `classify_error(error)`
+remain replaceable interfaces. Runner never closes the shared HTTP client. Provider failures
+are sanitized by Gateway before State persists them. Detailed resource and budget precedence
+is in [models](models.md).
 
 ## Persistence and recovery
 

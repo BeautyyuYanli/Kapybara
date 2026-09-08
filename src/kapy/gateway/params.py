@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, JsonValue
 
+from .models import ModelDefaults, ProviderConfig
+
 
 def skill_identifier(value: str) -> str:
     return str(UUID(value))
@@ -118,3 +120,53 @@ class SkillDownload(SkillTransfer):
 class SkillDelete(SkillId):
     request_id: UUID
     expected_revision: int = Field(ge=1)
+
+
+class ProviderId(Params):
+    provider_id: UUID
+
+
+class ProviderCreate(ProviderConfig):
+    request_id: UUID
+
+
+class ProviderUpdate(ProviderCreate):
+    provider_id: UUID
+    expected_revision: int = Field(ge=1)
+
+
+class ProviderDelete(ProviderId):
+    request_id: UUID
+    expected_revision: int = Field(ge=1)
+
+
+class ProviderList(Params):
+    after_id: UUID | None = None
+    limit: int = Field(100, ge=1, le=100)
+
+
+class ProviderModels(ProviderId):
+    after_id: UUID | None = None
+    limit: int = Field(100, ge=1, le=100)
+
+
+class ProviderDiscover(ProviderId):
+    request_id: UUID
+    page_token: str | None = Field(None, max_length=2048)
+    limit: int = Field(100, ge=1, le=100)
+
+
+class ModelId(Params):
+    model_id: UUID
+
+
+class ModelCreate(ProviderId):
+    request_id: UUID
+    name: str = Field(min_length=1, max_length=256)
+    defaults: ModelDefaults = Field(default_factory=ModelDefaults)
+
+
+class ModelUpdate(ModelId):
+    request_id: UUID
+    expected_revision: int = Field(ge=1)
+    defaults: ModelDefaults = Field(default_factory=ModelDefaults)

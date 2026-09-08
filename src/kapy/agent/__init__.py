@@ -1,7 +1,14 @@
 """Agent configuration, script plugins, and durable payload storage."""
 
 from .apply_patch import apply_patch_plugin
-from .models import ModelBackend, ModelFailure, OpenAICompatibleBackend
+from .models import (
+    ModelBackend,
+    ModelBackendFactory,
+    ModelConnection,
+    ModelFailure,
+    OpenAICompatibleBackend,
+    create_model_backend,
+)
 from .payloads import (
     AgentPayloadStore,
     PayloadCorrupt,
@@ -21,6 +28,9 @@ from .types import (
 )
 
 __all__ = [
+    "ModelConnection",
+    "ModelBackendFactory",
+    "create_model_backend",
     "ScriptHost",
     "apply_patch_plugin",
     "ModelBackend",

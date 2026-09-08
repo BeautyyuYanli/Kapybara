@@ -13,7 +13,7 @@ from uuid import uuid4
 import httpx2
 
 
-async def check(machine_id: str) -> None:
+async def check(machine_id: str, model_id: str) -> None:
     base = os.environ.get("KAPY_CONTROL_URL", "http://127.0.0.1:8000").rstrip("/")
     label = "Kapy recursive acceptance " + uuid4().hex[:12]
     async with httpx2.AsyncClient(
@@ -41,7 +41,7 @@ async def check(machine_id: str) -> None:
                 "title": label + " parent",
                 "machine_ids": [machine_id],
                 "default_machine_id": machine_id,
-                "config": {},
+                "config": {"model": {"model_id": model_id}},
             },
         )
         parent_id = parent["session"]["id"]
@@ -151,4 +151,6 @@ async def check(machine_id: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--machine", required=True)
-    asyncio.run(check(parser.parse_args().machine))
+    parser.add_argument("--model-id", required=True)
+    args = parser.parse_args()
+    asyncio.run(check(args.machine, args.model_id))

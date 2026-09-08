@@ -11,7 +11,7 @@ from kapy.gateway import create_app
 from kapy.gateway.auth import Principal
 from kapy.settings import Settings
 
-from .conftest import DATABASE, VALKEY
+from .conftest import DATABASE, VALKEY, register_model
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -60,12 +60,11 @@ async def test_real_lifespan_runner_checkpoint_and_resource_shutdown(monkeypatch
         valkey_namespace=namespace,
         control_token="test-admin",
         session_signing_key="test-signing",
-        model_api_key="test-provider",
-        context_window_tokens=100_000,
     )
     app = create_app(settings.model_copy(update={"frontends": []}))
     try:
         async with app.router.lifespan_context(app):
+            config = await register_model(app.state.control)
             pool = app.state.metadata.pool
             request_id = str(uuid4())
             created = await app.state.control.call(
@@ -73,6 +72,7 @@ async def test_real_lifespan_runner_checkpoint_and_resource_shutdown(monkeypatch
                 {
                     "request_id": request_id,
                     "input": "hello",
+                    "config": config,
                 },
                 principal=Principal("operator"),
             )

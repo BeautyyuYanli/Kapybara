@@ -21,7 +21,7 @@ from kapy.execution import resolve_paths
 from kapy.gateway import create_app
 from kapy.settings import Settings
 
-from .conftest import DATABASE, VALKEY
+from .conftest import DATABASE, VALKEY, register_model
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -42,9 +42,6 @@ async def test_cli_daemon_gateway_transfer_reconnect_and_delete(tmp_path: Path):
         control_token="integration-admin",
         session_signing_key="integration-signing",
         machine_tokens={"one": "integration-machine"},
-        model_api_key="integration-unused-provider",
-        model_base_url="http://127.0.0.1:9/v1",
-        context_window_tokens=100_000,
         telegram_bot_token=None,
     )
     app = create_app(settings.model_copy(update={"frontends": []}))
@@ -71,6 +68,7 @@ async def test_cli_daemon_gateway_transfer_reconnect_and_delete(tmp_path: Path):
                     await serving
                     pytest.fail("Control server exited before startup")
                 await asyncio.sleep(0.02)
+            model_config = await register_model(app.state.control, base_url="http://127.0.0.1:9/v1")
             daemon = await asyncio.create_subprocess_exec(
                 *cli,
                 "server",
@@ -113,6 +111,7 @@ async def test_cli_daemon_gateway_transfer_reconnect_and_delete(tmp_path: Path):
                         "request_id": str(uuid4()),
                         "machine_ids": ["one"],
                         "default_machine_id": "one",
+                        "config": model_config,
                     },
                 )
                 sid = created["session"]["id"]
@@ -145,7 +144,9 @@ async def test_cli_daemon_gateway_transfer_reconnect_and_delete(tmp_path: Path):
                 # The daemon injects the session capability and socket into this real child.
                 stdout, _ = await run_cli("session", "get")
                 assert json.loads(stdout)["id"] == sid
-                unrelated = await rpc("session.create", {"request_id": str(uuid4())})
+                unrelated = await rpc(
+                    "session.create", {"request_id": str(uuid4()), "config": model_config}
+                )
                 await run_cli(
                     "--session", unrelated["session"]["id"], "session", "get", success=False
                 )

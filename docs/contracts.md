@@ -84,7 +84,7 @@ aliases for discarded draft names.
 ### Approved Python exports
 
 - Runner(config, machine_caller, *, model_backend, payload_store, authorize_wait,
-  plugins=()) borrows its dependencies; initial_state(*, instructions, skills)
+  plugins=(), model_identity=None) borrows its dependencies; initial_state(*, instructions, skills)
   returns State.RunnerState. Its async call takes State.RunContext and returns
   State.RunResult. Construction has no I/O or background tasks.
 - AuthorizeWait accepts a session UUID and tuple of channel UUIDs, returns None
@@ -112,7 +112,7 @@ aliases for discarded draft names.
   `ModelBackend.create_model(model_name) -> Model` and
   `classify_error(Exception) -> ModelFailure | None` isolate the adapter. The provided
   `OpenAICompatibleBackend(*, base_url, api_key, http_client)` borrows its HTTP client.
-- `create_app(settings=None, *, model_backend=None, frontend_factories=None, plugins=None)`
+- `create_app(settings=None, *, model_backend_factory=create_model_backend, frontend_factories=None, plugins=None)`
   registers trusted Python frontend factories selected through Settings.frontends. Context
   contains Settings, ControlAPI, borrowed pool and schema; business calls use
   `ControlAPI.call(method, params, *, principal)`. Frontend.run owns plugin migration/tasks.
@@ -125,3 +125,15 @@ aliases for discarded draft names.
   apply_patch, with explicit sequence or configuration allowing removal/replacement.
 - Model tools do not include file_read/file_write. Text inspection/editing uses process
   commands and optional patch tools. Raw execution file RPCs and read_media are unchanged.
+
+
+## Provider resources and model selection (2026-09-08)
+
+Provider owns type (Responses default, Chat or Google AI Studio), endpoint and current key.
+The stable model catalog stores observed metadata and separate user defaults; discovery never
+replaces defaults. Session config.model accepts model_id and optional token budget overrides only.
+Effective budgets are session > model defaults > observed > 262144/16384, subject to known limits.
+Each run freezes the current provider/catalog; provider/default changes affect later calls.
+Provider deletion clears the key and leaves session history. Credentials never enter State config
+or generic request JSON. CRUD/defaults/discovery and their receipts commit atomically in Gateway.
+Full signatures, authorization and lifecycle are documented in [models](models.md).

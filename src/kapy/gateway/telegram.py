@@ -5,6 +5,7 @@ Bot API calls are injectable for tests. Production never logs token-bearing URLs
 
 import asyncio
 import copy
+import json
 import logging
 import random
 import re
@@ -30,7 +31,12 @@ logger = logging.getLogger(__name__)
 COMMANDS = {
     "new": "Create a session using saved settings",
     "settings": "Show saved settings",
-    "model": "Save the model name",
+    "providers": "List configured providers",
+    "provider": "Select a provider ID or configure one with JSON",
+    "discover": "Refresh models from the selected provider",
+    "models": "List saved model IDs",
+    "model": "Select a model ID or JSON budget overrides",
+    "modeldefaults": "Update shared model defaults with JSON",
     "machine": "Save the default machine",
     "instructions": "Save instructions for new sessions",
     "steer": "Steer the current run",
@@ -389,7 +395,7 @@ class TelegramFrontend:
             "title": "Telegram",
             "machine_ids": [],
             "default_machine_id": None,
-            "config": {"model": self.settings.model},
+            "config": {},
         }
         if len(self.settings.machine_tokens) == 1:
             machine = next(iter(self.settings.machine_tokens))
@@ -429,7 +435,7 @@ class TelegramFrontend:
                 ),
             }
         if command == "/settings":
-            return {"kind": "reply", "text": str(config)}
+            return {"kind": "reply", "text": json.dumps(redact_config(config), ensure_ascii=False)}
         if command == "/status":
             return (
                 {"kind": "status", "session_id": sid}
@@ -439,6 +445,74 @@ class TelegramFrontend:
                     "text": "No active session. Use /new or send text.",
                 }
             )
+        if command in {"/providers", "/provider", "/discover", "/models", "/modeldefaults"}:
+            params: dict[str, Any] = {}
+            selected_provider = config.get("provider_id")
+            select = False
+            if command == "/providers":
+                method = "provider.list"
+            elif command == "/provider":
+                select = True
+                if argument.lstrip().startswith("{"):
+                    try:
+                        params = json.loads(argument)
+                        if not isinstance(params, dict):
+                            raise ValueError
+                    except ValueError:
+                        return {
+                            "kind": "reply",
+                            "text": "Provider configuration must be a JSON object.",
+                        }
+                    method = "provider.update" if "provider_id" in params else "provider.create"
+                else:
+                    method, params = "provider.get", {"provider_id": argument.strip()}
+            elif command == "/modeldefaults":
+                selected_model = config.get("config", {}).get("model", {}).get("model_id")
+                if selected_model is None:
+                    return {"kind": "reply", "text": "Choose /model ID first."}
+                try:
+                    defaults = json.loads(argument)
+                    if not isinstance(defaults, dict):
+                        raise ValueError
+                except ValueError:
+                    return {"kind": "reply", "text": "Defaults must be a JSON object."}
+                current = cast(
+                    dict,
+                    await self.control.call(
+                        "provider.model.get",
+                        {"model_id": selected_model},
+                        principal=self.principal(inbox["chat_id"], inbox["thread_id"]),
+                    ),
+                )
+                method, params = (
+                    "provider.model.update",
+                    {
+                        "model_id": selected_model,
+                        "expected_revision": current["revision"],
+                        "defaults": defaults,
+                    },
+                )
+            else:
+                if selected_provider is None:
+                    return {"kind": "reply", "text": "Choose /provider ID first."}
+                method = "provider.discover" if command == "/discover" else "provider.models"
+                params = {"provider_id": selected_provider}
+                if command == "/discover" and argument.strip():
+                    params["page_token"] = argument.strip()
+            if method in {
+                "provider.create",
+                "provider.update",
+                "provider.discover",
+                "provider.model.update",
+            }:
+                params["request_id"] = request_id(self.bot_id, inbox["update_id"], method)
+            return {
+                "kind": "provider",
+                "method": method,
+                "params": params,
+                "select": select,
+                "config": config,
+            }
         if command in {"/model", "/machine", "/instructions"}:
             if not argument.strip():
                 return {"kind": "reply", "text": f"Usage: {command} <value>"}
@@ -447,6 +521,31 @@ class TelegramFrontend:
                     return {"kind": "reply", "text": "Unknown configured machine."}
                 config["machine_ids"] = [argument]
                 config["default_machine_id"] = argument
+            elif command == "/model":
+                try:
+                    selected = (
+                        json.loads(argument)
+                        if argument.lstrip().startswith("{")
+                        else {"model_id": argument.strip()}
+                    )
+                    from .models import parse_session_model
+
+                    selected = parse_session_model(selected).model_dump(mode="json")
+                    registered = cast(
+                        dict,
+                        await self.control.call(
+                            "provider.model.get",
+                            {"model_id": selected["model_id"]},
+                            principal=self.principal(inbox["chat_id"], inbox["thread_id"]),
+                        ),
+                    )
+                    config["provider_id"] = registered["provider_id"]
+                    config["config"]["model"] = selected
+                except ValueError, TypeError:
+                    return {
+                        "kind": "reply",
+                        "text": "Use /model ID or a model selection JSON object.",
+                    }
             else:
                 config["config"][command[1:]] = argument
             update = False
@@ -467,12 +566,17 @@ class TelegramFrontend:
                 return {"kind": "reply", "text": f"Usage: {command} <text>"}
         mode = "steer" if command == "/steer" else "queue"
         if command == "/new" or sid is None:
+            if not isinstance(config["config"].get("model"), dict):
+                return {
+                    "kind": "reply",
+                    "text": "Choose a configured model with /provider and /model first.",
+                }
             if not config["machine_ids"]:
                 return {"kind": "reply", "text": "Choose a machine with /machine <id> first."}
             return {
                 "kind": "create",
                 "params": {
-                    **config,
+                    **session_configuration(config),
                     "input": (None if command == "/new" else text),
                     "mode": mode,
                     "request_id": request_id(
@@ -541,6 +645,34 @@ class TelegramFrontend:
                     if action["params"].get("input") is None
                     else None
                 )
+        elif kind == "provider":
+            result = cast(
+                dict,
+                await self.control.call(action["method"], action["params"], principal=principal),
+            )
+            config = action["config"]
+            if action["select"]:
+                config["provider_id"] = result["id"]
+                config["config"].pop("model", None)
+            if action["select"] or action["method"] == "provider.discover":
+                listing = cast(
+                    dict,
+                    await self.control.call(
+                        "provider.models",
+                        {"provider_id": config["provider_id"]},
+                        principal=principal,
+                    ),
+                )
+                if listing["default_model_id"] is not None:
+                    config["config"]["model"] = {"model_id": listing["default_model_id"]}
+                await self.metadata.rows(
+                    "UPDATE gateway_telegram_routes SET config=%s "
+                    "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s",
+                    (Jsonb(config), self.bot_id, chat, thread),
+                )
+            reply = json.dumps(result, ensure_ascii=False)
+            if action["method"] in {"provider.update", "provider.model.update"}:
+                reply += "\nSaved. This shared setting applies to future runs of sessions using it."
         elif kind == "config":
             await self.metadata.rows(
                 "UPDATE gateway_telegram_routes SET config=%s "
@@ -552,7 +684,7 @@ class TelegramFrontend:
                     await self.control.call(
                         "session.update",
                         {
-                            **action["config"],
+                            **session_configuration(action["config"]),
                             "session_id": action["session_id"],
                             "request_id": action["request_id"],
                         },
@@ -579,6 +711,18 @@ class TelegramFrontend:
                 chunk, remaining = text_chunk(remaining)
                 await self.send(chat, thread, chunk)
         async with self.metadata.connection() as conn:
+            # Provider configuration is private while pending; discard key-bearing ingress
+            # once its durable operation and user acknowledgement have completed.
+            if message_command(inbox.get("payload", {})) == "/provider":
+                await conn.execute(
+                    "UPDATE gateway_telegram_inbox SET payload='{}',resolved_action=%s "
+                    "WHERE bot_id=%s AND update_id=%s",
+                    (
+                        Jsonb({"kind": "reply", "text": reply or "Settings saved."}),
+                        self.bot_id,
+                        inbox["update_id"],
+                    ),
+                )
             await conn.execute(
                 "UPDATE gateway_telegram_inbox SET handled=true WHERE bot_id=%s AND update_id=%s",
                 (self.bot_id, inbox["update_id"]),
@@ -606,10 +750,13 @@ class TelegramFrontend:
                 await self.handle(inbox)
             except TelegramFailure as exc:
                 if exc.code in {400, 403}:
+                    private_config = message_command(inbox.get("payload", {})) == "/provider"
                     await self.metadata.rows(
-                        "UPDATE gateway_telegram_inbox SET handled=true "
+                        "UPDATE gateway_telegram_inbox SET handled=true,"
+                        "payload=CASE WHEN %s THEN '{}'::jsonb ELSE payload END,"
+                        "resolved_action=CASE WHEN %s THEN '{}'::jsonb ELSE resolved_action END "
                         "WHERE bot_id=%s AND update_id=%s",
-                        (self.bot_id, inbox["update_id"]),
+                        (private_config, private_config, self.bot_id, inbox["update_id"]),
                     )
                 else:
                     await self.metadata.rows(
@@ -879,3 +1026,23 @@ class TelegramFrontend:
                 await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
                 failures += 1
             await asyncio.sleep(1)
+
+
+def session_configuration(config: dict[str, Any]) -> dict[str, Any]:
+    return {key: config[key] for key in ("title", "machine_ids", "default_machine_id", "config")}
+
+
+def redact_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: ("[configured]" if key == "api_key" else redact_config(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_config(item) for item in value]
+    return value
+
+
+def message_command(payload: dict) -> str:
+    text = payload.get("message", {}).get("text", "")
+    return text.partition(" ")[0].split("@")[0]
