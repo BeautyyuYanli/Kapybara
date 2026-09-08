@@ -114,8 +114,10 @@ async def test_concurrent_sessions_and_steer_queue(database: Database) -> None:
 
     service = await database.start(runner)
     first = await service.create_session(spec(), request_id=uuid4(), input="first")
+    assert first.submission is not None
     ctx = await asyncio.wait_for(starts.get(), 5)
     second = await service.create_session(spec(), request_id=uuid4(), input="other")
+    assert second.submission is not None
     await database.completed(second.submission.request_id)
     assert ctx.session.id in active  # second session finished while first is still running
     queue = await service.submit_input(first.session.id, "queue", request_id=uuid4(), mode="queue")
@@ -165,6 +167,7 @@ async def test_checkpoint_output_idempotency_and_cursor(database: Database) -> N
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="hello")
+    assert created.submission is not None
     await asyncio.wait_for(emitted.wait(), 5)
     page = await service.read_output(created.session.id, limit=1)
     observed = list(page.items)
@@ -205,6 +208,7 @@ async def test_restart_reserves_only_unconfirmed_inputs(database: Database) -> N
 
     service = await database.start(interrupted)
     created = await service.create_session(spec(), request_id=uuid4(), input="initial")
+    assert created.submission is not None
     await asyncio.wait_for(ready.wait(), 5)
     pending = await service.submit_input(
         created.session.id, "next", request_id=uuid4(), mode="queue"
@@ -243,6 +247,7 @@ async def test_failed_runner_and_delete_release_pending_work(database: Database)
 
     service = await database.start(runner)
     first = await service.create_session(spec(), request_id=uuid4(), input="fail")
+    assert first.submission is not None
     await asyncio.wait_for(started.wait(), 5)
     queued = await service.submit_input(first.session.id, "okay", request_id=uuid4(), mode="queue")
     gate.set()
@@ -251,6 +256,7 @@ async def test_failed_runner_and_delete_release_pending_work(database: Database)
     assert "secret" not in str((await service.read_output(first.session.id)).items)
     started.clear()
     blocked = await service.create_session(spec(), request_id=uuid4(), input="block")
+    assert blocked.submission is not None
     await asyncio.wait_for(started.wait(), 5)
     assert await service.delete_session(blocked.session.id, request_id=uuid4())
     assert (await database.completed(blocked.submission.request_id))["outcome"] == "deleted"
@@ -259,6 +265,7 @@ async def test_failed_runner_and_delete_release_pending_work(database: Database)
 async def test_lease_and_lost_valkey_hints(database: Database) -> None:
     service = await database.start(simple, valkey_url="redis://127.0.0.1:1/0")
     created = await service.create_session(spec(), request_id=uuid4(), input="durable")
+    assert created.submission is not None
     assert (await database.completed(created.submission.request_id))["outcome"] == "completed"
     with pytest.raises(Conflict):
         async with SessionService(
@@ -272,3 +279,58 @@ async def test_lease_and_lost_valkey_hints(database: Database) -> None:
             await asyncio.sleep(0.02)
     with pytest.raises(ServiceUnavailable):
         await service.create_session(spec(), request_id=uuid4())
+
+
+@pytest.mark.parametrize("public", [False, True])
+async def test_explicit_public_runner_failure_is_persisted_but_unknown_exception_is_private(
+    database: Database,
+    public: bool,
+) -> None:
+    from kapy.state import RunFailure
+
+    async def fail(ctx: RunContext) -> RunResult:
+        if public:
+            raise RunFailure("configuration_needed", "Choose a configured model before continuing.")
+        raise RuntimeError("api_key=private-runner-secret https://provider.invalid/?key=private")
+
+    service = await database.start(fail)
+    created = await service.create_session(spec(), request_id=uuid4(), input="run")
+    assert created.submission is not None
+    completed = await service.wait_submission(
+        created.session.id,
+        created.submission.request_id,
+        wait_seconds=5,
+    )
+    assert completed.completion is not None and completed.completion.outcome == "failed"
+    errors = [
+        record
+        for record in (await service.read_output(created.session.id)).items
+        if record.kind == "error"
+    ]
+    assert len(errors) == 1
+    if public:
+        assert errors[0].data == {
+            "kind": "configuration_needed",
+            "public_message": "Choose a configured model before continuing.",
+        }
+        assert (
+            completed.completion.output
+            == errors[0].text
+            == "Choose a configured model before continuing."
+        )
+    else:
+        assert completed.completion.output is None
+        assert "private-runner-secret" not in str(errors) and "provider.invalid" not in str(errors)
+
+
+async def test_public_runner_failure_bounds() -> None:
+    from kapy.state import RunFailure
+
+    for code, message in [
+        ("unsafe code", "fine"),
+        ("a" * 65, "fine"),
+        ("code", "😀" * 257),
+        ("code", "\0"),
+    ]:
+        with pytest.raises(ValueError):
+            RunFailure(code, message)

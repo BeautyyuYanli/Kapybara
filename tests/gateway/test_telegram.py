@@ -7,9 +7,18 @@ from uuid import UUID
 import httpx2
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
 from kapy.gateway.frontends import FrontendContext
-from kapy.gateway.telegram import TelegramFailure, TelegramFrontend, request_id
+from kapy.gateway.telegram import (
+    TelegramFailure,
+    TelegramFrontend,
+    progress_text,
+    project,
+    request_id,
+)
+
+from .conftest import MODEL_CONFIG, PROVIDER_ID
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -23,6 +32,19 @@ class Bot(TelegramFrontend):
         )
         self.sent = []
         self.fail = False
+
+    async def route(self, chat, thread):
+        """Legacy delivery tests use an explicitly preconfigured fixture route."""
+        route = await super().route(chat, thread)
+        if "provider_id" not in route["config"]:
+            route["config"]["provider_id"] = PROVIDER_ID
+            route["config"]["config"].update(MODEL_CONFIG)
+            await self.metadata.rows(
+                "UPDATE gateway_telegram_routes SET config=%s "
+                "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s",
+                (Jsonb(route["config"]), self.bot_id, chat, thread),
+            )
+        return route
 
     async def api(self, method, params):
         if self.fail and method == "sendMessage":
@@ -113,13 +135,17 @@ async def test_delivery_resume_partial_unicode_output(gateway):
     await bot.process_once()
     await bot.process_once()
     sid = (await bot.route(-100, 7))["session_id"]
-    await gateway.sessions.wait_submission(
+    status = await gateway.sessions.wait_submission(
         sid, UUID(request_id(12345, 2, "message.create")), wait_seconds=5
     )
+    assert status.completion is not None and status.completion.outcome == "completed"
     bot.sent.clear()
-    await bot.deliver_once()
-    row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
-    assert row["item_offset"] > 0
+    async with asyncio.timeout(5):
+        while True:
+            await bot.deliver_once()
+            row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
+            if row["item_offset"] > 0:
+                break
     first = sent_text(bot.sent[0][1])
     bot = Bot(gateway)
     for _ in range(12):
@@ -194,6 +220,11 @@ async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadlin
         gateway.settings, gateway, gateway.metadata.pool, gateway.metadata.schema
     )
     bot = TelegramFrontend(context)
+    route = await bot.route(-100, 7)
+    route["config"]["config"].update(MODEL_CONFIG)
+    await gateway.metadata.rows(
+        "UPDATE gateway_telegram_routes SET config=%s WHERE thread_id=7", (Jsonb(route["config"]),)
+    )
     content = "A" * 3990 + "😀" * 10000 + "tail"
     attempts, delivered = [], []
 
@@ -219,11 +250,16 @@ async def test_delivery_429_preserves_chunk_and_restarts_after_persisted_deadlin
         await bot.process_once()
         await bot.process_once()
         sid = (await bot.route(-100, 7))["session_id"]
-        await gateway.sessions.wait_submission(
+        status = await gateway.sessions.wait_submission(
             sid, UUID(request_id(12345, 1, "message.create")), wait_seconds=5
         )
-        await bot.deliver_once()
-        first = await delivery()
+        assert status.completion is not None and status.completion.outcome == "completed"
+        async with asyncio.timeout(5):
+            while True:
+                await bot.deliver_once()
+                first = await delivery()
+                if first["item_offset"] > 0:
+                    break
         pending = first["projection"]["pending"]
         assert first["item_offset"] > 0
         assert content in pending["text"]
@@ -319,7 +355,7 @@ async def test_private_drafts_restart_refresh_and_final(gateway, monkeypatch):
     restored = Bot(gateway)
     await restored.deliver_once()
     assert restored.sent[-1][1] == bot.sent[-1][1]
-    restored._draft_sent[first["draft_id"]] = ("Hello", time.monotonic() - 21)
+    restored._draft_sent[first["draft_id"]] = ("Hello", True, time.monotonic() - 21)
     restored._chat_ready.clear()
     await restored.deliver_once()
     assert len(restored.sent) == 2
@@ -331,72 +367,140 @@ async def test_private_drafts_restart_refresh_and_final(gateway, monkeypatch):
     ] == 0
 
 
-async def test_pages_runs_many_messages_retry_and_interrupted(gateway, monkeypatch):
+async def test_progress_replaced_by_first_delta_and_each_message_ends_draft(gateway, monkeypatch):
     records = []
     bot, _ = await install_output(gateway, monkeypatch, records, thread=9)
-    feed(records, record("model_response", "checking", message="preamble"))
-    feed(records, *(record("tool_call") for _ in range(198)))
-    feed(records, record("text_delta"))
-    records[-1]["data"]["text"] = "bad"
-    await bot.deliver_once()
-    first_draft = bot.sent[-1][1]
-    assert sent_text(first_draft) == "checking\n\nbad"
     feed(
         records,
-        {
-            "kind": "notice",
-            "data": {"kind": "attempt_failed", "failed_message_id": "m"},
-            "run_id": "r",
-        },
+        record(
+            "tool_call",
+            name="process_start",
+            args={"command": "pwd"},
+            tool_call_id="private-call",
+            attempt_id="private-attempt",
+        ),
     )
+    await bot.deliver_once()
+    first = bot.sent[-1]
+    assert first[0] == "sendMessageDraft"
+    assert sent_text(first[1]) == "process_start · calling · pwd"
+    assert "private-" not in sent_text(first[1])
+    feed(records, record("tool_result", result="/workspace"))
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert sent_text(bot.sent[-1][1]) == "checking"
-    assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
-    feed(records, record("text_delta", message="unfinished"))
-    records[-1]["data"]["text"] = "do not retain"
+    progress = sent_text(bot.sent[-1][1])
+    assert progress == "Tool · returned · /workspace"
+    assert bot.sent[-1][1]["draft_id"] == first[1]["draft_id"]
+    # An empty delta preserves progress; identical nonempty text still switches to rich.
+    feed(records, record("text_delta"))
+    await bot.deliver_once()
+    assert len(bot.sent) == 2
+    feed(records, record("text_delta"))
+    records[-1]["data"]["text"] = progress
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert sent_text(bot.sent[-1][1]) == "checking\n\ndo not retain"
+    assert bot.sent[-1][0] == "sendRichMessageDraft"
+    assert sent_text(bot.sent[-1][1]) == progress
+    assert bot.sent[-1][1]["draft_id"] == first[1]["draft_id"]
+    feed(records, record("model_response", "The directory is /workspace."))
+    await bot.deliver_once()
+    assert bot.sent[-1][0] == "sendRichMessage"
+    assert sent_text(bot.sent[-1][1]) == "The directory is /workspace."
+    row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
+    assert "draft" not in row["projection"] and "message" not in row["projection"]
+    # Formal ACK is the boundary; later work uses a fresh draft even after restart.
+    restored = Bot(gateway)
+    feed(records, record("tool_call", name="check", args={"path": "/workspace"}))
+    await restored.deliver_once()
+    second_id = restored.sent[-1][1]["draft_id"]
+    assert restored.sent[-1][0] == "sendMessageDraft" and second_id != first[1]["draft_id"]
+    feed(records, record("text_delta", message="second"))
+    records[-1]["data"]["text"] = "Done"
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["draft_id"] == second_id
+    assert sent_text(restored.sent[-1][1]) == "Done"
+    feed(
+        records, record("model_response", "Done", message="second"), record("final", output="Done")
+    )
+    await restored.deliver_once()
+    assert restored.sent[-1][0] == "sendRichMessage"
+    assert sent_text(restored.sent[-1][1]) == "Done"
+    count = len(restored.sent)
+    await restored.deliver_once()
+    assert len(restored.sent) == count
+    assert all(p["message_thread_id"] == 9 for _, p in bot.sent + restored.sent)
+
+
+async def test_pages_message_boundaries_retries_and_repeated_answers(gateway, monkeypatch):
+    records = []
+    bot, _ = await install_output(gateway, monkeypatch, records)
+    feed(records, record("model_response", "checking", message="preamble"))
+    feed(records, *(record("tool_result", result=i) for i in range(201)))
+    await bot.deliver_once()
+    assert bot.sent == [
+        ("sendRichMessage", {"chat_id": -100, "rich_message": {"markdown": "checking"}})
+    ]
+    assert (await gateway.metadata.rows("SELECT cursor FROM gateway_telegram_delivery"))[0][
+        "cursor"
+    ] == "1"
+    await bot.deliver_once()
+    assert sent_text(bot.sent[-1][1]) == "Tool · returned · 199"
+    await bot.deliver_once()
+    assert sent_text(bot.sent[-1][1]) == "Tool · returned · 200"
+    first_draft = bot.sent[-1][1]["draft_id"]
+    feed(records, record("text_delta"))
+    records[-1]["data"]["text"] = "bad partial"
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    assert sent_text(bot.sent[-1][1]) == "bad partial"
+    feed(records, record("notice"))
+    records[-1]["data"] = {
+        "kind": "attempt_failed",
+        "failed_message_id": "m",
+        "message": "private traceback",
+    }
+    bot._chat_ready.clear()
+    await bot.deliver_once()
+    assert sent_text(bot.sent[-1][1]) == "Retrying this reply…"
+    assert bot.sent[-1][1]["draft_id"] == first_draft
+    feed(records, record("text_delta", message="resumed"))
+    records[-1]["data"]["text"] = "interrupted partial"
+    bot._chat_ready.clear()
+    await bot.deliver_once()
     feed(records, record("interrupted"))
     bot._chat_ready.clear()
     await bot.deliver_once()
-    assert sent_text(bot.sent[-1][1]) == "checking"
-    assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
+    assert sent_text(bot.sent[-1][1]) == "Resuming this reply…"
+    assert bot.sent[-1][1]["draft_id"] == first_draft
+    # More than eight messages survive PostgreSQL round trips without retaining a run list.
     feed(records, *(record("model_response", f"part{i}", message=f"m{i}") for i in range(12)))
-    bot._chat_ready.clear()
-    await bot.deliver_once()
-    body = "\n\n".join(["checking", *(f"part{i}" for i in range(12))])
-    assert sent_text(bot.sent[-1][1]) == body
-    bot = Bot(gateway)
-    await bot.deliver_once()
-    assert sent_text(bot.sent[-1][1]) == body
-    assert bot.sent[-1][1]["draft_id"] == first_draft["draft_id"]
+    formal = ["checking"]
+    for _ in range(12):
+        restored = Bot(gateway)
+        await restored.deliver_once()
+        assert len(restored.sent) == 1 and restored.sent[0][0] == "sendRichMessage"
+        formal.append(sent_text(restored.sent[0][1]))
+    assert formal == ["checking", *(f"part{i}" for i in range(12))]
     feed(
         records,
-        record("model_response", "last", message="last"),
-        record("final", output="corrected"),
-    )
-    terminal = str(len(records))
-    feed(
-        records,
+        record("final", output="part11"),
         record("waiting"),
-        record("model_response", "corrected", run="r2"),
+        record("model_response", "part11", message="new", run="r2"),
+        record("model_response", "part11", message="newer", run="r2"),
         record("final", output="corrected", run="r2"),
     )
-    await bot.deliver_once()
-    row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
-    assert row["cursor"] == terminal
-    assert bot.sent[-1][0] == "sendRichMessage"
-    assert sent_text(bot.sent[-1][1]) == body + "\n\ncorrected"
-    await bot.deliver_once()
-    assert [sent_text(p) for _, p in bot.sent][-1] == "corrected"
-    assert all(p["message_thread_id"] == 9 for _, p in bot.sent)
+    restored = Bot(gateway)
+    for _ in range(4):
+        await restored.deliver_once()
+    assert [sent_text(p) for _, p in restored.sent] == ["part11", "part11", "corrected"]
 
 
 async def test_draft_400_falls_back_and_error_is_safe(gateway, monkeypatch):
     records = []
     bot, _ = await install_output(gateway, monkeypatch, records)
+    feed(records, record("model_response", "The first check completed.", message="completed"))
+    await bot.deliver_once()
     feed(records, record("text_delta"))
     records[-1]["data"]["text"] = "unconfirmed"
     original = bot.api
@@ -411,7 +515,7 @@ async def test_draft_400_falls_back_and_error_is_safe(gateway, monkeypatch):
     monkeypatch.setattr(bot, "api", api)
     await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
-    assert row["blocked_error"] is None and row["projection"]["draft"]["plain"]
+    assert row["blocked_error"] is None and row["projection"]["message"]["plain"]
     bot._chat_ready.clear()
     await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
@@ -426,9 +530,12 @@ async def test_draft_400_falls_back_and_error_is_safe(gateway, monkeypatch):
         },
     )
     await bot.deliver_once()
-    assert len(bot.sent) == 1
-    assert bot.sent[0][0] == "sendMessage"
-    text = sent_text(bot.sent[0][1])
+    assert len(bot.sent) == 2
+    assert bot.sent[0][0] == "sendRichMessage"
+    assert sent_text(bot.sent[0][1]) == "The first check completed."
+    assert bot.sent[1][0] == "sendMessage"
+    text = sent_text(bot.sent[1][1])
+    assert "The first check completed." not in text
     assert "SECRET" not in text and "unconfirmed" not in text and "RuntimeError" in text
 
 
@@ -445,10 +552,16 @@ async def test_legacy_projection_guard_preserves_everything(gateway, monkeypatch
     assert bot.sent == []
 
 
-async def test_ack_failure_repeats_unacknowledged_final(gateway, monkeypatch):
+async def test_ack_failure_repeats_only_unacknowledged_message(gateway, monkeypatch):
     records = []
     bot, _ = await install_output(gateway, monkeypatch, records)
-    feed(records, record("final", output="one final"))
+    feed(records, record("model_response", "already acknowledged", message="first"))
+    await bot.deliver_once()
+    feed(
+        records,
+        record("model_response", "one message", message="second"),
+        record("final", output="one message"),
+    )
     original = bot.metadata.rows
     failed = False
 
@@ -464,8 +577,156 @@ async def test_ack_failure_repeats_unacknowledged_final(gateway, monkeypatch):
         await bot.deliver_once()
     restored = Bot(gateway)
     await restored.deliver_once()
-    assert bot.sent == restored.sent
-    assert sent_text(bot.sent[0][1]) == "one final"
+    assert bot.sent[1:] == restored.sent
+    assert [sent_text(p) for _, p in bot.sent] == ["already acknowledged", "one message"]
+    assert sent_text(restored.sent[0][1]) == "one message"
+    # Final is not a second copy, including after recovery from a failed ACK.
+    await restored.deliver_once()
+    assert len(restored.sent) == 1
+
+
+async def test_progress_preview_is_bounded_and_restored(gateway, monkeypatch):
+    records = []
+    bot, _ = await install_output(gateway, monkeypatch, records)
+    feed(records, record("tool_result", result="😀" * 2100, tool_call_id="private-call"))
+    await bot.deliver_once()
+    method, params = bot.sent[-1]
+    assert method == "sendMessageDraft"
+    assert len(params["text"]) == 300 and params["text"].endswith("… [truncated]")
+    assert "private-call" not in params["text"]
+    restored = Bot(gateway)
+    await restored.deliver_once()
+    assert restored.sent == bot.sent
+    feed(records, record("tool_call", summary="Large content is available in history"))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["draft_id"] == params["draft_id"]
+    assert (
+        sent_text(restored.sent[-1][1]) == "Tool · calling · Large content is available in history"
+    )
+    row = (await gateway.metadata.rows("SELECT projection FROM gateway_telegram_delivery"))[0]
+    assert "😀" not in json.dumps(row["projection"], ensure_ascii=False)
+
+
+async def test_thinking_preview_survives_restart_and_yields_to_text_tools_and_recovery(
+    gateway, monkeypatch
+):
+    records = []
+    bot, _ = await install_output(gateway, monkeypatch, records)
+
+    def thinking(text, part=0, message="m"):
+        item = record("notice", message=message, part_index=part)
+        item["data"].update(kind="thinking_delta", text=text)
+        return item
+
+    feed(records, thinking("Initial plan. " + "x" * 1990))
+    await bot.deliver_once()
+    method, first = bot.sent[-1]
+    assert method == "sendMessageDraft" and len(first["text"]) == 2000
+    restored = Bot(gateway)
+    feed(records, thinking(" Next step."))
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["draft_id"] == first["draft_id"]
+    assert restored.sent[-1][1]["text"] == (first["text"] + " Next step.")[-2000:]
+    feed(records, thinking("New part", part=1), thinking("", part=2))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["text"] == "New part"
+    feed(records, record("text_delta"))
+    records[-1]["data"]["text"] = "Answer"
+    feed(records, thinking("Late thought", part=1))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert restored.sent[-1][0] == "sendRichMessageDraft"
+    assert sent_text(restored.sent[-1][1]) == "Answer"
+    feed(records, record("model_response", "Answer"))
+    await restored.deliver_once()
+    feed(records, thinking("Another thought", message="second"))
+    await restored.deliver_once()
+    assert restored.sent[-1][1]["draft_id"] != first["draft_id"]
+    feed(records, record("tool_call", name="read_media", args={"path": "./plot.png"}))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert sent_text(restored.sent[-1][1]) == "read_media · calling · ./plot.png"
+    feed(records, thinking("Will be interrupted", message="third"), record("interrupted"))
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert sent_text(restored.sent[-1][1]) == "Resuming this reply…"
+    feed(records, thinking("Will retry", message="fourth"))
+    notice = record("notice", failed_message_id="fourth")
+    notice["data"]["kind"] = "attempt_failed"
+    feed(records, notice)
+    restored._chat_ready.clear()
+    await restored.deliver_once()
+    assert sent_text(restored.sent[-1][1]) == "Retrying this reply…"
+    preview, projection = project([thinking("Empty response"), record("model_response")], {})
+    assert preview == "" and "thinking" not in projection
+    assert [sent_text(p) for m, p in restored.sent if m == "sendRichMessage"] == ["Answer"]
+
+
+async def test_tool_summaries_show_actions_and_results_without_payload_dumps():
+    call = progress_text(
+        "tool_call",
+        {
+            "name": "custom_edit",
+            "args": {
+                "path": "file.py",
+                "patch": "secret code\n" * 200,
+                "session_token": "hidden-token",
+                "process_id": "hidden-id",
+            },
+        },
+    )
+    assert "custom_edit · calling · file.py" in call and "200 lines" in call
+    assert "secret" not in call and "hidden" not in call
+    for state, reason, code in [
+        ("running", "quiet", None),
+        ("running", "timeout", None),
+        ("exited", "exited", 1),
+        ("exited", "exited", 0),
+    ]:
+        result = progress_text(
+            "tool_result",
+            {
+                "name": "process_start",
+                "result": {
+                    "process": {"state": state, "exit_code": code, "process_id": "hidden"},
+                    "reason": reason,
+                    "output": {
+                        "stdout": {
+                            "text": "working tree clean\n" + "detail\n" * 100,
+                            "reference": {"session_id": "hidden"},
+                        }
+                    },
+                },
+            },
+        )
+        assert state in result and reason in result and "working tree clean" in result
+        assert "hidden" not in result and len(result) <= 300 and len(result.splitlines()) <= 3
+        assert result.endswith("… [truncated]")
+        if code is not None:
+            assert f"exit {code}" in result
+        else:
+            assert "exit " not in result and "success" not in result
+    assert "outcome_unknown" in progress_text(
+        "tool_result",
+        {
+            "name": "custom",
+            "result": {"error": "outcome_unknown", "message": "private exception"},
+        },
+    )
+    assert "private" not in progress_text(
+        "tool_result", {"result": {"error": "machine_error", "message": "private exception"}}
+    )
+    assert (
+        progress_text("tool_result", {"result": ["media payload", "base64"]})
+        == "Tool · returned · 2 items"
+    )
+    assert (
+        progress_text("tool_result", {"result": {"data_base64": "secret"}})
+        == "Tool · returned · Result with 1 fields"
+    )
+    assert "encoded content omitted" in progress_text("tool_result", {"result": "A" * 400})
 
 
 async def test_route_order_backoff_and_waiting_session_release(gateway, monkeypatch):
@@ -530,22 +791,22 @@ async def test_large_body_exceeds_previous_limit_without_loss(gateway, monkeypat
 
 
 @pytest.mark.parametrize("last, final", [("last", "last"), ("", "检查结果")])
-async def test_durable_message_order_and_empty_last_response(gateway, monkeypatch, last, final):
+async def test_group_messages_send_before_final_and_empty_response(
+    gateway, monkeypatch, last, final
+):
     records = []
-    bot, _ = await install_output(gateway, monkeypatch, records)
+    bot, _ = await install_output(gateway, monkeypatch, records, private=False)
     feed(
         records,
-        record("model_response", "正在检查", message="ffffffff-ffff-ffff-ffff-ffffffffffff"),
-        record("model_response", last, message="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        record("model_response", "正在检查", message="z"),
+        record("model_response", last, message="a"),
     )
     await bot.deliver_once()
-    assert sent_text(bot.sent[-1][1]) == "正在检查\n\n" + last
-    # Restart forces projection through PostgreSQL JSONB, which sorts object keys.
+    assert [sent_text(p) for _, p in bot.sent] == ["正在检查"]
     restored = Bot(gateway)
     await restored.deliver_once()
-    assert sent_text(restored.sent[-1][1]) == sent_text(bot.sent[-1][1])
+    assert [sent_text(p) for _, p in restored.sent] == ([last] if last else [])
     feed(records, record("final", output=final))
     await restored.deliver_once()
-    assert [sent_text(p) for m, p in restored.sent if m == "sendRichMessage"] == [
-        "正在检查\n\n" + final
-    ]
+    assert [sent_text(p) for _, p in restored.sent] == [final]
+    assert all(m == "sendRichMessage" for m, _ in bot.sent + restored.sent)

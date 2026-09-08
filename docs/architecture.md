@@ -62,10 +62,11 @@ machine, defaulting to the session default machine.
 
 Runner borrows a `ModelBackend`, whose `create_model(name)` returns a Pydantic AI Model
 and whose `classify_error(error)` returns a safe context-length/media failure or None.
-The initial `OpenAICompatibleBackend` implements Chat Completions; provider HTTP client,
-endpoint and key belong to application composition. Other native provider protocols are
-outside the current scope. Model names and context window are explicit deployment/session
-configuration, not a fixed OpenAI catalogue.
+Gateway-owned providers select OpenAI Responses (default), OpenAI Chat or Google AI Studio.
+Each connection owns its endpoint/key; a persistent catalog keeps stable model IDs,
+observed limits and manual defaults. Sessions retain model IDs and optional budgets.
+Each Runner call freezes current provider/catalog values; no model credentials come
+from service environment defaults. See [model resource contracts](models.md).
 
 Frontend factories are selected by configured names. Each receives `FrontendContext`
 with `ControlAPI`, settings, a borrowed metadata pool and schema. Only `ControlAPI.call`

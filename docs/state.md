@@ -225,3 +225,11 @@ restart/flush is performed. No Telegram messages are sent.
 The load tests print accepted/completed/replayed counts, ordering and timings for 100 sessions
 with 20 inputs each, and distinct deliveries/consumption/latency for 100 event listeners.
 Measurements are evidence for that local fake-runner workload, not production performance claims.
+
+
+Runner code can raise `RunFailure(code, public_message)` for a known, nonsecret failure.
+The code is an ASCII identifier of at most 64 characters; public_message is 1–1024 UTF-8
+bytes without NUL. State records `{kind: code, public_message}` and uses the explanation
+as failed Completion.output. This is an explicit trust boundary: callers must not wrap
+arbitrary SDK/exception strings. Other exceptions retain a generic error and empty failed
+completion output. State does not interpret provider or frontend configuration.

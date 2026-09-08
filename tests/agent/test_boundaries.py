@@ -32,9 +32,9 @@ async def test_compatible_backend_preserves_endpoint_key_model_and_borrowed_clie
             http_client=client,
         )
         agent = runner(client, plugins=())
+        agent.config = replace(agent.config, model="vendor/family-17b")
         agent.model_backend = backend
         ctx = Context(agent.initial_state(instructions="original", skills=[]))
-        ctx.session = replace(ctx.session, config={"model": "vendor/family-17b"})
         result = await agent(ctx)
         assert result.output == "compatible reply" and not client.is_closed
         assert str(calls[0].url) == "https://compatible.invalid/custom/v1/chat/completions"
@@ -143,6 +143,23 @@ async def test_removed_tool_recovery_records_unknown_without_machine_action():
             and "No operation was repeated" in returned["content"]
         )
         assert not result.checkpoint.state.data["pending_tools"]
+
+
+@pytest.mark.asyncio
+async def test_large_tool_display_keeps_name_and_complete_history():
+    async with httpx2.AsyncClient() as client:
+        agent = runner(client, plugins=())
+        ctx = Context(agent.initial_state(instructions="", skills=[]))
+        runtime = Runtime(agent, ctx, "test")
+        await runtime.initialize()
+        result = "Complete output line\n" * 2000
+        await runtime.record(ModelResponse([ToolCallPart("custom_report", {}, "call-large")]))
+        await runtime.tool_result("custom_report", "call-large", result)
+        event = ctx.deltas[-1]
+        assert event.kind == "tool_result" and isinstance(event.data, dict)
+        assert event.data["name"] == "custom_report" and "summary" in event.data
+        assert "result" not in event.data
+        assert runtime.current["messages"][-1]["parts"][0]["content"] == result
 
 
 @pytest.mark.asyncio

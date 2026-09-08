@@ -5,6 +5,8 @@ Bot API calls are injectable for tests. Production never logs token-bearing URLs
 
 import asyncio
 import copy
+import hashlib
+import json
 import logging
 import random
 import re
@@ -30,7 +32,12 @@ logger = logging.getLogger(__name__)
 COMMANDS = {
     "new": "Create a session using saved settings",
     "settings": "Show saved settings",
-    "model": "Save the model name",
+    "providers": "List configured providers",
+    "provider": "Select a provider ID or configure one with JSON",
+    "discover": "Refresh models from the selected provider",
+    "models": "List saved model IDs",
+    "model": "Select a model ID or JSON budget overrides",
+    "modeldefaults": "Update shared model defaults with JSON",
     "machine": "Save the default machine",
     "instructions": "Save instructions for new sessions",
     "steer": "Steer the current run",
@@ -112,7 +119,7 @@ def rich_rejection(description: Any) -> bool:
 
 def empty_projection() -> dict[str, Any]:
     """Only install over a legacy row after an offline, verified drain."""
-    return {"version": 1, "messages": {}}
+    return {"version": 2}
 
 
 class ProjectionMigrationRequired(ValueError):
@@ -120,13 +127,11 @@ class ProjectionMigrationRequired(ValueError):
 
 
 def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    if previous and previous.get("version") != 1:
+    if previous and previous.get("version") != 2:
         raise ProjectionMigrationRequired(
             "Telegram projection requires offline drain and migration"
         )
     projection = copy.deepcopy(previous or empty_projection())
-    messages = projection["messages"]
-    order = projection.setdefault("message_order", [])
     for record in records:
         kind = record["kind"]
         data = record.get("data") or {}
@@ -134,74 +139,193 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
             data = {}
         if record.get("cursor") is not None:
             projection["cursor"] = record["cursor"]
-        if kind not in {"text_delta", "model_response", "final", "error", "interrupted", "notice"}:
+        if kind not in {
+            "text_delta",
+            "model_response",
+            "tool_call",
+            "tool_result",
+            "final",
+            "error",
+            "interrupted",
+            "notice",
+        }:
+            continue
+        if kind == "notice" and data.get("kind") not in {"attempt_failed", "thinking_delta"}:
             continue
         run = record.get("run_id")
         if run is not None:
+            if run != projection.get("run_id"):
+                for field in ("message", "progress", "thinking", "last_response"):
+                    projection.pop(field, None)
             projection["run_id"] = run
         key = record.get("message_id") or ""
-        if kind in {"text_delta", "model_response"}:
-            if key not in messages:
-                order.append(key)
-            message = messages.setdefault(key, {"parts": {}, "text": None})
+        if kind == "notice" and data.get("kind") == "thinking_delta":
+            text = data.get("text", "")
+            if not isinstance(text, str) or not text or projection.get("message") is not None:
+                continue
+            marker = {"message_id": key, "part_index": data.get("part_index", 0)}
+            prior = projection.get("progress", "") if projection.get("thinking") == marker else ""
+            projection["progress"] = (prior + text)[-2000:]
+            projection["thinking"] = marker
+        elif kind == "text_delta":
+            text = data.get("text", "")
+            if not text:
+                continue
+            message: dict[str, Any] | None = projection.get("message")
+            if message is None or message["id"] != key:
+                message = dict[str, Any](id=key, parts={})
+                projection["message"] = message
+            projection.pop("progress", None)
+            projection.pop("thinking", None)
+            part = str(data.get("part_index", 0))
+            message["parts"][part] = message["parts"].get(part, "") + text
+        elif kind in {"tool_call", "tool_result", "notice", "interrupted"}:
+            if kind == "notice":
+                message = projection.get("message")
+                active_id = (
+                    message["id"]
+                    if message is not None
+                    else projection.get("thinking", {}).get("message_id")
+                )
+                if active_id is not None and active_id != data.get("failed_message_id"):
+                    continue
+            projection.pop("message", None)
+            projection.pop("thinking", None)
+            projection["progress"] = progress_text(kind, data)
+        elif kind in {"model_response", "final", "error"}:
+            following = empty_projection()
+            if "chat_type" in projection:
+                following["chat_type"] = projection["chat_type"]
             if kind == "model_response":
-                message["text"] = record.get("text", "")
-                message["parts"] = {}
-            elif message["text"] is None:
-                part = str(data.get("part_index", 0))
-                message["parts"][part] = message["parts"].get(part, "") + str(data.get("text", ""))
-        elif kind == "notice" and data.get("kind") == "attempt_failed":
-            failed = data.get("failed_message_id")
-            if failed in messages and messages[failed]["text"] is None:
-                del messages[failed]
-                order.remove(failed)
-        elif kind in {"interrupted", "error"}:
-            for message_id in list(messages):
-                if messages[message_id]["text"] is None:
-                    del messages[message_id]
-                    order.remove(message_id)
-        if kind in {"final", "error"}:
-            completed = [
-                messages[key]["text"] for key in order if messages[key]["text"] is not None
-            ]
-            if kind == "final":
+                text = record.get("text", "")
+                projection.pop("message", None)
+                projection.pop("progress", None)
+                projection.pop("thinking", None)
+                if not text:
+                    continue
+                if "run_id" in projection:
+                    following["run_id"] = projection["run_id"]
+                following["last_response"] = {
+                    "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                }
+            elif kind == "final":
                 output = data.get("output", record.get("text", ""))
-                final = output if isinstance(output, str) else ""
-                # The final result replaces the last response, preserving tool preambles.
-                if final:
-                    if completed:
-                        completed[-1] = final
-                    else:
-                        completed.append(final)
+                text = output if isinstance(output, str) else ""
+                if hashlib.sha256(text.encode()).hexdigest() == projection.get(
+                    "last_response", {}
+                ).get("sha256"):
+                    text = ""
             else:
                 category = data.get("kind", "")
-                # State persists an exception class, never its raw message.
+                # Unknown failures expose only their exception category; trusted
+                # RunFailure records carry a separately bounded public explanation.
                 safe = (
                     category
                     if isinstance(category, str) and category.isidentifier() and len(category) <= 80
                     else ""
                 )
-                completed.append(
-                    "Sorry, I couldn’t complete this reply." + (f" ({safe})" if safe else "")
+                explanation = data.get("public_message")
+                text = (
+                    "Sorry, I couldn’t complete this reply. " + explanation
+                    if isinstance(explanation, str) and 0 < len(explanation) <= 1024
+                    else "Sorry, I couldn’t complete this reply." + (f" ({safe})" if safe else "")
                 )
-            text = "\n\n".join(text for text in completed if text)
-            following = empty_projection()
-            if "chat_type" in projection:
-                following["chat_type"] = projection["chat_type"]
             projection["pending"] = {
                 "text": text,
                 "cursor": projection.get("cursor"),
                 "next": following,
-                "format": "rich" if kind == "final" else "plain",
+                "format": "plain" if kind == "error" else "rich",
             }
             break
-    preview = "\n\n".join(
-        m["text"]
-        if m["text"] is not None
-        else "".join(m["parts"][part] for part in sorted(m["parts"], key=int))
-        for m in (messages[key] for key in order)
+    message = projection.get("message")
+    preview = (
+        "".join(message["parts"][part] for part in sorted(message["parts"], key=int))
+        if message is not None
+        else projection.get("progress", "")
     )
     return preview, projection
+
+
+def progress_text(kind: str, data: dict[str, Any]) -> str:
+    """Only the latest, bounded progress preview; never persist it as a chat message."""
+    if kind == "notice":
+        return "Retrying this reply…"
+    if kind == "interrupted":
+        return "Resuming this reply…"
+    name = data.get("name")
+    label = name if isinstance(name, str) and name else "Tool"
+    label += " · calling" if kind == "tool_call" else " · returned"
+    content = data.get("summary", data.get("args" if kind == "tool_call" else "result", ""))
+    detail = tool_summary(content, calling=kind == "tool_call")
+    return short_progress(label + (f" · {detail}" if detail else ""))
+
+
+def short_progress(text: str) -> str:
+    """At most three lines/300 characters; never silently truncate a preview."""
+    suffix = "… [truncated]"
+    lines = text.splitlines()
+    clipped = "\n".join(lines[:3])
+    if len(lines) > 3 or len(clipped) > 300:
+        return clipped[: 300 - len(suffix)] + suffix
+    return clipped
+
+
+def tool_summary(value: Any, *, calling: bool = False) -> str:
+    """Select only direct fields and known process output; no arbitrary JSON rendering."""
+    if isinstance(value, str):
+        if re.search(r"[A-Za-z0-9+/=_-]{100,}", value):
+            return "Long encoded content omitted"
+        if calling and ("\n" in value or "\r" in value):
+            return f"{len(value.splitlines())} lines, {len(value)} characters"
+        return short_progress(value)
+    if isinstance(value, list):
+        return f"{len(value)} items"
+    if not isinstance(value, dict):
+        return "No content" if value is None else str(value)
+    if calling:
+        details = []
+        for key in ("command", "path", "query", "pattern", "patch", "script", "input", "content"):
+            field = value.get(key)
+            if isinstance(field, str) and field:
+                if key in {"patch", "script", "input", "content"}:
+                    details.append(
+                        f"{key}: {len(field.splitlines())} lines, {len(field)} characters"
+                    )
+                else:
+                    details.append(tool_summary(field, calling=True))
+                if len(details) == 2:
+                    break
+        return " · ".join(details) if details else f"{len(value)} parameters"
+    if value.get("error"):
+        # Keep the error category, not an unbounded provider/transport exception.
+        error = value["error"]
+        return "Error · " + (short_progress(error) if isinstance(error, str) else "reported")
+    process = value.get("process", value)
+    details = []
+    if isinstance(process, dict):
+        state = process.get("state")
+        if isinstance(state, str):
+            details.append(state)
+        code = process.get("exit_code")
+        if isinstance(code, int):
+            details.append(f"exit {code}")
+    reason = value.get("reason")
+    if isinstance(reason, str) and reason not in details:
+        details.append(reason)
+    output = value.get("output")
+    if isinstance(output, dict):
+        for stream in ("stderr", "stdout", "pty"):
+            chunk = output.get(stream)
+            if isinstance(chunk, dict) and isinstance(chunk.get("text"), str) and chunk["text"]:
+                details.append(f"{stream}: {tool_summary(chunk['text'])}")
+                if chunk.get("truncated") or chunk.get("display_truncated"):
+                    details.append("Output truncated")
+                break
+    if details:
+        return " · ".join(details)
+    if isinstance(value.get("items"), list):
+        return f"{len(value['items'])} items"
+    return f"Result with {len(value)} fields"
 
 
 class TelegramFrontend:
@@ -222,7 +346,7 @@ class TelegramFrontend:
         self.disabled = False
         self._chat_ready: dict[int, float] = {}
         self._chat_locks: dict[int, asyncio.Lock] = {}
-        self._draft_sent: dict[int, tuple[str, float]] = {}
+        self._draft_sent: dict[int, tuple[str, bool, float]] = {}
 
     def principal(self, chat: int, thread: int) -> Principal:
         return Principal(
@@ -390,7 +514,7 @@ class TelegramFrontend:
             "title": "Telegram",
             "machine_ids": [],
             "default_machine_id": None,
-            "config": {"model": self.settings.model},
+            "config": {},
         }
         if len(self.settings.machine_tokens) == 1:
             machine = next(iter(self.settings.machine_tokens))
@@ -430,7 +554,7 @@ class TelegramFrontend:
                 ),
             }
         if command == "/settings":
-            return {"kind": "reply", "text": str(config)}
+            return {"kind": "reply", "text": json.dumps(redact_config(config), ensure_ascii=False)}
         if command == "/status":
             return (
                 {"kind": "status", "session_id": sid}
@@ -440,6 +564,74 @@ class TelegramFrontend:
                     "text": "No active session. Use /new or send text.",
                 }
             )
+        if command in {"/providers", "/provider", "/discover", "/models", "/modeldefaults"}:
+            params: dict[str, Any] = {}
+            selected_provider = config.get("provider_id")
+            select = False
+            if command == "/providers":
+                method = "provider.list"
+            elif command == "/provider":
+                select = True
+                if argument.lstrip().startswith("{"):
+                    try:
+                        params = json.loads(argument)
+                        if not isinstance(params, dict):
+                            raise ValueError
+                    except ValueError:
+                        return {
+                            "kind": "reply",
+                            "text": "Provider configuration must be a JSON object.",
+                        }
+                    method = "provider.update" if "provider_id" in params else "provider.create"
+                else:
+                    method, params = "provider.get", {"provider_id": argument.strip()}
+            elif command == "/modeldefaults":
+                selected_model = config.get("config", {}).get("model", {}).get("model_id")
+                if selected_model is None:
+                    return {"kind": "reply", "text": "Choose /model ID first."}
+                try:
+                    defaults = json.loads(argument)
+                    if not isinstance(defaults, dict):
+                        raise ValueError
+                except ValueError:
+                    return {"kind": "reply", "text": "Defaults must be a JSON object."}
+                current = cast(
+                    dict,
+                    await self.control.call(
+                        "provider.model.get",
+                        {"model_id": selected_model},
+                        principal=self.principal(inbox["chat_id"], inbox["thread_id"]),
+                    ),
+                )
+                method, params = (
+                    "provider.model.update",
+                    {
+                        "model_id": selected_model,
+                        "expected_revision": current["revision"],
+                        "defaults": defaults,
+                    },
+                )
+            else:
+                if selected_provider is None:
+                    return {"kind": "reply", "text": "Choose /provider ID first."}
+                method = "provider.discover" if command == "/discover" else "provider.models"
+                params = {"provider_id": selected_provider}
+                if command == "/discover" and argument.strip():
+                    params["page_token"] = argument.strip()
+            if method in {
+                "provider.create",
+                "provider.update",
+                "provider.discover",
+                "provider.model.update",
+            }:
+                params["request_id"] = request_id(self.bot_id, inbox["update_id"], method)
+            return {
+                "kind": "provider",
+                "method": method,
+                "params": params,
+                "select": select,
+                "config": config,
+            }
         if command in {"/model", "/machine", "/instructions"}:
             if not argument.strip():
                 return {"kind": "reply", "text": f"Usage: {command} <value>"}
@@ -448,6 +640,31 @@ class TelegramFrontend:
                     return {"kind": "reply", "text": "Unknown configured machine."}
                 config["machine_ids"] = [argument]
                 config["default_machine_id"] = argument
+            elif command == "/model":
+                try:
+                    selected = (
+                        json.loads(argument)
+                        if argument.lstrip().startswith("{")
+                        else {"model_id": argument.strip()}
+                    )
+                    from .models import parse_session_model
+
+                    selected = parse_session_model(selected).model_dump(mode="json")
+                    registered = cast(
+                        dict,
+                        await self.control.call(
+                            "provider.model.get",
+                            {"model_id": selected["model_id"]},
+                            principal=self.principal(inbox["chat_id"], inbox["thread_id"]),
+                        ),
+                    )
+                    config["provider_id"] = registered["provider_id"]
+                    config["config"]["model"] = selected
+                except ValueError, TypeError:
+                    return {
+                        "kind": "reply",
+                        "text": "Use /model ID or a model selection JSON object.",
+                    }
             else:
                 config["config"][command[1:]] = argument
             update = False
@@ -468,12 +685,17 @@ class TelegramFrontend:
                 return {"kind": "reply", "text": f"Usage: {command} <text>"}
         mode = "steer" if command == "/steer" else "queue"
         if command == "/new" or sid is None:
+            if not isinstance(config["config"].get("model"), dict):
+                return {
+                    "kind": "reply",
+                    "text": "Choose a configured model with /provider and /model first.",
+                }
             if not config["machine_ids"]:
                 return {"kind": "reply", "text": "Choose a machine with /machine <id> first."}
             return {
                 "kind": "create",
                 "params": {
-                    **config,
+                    **session_configuration(config),
                     "input": (None if command == "/new" else text),
                     "mode": mode,
                     "request_id": request_id(
@@ -542,6 +764,34 @@ class TelegramFrontend:
                     if action["params"].get("input") is None
                     else None
                 )
+        elif kind == "provider":
+            result = cast(
+                dict,
+                await self.control.call(action["method"], action["params"], principal=principal),
+            )
+            config = action["config"]
+            if action["select"]:
+                config["provider_id"] = result["id"]
+                config["config"].pop("model", None)
+            if action["select"] or action["method"] == "provider.discover":
+                listing = cast(
+                    dict,
+                    await self.control.call(
+                        "provider.models",
+                        {"provider_id": config["provider_id"]},
+                        principal=principal,
+                    ),
+                )
+                if listing["default_model_id"] is not None and not config["config"].get("model"):
+                    config["config"]["model"] = {"model_id": listing["default_model_id"]}
+                await self.metadata.rows(
+                    "UPDATE gateway_telegram_routes SET config=%s "
+                    "WHERE bot_id=%s AND chat_id=%s AND thread_id=%s",
+                    (Jsonb(config), self.bot_id, chat, thread),
+                )
+            reply = json.dumps(result, ensure_ascii=False)
+            if action["method"] in {"provider.update", "provider.model.update"}:
+                reply += "\nSaved. This shared setting applies to future runs of sessions using it."
         elif kind == "config":
             await self.metadata.rows(
                 "UPDATE gateway_telegram_routes SET config=%s "
@@ -553,7 +803,7 @@ class TelegramFrontend:
                     await self.control.call(
                         "session.update",
                         {
-                            **action["config"],
+                            **session_configuration(action["config"]),
                             "session_id": action["session_id"],
                             "request_id": action["request_id"],
                         },
@@ -580,6 +830,18 @@ class TelegramFrontend:
                 chunk, remaining = text_chunk(remaining)
                 await self.send(chat, thread, chunk)
         async with self.metadata.connection() as conn:
+            # Provider configuration is private while pending; discard key-bearing ingress
+            # once its durable operation and user acknowledgement have completed.
+            if message_command(inbox.get("payload", {})) == "/provider":
+                await conn.execute(
+                    "UPDATE gateway_telegram_inbox SET payload='{}',resolved_action=%s "
+                    "WHERE bot_id=%s AND update_id=%s",
+                    (
+                        Jsonb({"kind": "reply", "text": reply or "Settings saved."}),
+                        self.bot_id,
+                        inbox["update_id"],
+                    ),
+                )
             await conn.execute(
                 "UPDATE gateway_telegram_inbox SET handled=true WHERE bot_id=%s AND update_id=%s",
                 (self.bot_id, inbox["update_id"]),
@@ -607,10 +869,13 @@ class TelegramFrontend:
                 await self.handle(inbox)
             except TelegramFailure as exc:
                 if exc.code in {400, 403}:
+                    private_config = message_command(inbox.get("payload", {})) == "/provider"
                     await self.metadata.rows(
-                        "UPDATE gateway_telegram_inbox SET handled=true "
+                        "UPDATE gateway_telegram_inbox SET handled=true,"
+                        "payload=CASE WHEN %s THEN '{}'::jsonb ELSE payload END,"
+                        "resolved_action=CASE WHEN %s THEN '{}'::jsonb ELSE resolved_action END "
                         "WHERE bot_id=%s AND update_id=%s",
-                        (self.bot_id, inbox["update_id"]),
+                        (private_config, private_config, self.bot_id, inbox["update_id"]),
                     )
                 else:
                     await self.metadata.rows(
@@ -620,13 +885,28 @@ class TelegramFrontend:
                         (retry_delay(exc), self.bot_id, inbox["update_id"]),
                     )
             except RpcError as exc:
-                if exc.code in {-32602, -32001, -32004, -32009, -32020}:
-                    # Persist a safe reply action, then resume its normal send/retry path.
+                discovery_failed = (
+                    message_command(inbox.get("payload", {})) == "/discover" and exc.code == -32030
+                )
+                if discovery_failed or exc.code in {-32602, -32001, -32004, -32009, -32020}:
+                    # Explicit discovery is a user command: report failure without
+                    # retrying its network request ahead of repair commands in this topic.
+                    # The saved reply still uses normal Telegram send/ACK retries.
                     await self.metadata.rows(
                         "UPDATE gateway_telegram_inbox SET resolved_action=%s "
                         "WHERE bot_id=%s AND update_id=%s",
                         (
-                            Jsonb({"kind": "reply", "text": exc.message}),
+                            Jsonb(
+                                {
+                                    "kind": "reply",
+                                    "text": (
+                                        "Model discovery failed. Check provider settings "
+                                        "and use /discover to retry."
+                                        if discovery_failed
+                                        else exc.message
+                                    ),
+                                }
+                            ),
                             self.bot_id,
                             inbox["update_id"],
                         ),
@@ -721,7 +1001,7 @@ class TelegramFrontend:
     async def _deliver_row(self, row: dict[str, Any]) -> bool:
         key = (self.bot_id, row["chat_id"], row["thread_id"], row["session_id"])
         projection = row["projection"]
-        if projection and projection.get("version") != 1:
+        if projection and projection.get("version") != 2:
             raise ProjectionMigrationRequired(
                 "Telegram projection requires offline drain and migration"
             )
@@ -818,24 +1098,26 @@ class TelegramFrontend:
                         else (await self.api("getChat", {"chat_id": row["chat_id"]}))["type"]
                     )
                 if projection["chat_type"] == "private":
-                    text = rich_chunk(preview)[0]
-                    if not draft.get("plain") and not text and preview:
-                        draft["plain"] = True
-                        self._draft_sent.pop(draft["id"], None)
+                    message = projection.get("message")
+                    rich = message is not None and not message.get("plain")
+                    text = rich_chunk(preview)[0] if rich else text_chunk(preview)[0]
+                    if rich and not text and preview:
+                        assert message is not None
+                        message["plain"] = True
                         await self._save_projection(projection, key)
-                    if draft.get("plain"):
+                        rich = False
                         text = text_chunk(preview)[0]
                     sent = self._draft_sent.get(draft["id"])
-                    if sent is None or sent[0] != text or time.monotonic() - sent[1] >= 20:
+                    if sent is None or sent[:2] != (text, rich) or time.monotonic() - sent[2] >= 20:
                         try:
-                            send = self.send_draft if draft.get("plain") else self.send_rich_draft
+                            send = self.send_rich_draft if rich else self.send_draft
                             await send(row["chat_id"], row["thread_id"], draft["id"], text)
-                            self._draft_sent[draft["id"]] = (text, time.monotonic())
+                            self._draft_sent[draft["id"]] = (text, rich, time.monotonic())
                         except TelegramFailure as exc:
-                            if not draft.get("plain") and exc.rich_content_rejected:
-                                draft["plain"] = True
-                                self._draft_sent.pop(draft["id"], None)
-                            elif draft.get("plain") and exc.code == 400:
+                            if rich and exc.rich_content_rejected:
+                                assert message is not None
+                                message["plain"] = True
+                            elif not rich and exc.code == 400:
                                 draft["unavailable"] = True
                             else:
                                 raise
@@ -880,3 +1162,23 @@ class TelegramFrontend:
                 await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
                 failures += 1
             await asyncio.sleep(1)
+
+
+def session_configuration(config: dict[str, Any]) -> dict[str, Any]:
+    return {key: config[key] for key in ("title", "machine_ids", "default_machine_id", "config")}
+
+
+def redact_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: ("[configured]" if key == "api_key" else redact_config(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_config(item) for item in value]
+    return value
+
+
+def message_command(payload: dict) -> str:
+    text = payload.get("message", {}).get("text", "")
+    return text.partition(" ")[0].split("@")[0]

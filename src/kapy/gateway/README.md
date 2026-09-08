@@ -1,26 +1,13 @@
 # Gateway, CLI and Telegram
 
-For a first start, inject environment variables explicitly: the CLI and Settings do not
-automatically load `.env` or `.env.example`. Replace the placeholders below and set the
-model's actual context window. The control server requires `KAPY_MODEL_API_KEY`,
-`KAPY_CONTEXT_WINDOW_TOKENS`, `KAPY_CONTROL_TOKEN`, and `KAPY_SESSION_SIGNING_KEY`:
+Control-server requires `KAPY_CONTROL_TOKEN` and `KAPY_SESSION_SIGNING_KEY`, plus reachable
+PostgreSQL/Valkey. It does not require model environment variables. Configure independent
+providers, discover or manually register models, then select their stable IDs on sessions.
+See [full provider/model API and CLI examples](../../../docs/models.md).
 
-```sh
-env KAPY_MODEL_API_KEY='<provider-api-key>' \
-  KAPY_MODEL_BASE_URL='https://api.openai.com/v1' KAPY_MODEL='gpt-5.6-luna' \
-  KAPY_CONTEXT_WINDOW_TOKENS=100000 \
-  KAPY_CONTROL_TOKEN='<control-admin-token>' \
-  KAPY_SESSION_SIGNING_KEY='<random-signing-key>' \
-  KAPY_MACHINE_TOKENS='{"docker-machine":"<machine-bearer>"}' \
-  kapy control-server
-```
-
-PostgreSQL and Valkey must be reachable. Set `KAPY_DATABASE_URL` and `KAPY_VALKEY_URL`
-for your network; development defaults use `127.0.0.1:55432` and `127.0.0.1:56379`.
-`KAPY_MODEL_BASE_URL` and `KAPY_MODEL` select the provider endpoint and model; other
-settings use `KAPY_`. Telegram is optional: enabling `TELEGRAM_BOT_TOKEN` also requires
-the allowed numeric `TELEGRAM_CHAT_ID`. An explicit `KAPY_FRONTENDS='[]'` disables
-frontends, including Telegram, without requiring or validating leftover Telegram configuration.
+Settings do not discover `.env`; pass it explicitly through the shell/uv when desired.
+`TELEGRAM_BOT_TOKEN` requires an allowed numeric `TELEGRAM_CHAT_ID`; explicit
+`KAPY_FRONTENDS='[]'` disables frontends even when unused Telegram configuration exists.
 
 In the project machine container, start its daemon using the exact machine ID and bearer
 from the control server's JSON mapping. This bearer is separate from the administrator
@@ -45,14 +32,11 @@ env KAPY_CONTROL_TOKEN='<control-admin-token>' kapy control session list
 `create_app` composes the actual State, RPC, Execution, Skills and Agent exports.
 Gateway owns its PostgreSQL metadata pool and HTTP client. Skills and agent payload
 storage borrow the pool; State creates and closes its own pool and Valkey client.
-No module reads `.env` implicitly. Settings accept legacy `OPENAI_*` and existing `TELEGRAM_*` aliases;
-other environment names start with `KAPY_`. Secrets are not stored in route configuration.
-
-`create_app(settings=None, *, model_backend=None, frontend_factories=None, plugins=None)`
-accepts borrowed adapters. An injected ModelBackend removes the model-key requirement;
-Gateway creates/closes model HTTP resources only for its default OpenAI-compatible backend.
-`KAPY_MODEL_BASE_URL`, `KAPY_MODEL_API_KEY` and `KAPY_MODEL` override legacy `OPENAI_*` aliases.
-Model names have no vendor whitelist. The configured context window remains required.
+No module reads `.env` implicitly. Model key/base/type belong to current provider rows,
+not Settings or saved session config. `create_app(settings=None, *,
+model_backend_factory=create_model_backend, frontend_factories=None, plugins=None)`
+borrows a per-call ModelBackend from the factory and owns its shared HTTP client.
+The factory receives an immutable ModelConnection selected from the current provider.
 
 `Frontend`, `FrontendFactory`, `FrontendContext` and `ControlAPI` are exported by Gateway.
 The context exposes settings, a borrowed metadata pool/schema, and the single async
@@ -76,7 +60,7 @@ Machines connect to `/rpc/machines/{machine_id}` with an independent configured 
 and `kapy.jsonrpc.v1`. Session capabilities bind the session and machine. Replacing a
 connection fences the previous connection, and associations are ensured before calls.
 `session.wait` delegates to State's non-consuming durable request receipt. Deterministic
-mutation rejections have durable error receipts and never become deferred work. Session-create
+session mutation rejections have durable error receipts and never become deferred work. Session-create
 intents save their initial Runner snapshot before calling State, so catalog changes cannot
 block recovery of an already committed creation.
 
@@ -89,7 +73,7 @@ Prompt and SQL commands accept `--file PATH` or `--stdin`, and `session output` 
 record per line. Examples:
 
 ```sh
-kapy control session create --machine docker-machine 'Inspect the project'
+kapy control session create --machine docker-machine --model MODEL_UUID 'Inspect the project'
 kapy control --session SESSION_UUID session input 'Continue'
 kapy control --session SESSION_UUID session wait --request-id REQUEST_UUID
 kapy control --session SESSION_UUID history export --output history.ndjson
@@ -99,9 +83,11 @@ kapy control --session SESSION_UUID --machine docker-machine skill download SKIL
 
 `session create --output-mode reply_to` selects explicit replies; the default is `text`.
 The chosen output mode cannot change. Every input receipt has a new one-shot waiting_id;
-empty creation has no submission. `session update` replaces mutable settings while waiting. Its
-`--help` describes how omitted configuration clears mutable values while preserving output_mode.
-Omitting default-machine clears its prior value.
+empty creation has no submission. `session update` replaces mutable settings while waiting.
+Supply a registered model ID through `--model`, `--config` or `--config-file`; updates do not
+inherit the existing model selection. Omitted configuration fields are cleared except for
+output_mode, which is preserved. Omitting `--default-machine` clears the prior default machine.
+Only recursive session creation can inherit its parent's model selection.
 
 Skills preserve expected revisions and scoped idempotency. Archives move in 64 KiB chunks
 through the existing machine file protocol, with at most two concurrent exchanges and a
@@ -137,53 +123,76 @@ ports; process and filesystem isolation remain enabled. The regression starts th
 `kapy server` entry, exercises authenticated child CLI calls and multichunk skill transfers,
 checks reconnect, and waits for durable final deletion to remove the machine session.
 
-Telegram replies use one stable nonzero `sendRichMessageDraft` ID per logical run in
-private chats (including private topics), refreshing changed text and idle drafts
-about every 20 seconds. Tool calls and waiting/attempt notices are not chat messages.
-Completed model messages provide authoritative text; failed temporary attempts are
-removed. Groups and group topics receive only the final reply. Final replies are
-persisted with `sendRichMessage`, sending raw `rich_message.markdown`. Rich source
-uses a conservative 32768 UTF-8 byte budget, splitting at blank lines outside ordinary
-backtick/tilde fences. Oversized indivisible blocks fall back to plain `sendMessage`
-within 4000 UTF-16 units, without truncation or synthetic wrappers. A draft is temporary, expires after roughly 30 seconds,
-and is never a final receipt. Restart sends the active draft again. Explicit rich
-content rejection falls back to plain draft; a plain draft HTTP 400 falls back to
-final-only delivery. Errors remain natural, explicit failures without
-raw exception strings. Normal replies and implicit session creation have no session
-IDs; `/new` gives a brief confirmation.
+Telegram gives each message its own draft lifecycle in private chats (including
+private topics). The latest tool call/result, retry or recovery status appears as a
+plain temporary preview. Tool previews give the tool name, a few primary arguments or
+process state/exit code and a short decoded output excerpt, at most 300 characters and
+three lines with an explicit truncation marker. Multiline inputs and patches show their
+size; unknown objects and media lists show their shape/count instead of JSON or base64.
+Quiet, running and timed-out observations remain distinct from exited commands.
+SDK-provided thinking text is also temporary: only the latest part's last 2000 characters
+are retained across restart. Empty/signature-only events do not replace the preview;
+tools, retry/recovery and complete responses end it. Late thinking cannot cover an
+already-started body. Providers that do not return visible thinking produce no such preview.
+The first nonempty text delta replaces that progress with the new message's Rich
+Markdown; subsequent parts accumulate in numeric order. An empty delta leaves progress
+visible. The draft ID stays stable during this preview, with roughly 20-second refreshes.
+Every complete model response with text is sent immediately using `sendRichMessage`,
+without waiting for the whole run to finish. Formal acknowledgement ends that draft;
+the next progress or message uses a new ID. Groups and group topics send each complete
+message without drafts. Progress never becomes a permanent log message.
 
-Delivery projection version 1 reuses the existing cursor, pending text, and acknowledged
-character offset. Terminal processing stops at the terminal record's cursor, leaving
-later runs for another read. Same-route sessions follow their creating inbox update
-order; pending or running replies block later sessions, while drained waiting sessions
-do not. HTTP retry deadlines survive restart. A successful send with a lost response
-or database acknowledgement may repeat the unacknowledged segment (at least once).
+Rich source uses a conservative 32768 UTF-8 byte budget, splitting at blank lines
+outside ordinary backtick/tilde fences. Oversized indivisible blocks fall back to plain
+`sendMessage` within 4000 UTF-16 units, without truncation or synthetic wrappers. A draft
+expires after roughly 30 seconds and is never a formal receipt. Restart sends the active
+draft again. Explicit rich content rejection falls back to plain for the current message's
+draft; later messages try rich again. A plain draft HTTP 400 disables that draft, while
+formal delivery continues. Failed partial messages are replaced by a recovery notice;
+already sent messages remain. Terminal errors are separate natural failure messages,
+without raw exception strings or repeated earlier body text. Normal replies and implicit
+session creation have no session IDs; `/new` gives a brief confirmation.
 
-Upgrade contract: `empty_projection()` returns exactly `{"version": 1, "messages": {}}`.
-A newly empty `{}` initializes normally. Any nonempty unversioned projection requires
-operator migration and is left untouched; Gateway logs the required offline drain.
-For the controlled upgrade, stop old control, verify every session has no active run,
-every delivery cursor has reached output end, and no pending text or nonzero offset
-exists. Only then replace projections with this empty shape while preserving cursors.
-If input or output raced the stop, resume the old version and drain before trying again.
-Never reset active delivery state, replay historical completed messages, or discard
-unacknowledged text. No migration runner or legacy rendering emulation is provided.
+Delivery projection version 2 reuses the existing cursor, single pending body, and
+acknowledged raw-character offset. Reading stops at every nonempty complete message;
+its pending text is persisted before sending and fully acknowledged before reading
+later records. Only the active message, latest progress and last acknowledged response
+fingerprint are retained; there is no accumulated run message list. An identical final
+result is omitted, while a different result or one without a preceding response is sent.
+Repeated text in distinct messages or runs is still delivered. Structured reply/wait
+outputs and waiting records are not rendered as diagnostics. Same-route sessions follow
+their creating inbox order; pending or running replies block later sessions, while drained
+waiting sessions do not. HTTP retry deadlines survive restart. A successful send with a
+lost response or database acknowledgement may repeat the unacknowledged segment
+(at least once).
+
+Upgrade contract: `empty_projection()` returns exactly `{"version": 2}`. A newly empty
+`{}` initializes normally. Any nonempty older projection, including version 1 pending
+text, requires operator migration and is left untouched; Gateway logs the required
+offline drain. Stop old control, verify every session has no active run, every delivery
+cursor has reached output end, and no pending text or nonzero offset exists. Only then
+replace projections with this empty shape while preserving cursors. If input or output
+raced the stop, resume the old version and drain before trying again. Never reset active
+delivery state, replay historical completed messages, or discard unacknowledged text.
+No migration runner or legacy rendering emulation is provided.
 
 Rich Markdown needs no MarkdownV2 escaping, parse_mode, or local renderer. Telegram
 validates its structural limits (500 blocks, nesting depth 16, tables up to 20 columns);
 its documented 32768 UTF-8 character limit is distinct from our conservative byte budget.
-Commands and error pending bodies always use plain text. New final pending adds
-`format: "rich"`; existing version 1 pending without that field remains plain.
+Commands and error pending bodies always use plain text. Model message pending uses
+`format: "rich"`; content rejection persists its switch to `format: "plain"`.
 `item_offset` counts acknowledged Python characters in original source, including CRLF,
-never encoded bytes or added formatting. No migration is required.
+never encoded bytes or added formatting. No database table migration is required;
+the projection upgrade still requires the verified drain described above.
 
 Only the four verified rich HTTP/API 400 content-limit descriptions trigger persistent
 `format: "plain"`; raw descriptions are neither saved nor logged. Unknown/non-content
 400 stays blocked; 429, network errors, server failures, and lost acknowledgements
 keep the original format and offset. A rich prefix may be followed by plain remaining
 source if an oversized fence/table cannot be safely split. Draft format rejection or
-an oversized indivisible preview sets a run-local plain marker and clears its send cache;
-final rich formatting is attempted independently. Drafts may contain incomplete Markdown.
+an oversized indivisible preview sets a plain marker on the current message. The send
+cache compares both text and format; each complete message attempts rich delivery
+independently. Drafts may contain incomplete Markdown.
 See https://core.telegram.org/bots/api#rich-message-formatting-options.
 
 Content rejection evidence is recorded in `.context/delivery.md` at architect commit

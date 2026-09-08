@@ -95,6 +95,7 @@ async def test_many_steer_requests_complete_once_even_for_runner_state_errors(
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="initial")
+    assert created.submission is not None
     await asyncio.wait_for(entered.wait(), 5)
     request_ids = [created.submission.request_id]
     for _ in range(193):
@@ -216,6 +217,7 @@ async def test_delete_intent_recovers_and_preserves_first_result(
 ) -> None:
     service = await database.start(blocked)
     created = await service.create_session(spec(), request_id=uuid4(), input="pending")
+    assert created.submission is not None
     entered = asyncio.Event()
 
     async def pause_delete(session_id: UUID) -> None:
@@ -249,6 +251,7 @@ async def test_receipt_wait_is_nonconsuming_repeatable_and_closes_promptly(
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="work")
+    assert created.submission is not None
     status = await service.wait_submission(
         created.session.id, created.submission.request_id, wait_seconds=0.01
     )

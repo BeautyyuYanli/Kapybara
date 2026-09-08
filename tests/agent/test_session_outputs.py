@@ -2,7 +2,6 @@
 
 import json
 from dataclasses import replace
-from typing import Any, cast
 from uuid import uuid4
 
 import httpx2
@@ -34,15 +33,22 @@ async def test_reply_schema_prompt_and_complete_framework_output() -> None:
     assert set(tools["reply_to"]["parameters"]["properties"]) == {"ids"}
     assert "being_waited_id" in json.dumps(requests[0]["messages"])
     assert requests[0]["tool_choice"] == "required"
-    cycle = cast(dict[str, Any], result.checkpoint.state.data)["cycles"][-1]
-    assert cycle["outputs"] == [
+    cycles = result.checkpoint.state.data["cycles"]
+    assert isinstance(cycles, list)
+    cycle = cycles[-1]
+    assert isinstance(cycle, dict)
+    outputs = cycle["outputs"]
+    assert outputs == [
         {
             "kind": "reply_to",
             "being_waited_ids": [str(address)],
             "payload": "The complete answer",
         }
     ]
-    assert cycle["pending_final"]["output"] == cycle["outputs"][-1]
+    assert isinstance(outputs, list)
+    pending = cycle["pending_final"]
+    assert isinstance(pending, dict)
+    assert pending["output"] == outputs[-1]
 
 
 @pytest.mark.asyncio

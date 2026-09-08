@@ -78,6 +78,7 @@ async def test_lost_all_wakeups_periodic_scan_finds_work(
     # Suppress both the local immediate wake and network notification for this commit.
     monkeypatch.setattr(service, "_signal", lambda: None)
     created = await service.create_session(spec(), request_id=uuid4(), input="periodic scan")
+    assert created.submission is not None
     assert (await database.completed(created.submission.request_id))["outcome"] == "completed"
 
 
@@ -108,6 +109,7 @@ async def test_final_transaction_rolls_back_before_failure_completion(
 
     monkeypatch.setattr(service, "_completion", event)
     created = await service.create_session(spec(), request_id=uuid4(), input="go")
+    assert created.submission is not None
     assert (await database.completed(created.submission.request_id))["outcome"] == "failed"
     records = await service.read_output(created.session.id)
     assert [record.kind for record in records.items] == ["input", "error"]

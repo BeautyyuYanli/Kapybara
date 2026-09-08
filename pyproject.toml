@@ -40,8 +40,8 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 known-first-party = ["kapy"]
 
 [tool.pyrefly]
-project-includes = ["src", "tests"]
-search-path = ["src", "tests"]
+project-includes = ["src", "tests", "scripts"]
+search-path = ["src", "tests", "scripts"]
 python-version = "3.14"
 
 [tool.pytest.ini_options]

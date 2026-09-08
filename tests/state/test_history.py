@@ -22,8 +22,11 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 async def test_scoped_sql_join_subquery_and_functions(database: Database) -> None:
     service = await database.start(simple)
     first = await service.create_session(spec("a"), request_id=uuid4(), input="public apple")
+    assert first.submission is not None
     second = await service.create_session(spec("b"), request_id=uuid4(), input="secret orange")
+    assert second.submission is not None
     for created in (first, second):
+        assert created.submission is not None
         await database.completed(created.submission.request_id)
     answer = await service.query_history(
         first.session.id,
@@ -145,6 +148,7 @@ async def test_encoded_page_cap_and_query_limits(database: Database) -> None:
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="start")
+    assert created.submission is not None
     assert (await database.completed(created.submission.request_id))["outcome"] == "completed"
     page = await service.read_output(created.session.id)
     records = list(page.items)

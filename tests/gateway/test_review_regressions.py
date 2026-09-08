@@ -12,6 +12,7 @@ from kapy.gateway.params import Create
 from kapy.gateway.telegram import TelegramFailure, TelegramFrontend, project
 from kapy.rpc import RpcError
 
+from .conftest import MODEL_CONFIG, MODEL_ID
 from .test_control import OPERATOR, create
 from .test_machines import Peer
 from .test_skills import Files, archive
@@ -22,14 +23,14 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 async def test_rejected_running_update_stays_rejected_after_run_completes(gateway, monkeypatch):
     entered, finish = asyncio.Event(), asyncio.Event()
-    original = type(gateway.runner).__call__
+    original = gateway.http_client.send
 
-    async def blocked(self, context):
+    async def blocked(*args, **kwargs):
         entered.set()
         await finish.wait()
-        return await original(self, context)
+        return await original(*args, **kwargs)
 
-    monkeypatch.setattr(type(gateway.runner), "__call__", blocked)
+    monkeypatch.setattr(gateway.http_client, "send", blocked)
     created = await create(gateway, input="running")
     await asyncio.wait_for(entered.wait(), 1)
     sid = created["session"]["id"]
@@ -39,7 +40,7 @@ async def test_rejected_running_update_stays_rejected_after_run_completes(gatewa
         "title": "must stay rejected",
         "machine_ids": ["one"],
         "default_machine_id": "one",
-        "config": {},
+        "config": MODEL_CONFIG,
     }
     with pytest.raises(RpcError) as first:
         await gateway.call("session.update", change, principal=OPERATOR)
@@ -79,23 +80,29 @@ async def test_creation_recovers_fixed_snapshot_without_reading_changed_catalog(
     await gateway.recover()
     receipt = await gateway.metadata.request(UUID(request_id))
     assert receipt["result"] is not None and receipt["error"] is None
-    assert receipt["operation"]["initial_state"]["data"]["instructions"] == "original"
+    snapshot = receipt["operation"]["initial_state"]["data"]
+    assert snapshot["instructions"] == "original"
+    assert snapshot["skill_descriptions"] == []
 
 
 async def test_permanent_initial_state_error_does_not_stop_other_recovery(gateway, monkeypatch):
-    initial = gateway.runner.initial_state
+    from kapy.agent import Runner
+
+    initial = Runner.initial_state
 
     def reject_large(*, instructions, skills):
         if instructions == "oversized":
             raise AgentResourceLimit()
         return initial(instructions=instructions, skills=skills)
 
-    monkeypatch.setattr(gateway.runner, "initial_state", reject_large)
+    monkeypatch.setattr(Runner, "initial_state", staticmethod(reject_large))
     ids = []
     for instructions in ("oversized", "small"):
         request_id = uuid4()
         ids.append(request_id)
-        params = Create(request_id=request_id, config={"instructions": instructions})
+        params = Create(
+            request_id=request_id, config={**MODEL_CONFIG, "instructions": instructions}
+        )
         await gateway.metadata.reserve(
             request_id, OPERATOR, "session.create", params.model_dump(mode="json"), None
         )
@@ -149,7 +156,7 @@ async def test_offline_removed_machine_is_retained_until_safe_release_or_delete(
                 "title": "test",
                 "machine_ids": machines,
                 "default_machine_id": machines[0],
-                "config": {},
+                "config": MODEL_CONFIG,
             },
             principal=OPERATOR,
         )
@@ -202,7 +209,7 @@ async def test_pending_skill_transfer_keeps_original_default_machine(gateway, mo
             "title": "test",
             "machine_ids": ["one", "two"],
             "default_machine_id": "two",
-            "config": {},
+            "config": MODEL_CONFIG,
         },
         principal=OPERATOR,
     )
@@ -228,19 +235,19 @@ async def test_model_command_updates_waiting_session_with_persistent_run_id(gate
         sid, UUID(request_id(12345, 2, "message.create")), wait_seconds=5
     )
     assert (await gateway.sessions.get_session(sid)).run_id is not None
-    await bot.ingest([update(3, "/model newer-model")])
+    await bot.ingest([update(3, f'/model {{"model_id":"{MODEL_ID}","max_output_tokens":1000}}')])
     await bot.process_once()
-    assert (await gateway.sessions.get_session(sid)).config["model"] == "newer-model"
+    assert (await gateway.sessions.get_session(sid)).config["model"]["max_output_tokens"] == 1000
 
 
-async def test_terminal_projection_releases_accumulated_messages():
+async def test_terminal_projection_releases_temporary_message():
     preview, projection = project(
         [{"kind": "text_delta", "message_id": "same", "data": {"text": "Hello"}}], {}
     )
     assert preview == "Hello"
     _, projection = project([{"kind": "final", "data": {"output": "Hello"}}], projection)
     assert projection["pending"]["text"] == "Hello"
-    assert projection["pending"]["next"] == {"version": 1, "messages": {}}
+    assert projection["pending"]["next"] == {"version": 2}
 
 
 @pytest.mark.parametrize("loop", ["poll", "process", "deliver"])
@@ -349,7 +356,7 @@ async def test_online_removal_preserves_daemon_session_until_final_delete(gatewa
                 "title": "test",
                 "machine_ids": machines,
                 "default_machine_id": machines[0],
-                "config": {},
+                "config": MODEL_CONFIG,
             },
             principal=OPERATOR,
         )

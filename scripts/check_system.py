@@ -16,7 +16,7 @@ from uuid import uuid4
 import httpx2
 
 
-async def check(machine_id: str) -> None:
+async def check(machine_id: str, model_id: str) -> None:
     base_url = os.environ.get("KAPY_CONTROL_URL", "http://127.0.0.1:8000").rstrip("/")
     token = os.environ["KAPY_CONTROL_TOKEN"]
     async with httpx2.AsyncClient(
@@ -43,7 +43,7 @@ async def check(machine_id: str) -> None:
             "title": "Kapy live acceptance " + uuid4().hex[:8],
             "machine_ids": [machine_id],
             "default_machine_id": machine_id,
-            "config": {},
+            "config": {"model": {"model_id": model_id}},
         }
         created = await rpc("session.create", params)
         session_id = created["session"]["id"]
@@ -129,5 +129,6 @@ async def check(machine_id: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--machine", required=True, help="An online Docker execution machine ID")
+    parser.add_argument("--model-id", required=True, help="Registered model UUID")
     arguments = parser.parse_args()
-    asyncio.run(check(arguments.machine))
+    asyncio.run(check(arguments.machine, arguments.model_id))

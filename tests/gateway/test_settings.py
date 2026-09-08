@@ -4,19 +4,16 @@ from pydantic import ValidationError
 from kapy.settings import Settings, load_settings
 
 
-def test_explicit_aliases_no_automatic_dotenv_and_secret_redaction(monkeypatch, tmp_path):
+def test_dotenv_is_loaded_only_when_explicitly_selected(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("OPENAI_MODEL=dotenv-model\nOPENAI_API_KEY=dotenv-secret\n")
-    monkeypatch.delenv("OPENAI_MODEL", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    assert load_settings().model == "gpt-5.6-luna"
-    settings = load_settings(env_file=str(tmp_path / ".env"))
-    assert settings.model == "dotenv-model"
-    assert "dotenv-secret" not in repr(settings)
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "")
-    monkeypatch.setenv("KAPY_CONTROL_TOKEN", "")
-    assert load_settings().telegram_chat_id is None
+    (tmp_path / ".env").write_text("KAPY_CONTROL_TOKEN=explicit\n")
+    monkeypatch.delenv("KAPY_CONTROL_TOKEN", raising=False)
     assert load_settings().control_token is None
+    settings = load_settings(env_file=str(tmp_path / ".env"))
+    assert settings.control_token is not None
+    assert settings.control_token.get_secret_value() == "explicit"
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "")
+    assert load_settings().telegram_chat_id is None
 
 
 def test_schema_and_machine_configuration_cannot_inject_identifiers():
@@ -26,19 +23,7 @@ def test_schema_and_machine_configuration_cannot_inject_identifiers():
         Settings(machine_tokens={"contains.dot": "secret"})
 
 
-def test_neutral_model_aliases_take_precedence_and_frontends_are_explicit(monkeypatch):
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://old.invalid/v1")
-    monkeypatch.setenv("OPENAI_API_KEY", "old-key")
-    monkeypatch.setenv("OPENAI_MODEL", "old-model")
-    old = Settings()
-    assert old.model_api_key is not None
-    assert old.model == "old-model" and old.model_api_key.get_secret_value() == "old-key"
-    monkeypatch.setenv("KAPY_MODEL_BASE_URL", "https://new.invalid/compatible")
-    monkeypatch.setenv("KAPY_MODEL_API_KEY", "new-key")
-    monkeypatch.setenv("KAPY_MODEL", "vendor/model")
-    monkeypatch.setenv("KAPY_FRONTENDS", "[]")
-    settings = Settings(telegram_bot_token="leftover", telegram_chat_id=None)
-    assert settings.model_base_url == "https://new.invalid/compatible"
-    assert settings.model_api_key is not None
-    assert settings.model_api_key.get_secret_value() == "new-key"
-    assert settings.model == "vendor/model" and settings.enabled_frontends() == ()
+def test_control_starts_with_explicit_infrastructure_settings():
+    settings = Settings(control_token="admin", session_signing_key="signing", frontends=[])
+    settings.require_control()
+    assert settings.enabled_frontends() == ()

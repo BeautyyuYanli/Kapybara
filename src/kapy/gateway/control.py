@@ -3,15 +3,24 @@
 import asyncio
 import json
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 from weakref import WeakValueDictionary
 
+import httpx2
 import psycopg
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_core import to_jsonable_python
 
-from kapy.agent import AgentResourceLimit
+from kapy.agent import (
+    AgentResourceLimit,
+    ModelBackendFactory,
+    Runner,
+    RunnerConfig,
+    ScriptTool,
+    create_model_backend,
+)
 from kapy.rpc import JsonObject, JsonValue, RpcError
 from kapy.settings import Settings
 from kapy.state import (
@@ -20,6 +29,7 @@ from kapy.state import (
     NotFound,
     QueryLimitExceeded,
     RunContext,
+    RunFailure,
     RunnerState,
     RunResult,
     ServiceUnavailable,
@@ -31,10 +41,11 @@ from kapy.state import (
 
 from . import params as p
 from .auth import Principal, Rejected, denied
+from .models import Providers, invalid, parse_session_model, public_provider
 from .storage import Metadata
 
 if TYPE_CHECKING:
-    from kapy.agent import AgentPayloadStore, Runner
+    from kapy.agent import AgentPayloadStore
     from kapy.skills import SkillService
     from kapy.state import SessionService
 
@@ -48,6 +59,16 @@ def plain(value: Any) -> JsonValue:
 
 
 MODELS: dict[str, type[BaseModel]] = {
+    "provider.create": p.ProviderCreate,
+    "provider.get": p.ProviderId,
+    "provider.list": p.ProviderList,
+    "provider.update": p.ProviderUpdate,
+    "provider.delete": p.ProviderDelete,
+    "provider.discover": p.ProviderDiscover,
+    "provider.models": p.ProviderModels,
+    "provider.model.create": p.ModelCreate,
+    "provider.model.get": p.ModelId,
+    "provider.model.update": p.ModelUpdate,
     "session.create": p.Create,
     "session.get": p.SessionId,
     "session.list": p.ListSessions,
@@ -123,7 +144,9 @@ class ControlService:
         metadata: Metadata,
         sessions: SessionService,
         skills: SkillService,
-        runner: Runner,
+        http_client: httpx2.AsyncClient,
+        model_backend_factory: ModelBackendFactory = create_model_backend,
+        plugins: Sequence[ScriptTool] = (),
         machines: MachineRegistry,
         payload_store: AgentPayloadStore,
     ) -> None:
@@ -131,7 +154,10 @@ class ControlService:
         self.metadata = metadata
         self.sessions = sessions
         self.skills = skills
-        self.runner = runner
+        self.http_client = http_client
+        self.model_backend_factory = model_backend_factory
+        self.plugins = tuple(plugins)
+        self.providers = Providers(metadata, http_client)
         self.machines = machines
         self.payload_store = payload_store
         self.skill_slots = asyncio.Semaphore(2)
@@ -153,12 +179,23 @@ class ControlService:
             raise RpcError(-32602, "Invalid method parameters") from None
         data = parsed.model_dump()
         canonical = cast(JsonObject, parsed.model_dump(mode="json"))
+        if isinstance(data.get("api_key"), SecretStr):
+            canonical["api_key"] = data["api_key"].get_secret_value()
         try:
             # Even direct plugin calls must enforce a live caller identity.
             if principal.kind == "session":
                 caller = await self.sessions.get_session(cast(UUID, principal.session_id))
                 if principal.machine_id not in caller.machine_ids:
                     raise denied("Caller is not associated with this machine")
+            if method.startswith("provider."):
+                await self._authorize(method, data, principal)
+                if "request_id" in data:
+                    lock = self._locks.setdefault(data["request_id"], asyncio.Lock())
+                    async with lock:
+                        return plain(
+                            await self.providers.mutate(method, data, canonical, principal)
+                        )
+                return await self._provider_read(method, data)
             if method in MUTATIONS:
                 request_id: UUID = data["request_id"]
                 lock = self._locks.setdefault(request_id, asyncio.Lock())
@@ -221,12 +258,35 @@ class ControlService:
                 if not set(machines) <= set(caller.machine_ids):
                     raise denied("Child machines must be a subset of caller machines")
             config = data["config"]
-            if set(config) - {"model", "instructions", "output_mode"} or any(
-                not isinstance(value, str) for value in config.values()
+            if set(config) - {"model", "instructions", "output_mode"} or not isinstance(
+                config.get("instructions", ""), str
             ):
-                raise InvalidArgument("Config accepts model, instructions and output_mode strings")
+                raise invalid("Config accepts model object, instructions and output_mode")
             if config.get("output_mode", "text") not in ("text", "reply_to"):
-                raise InvalidArgument("output_mode must be text or reply_to")
+                raise invalid("output_mode must be text or reply_to")
+            supplied_model = config.get("model")
+            if supplied_model is not None and (
+                not isinstance(supplied_model, dict)
+                or set(supplied_model) - {"model_id", "context_window_tokens", "max_output_tokens"}
+            ):
+                raise invalid("Model accepts model_id and token budget overrides only")
+            if principal.kind == "session" and config.get("model") is not None:
+                supplied = config["model"]
+                if not isinstance(supplied, dict):
+                    raise invalid("config.model must be an object")
+                selected = supplied.get("model_id")
+                if selected is not None:
+                    try:
+                        selected_id = UUID(selected)
+                    except ValueError, TypeError, AttributeError:
+                        raise invalid("model_id must be a UUID") from None
+                    await self._bound_provider(principal, model_id=selected_id)
+        if method.startswith("provider.") and principal.kind == "session":
+            if method not in {"provider.get", "provider.models", "provider.model.get"}:
+                raise denied("Session capabilities cannot manage or enumerate providers")
+            await self._bound_provider(
+                principal, provider_id=data.get("provider_id"), model_id=data.get("model_id")
+            )
         if method == "event.publish":
             await self.metadata.channel(data["waiting_id"], principal, publish=True)
         if method in {"skill.update", "skill.delete"} and principal.kind != "operator":
@@ -236,6 +296,59 @@ class ControlService:
             )
             if not rows or rows[0]["creator_principal"] != principal.id:
                 raise denied("Only the skill creator may change it")
+
+    async def _bound_provider(
+        self, principal: Principal, *, provider_id: UUID | None = None, model_id: UUID | None = None
+    ) -> None:
+        caller = await self.sessions.get_session(cast(UUID, principal.session_id))
+        current = parse_session_model(caller.config.get("model"))
+        bound = await self.providers.model(current.model_id)
+        if model_id is not None:
+            selected = await self.providers.model(model_id)
+            provider_id = selected["provider_id"]
+        if provider_id != bound["provider_id"]:
+            raise denied("Provider is not bound to the calling session")
+
+    async def _provider_read(self, method: str, data: dict) -> JsonValue:
+        if method == "provider.get":
+            return plain(public_provider(await self.providers.get(data["provider_id"])))
+        if method == "provider.model.get":
+            model = await self.providers.model(data["model_id"])
+            await self.providers.get(model["provider_id"])
+            return plain(model)
+        if method == "provider.models":
+            await self.providers.get(data["provider_id"])
+            rows = await self.metadata.rows(
+                "SELECT * FROM gateway_provider_models WHERE provider_id=%s AND (%s::uuid IS "
+                "NULL OR id>%s) ORDER BY id LIMIT %s",
+                (data["provider_id"], data["after_id"], data["after_id"], data["limit"] + 1),
+            )
+            complete = await self.metadata.rows(
+                "SELECT id FROM gateway_provider_models WHERE provider_id=%s ORDER BY id LIMIT 2",
+                (data["provider_id"],),
+            )
+            return plain(
+                {
+                    "items": rows[: data["limit"]],
+                    "next_after_id": rows[data["limit"] - 1]["id"]
+                    if len(rows) > data["limit"]
+                    else None,
+                    "default_model_id": complete[0]["id"] if len(complete) == 1 else None,
+                }
+            )
+        rows = await self.metadata.rows(
+            "SELECT * FROM gateway_providers WHERE NOT deleted AND (%s::uuid IS NULL OR id>%s) "
+            "ORDER BY id LIMIT %s",
+            (data["after_id"], data["after_id"], data["limit"] + 1),
+        )
+        return plain(
+            {
+                "items": [public_provider(row) for row in rows[: data["limit"]]],
+                "next_after_id": rows[data["limit"] - 1]["id"]
+                if len(rows) > data["limit"]
+                else None,
+            }
+        )
 
     async def completion_channel(
         self,
@@ -256,6 +369,19 @@ class ControlService:
         principal: Principal,
         request: dict[str, Any] | None,
     ) -> JsonValue:
+        if method in {"session.create", "session.update"}:
+            assert request is not None
+            operation = request["operation"]
+            if "config" not in operation:
+                inherited = None
+                if method == "session.create" and principal.kind == "session":
+                    caller = await self.sessions.get_session(cast(UUID, principal.session_id))
+                    candidate = caller.config.get("model")
+                    inherited = candidate if isinstance(candidate, dict) else None
+                resolved = await self.providers.resolve(data["config"].get("model"), inherited)
+                operation["config"] = {**data["config"], "model": resolved}
+                await self.metadata.operation(data["request_id"], operation)
+            data = {**data, "config": operation["config"]}
         if method.startswith("skill."):
             from .skills import dispatch_skill
 
@@ -265,7 +391,7 @@ class ControlService:
             assert request is not None
             operation = request["operation"]
             if "initial_state" not in operation:
-                initial = self.runner.initial_state(
+                initial = Runner.initial_state(
                     instructions=data["config"].get("instructions", ""),
                     skills=await self.skills.catalog(),
                 )
@@ -417,7 +543,48 @@ class ControlService:
     async def run(self, context: RunContext) -> RunResult:
         while await self.metadata.access(context.session.id) is None:  # noqa: ASYNC110 - durable gate
             await asyncio.sleep(0.05)
-        result = await self.runner(context)
+        try:
+            selected = parse_session_model(context.session.config.get("model"))
+            provider, model, window, output = await self.providers.effective(selected)
+        except Rejected as exc:
+            code = "model_unavailable" if exc.code == -32004 else "model_configuration"
+            raise RunFailure(code, exc.message) from None
+        except Exception:
+            raise RuntimeError("Model configuration is unavailable; retry later") from None
+        try:
+            identity = json.dumps(
+                [
+                    str(provider["id"]),
+                    provider["revision"],
+                    provider["type"],
+                    provider["base_url"],
+                    str(model["id"]),
+                    model["name"],
+                ]
+            )
+            runner = Runner(
+                RunnerConfig(
+                    model=model["name"],
+                    context_window_tokens=window,
+                    max_output_tokens=output,
+                    compression_ratio=self.settings.compression_ratio,
+                    keep_recent_ratio=self.settings.keep_recent_ratio,
+                    media_max_bytes=self.settings.media_max_bytes,
+                ),
+                self.machines,
+                model_backend=self.model_backend_factory(
+                    self.providers.connection(provider), self.http_client
+                ),
+                payload_store=self.payload_store,
+                authorize_wait=self.authorize_wait,
+                plugins=self.plugins,
+                model_identity=identity,
+            )
+            result = await runner(context)
+        except Exception:
+            raise RuntimeError(
+                "Model execution failed; check model configuration or retry"
+            ) from None
         if isinstance(result.output, WaitFor):
             await self.authorize_wait(context.session.id, result.output.waiting_ids)
         return result

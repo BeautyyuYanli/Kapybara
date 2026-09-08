@@ -3,7 +3,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 from uuid import uuid4
 
-import httpx2
 import psycopg
 import pytest
 from psycopg import sql
@@ -17,7 +16,7 @@ from kapy.gateway.telegram import empty_projection
 from kapy.rpc import RpcError
 from kapy.settings import Settings
 
-from .conftest import DATABASE, VALKEY
+from .conftest import DATABASE, VALKEY, register_model
 from .test_control import create
 from .test_telegram import Bot, feed, install_output, record, sent_text, update
 
@@ -60,9 +59,6 @@ async def test_named_frontend_uses_only_control_port_and_borrowed_backend(
         valkey_namespace=namespace,
         control_token="admin",
         session_signing_key="signing",
-        model_api_key=None,
-        model="local/custom-model",
-        context_window_tokens=100_000,
         telegram_bot_token="leftover-token",
         telegram_chat_id=None,
         frontends=["terminal"],
@@ -77,12 +73,13 @@ async def test_named_frontend_uses_only_control_port_and_borrowed_backend(
             try:
                 owner = Principal("frontend", frontend_id="terminal", subject="user:one")
                 request = str(uuid4())
+                config = await register_model(self.control, name="vendor/model-x")
                 made = await self.control.call(
                     "session.create",
                     {
                         "request_id": request,
                         "input": "hello",
-                        "config": {"model": "vendor/model-x"},
+                        "config": config,
                     },
                     principal=owner,
                 )
@@ -130,13 +127,11 @@ async def test_named_frontend_uses_only_control_port_and_borrowed_backend(
             finally:
                 stopped.set()
 
-    # An injected backend needs neither a model key nor a Gateway-owned HTTP client.
-    def unexpected_http(**kwargs):
-        raise AssertionError("Gateway must not create model HTTP resources for an injected backend")
-
-    monkeypatch.setattr(httpx2, "AsyncClient", unexpected_http)
     app = create_app(
-        settings, model_backend=backend, frontend_factories={"terminal": Terminal}, plugins=override
+        settings,
+        model_backend_factory=lambda connection, http: backend,
+        frontend_factories={"terminal": Terminal},
+        plugins=override,
     )
     try:
         async with app.router.lifespan_context(app):

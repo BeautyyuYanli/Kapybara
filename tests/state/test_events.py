@@ -53,6 +53,7 @@ async def test_publish_before_wait_delivers_once_across_restart(database: Databa
     assert completed.completion and completed.completion.output == "done"
     assert len(seen) == 1 and seen[0].event_id == channel
     assert seen[0].being_waited_id is None
+    assert isinstance(seen[0].payload, dict)
     assert seen[0].payload["output"] == "ready"
     assert (
         await service.publish_event(
@@ -79,6 +80,7 @@ async def test_wait_does_not_reply_and_direct_input_gets_fresh_address(database:
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="wait")
+    assert created.submission is not None
     assert created.submission
     await waiting(database, created.session.id)
     assert (
@@ -130,6 +132,7 @@ async def test_reply_to_selects_old_input_and_preserves_full_output(database: Da
     created = await service.create_session(
         replace(spec(), config={"output_mode": "reply_to"}), request_id=uuid4(), input="first"
     )
+    assert created.submission is not None
     assert created.submission
     await waiting(database, created.session.id)
     second = await service.submit_input(created.session.id, "second", request_id=uuid4())
@@ -170,15 +173,18 @@ async def test_mixed_reply_targets_reject_the_whole_completion(
     async def runner(ctx: RunContext) -> RunResult:
         if ctx.session.title == "receiver":
             if ctx.inputs[0].event_id is None:
+                assert valid_address is not None
                 return result(ctx, waits=(valid_address,))
             received.extend(item.payload for item in ctx.inputs)
             delivered.set()
             return result(ctx)
         if ctx.inputs[0].payload == "seed":
+            assert ctx.inputs[0].being_waited_id is not None
             targets = (ctx.inputs[0].being_waited_id,)
         elif ctx.inputs[0].payload == "reply":
             started.set()
             await release.wait()
+            assert valid_address is not None and invalid_address is not None
             targets = (valid_address, invalid_address)
         else:
             await asyncio.Event().wait()
@@ -236,6 +242,7 @@ async def test_mixed_reply_targets_reject_the_whole_completion(
     assert failed.completion.output is None
     await asyncio.wait_for(delivered.wait(), 5)
     assert len(received) == 1
+    assert isinstance(received[0], dict)
     assert received[0]["outcome"] == "failed" and received[0]["output"] is None
     assert (
         await database.rows("SELECT * FROM waiting_channels WHERE id=%s", (invalid_address,))
@@ -375,6 +382,7 @@ async def test_single_receiver_binding_survives_wait_replacement(database: Datab
 
     service = await database.start(runner)
     first = await service.create_session(spec(), request_id=uuid4(), input="first")
+    assert first.submission is not None
     assert first.submission
     await waiting(database, first.session.id)
     new = await service.submit_input(first.session.id, "replace", request_id=uuid4())
@@ -384,6 +392,7 @@ async def test_single_receiver_binding_survives_wait_replacement(database: Datab
         ):
             await asyncio.sleep(0.01)
     other = await service.create_session(spec(), request_id=uuid4(), input="first")
+    assert other.submission is not None
     assert other.submission
     failed = await service.wait_submission(
         other.session.id, other.submission.request_id, wait_seconds=10
@@ -412,6 +421,7 @@ async def test_self_producer_is_not_special_and_queue_survives_clear(database: D
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="wait")
+    assert created.submission is not None
     assert created.submission
     await waiting(database, created.session.id)
     work = await service.submit_input(created.session.id, "work", request_id=uuid4())
@@ -467,6 +477,7 @@ async def test_interrupted_delivery_resumes_same_input(database: Database) -> No
 
     service = await database.start(initial)
     created = await service.create_session(spec(), request_id=uuid4(), input="wait")
+    assert created.submission is not None
     assert created.submission
     await waiting(database, created.session.id)
     await service.publish_event(channel, "durable", request_id=uuid4(), producer_session_id=None)
@@ -506,6 +517,7 @@ async def test_completion_backlog_is_validated_before_producer_commits(database,
                 CheckpointWrite(ctx.checkpoint_number + 1, ctx.state, (), ()),
             )
         if ctx.inputs[0].event_id is None:
+            assert address is not None
             return result(ctx, waits=(address,))
         received.append(ctx.inputs[0].payload)
         return result(ctx, "observed")
@@ -547,6 +559,7 @@ async def test_completion_backlog_is_validated_before_producer_commits(database,
     )
     assert observed.completion is not None and observed.completion.outcome == "completed"
     assert received[0]["output"] == expected_output
+    assert isinstance(received[0], dict)
     assert received[0]["outcome"] == expected_outcome
     assert (await database.rows("SELECT state FROM waiting_channels WHERE id=%s", (address,)))[0][
         "state"

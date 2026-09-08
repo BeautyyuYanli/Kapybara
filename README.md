@@ -20,8 +20,7 @@ flowchart LR
 需要 Docker Compose 和 uv。源码使用 Python 3.14；Docker 镜像提供对应运行环境。
 
 1. 使用 `.env.example` 创建 `.env`。本工作区已有 `.env` 时直接沿用。
-2. 填写 `KAPY_MODEL_BASE_URL`、`KAPY_MODEL_API_KEY`、`KAPY_MODEL`，并将
-   `KAPY_CONTEXT_WINDOW_TOKENS` 设置为所用模型的实际上下文窗口。
+2. 模型连接启动后通过 provider API 配置；无需在服务环境填写模型 key 或窗口。
 3. 分别为 `KAPY_CONTROL_TOKEN`、`KAPY_SESSION_SIGNING_KEY`、
    `KAPY_MACHINE_TOKEN` 设置随机值。可重复执行
    `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` 生成。
@@ -59,7 +58,7 @@ daemon 使用独立文件系统与 PID 空间，由常驻 `network` 服务提供
 
 ```sh
 uv sync --locked
-uv run --env-file .env python scripts/check_system.py --machine docker-machine
+uv run --env-file .env python scripts/check_system.py --machine docker-machine --model-id MODEL_ID
 ```
 
 该脚本创建临时会话，让模型调用执行机生成随机结果，核对最终回复与持久化工具
@@ -67,12 +66,13 @@ uv run --env-file .env python scripts/check_system.py --machine docker-machine
 
 ## 模型与前端配置
 
-模型默认使用 OpenAI-compatible Chat Completions，可配置任意兼容 endpoint、密钥和模型名，
-不限制为 OpenAI 自有型号。现有 `OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL` 环境变量
-仍可迁移使用；中性 `KAPY_MODEL_*` / `KAPY_MODEL` 优先。上下文窗口由部署显式配置，
-token 数只使用 API usage。
+调用协议由独立 provider 选择：默认 OpenAI Responses，也支持 Chat Completions 和
+Google AI Studio。provider 管端点与只写 key，持久模型目录保存稳定 ID、探测 metadata
+与手工 defaults。session 选择模型 ID，可覆盖预算；优先级为 session → model defaults →
+探测结果 → 262144/16384。实际 token 数仅用 API usage。
+完整 API、CLI 与配置示例见 [Provider 与模型配置](docs/models.md)。
 
-Python 应用可通过 `create_app(settings, model_backend=..., frontend_factories=..., plugins=...)`
+Python 应用可通过 `create_app(settings, model_backend_factory=..., frontend_factories=..., plugins=...)`
 注入模型适配器、注册可信前端工厂和选择脚本插件。`ModelBackend` 构造 Pydantic AI Model
 并分类可安全展示的错误；Runner 不拥有供应商客户端。前端只需实现 `run()`，并使用
 `FrontendContext.control.call(...)` 操作会话。`KAPY_FRONTENDS='["terminal"]'` 选择已注册的名称。
@@ -85,7 +85,7 @@ Python 应用可通过 `create_app(settings, model_backend=..., frontend_factori
 
 ```sh
 uv run --env-file .env docker compose --profile app exec -e KAPY_CONTROL_TOKEN daemon \
-  kapy control session create '请检查当前工作目录' --machine docker-machine
+  kapy control session create '请检查当前工作目录' --model MODEL_ID --machine docker-machine
 ```
 
 返回值包含会话 ID 和提交回执。后续命令可以使用 `--session <session-id>`：
@@ -114,7 +114,7 @@ kapy control --session <session-id> history query 'SELECT kind, text FROM histor
 真实父子任务验收可运行：
 
 ```sh
-uv run --env-file .env python scripts/check_recursive.py --machine docker-machine
+uv run --env-file .env python scripts/check_recursive.py --machine docker-machine --model-id MODEL_ID
 ```
 
 `queue` 在下一轮处理；`steer` 在当前模型或工具边界处理。完整历史保存在
@@ -128,7 +128,9 @@ PostgreSQL，模型上下文压缩不会删掉原始历史。压缩依据 API �
 `KAPY_FRONTENDS` 未设置时按 token 自动启用 Telegram；显式 `[]` 关闭所有前端插件。
 
 - `/machine docker-machine`：保存默认执行机。
-- `/model gpt-5.6-luna`：保存模型。
+- `/providers`、`/provider ID`：查看并选择模型连接。
+- `/discover`、`/models`：刷新、读取持久模型目录。
+- `/model ID`：选择已登记模型；`/modeldefaults JSON` 配置共享默认预算。
 - `/instructions ...`：保存新会话的基础指令。
 - `/new`：按已保存设置创建新会话。
 - `/steer ...`、`/queue ...`：选择输入方式；普通消息使用 queue。
@@ -137,7 +139,7 @@ PostgreSQL，模型上下文压缩不会删掉原始历史。压缩依据 API �
 模型回复使用 Telegram 原生 Rich Markdown，直接渲染标题、列表、表格和代码块。
 私聊使用富文本流式草稿：生成时更新同一条预览，完成后发送完整富文本正文。
 普通回复不展示 session 前缀、工具日志或 waiting 状态；长回复按段落和消息上限分段。
-群组只发送完成后的正文。现有会话可直接继续聊天，无需重新 `/new`。
+群组只发送完成后的正文。旧版会话需先通过 session.update 选择模型 ID，历史保留。
 命令和错误提示使用纯文本；无法安全拆分的超长 Markdown 块或已确认的内容上限拒绝
 会降级为完整纯文本源码，避免丢掉正文。格式降级不会用于网络错误或发送结果未知。
 

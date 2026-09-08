@@ -223,7 +223,7 @@ class MachineRegistry:
             or not isinstance(arguments, dict)
         ):
             raise RpcError(-32602, "Invalid proxy envelope")
-        if not target.startswith(("session.", "history.", "event.", "skill.")):
+        if not target.startswith(("session.", "history.", "event.", "skill.", "provider.")):
             raise denied("Proxy method is not permitted")
         token = auth.get("token")
         if not isinstance(token, str):

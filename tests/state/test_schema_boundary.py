@@ -54,9 +54,10 @@ async def test_old_protocol_state_is_left_untouched(gateway: bool) -> None:
                 ).fetchone()
             else:
                 row = await (await conn.execute("SELECT id FROM sessions")).fetchone()
-                assert (
-                    await (await conn.execute("SELECT to_regclass('waiting_channels')")).fetchone()
-                )[0] is None
+                table = await (
+                    await conn.execute("SELECT to_regclass('waiting_channels')")
+                ).fetchone()
+                assert table == (None,)
             assert row == (identifier,)
     finally:
         async with await psycopg.AsyncConnection.connect(DATABASE_URL, autocommit=True) as conn:

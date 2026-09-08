@@ -74,7 +74,12 @@ async def test_rich_prefix_then_oversized_table_plain_restart_raw_offset(gateway
     bot, _ = await install_output(gateway, monkeypatch, records, private=False)
     prefix = "# 😀" + "\r\n\r\n"
     table = "| a | b |\r\n|---|---|\r\n" + "|😀|x|\r\n" * 5000
-    feed(records, record("final", output=prefix + table))
+    feed(
+        records,
+        record("model_response", prefix + table),
+        record("model_response", "after the table", message="next"),
+        record("final", output="after the table"),
+    )
     await bot.deliver_once()
     row = (await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery"))[0]
     assert bot.sent == [
@@ -98,6 +103,14 @@ async def test_rich_prefix_then_oversized_table_plain_restart_raw_offset(gateway
             break
     assert all(m == "sendMessage" for m, _ in restored.sent)
     assert "".join(sent_text(p) for _, p in bot.sent + restored.sent) == prefix + table
+    await restored.deliver_once()
+    assert restored.sent[-1] == (
+        "sendRichMessage",
+        {"chat_id": -100, "rich_message": {"markdown": "after the table"}},
+    )
+    count = len(restored.sent)
+    await restored.deliver_once()
+    assert len(restored.sent) == count
 
 
 @pytest.mark.parametrize("draft", [False, True])
@@ -113,7 +126,7 @@ async def test_explicit_format_rejection_persists_plain_before_restart(gateway, 
     if draft:
         await bot.deliver_once()
         draft_id = bot.sent[-1][1]["draft_id"]
-        bot._draft_sent[draft_id] = (source, -100)
+        bot._draft_sent[draft_id] = (source, True, -100)
         bot._chat_ready.clear()
 
     def respond(request):
@@ -137,7 +150,7 @@ async def test_explicit_format_rejection_persists_plain_before_restart(gateway, 
     assert row["item_offset"] == len(prefix) and row["blocked_error"] is None
     assert "RICH_MESSAGE_DEPTH_INVALID" not in json.dumps(row["projection"])
     if draft:
-        assert row["projection"]["draft"]["plain"]
+        assert row["projection"]["message"]["plain"]
     else:
         assert row["projection"]["pending"]["format"] == "plain"
     restored = Bot(gateway)
@@ -235,35 +248,28 @@ async def test_unconfirmed_or_nonformat_failures_never_change_format(
     ]
 
 
-async def test_existing_version_one_pending_without_format_remains_plain(gateway, monkeypatch):
+async def test_version_one_pending_requires_drain_without_mutation(gateway, monkeypatch):
     records = []
     bot, _ = await install_output(gateway, monkeypatch, records)
     from psycopg.types.json import Jsonb
 
     source = "**already sent**\n\n" + "😀" * 3000
     offset = len("**already sent**\n\n")
+    projection = {
+        "version": 1,
+        "messages": {},
+        "pending": {"text": source, "cursor": "old", "next": {"version": 1, "messages": {}}},
+    }
     await gateway.metadata.rows(
         "UPDATE gateway_telegram_delivery SET projection=%s,item_offset=%s",
-        (
-            Jsonb(
-                {
-                    "version": 1,
-                    "messages": {},
-                    "pending": {
-                        "text": source,
-                        "cursor": None,
-                        "next": {"version": 1, "messages": {}},
-                    },
-                }
-            ),
-            offset,
-        ),
+        (Jsonb(projection), offset),
     )
+    before = await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery")
     await bot.deliver_once()
     restored = Bot(gateway)
     await restored.deliver_once()
-    assert all(m == "sendMessage" for m, _ in bot.sent + restored.sent)
-    assert "".join(sent_text(p) for _, p in bot.sent + restored.sent) == source[offset:]
+    assert bot.sent == restored.sent == []
+    assert await gateway.metadata.rows("SELECT * FROM gateway_telegram_delivery") == before
 
 
 async def test_oversized_fence_draft_uses_plain_but_final_can_use_rich(gateway, monkeypatch):

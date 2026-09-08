@@ -9,7 +9,7 @@ import httpx2
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from psycopg_pool import AsyncConnectionPool
 
-from kapy.agent import ModelBackend, OpenAICompatibleBackend, ScriptTool, apply_patch_plugin
+from kapy.agent import ModelBackendFactory, ScriptTool, apply_patch_plugin, create_model_backend
 from kapy.rpc import JsonParams, JsonValue, RpcError, RpcPeer, dispatch_json
 from kapy.settings import Settings, load_settings
 
@@ -40,7 +40,7 @@ async def supervise(name: str, run: Callable[[], Awaitable[None]]) -> None:
 def create_app(
     settings: Settings | None = None,
     *,
-    model_backend: ModelBackend | None = None,
+    model_backend_factory: ModelBackendFactory = create_model_backend,
     frontend_factories: Mapping[str, FrontendFactory] | None = None,
     plugins: Sequence[ScriptTool] | None = None,
 ) -> FastAPI:
@@ -67,12 +67,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        from kapy.agent import AgentPayloadStore, Runner, RunnerConfig
+        from kapy.agent import AgentPayloadStore
         from kapy.skills import SkillService
         from kapy.state import SessionService
         from kapy.state import migrate as migrate_state
 
-        config.require_control(model_backend_supplied=model_backend is not None)
+        config.require_control()
         database_url = config.database_url.get_secret_value()
         await migrate_state(database_url, schema=config.database_schema)
         await migrate(database_url, schema=config.database_schema)
@@ -80,13 +80,7 @@ def create_app(
             pool = AsyncConnectionPool(database_url, open=False, min_size=1, max_size=8)
             await resources.enter_async_context(pool)
             await pool.wait()
-            backend = model_backend
-            if backend is None:
-                http = await resources.enter_async_context(httpx2.AsyncClient(trust_env=False))
-                assert config.model_api_key is not None
-                backend = OpenAICompatibleBackend(
-                    base_url=config.model_base_url, api_key=config.model_api_key, http_client=http
-                )
+            http = await resources.enter_async_context(httpx2.AsyncClient(trust_env=False))
             metadata = Metadata(pool, schema=config.database_schema)
             skills = SkillService(pool, schema=config.database_schema)
             payloads = AgentPayloadStore(pool, schema=config.database_schema)
@@ -94,26 +88,6 @@ def create_app(
             await payloads.initialize()
             machines = MachineRegistry(auth, metadata, lambda: sessions)
             resources.push_async_callback(machines.aclose)
-
-            async def authorize_wait(session_id, waiting_ids) -> None:
-                await control.authorize_wait(session_id, waiting_ids)
-
-            assert config.context_window_tokens is not None
-            runner = Runner(
-                RunnerConfig(
-                    model=config.model,
-                    context_window_tokens=config.context_window_tokens,
-                    max_output_tokens=config.max_output_tokens,
-                    compression_ratio=config.compression_ratio,
-                    keep_recent_ratio=config.keep_recent_ratio,
-                    media_max_bytes=config.media_max_bytes,
-                ),
-                machines,
-                model_backend=backend,
-                payload_store=payloads,
-                authorize_wait=authorize_wait,
-                plugins=selected_plugins,
-            )
 
             async def run(context):
                 return await control.run(context)
@@ -130,7 +104,9 @@ def create_app(
                 metadata=metadata,
                 sessions=sessions,
                 skills=skills,
-                runner=runner,
+                http_client=http,
+                model_backend_factory=model_backend_factory,
+                plugins=selected_plugins,
                 machines=machines,
                 payload_store=payloads,
             )
