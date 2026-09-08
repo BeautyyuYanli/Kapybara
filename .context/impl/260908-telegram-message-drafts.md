@@ -11,3 +11,11 @@ cmd-proposal 完成恰好一次全上下文 Mei 简化审查与一次简化。cm
 验证：非 root Docker Gateway 114 passed（50.70 秒），启用真实 machine 专项；最后补强的失败恢复定向检查 1 passed。全仓 Ruff、Pyrefly、格式和 diff 检查通过。覆盖逐条发送、首 delta 替换、不同 draft ID、多 part、跨页、PostgreSQL JSONB 重启、长 pending、第二条消息 ACK 丢失、重复正文跨 message/run、进度上限和失败后保留已发正文。没有发送真实测试 Telegram 消息或调用模型。
 
 非空旧投影保持原样，须确认旧版投递已排空后保留 cursor 转换；不会自动重播或丢弃未确认内容。Telegram 与数据库无共同事务，正式发送成功但 ACK 丢失时仍可能重复未确认分段。
+
+## 部署
+
+实现提交 `bc57192` 已部署到运行中的 compose control。镜像 manifest 为 `sha256:d32d0827def8c2de2a708620a570d43f24f1391b5681fb56f1175091411e3b74`。保留旧镜像 `kapy-v2:before-message-drafts`；本次没有重建 daemon、网络或共享存储。
+
+停止旧 control 前以及停止后事务内均确认：六个 session 全为 waiting，无 active/interrupted run、未消费输入或未处理 Telegram inbox；两条 delivery 无 pending、offset 或阻塞，旧消息集合为空，cursor 分别为 3646、731，均到达输出末尾。旧投影先备份至私有 `/tmp/kapy-message-drafts-deploy-bu5oevyo/backup.json`（0600），再仅转换 projection 为 v2 并保留 chat_type。cursor、route、session、历史和 provider 配置不变。
+
+新 control 健康且 UID=10001，部署 telegram.py SHA-256 与仓库一致：`00bcc8cc9044426f7e2a02f8d57d9336760cca5ffeb516cb032ca2ddb0dbf4a1`。daemon 保持原容器并重新连接；两条 v2 投递 cursor 未移动，无 pending/blocked；日志无 traceback 或投影升级错误。没有主动向真实 bot 发送测试消息。
