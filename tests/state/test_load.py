@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from kapy.state import CheckpointWrite, RunContext, RunResult
+from kapy.state import CheckpointWrite, RunContext, RunResult, WaitFor
 
 from .conftest import Database, spec
 
@@ -29,7 +29,6 @@ async def test_hundred_sessions_twenty_inputs_and_replay(database: Database) -> 
         active.remove(ctx.session.id)
         return RunResult(
             "completed",
-            (),
             CheckpointWrite(
                 ctx.checkpoint_number + 1, ctx.state, (), tuple(item.id for item in ctx.inputs)
             ),
@@ -92,67 +91,38 @@ async def test_hundred_sessions_twenty_inputs_and_replay(database: Database) -> 
     )
 
 
-async def test_broadcast_to_hundred_listeners(database: Database) -> None:
-    channel = uuid4()
-    event_sessions: set[UUID] = set()
-    all_received = asyncio.Event()
+async def test_hundred_independent_one_shot_handoffs(database: Database) -> None:
+    channels = [uuid4() for _ in range(100)]
+    received = set()
 
     async def runner(ctx: RunContext) -> RunResult:
-        if any(isinstance(item.payload, dict) for item in ctx.inputs):
-            assert ctx.session.id not in event_sessions
-            event_sessions.add(ctx.session.id)
-            if len(event_sessions) == 100:
-                all_received.set()
+        if ctx.inputs[0].event_id:
+            received.add(ctx.session.id)
+            output = "done"
+        else:
+            output = WaitFor((channels[int(ctx.session.title)],))
         return RunResult(
-            "completed",
-            (channel,),
+            output,
             CheckpointWrite(
-                ctx.checkpoint_number + 1, ctx.state, (), tuple(item.id for item in ctx.inputs)
+                ctx.checkpoint_number + 1, ctx.state, (), tuple(i.id for i in ctx.inputs)
             ),
         )
 
     service = await database.start(runner)
     await asyncio.gather(
         *(
-            service.create_session(spec(str(i)), request_id=uuid4(), input="subscribe")
+            service.publish_event(channel, "ready", request_id=uuid4(), producer_session_id=None)
+            for channel in channels
+        )
+    )
+    sessions = await asyncio.gather(
+        *(
+            service.create_session(spec(str(i)), request_id=uuid4(), input="wait")
             for i in range(100)
         )
     )
     async with asyncio.timeout(60):
-        while True:
-            subscribed = await database.rows(
-                "SELECT count(*) AS count FROM subscriptions WHERE channel_id=%s", (channel,)
-            )
-            if subscribed[0]["count"] == 100:
-                break
+        while len(received) != 100:  # noqa: ASYNC110 - bounded DB observation
             await asyncio.sleep(0.02)
-    started = time.perf_counter()
-    receipt = await service.publish_event(
-        channel, "broadcast", request_id=uuid4(), producer_session_id=None
-    )
-    assert receipt.delivered == 100 and not receipt.pending
-    await asyncio.wait_for(all_received.wait(), 30)
-    delivery_seconds = time.perf_counter() - started
-    async with asyncio.timeout(30):
-        while True:
-            rows = await database.rows(
-                "SELECT count(*) AS count FROM inputs WHERE event_id=%s AND state='consumed'",
-                (receipt.event_id,),
-            )
-            if rows[0]["count"] == 100:
-                break
-            await asyncio.sleep(0.02)
-    completion_seconds = time.perf_counter() - started
-    assert len(event_sessions) == 100
-    print(
-        "EVENT_LOAD "
-        + json.dumps(
-            {
-                "listeners": 100,
-                "distinct_delivered": 100,
-                "consumed": 100,
-                "delivery_seconds": round(delivery_seconds, 3),
-                "completion_seconds": round(completion_seconds, 3),
-            }
-        )
-    )
+    assert len(await database.rows("SELECT id FROM inputs WHERE event_id IS NOT NULL")) == 100
+    assert len({s.session.id for s in sessions}) == 100

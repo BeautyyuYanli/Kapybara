@@ -16,6 +16,7 @@ from valkey.asyncio import Valkey
 from valkey.exceptions import ValkeyError
 
 from .contracts import (
+    SESSION_OUTPUT,
     CheckpointWrite,
     Completion,
     Conflict,
@@ -33,17 +34,21 @@ from .contracts import (
     QueryResult,
     Record,
     RecordPage,
+    ReplyAddressPage,
+    ReplyTo,
     RunFailure,
     RunnerState,
     RunResult,
     ServiceUnavailable,
     SessionInput,
+    SessionOutput,
     SessionPage,
     SessionRunner,
     SessionSpec,
     SessionView,
     Submission,
     SubmissionStatus,
+    WaitFor,
 )
 from .encoding import (
     CHECKPOINT_BYTES,
@@ -114,7 +119,14 @@ def _submission(row: dict[str, Any]) -> Submission:
 
 
 def _input(row: dict[str, Any]) -> SessionInput:
-    return SessionInput(row["id"], row["seq"], row["mode"], row["payload"], row["event_id"])
+    return SessionInput(
+        row["id"],
+        row["seq"],
+        row["mode"],
+        row["payload"],
+        row["event_id"],
+        row.get("being_waited_id"),
+    )
 
 
 def _record_view(row: dict[str, Any]) -> Record:
@@ -133,12 +145,22 @@ def _record_view(row: dict[str, Any]) -> Record:
 def _input_text(payload: JsonValue) -> str:
     if isinstance(payload, str):
         return payload
-    if isinstance(payload, dict):
-        if payload.get("type") == "event" and "payload" in payload:
-            return _input_text(payload["payload"])
-        if payload.get("type") == "session.waiting" and isinstance(payload.get("output"), str):
-            return cast(str, payload["output"])
     return json.dumps(payload, ensure_ascii=False, allow_nan=False)
+
+
+def _waiting_envelope(
+    channel_id: UUID,
+    producer: UUID | None,
+    output: JsonValue,
+    outcome: str | None,
+) -> JsonObject:
+    return {
+        "type": "waiting",
+        "waiting_id": str(channel_id),
+        "producer_session_id": str(producer) if producer else None,
+        "output": output,
+        "outcome": outcome,
+    }
 
 
 def _check_record(
@@ -401,55 +423,38 @@ class SessionService:
         payload: JsonValue,
         mode: InputMode,
         event_id: UUID | None = None,
+        being_waited_id: UUID | None = None,
     ) -> UUID:
         input_id = uuid4()
         text = _input_text(payload)
         seq = await self._append(conn, session_id, "input", payload, text)
         await conn.execute(
-            "INSERT INTO inputs(id,session_id,event_id,mode,payload,seq) VALUES "
-            "(%s,%s,%s,%s,%s,%s)",
-            (input_id, session_id, event_id, mode, Jsonb(payload), seq),
+            "INSERT INTO inputs(id,session_id,event_id,mode,payload,seq,being_waited_id) VALUES "
+            "(%s,%s,%s,%s,%s,%s,%s)",
+            (input_id, session_id, event_id, mode, Jsonb(payload), seq, being_waited_id),
         )
         return input_id
 
-    async def _deliver(self, conn: Connection, channel_id: UUID) -> dict[UUID, int]:
-        events = await (
+    async def _deliver(self, conn: Connection, channel_id: UUID) -> int:
+        channel = await (
             await conn.execute(
-                "SELECT * FROM events WHERE channel_id=%s AND state='pending' ORDER BY ordinal",
+                "SELECT c.* FROM waiting_channels c JOIN sessions s ON s.id=c.receiver_session_id "
+                "WHERE c.id=%s AND c.active AND c.state='ready' AND s.status <> 'deleting'",
                 (channel_id,),
             )
-        ).fetchall()
-        counts: dict[UUID, int] = {}
-        for event in events:
-            listeners = await (
-                await conn.execute(
-                    "SELECT s.session_id FROM subscriptions s JOIN sessions t ON t.id=s.session_id "
-                    "WHERE s.channel_id=%s AND t.status <> 'deleting' "
-                    "AND s.session_id IS DISTINCT FROM %s",
-                    (channel_id, event["producer_session_id"]),
-                )
-            ).fetchall()
-            if not listeners:
-                continue
-            envelope = cast(
-                JsonValue,
-                {
-                    "type": "event",
-                    "event_id": str(event["id"]),
-                    "waiting_id": str(channel_id),
-                    "producer_session_id": str(event["producer_session_id"])
-                    if event["producer_session_id"]
-                    else None,
-                    "payload": event["payload"],
-                },
-            )
-            for listener in listeners:
-                await self._insert_input(
-                    conn, listener["session_id"], envelope, event["mode"], event["id"]
-                )
-            await conn.execute("UPDATE events SET state='delivered' WHERE id=%s", (event["id"],))
-            counts[event["id"]] = len(listeners)
-        return counts
+        ).fetchone()
+        if not channel:
+            return 0
+        envelope = _waiting_envelope(
+            channel_id, channel["producer_session_id"], channel["output"], channel["outcome"]
+        )
+        await self._insert_input(
+            conn, channel["receiver_session_id"], envelope, channel["mode"], channel_id
+        )
+        await conn.execute(
+            "UPDATE waiting_channels SET state='delivered',active=false WHERE id=%s", (channel_id,)
+        )
+        return 1
 
     async def _event(
         self,
@@ -459,23 +464,62 @@ class SessionService:
         producer: UUID | None,
         mode: InputMode,
     ) -> tuple[UUID, int]:
-        event_id = uuid4()
-        envelope: JsonValue = {
-            "type": "event",
-            "event_id": str(event_id),
-            "waiting_id": str(channel_id),
-            "producer_session_id": str(producer) if producer else None,
-            "payload": payload,
-        }
-        # Validate before accepting backlog: every future listener must be able to store it.
+        envelope = _waiting_envelope(channel_id, producer, payload, "completed")
         _check_record(UUID(int=0), "input", envelope, _input_text(envelope))
         await conn.execute(
-            "INSERT INTO events(id,channel_id,producer_session_id,mode,payload) "
-            "VALUES (%s,%s,%s,%s,%s)",
-            (event_id, channel_id, producer, mode, Jsonb(payload)),
+            "INSERT INTO waiting_channels(id,producer_session_id) VALUES (%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            (channel_id, producer),
         )
-        delivered = await self._deliver(conn, channel_id)
-        return event_id, delivered.get(event_id, 0)
+        channel = await (
+            await conn.execute(
+                "SELECT * FROM waiting_channels WHERE id=%s",
+                (channel_id,),
+            )
+        ).fetchone()
+        assert channel is not None
+        if channel["request_id"] is not None:
+            raise Conflict("input reply channels can only be completed by session output")
+        if channel["state"] != "open":
+            raise Conflict("channel already has a result")
+        if (
+            channel["producer_session_id"] is not None
+            and channel["producer_session_id"] != producer
+        ):
+            raise Conflict("channel belongs to another producer")
+        await conn.execute(
+            "UPDATE waiting_channels SET producer_session_id=%s,state='ready',output=%s,mode=%s,"
+            "outcome='completed',completed_at=now() WHERE id=%s",
+            (producer, Jsonb(payload), mode, channel_id),
+        )
+        return channel_id, await self._deliver(conn, channel_id)
+
+    async def _wait_for(self, conn: Connection, session_id: UUID, ids: tuple[UUID, ...]) -> None:
+        await conn.execute(
+            "UPDATE waiting_channels SET active=false WHERE receiver_session_id=%s", (session_id,)
+        )
+        for channel_id in ids:
+            await conn.execute(
+                "INSERT INTO waiting_channels(id,receiver_session_id) VALUES (%s,%s) "
+                "ON CONFLICT DO NOTHING",
+                (channel_id, session_id),
+            )
+            channel = await (
+                await conn.execute(
+                    "SELECT receiver_session_id,state FROM waiting_channels WHERE id=%s",
+                    (channel_id,),
+                )
+            ).fetchone()
+            assert channel is not None
+            if channel["state"] == "delivered":
+                raise Conflict("channel has already been delivered")
+            if channel["receiver_session_id"] not in (None, session_id):
+                raise Conflict("channel belongs to another receiver")
+            await conn.execute(
+                "UPDATE waiting_channels SET receiver_session_id=%s,active=true WHERE id=%s",
+                (session_id, channel_id),
+            )
+            await self._deliver(conn, channel_id)
 
     async def create_session(
         self,
@@ -484,7 +528,7 @@ class SessionService:
         request_id: UUID,
         input: JsonValue = None,
         mode: InputMode = "queue",
-        waiting_id: UUID | None = None,
+        receiver_session_id: UUID | None = None,
     ) -> CreatedSession:
         self._ensure_open()
         _mode(mode)
@@ -500,18 +544,19 @@ class SessionService:
                     "config": spec.config,
                     "input": input,
                     "mode": mode,
-                    "waiting_id": waiting_id,
+                    "receiver_session_id": receiver_session_id,
                 },
             )
             if prior:
                 saved = prior["receipt"]
                 return CreatedSession(
-                    _saved_view(saved["session"]), _submission(saved["submission"])
+                    _saved_view(saved["session"]),
+                    _submission(saved["submission"]) if saved["submission"] else None,
                 )
             self._validate_spec(spec.title, spec.machine_ids, spec.default_machine_id, spec.config)
             bounded(spec.initial_state, CHECKPOINT_BYTES)
             bounded(input)
-            session_id, channel = uuid4(), waiting_id or uuid4()
+            session_id, channel = uuid4(), uuid4() if input is not None else None
             await conn.execute(
                 "INSERT INTO "
                 "sessions(id,title,machine_ids,default_machine_id,config,initial_state,status) "
@@ -521,25 +566,29 @@ class SessionService:
                     spec.title,
                     Jsonb(list(spec.machine_ids)),
                     spec.default_machine_id,
-                    Jsonb(spec.config),
+                    Jsonb({"output_mode": "text", **spec.config}),
                     Jsonb(plain(spec.initial_state)),
                 ),
             )
-            await conn.execute("INSERT INTO subscriptions VALUES (%s,%s)", (session_id, session_id))
             input_id = (
-                await self._insert_input(conn, session_id, input, mode)
+                await self._insert_input(conn, session_id, input, mode, being_waited_id=channel)
                 if input is not None
                 else None
             )
-            submission = Submission(request_id, session_id, input_id, channel)
+            submission = Submission(request_id, session_id, input_id, channel) if channel else None
             await conn.execute(
                 "INSERT INTO "
                 "requests(id,operation,fingerprint,target_session_id,input_id,waiting_id) "
                 "VALUES (%s,'create',%s,%s,%s,%s)",
                 (request_id, digest, session_id, input_id, channel),
             )
-            if input is None:
-                await self._completion(conn, session_id, None, "completed", "", [request_id])
+            if channel is not None:
+                await conn.execute(
+                    "INSERT INTO waiting_channels(id,request_id,"
+                    "producer_session_id,receiver_session_id) "
+                    "VALUES (%s,%s,%s,%s)",
+                    (channel, request_id, session_id, receiver_session_id),
+                )
             result = CreatedSession(_view(await self._session(conn, session_id)), submission)
             await conn.execute(
                 "UPDATE requests SET receipt=%s WHERE id=%s", (Jsonb(plain(result)), request_id)
@@ -554,6 +603,8 @@ class SessionService:
         default_machine_id: str | None,
         config: JsonObject,
     ) -> None:
+        if config.get("output_mode", "text") not in ("text", "reply_to"):
+            raise InvalidArgument("output_mode must be text or reply_to")
         if default_machine_id is not None and default_machine_id not in machine_ids:
             raise InvalidArgument("default_machine_id must be in machine_ids")
         if len(machine_ids) != len(set(machine_ids)):
@@ -637,6 +688,9 @@ class SessionService:
                 return _saved_view(prior["receipt"])
             self._validate_spec(title, machine_ids, default_machine_id, config)
             row = await self._session(conn, session_id)
+            config = {"output_mode": row["config"].get("output_mode", "text"), **config}
+            if config.get("output_mode", "text") != row["config"].get("output_mode", "text"):
+                raise Conflict("output_mode is fixed at creation")
             if row["status"] != "waiting":
                 raise Conflict("session settings can only change while waiting")
             row = await (
@@ -707,7 +761,7 @@ class SessionService:
             requests = await (
                 await conn.execute(
                     "SELECT id FROM requests WHERE target_session_id=%s AND completion IS NULL "
-                    "AND operation IN ('create','input') ORDER BY id",
+                    "AND input_id IS NOT NULL AND operation IN ('create','input') ORDER BY id",
                     (session_id,),
                 )
             ).fetchall()
@@ -716,7 +770,7 @@ class SessionService:
                 session_id,
                 row["latest_run_id"],
                 "deleted",
-                "",
+                None,
                 [request["id"] for request in requests],
             )
             await conn.execute("DELETE FROM sessions WHERE id=%s", (session_id,))
@@ -733,7 +787,7 @@ class SessionService:
         *,
         request_id: UUID,
         mode: InputMode = "steer",
-        waiting_id: UUID | None = None,
+        receiver_session_id: UUID | None = None,
     ) -> Submission:
         self._ensure_open()
         _mode(mode)
@@ -747,7 +801,7 @@ class SessionService:
                     "session_id": session_id,
                     "payload": payload,
                     "mode": mode,
-                    "waiting_id": waiting_id,
+                    "receiver_session_id": receiver_session_id,
                 },
             )
             if prior:
@@ -755,13 +809,21 @@ class SessionService:
             session = await self._session(conn, session_id)
             if session["status"] == "deleting":
                 raise Conflict("session is deleting")
-            channel = waiting_id or uuid4()
-            input_id = await self._insert_input(conn, session_id, payload, mode)
+            channel = uuid4()
+            input_id = await self._insert_input(
+                conn, session_id, payload, mode, being_waited_id=channel
+            )
             result = Submission(request_id, session_id, input_id, channel)
             await conn.execute(
                 "INSERT INTO requests(id,operation,fingerprint,receipt,target_session_id,input_id,"
                 "waiting_id) VALUES (%s,'input',%s,%s,%s,%s,%s)",
                 (request_id, digest, Jsonb(plain(result)), session_id, input_id, channel),
+            )
+            await conn.execute(
+                "INSERT INTO waiting_channels(id,request_id,"
+                "producer_session_id,receiver_session_id) "
+                "VALUES (%s,%s,%s,%s)",
+                (channel, request_id, session_id, receiver_session_id),
             )
         self._signal()
         return result
@@ -817,60 +879,43 @@ class SessionService:
         session_id: UUID,
         run_id: UUID | None,
         outcome: Literal["completed", "failed", "deleted"],
-        output: str,
+        output: SessionOutput | None,
         request_ids: list[UUID],
     ) -> None:
         completed_at = datetime.now(UTC)
-        # A run can consume arbitrarily many requests through repeated steer polls. Keep every
-        # receipt, but never aggregate its entire request set into one unbounded channel payload.
-        for start in range(0, max(1, len(request_ids)), 64):
-            batch = request_ids[start : start + 64]
-            session = await self._session(conn, session_id)
-            position = cursor(session_id, session["next_seq"] + 1)
-            payload = cast(
-                JsonObject,
-                {
-                    "type": "session.waiting",
-                    "session_id": str(session_id),
-                    "run_id": str(run_id) if run_id else None,
-                    "request_ids": [str(value) for value in batch],
-                    "outcome": outcome,
-                    "output": output,
-                    "cursor": position,
-                },
-            )
-            await self._append(conn, session_id, "waiting", payload, run_id=run_id)
-            await self._event(conn, session_id, payload, session_id, "steer")
-            for request_id in batch:
-                request = await (
-                    await conn.execute(
-                        "SELECT waiting_id FROM requests WHERE id=%s AND completion IS NULL",
-                        (request_id,),
-                    )
-                ).fetchone()
-                if not request:
-                    continue
-                completion = plain(
-                    {
-                        "run_id": run_id,
-                        "outcome": outcome,
-                        "output": output,
-                        "cursor": position,
-                        "completed_at": completed_at,
-                    }
-                )
+        value = SESSION_OUTPUT.dump_python(output, mode="json") if output is not None else None
+        session = await self._session(conn, session_id)
+        position = cursor(session_id, session["next_seq"])
+        for request_id in request_ids:
+            channel = await (
                 await conn.execute(
-                    "UPDATE requests SET completed_run_id=%s,completion=%s WHERE id=%s",
-                    (run_id, Jsonb(completion), request_id),
+                    "UPDATE waiting_channels SET state='ready',output=%s,run_id=%s,outcome=%s,"
+                    "completed_at=%s,cursor=%s WHERE request_id=%s AND state='open' RETURNING id",
+                    (Jsonb(value), run_id, outcome, completed_at, position, request_id),
                 )
-                if request["waiting_id"] != session_id:
-                    await self._event(
-                        conn,
-                        request["waiting_id"],
-                        {**payload, "request_ids": [str(request_id)]},
-                        session_id,
-                        "steer",
-                    )
+            ).fetchone()
+            if not channel:
+                raise Conflict("reply address has already been completed")
+            envelope = _waiting_envelope(channel["id"], session_id, value, outcome)
+            _check_record(UUID(int=0), "input", envelope, _input_text(envelope))
+            await conn.execute(
+                "UPDATE requests SET completed_run_id=%s,completion=%s WHERE id=%s",
+                (
+                    run_id,
+                    Jsonb(
+                        plain(
+                            {
+                                "run_id": run_id,
+                                "outcome": outcome,
+                                "cursor": position,
+                                "completed_at": completed_at,
+                            }
+                        )
+                    ),
+                    request_id,
+                ),
+            )
+            await self._deliver(conn, channel["id"])
 
     async def _prepare(self, session_id: UUID) -> _Context | None:
         async with self._store.write() as conn:
@@ -1091,11 +1136,23 @@ class SessionService:
         return cursor(context.session.id, seq)
 
     async def _finish(self, context: _Context, result: RunResult) -> None:
-        bounded(result.output)
-        if len(result.wait_for) > 128 or not all(
-            isinstance(item, UUID) for item in result.wait_for
-        ):
-            raise InvalidArgument("wait_for must contain at most 128 UUIDs")
+        output = result.output
+        value = SESSION_OUTPUT.dump_python(output, mode="json")
+        bounded(value)
+        explicit = context.session.config.get("output_mode", "text") == "reply_to"
+        if isinstance(output, str) and explicit or isinstance(output, ReplyTo) and not explicit:
+            raise InvalidArgument("output is not allowed by this session's output_mode")
+        ids = (
+            output.waiting_ids
+            if isinstance(output, WaitFor)
+            else (output.being_waited_ids if isinstance(output, ReplyTo) else ())
+        )
+        if len(ids) > 128 or len(ids) != len(set(ids)) or not all(isinstance(i, UUID) for i in ids):
+            raise InvalidArgument("output addresses must be at most 128 distinct UUIDs")
+        if isinstance(output, WaitFor) and not ids:
+            raise InvalidArgument("wait_for requires at least one address")
+        if isinstance(output, ReplyTo) and not output.payload.strip():
+            raise InvalidArgument("reply_to requires a nonempty model output")
         async with self._store.write() as conn:
             await self._checkpoint(conn, context, result.checkpoint, final=True)
             reserved = await (
@@ -1106,12 +1163,25 @@ class SessionService:
             ).fetchone()
             if reserved:
                 raise Conflict("runner returned with unconfirmed inputs")
+            requests = await (
+                await conn.execute(
+                    "SELECT r.id,r.waiting_id FROM requests r JOIN inputs i ON i.id=r.input_id "
+                    "WHERE i.session_id=%s AND i.state='consumed' "
+                    "AND r.completion IS NULL ORDER BY i.seq",
+                    (context.session.id,),
+                )
+            ).fetchall()
+            if isinstance(output, ReplyTo):
+                eligible = {r["waiting_id"] for r in requests}
+                if not set(ids) <= eligible or not ids and eligible:
+                    raise Conflict("reply_to must select unanswered consumed inputs")
+                requests = [r for r in requests if r["waiting_id"] in ids]
             await self._append(
                 conn,
                 context.session.id,
                 "final",
-                {"output": result.output},
-                result.output,
+                {"output": value},
+                output if isinstance(output, str) else "",
                 run_id=context.run_id,
                 attempt=context.attempt,
             )
@@ -1121,33 +1191,28 @@ class SessionService:
             await conn.execute(
                 "UPDATE sessions SET status='waiting' WHERE id=%s", (context.session.id,)
             )
-            channels = list(set(result.wait_for) | {context.session.id})
-            await conn.execute(
-                "DELETE FROM subscriptions WHERE session_id=%s AND NOT(channel_id=ANY(%s))",
-                (context.session.id, channels),
-            )
-            for channel in channels:
-                await conn.execute(
-                    "INSERT INTO subscriptions VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                    (channel, context.session.id),
-                )
-                await self._deliver(conn, channel)
-            requests = await (
-                await conn.execute(
-                    "SELECT r.id FROM requests r JOIN inputs i ON i.id=r.input_id "
-                    "WHERE i.run_id=%s AND i.state='consumed' AND r.completion IS NULL "
-                    "ORDER BY i.seq",
-                    (context.run_id,),
-                )
-            ).fetchall()
-            await self._completion(
+            await self._append(
                 conn,
                 context.session.id,
-                context.run_id,
-                "completed",
-                result.output,
-                [request["id"] for request in requests],
+                "waiting",
+                {
+                    "output": value,
+                    "wait_for": [str(i) for i in ids] if isinstance(output, WaitFor) else [],
+                },
+                run_id=context.run_id,
             )
+            await self._wait_for(
+                conn, context.session.id, ids if isinstance(output, WaitFor) else ()
+            )
+            if not isinstance(output, WaitFor):
+                await self._completion(
+                    conn,
+                    context.session.id,
+                    context.run_id,
+                    "completed",
+                    output,
+                    [r["id"] for r in requests],
+                )
         self._signal()
 
     async def _fail(self, context: _Context, error: Exception) -> None:
@@ -1184,8 +1249,9 @@ class SessionService:
             requests = await (
                 await conn.execute(
                     "SELECT r.id FROM requests r JOIN inputs i ON i.id=r.input_id "
-                    "WHERE i.run_id=%s AND r.completion IS NULL ORDER BY i.seq",
-                    (context.run_id,),
+                    "WHERE i.session_id=%s AND i.state='consumed' "
+                    "AND r.completion IS NULL ORDER BY i.seq",
+                    (context.session.id,),
                 )
             ).fetchall()
             await self._completion(
@@ -1193,7 +1259,7 @@ class SessionService:
                 context.session.id,
                 context.run_id,
                 "failed",
-                public_message,
+                public_message or None,
                 [request["id"] for request in requests],
             )
         self._signal()
@@ -1381,8 +1447,10 @@ class SessionService:
             async with self._store.pool.connection() as conn:
                 row = await (
                     await conn.execute(
-                        "SELECT operation,receipt,completion FROM requests WHERE id=%s "
-                        "AND target_session_id=%s AND operation IN ('create','input')",
+                        "SELECT r.operation,r.receipt,r.completion,c.output FROM requests r "
+                        "LEFT JOIN waiting_channels c ON c.request_id=r.id WHERE r.id=%s "
+                        "AND r.target_session_id=%s AND r.input_id IS NOT NULL "
+                        "AND r.operation IN ('create','input')",
                         (request_id, session_id),
                     )
                 ).fetchone()
@@ -1399,7 +1467,9 @@ class SessionService:
                 else Completion(
                     UUID(saved["run_id"]) if saved["run_id"] else None,
                     saved["outcome"],
-                    saved["output"],
+                    SESSION_OUTPUT.validate_python(row["output"])
+                    if row["output"] is not None
+                    else None,
                     saved["cursor"],
                     datetime.fromisoformat(saved["completed_at"]),
                 )
@@ -1477,6 +1547,26 @@ class _Context:
 
     async def poll_steer(self, *, limit: int = 64) -> tuple[SessionInput, ...]:
         return await self._service._poll(self, limit)
+
+    async def unreplied_addresses(self, *, after: int = 0, limit: int = 64) -> ReplyAddressPage:
+        page_limit(limit)
+        if after < 0:
+            raise InvalidArgument("after must be nonnegative")
+        async with self._service._store.pool.connection() as conn:
+            await self._service._attempt(conn, self)
+            rows = await (
+                await conn.execute(
+                    "SELECT i.seq,r.waiting_id FROM inputs i JOIN requests r ON r.input_id=i.id "
+                    "WHERE i.session_id=%s AND i.state='consumed' AND r.completion IS NULL "
+                    "AND i.seq>%s ORDER BY i.seq LIMIT %s",
+                    (self.session.id, after, limit + 1),
+                )
+            ).fetchall()
+        items = rows[:limit]
+        return ReplyAddressPage(
+            tuple(row["waiting_id"] for row in items),
+            items[-1]["seq"] if len(rows) > limit else None,
+        )
 
     async def emit(self, delta: OutputDelta) -> Cursor:
         return await self._service._emit(self, delta)

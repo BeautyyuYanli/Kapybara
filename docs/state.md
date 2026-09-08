@@ -1,11 +1,11 @@
 # State module
 
 `kapy.state` owns PostgreSQL sessions, the injected runner lifecycle, inputs, output/history,
-subscriptions and sticky events. Public dataclasses and runner methods are in
+one-shot waiting channels. Public dataclasses and runner methods are in
 `src/kapy/state/contracts.py`; `SessionService` and `migrate` are exported from the package.
-The implementation uses the approved `1fbe9a5` interfaces, the later
-`docs/contracts.md` receipt/idempotency/export additions, and the 512 KiB page amendment.
-Gateway owns authentication, caller/target separation, session authorization and channel grants.
+The public interaction model is defined by `docs/contracts.md`, including typed output and
+one-shot reply addresses.
+Gateway owns authentication, caller/target separation, session authorization and channel endpoints.
 State has no owner, parent, scope, grants or authentication token DTO.
 
 ## Assembly and lifetime
@@ -24,16 +24,14 @@ all writes acquire the service-meta row lock and verify that epoch. Runner write
 run id and attempt. The lease is checked at least once per scan with a two-second deadline;
 lease failure closes admission and cancels local runners. No model/machine I/O or Valkey call
 holds a State database write transaction. Different session runners can overlap; one session's
-runner never overlaps its successor. Short state commits serialize across the schema. A broadcast
-or backlog drain transaction grows with the affected audience and backlog, so large backlogs
-can delay unrelated writes; no throughput guarantee is implied.
+runner never overlaps its successor. Short state commits serialize across the schema. A reply can settle multiple inputs in one transaction; no throughput guarantee is implied.
 
 Valkey publishes a small `changed` hint on `<namespace>:wake`. PostgreSQL is authoritative.
 Hints are coalesced and do not contain work or cursor positions. Local notifications and a
 maximum one-second scan wake committed work even when every hint is lost. The PubSub loop
 reconnects independently. The service neither creates Valkey work keys nor flushes the server.
 Closing cancels and awaits tasks, then closes PubSub, the client, the pool and lease connection;
-it retains subscriptions and uncompleted runs for recovery. Output observers wake with
+it retains waiting channels and uncompleted runs for recovery. Output observers wake with
 ServiceUnavailable when the service closes.
 
 ## Transactions, input and recovery
@@ -41,7 +39,8 @@ ServiceUnavailable when the service closes.
 create/input/publish/update/delete take a UUID `request_id`. Matching retries return the first durable receipt;
 different operation/parameters under the same UUID raise Conflict. Initial runner state is
 excluded from create's retry fingerprint: the first successful initialization wins. Update is
-a full replacement of mutable settings while waiting. Update/delete check their durable receipt
+a full replacement of mutable settings while waiting; omitted output_mode preserves its
+creation-time value. Update/delete check their durable receipt
 before the current session state, so an old retry returns its original result even after newer
 settings or deletion. Deletion commits an intent before cancellation and atomically stores its
 original boolean result with final cleanup; interrupted intents resume at startup.
@@ -60,78 +59,75 @@ model messages. Checkpoint numbers strictly increase; retrying any committed num
 same content returns its original cursor. Emission ids deduplicate output. The runner must finish
 with a next-number final checkpoint that acknowledges every outstanding reservation.
 
-Successful finish atomically commits final state/output, enters waiting, replaces external
-subscriptions, drains eligible backlog, and publishes completion for requests consumed by the
-run plus the default channel. Completion request ids are grouped into batches of at most 64:
-each batch has a waiting record/default-channel event, while every request retains its own
-receipt and notification to its requested channel. This preserves the existing payload shape.
-For runs or deletions with more than 64 requests, default-channel observers receive multiple
-terminal notifications for that same run; this is the bounded-payload amendment from review.
-All batches still commit in the same waiting/deletion transaction, with no lost or early receipts.
-An early child completion waits durably until the parent subscribes.
-A late steer or queue input is not completed by an earlier run. Natural completion uses an empty
-external wait set. Subscriptions persist while the runner works and through process restarts;
-a later successful wait result replaces them. Removing a subscription does not retract inputs
-already delivered. Default subscriptions remain until deletion.
+Session config fixes `output_mode` at creation (`text` by default, or `reply_to`). Updates
+cannot change it. Each direct input creates a fresh one-shot reply channel and returns its
+`Submission.waiting_id`. It is the receiver's `SessionInput.being_waited_id`; client-selected
+waiting IDs are not accepted. Empty creation returns `submission=None` and creates no channel.
+Retries with the same request ID and arguments return the same address.
 
-Publishing delivers once to every currently subscribed session except the trusted producer id.
-No eligible subscriber (including only the producer) leaves an event pending. The first later
-eligible subscription hands the backlog to the then-current audience; subscribers arriving after
-that durable handoff do not retroactively receive it. Handoff creates durable inputs in the same
-transaction and marks the event delivered. This is the event acknowledgement; frontends read
-output and never consume agent subscriber queues.
+`RunResult(output, checkpoint)` carries a `SessionOutput`: `str | WaitFor | ReplyTo`.
+`WaitFor(waiting_ids)` requires 1–128 distinct UUIDs and replaces the active waiting set.
+It never settles input replies. Text mode ends with text and settles every consumed unresolved
+input, including earlier runs. Reply mode ends with `ReplyTo(being_waited_ids, payload)` and
+settles only the selected consumed unresolved inputs. The maximum is 128 distinct addresses;
+an empty reply selection is valid only when no read inputs await reply. Unselected inputs
+remain unresolved until future direct input or waiting results continue the session; they do
+not cause automatic runs. Waiting inputs have no new reply address.
 
-`submit_input(session_id, payload, ...)` stores the caller's JSON payload unchanged and
-creates an input only for that target session. Its `waiting_id` selects a completion channel;
-it does not broadcast the submitted prompt. `publish_event(waiting_id, payload, ...)` instead
-broadcasts to that channel's eligible subscribers. Each receiving `SessionInput.payload` and
-its input record's `data` contain this envelope (UUID placeholders below are JSON strings):
+Pydantic AI output functions expose only an `ids` array to the model. The reply function fills
+its DTO from the latest complete visible model text in this run and returns the complete DTO
+as framework output. State routes by its type and addresses and persists the entire output;
+it does not unwrap `ReplyTo.payload`. Text and reply endings clear active waits. A waiting
+record marks a run boundary and by itself never publishes a result.
+
+Successful finish atomically commits the checkpoint, complete output, run boundary, selected
+request completions and ready-channel handoffs. Consumption means an input is in a durable
+checkpoint; it does not mean the input was replied to. Runner's paged
+`unreplied_addresses(after=0, limit=64)` reads only this session's consumed unresolved addresses,
+ordered by input sequence. Reply mode puts these addresses in the model instructions. Text
+mode does not expose addresses or the reply tool/prompt. Compression preserves complete typed
+outputs and protects cycles containing unresolved inputs.
+
+Each channel has a unique producer, at most one receiver, and an immutable receiver binding.
+Its lifecycle is `open → ready → delivered`. Publication before waiting stores a ready result;
+waiting hands it into the receiver's durable input queue. Channel ID is also the input's
+`event_id`, protected by a unique constraint. The handoff and terminal channel state commit in
+one transaction. Retry receipts are repeatable, but another logical publication, receiver or
+handoff is rejected. Cancelling an active wait never releases receiver ownership. No session
+has a default channel, automatic self-listening or default completion publication. A producer
+that is explicitly also its receiver follows the same rules as other endpoints.
+
+`publish_event(waiting_id, payload, ...)` publishes once on an independent external channel;
+input-linked reply channels can only be settled by State. Gateway checks the producer and
+receiver principals. A waiting input contains:
 
 ```json
 {
-  "type": "event",
-  "event_id": "<event UUID>",
+  "type": "waiting",
   "waiting_id": "<channel UUID>",
-  "producer_session_id": null,
-  "payload": null
+  "producer_session_id": "<producer UUID or null>",
+  "output": {"kind": "reply_to", "being_waited_ids": ["<input address>"], "payload": "reply text"},
+  "outcome": "completed"
 }
 ```
 
-`producer_session_id` is the trusted producer's UUID string or `null`; `payload` is the original
-published JSON value, including objects/arrays/scalars/null, without content transformation.
-`event_id` identifies the publication and also appears in `SessionInput.event_id`. Delivery mode
-is carried separately in `SessionInput.mode`: the publication's `steer` or `queue`, defaulting
-to `steer`. The envelope does not contain a mode field.
+`output` is the entire original result (a string, complete typed output, or external JSON).
+`outcome` is `completed`, `failed` or `deleted`. Failures/deletion have a null output; they are
+control outcomes rather than a third model output tool. Replies enter the receiver as steer;
+external publication may explicitly choose queue. Already handed-off inputs survive wait
+replacement and are never retracted. Remaining active waits survive a wake until the next
+successful output replaces or clears them.
 
-A completion publication uses the following object as that envelope's inner `payload`.
-The same object appears directly as `Record.data` on the source session's `waiting` record:
-
-```json
-{
-  "type": "session.waiting",
-  "session_id": "<source session UUID>",
-  "run_id": null,
-  "request_ids": ["<request UUID>"],
-  "outcome": "completed",
-  "output": "final output text",
-  "cursor": "<source session waiting-record cursor>"
-}
-```
-
-`run_id` is the source run's UUID string or `null` when there is no run, such as empty creation.
-`outcome` is `completed`, `failed`, or `deleted`. The source session is the trusted producer,
-so its own default-channel completion cannot wake itself. Completions always use `steer`.
-For the default channel (`waiting_id == source session_id`), each notification carries at most
-64 `request_ids`; a larger completion therefore produces several same-run notifications in
-one transaction, each with its corresponding waiting-record cursor. A completion without
-associated requests still publishes one default notification with an empty `request_ids` array.
-For each request whose chosen waiting channel differs from the default channel, State also
-publishes to that channel with exactly that request's single id. Requests choosing the default
-channel are included in its batch without a second notification. Subscribers receive these
-completion objects inside the event envelope above, not as unwrapped completion inputs.
+Completion output has one authoritative copy in `waiting_channels.output`; request rows
+retain only completion metadata. `wait_submission` joins the channel and never consumes it.
+Migration 002 installs the new schema only when there are no old sessions, requests or channel
+rows. Existing old business state is unsupported and causes the migration transaction to fail;
+it is neither converted nor cleared. Old Gateway channel metadata is likewise rejected.
+Runner accepts only `kapy.agent.v2` snapshots. Use a new schema for the new protocol; no runtime
+adapter interprets old prompts, final outputs, wait calls or receipt payloads.
 
 A normal runner exception, including a runner-raised NotFound or ServiceUnavailable, produces
-a sanitized error and failed completion for its accepted inputs, then permits queued work to run.
+a sanitized error and failed completion for all consumed unresolved inputs, including prior waits, then permits queued work to run.
 Failure completion first verifies that the service still runs and the durable attempt is active;
 actual deletion, lease loss and cancellation cannot produce a spurious failed completion. Shutdown/cancellation/abrupt process exit leave the run
 recoverable: the next owner keeps its run id, increments attempt, appends interrupted output and
@@ -179,7 +175,7 @@ must also fit a complete page, so a payload near its individual cap can be rejec
 searchable text/envelope overhead would exceed that page. This check also runs before accepting
 backlog, so a large event cannot poison future delivery. PostgreSQL-incompatible NUL/surrogate
 strings and nonfinite JSON numbers are rejected before writing. Media is persisted as references.
-History and pending events have no implicit TTL.
+History and waiting channels have no implicit TTL.
 
 Substring uses parameterized literal `strpos`, so `%` and `_` are ordinary characters. Keyword
 search normalizes NFKC/casefold, indexes Unicode words with PostgreSQL's built-in simple GIN

@@ -606,6 +606,6 @@ async def test_model_configuration_error_reaches_receipt_and_telegram_but_sdk_er
         assert "max_output_tokens must be smaller" in result["completion"]["output"]
         assert result["completion"]["output"] in text
     else:
-        assert result["completion"]["output"] == ""
+        assert result["completion"]["output"] is None
         assert "secret-provider-message" not in str(records) + text
         assert "private.invalid" not in str(records) + text

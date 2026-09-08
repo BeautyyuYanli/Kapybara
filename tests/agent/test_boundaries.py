@@ -101,7 +101,7 @@ async def test_actual_model_instructions_schema_and_current_context_keep_snapsho
         ]
         assert any(set(item.get("properties", {})) == {"pty"} for item in objects)
         assert any(set(item.get("properties", {})) == {"stdout", "stderr"} for item in objects)
-        assert set(tools["wait"]["parameters"]["properties"]) == {"wait_for"}
+        assert set(tools["wait_for"]["parameters"]["properties"]) == {"ids"}
 
 
 @pytest.mark.parametrize(

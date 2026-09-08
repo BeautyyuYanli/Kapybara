@@ -83,6 +83,7 @@ async def check(model_id: str) -> None:
                     request_id=uuid4(),
                     input=f"Reply with exactly {marker}. No tools are needed.",
                 )
+                assert created.submission is not None
                 cursor = None
                 finished = False
                 while not finished:

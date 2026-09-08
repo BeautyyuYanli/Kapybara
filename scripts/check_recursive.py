@@ -75,7 +75,7 @@ async def check(machine_id: str, model_id: str) -> None:
                         "Create one child task by executing this exact command with process_start "
                         f"in stdio mode on the default machine:\n{command}\n"
                         "After successful creation, read waiting_id from the CLI JSON receipt "
-                        "and use your wait tool with wait_for containing only that ID. "
+                        "and use wait_for with ids containing only that ID. "
                         "Do not poll the child or wait via CLI. "
                         "When its completion event arrives, reply with only the child's random "
                         "KAPY_CHILD_ marker from that event. Do not generate a marker yourself."
@@ -108,7 +108,7 @@ async def check(machine_id: str, model_id: str) -> None:
                 for record in records
                 if record["kind"] == "input"
                 and isinstance(record["data"], dict)
-                and record["data"].get("type") == "event"
+                and record["data"].get("type") == "waiting"
             ]
             if len(events) != 1 or marker not in json.dumps(events[0]["data"]):
                 raise AssertionError(

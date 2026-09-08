@@ -80,10 +80,9 @@ async def test_creation_recovers_fixed_snapshot_without_reading_changed_catalog(
     await gateway.recover()
     receipt = await gateway.metadata.request(UUID(request_id))
     assert receipt["result"] is not None and receipt["error"] is None
-    assert (
-        receipt["operation"]["initial_state"]["data"]["instructions"]
-        == "original\nAvailable skill descriptions:\n[]"
-    )
+    snapshot = receipt["operation"]["initial_state"]["data"]
+    assert snapshot["instructions"] == "original"
+    assert snapshot["skill_descriptions"] == []
 
 
 async def test_permanent_initial_state_error_does_not_stop_other_recovery(gateway, monkeypatch):

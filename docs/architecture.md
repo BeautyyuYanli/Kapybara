@@ -5,7 +5,7 @@ describes the implemented integration contract. The initial target is Linux, one
 server process, multiple independent sessions and execution machines. Durable
 state survives control-server restarts. No clustering framework is required.
 
-Read `docs/contracts.md` for architect decisions resolving older proposal conflicts.
+Read [contracts](contracts.md), including the [session interaction and output contract](contracts.md#session-interaction-and-output), for concrete public interfaces.
 
 ## Ownership
 
@@ -36,13 +36,14 @@ use `session.*`, `event.*`, `history.*`, and `skill.*`. Concrete method names an
 
 State exports SessionService. Gateway delegates session/input/output/event/history
 operations to it. State owns per-session serialization, durable input buffers,
-waiting-channel subscriptions, output cursors and state transitions. Intelligence
+one-shot waiting-channel handoffs, output cursors and state transitions. Intelligence
 provides an injected runner callback: it receives a State RunContext containing inputs and durable runner state; emits deltas/messages through that context; polls steer input at model/tool
-boundaries; and returns final output plus waiting ids. State alone transitions to
-waiting and emits completion events. Final natural model completion also waits on
-the session's own input channel. The shared RunContext/RunResult types are exported by State. Output/history reads always scope by session.
+boundaries; and returns a typed output plus its final checkpoint. Creation fixes output mode: text or
+WaitFor, versus ReplyTo or WaitFor. State alone enters waiting and atomically settles the
+selected reply channels. Waiting itself does not complete inputs. Sessions have no default
+channel or automatic self-listener. The shared RunContext/RunResult types are exported by State. Output/history reads always scope by session.
 
-PostgreSQL stores authoritative sessions, inputs, outputs/history and pending events.
+PostgreSQL stores authoritative sessions, inputs, outputs/history and one-shot result channels.
 Valkey provides wakeup hints/caching where useful; loss of a hint cannot lose an input
 or strand an already committed event. History SQL is read-only and must enforce
 session isolation even for joins/subqueries; do not rely on string concatenation or
@@ -82,7 +83,7 @@ The generated upstream resources are changed only by their generator.
 
 Acceptance covers process interactivity/timeouts/tree cleanup/8192-byte PTY buffers,
 large stdio and chunked files, reconnect, session isolation and restart recovery,
-steer/queue sequencing, broadcast/queued/self-excluded events, recursive completion,
+steer/queue sequencing, one-shot queued handoffs, reply selection and input-driven wakeups, recursive completion,
 history cursor replay and SQL isolation/search, compression and protocol-valid model
 history, media rejection fallback, skills/plugins, CLI and Telegram chat/topic routing.
 Use real PostgreSQL/Valkey and non-root Docker subprocesses for integration. A small

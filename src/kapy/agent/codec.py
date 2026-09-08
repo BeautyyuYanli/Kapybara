@@ -19,7 +19,7 @@ from kapy.state import CheckpointWrite, JsonObject, RunnerState
 from .payloads import AgentPayloadStore, PayloadRef
 from .types import AgentResourceLimit
 
-CODEC = "kapy.agent.v1"
+CODEC = "kapy.agent.v2"
 MESSAGE_LIMIT = 256 * 1024
 DELTA_LIMIT = 16 * 1024
 CHECKPOINT_LIMIT = 4 * 1024 * 1024
@@ -81,7 +81,7 @@ class MessageCodec:
         raw = json_bytes(data)
         if len(raw) > INLINE_LIMIT:
             ref = await self.store.put(self.session_id, raw)
-            return RunnerState(CODEC, {"version": 1, "payload": cast(JsonObject, asdict(ref))})
+            return RunnerState(CODEC, {"version": 2, "payload": cast(JsonObject, asdict(ref))})
         return RunnerState(CODEC, cast(JsonObject, copy.deepcopy(data)))
 
     async def load(self, state: RunnerState) -> dict[str, Any]:
@@ -91,7 +91,7 @@ class MessageCodec:
         if "payload" in data:
             ref = PayloadRef(**cast(dict[str, Any], data["payload"]))
             data = json.loads(await self.store.get(self.session_id, ref))
-        if data.get("version") != 1:
+        if data.get("version") != 2:
             raise ValueError("Unsupported runner state version")
         return data
 

@@ -1,6 +1,7 @@
 """Durable sessions, events, and isolated history."""
 
 from .contracts import (
+    SESSION_OUTPUT,
     CheckpointWrite,
     Completion,
     Conflict,
@@ -19,12 +20,15 @@ from .contracts import (
     QueryResult,
     Record,
     RecordPage,
+    ReplyAddressPage,
+    ReplyTo,
     RunContext,
     RunFailure,
     RunnerState,
     RunResult,
     ServiceUnavailable,
     SessionInput,
+    SessionOutput,
     SessionPage,
     SessionRunner,
     SessionSpec,
@@ -33,6 +37,7 @@ from .contracts import (
     Submission,
     SubmissionStatus,
     UnsafeQuery,
+    WaitFor,
 )
 from .service import SessionService
 from .store import migrate
@@ -64,6 +69,11 @@ __all__ = [
     "RunContext",
     "RunResult",
     "RunFailure",
+    "ReplyAddressPage",
+    "ReplyTo",
+    "WaitFor",
+    "SessionOutput",
+    "SESSION_OUTPUT",
     "SessionRunner",
     "StateError",
     "NotFound",

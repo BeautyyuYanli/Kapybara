@@ -5,7 +5,7 @@ import json
 import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
-from uuid import UUID, uuid5
+from uuid import UUID
 from weakref import WeakValueDictionary
 
 import httpx2
@@ -36,6 +36,7 @@ from kapy.state import (
     SessionSpec,
     StateError,
     UnsafeQuery,
+    WaitFor,
 )
 
 from . import params as p
@@ -257,10 +258,12 @@ class ControlService:
                 if not set(machines) <= set(caller.machine_ids):
                     raise denied("Child machines must be a subset of caller machines")
             config = data["config"]
-            if set(config) - {"model", "instructions"} or not isinstance(
+            if set(config) - {"model", "instructions", "output_mode"} or not isinstance(
                 config.get("instructions", ""), str
             ):
-                raise invalid("Config accepts model object and instructions string")
+                raise invalid("Config accepts model object, instructions and output_mode")
+            if config.get("output_mode", "text") not in ("text", "reply_to"):
+                raise invalid("output_mode must be text or reply_to")
             supplied_model = config.get("model")
             if supplied_model is not None and (
                 not isinstance(supplied_model, dict)
@@ -349,17 +352,15 @@ class ControlService:
 
     async def completion_channel(
         self,
-        request_id: UUID,
-        supplied: UUID | None,
+        channel: UUID,
         principal: Principal,
-        target: UUID | None = None,
-    ) -> UUID:
-        channel = supplied or uuid5(request_id, "completion-channel")
-        await self.metadata.channel(channel, principal, create=supplied is None, subscribe=True)
-        await self.metadata.grant(channel, principal.id, publish=False, subscribe=True)
-        if target is not None:
-            await self.metadata.grant(channel, f"session:{target}", publish=True, subscribe=False)
-        return channel
+        target: UUID,
+    ) -> None:
+        await self.metadata.register_channel(
+            channel,
+            producer=f"session:{target}",
+            receiver=principal.id,
+        )
 
     async def _dispatch(
         self,
@@ -387,11 +388,6 @@ class ControlService:
             return await dispatch_skill(self, method, data, principal, request)
         sid = cast(UUID, data.get("session_id"))
         if method == "session.create":
-            channel = await self.completion_channel(
-                data["request_id"],
-                data["waiting_id"],
-                principal,
-            )
             assert request is not None
             operation = request["operation"]
             if "initial_state" not in operation:
@@ -415,12 +411,11 @@ class ControlService:
                 request_id=data["request_id"],
                 input=data["input"],
                 mode=data["mode"],
-                waiting_id=channel,
+                receiver_session_id=principal.session_id,
             )
             sid = created.session.id
-            await self.metadata.channel(sid, principal, create=True)
-            await self.metadata.grant(sid, f"session:{sid}", publish=True, subscribe=True)
-            await self.metadata.grant(channel, f"session:{sid}", publish=True, subscribe=False)
+            if created.submission is not None:
+                await self.completion_channel(created.submission.waiting_id, principal, sid)
             owner = principal.id
             if principal.kind == "session":
                 access = await self.metadata.authorize(principal, cast(UUID, principal.session_id))
@@ -452,13 +447,12 @@ class ControlService:
         if method == "session.delete":
             return {"deleted": await self._delete(sid, data["request_id"])}
         if method == "session.input":
-            data["waiting_id"] = await self.completion_channel(
-                data["request_id"],
-                data["waiting_id"],
-                principal,
-                sid,
+            submission = await self.sessions.submit_input(
+                **data,
+                receiver_session_id=principal.session_id,
             )
-            return plain(await self.sessions.submit_input(**data))
+            await self.completion_channel(submission.waiting_id, principal, sid)
+            return plain(submission)
         if method == "session.output":
             return plain(await self.sessions.read_output(**data))
         if method == "session.wait":
@@ -532,13 +526,13 @@ class ControlService:
     ) -> None:
         await self.metadata.authorize(principal, target_session_id)
         rows = await self.metadata.rows(
-            "SELECT creator_principal FROM gateway_channels WHERE waiting_id=%s",
+            "SELECT producer_principal FROM gateway_channels WHERE waiting_id=%s",
             (waiting_id,),
         )
         if principal.kind != "operator" and (
-            not rows or rows[0]["creator_principal"] != principal.id
+            not rows or rows[0]["producer_principal"] != principal.id
         ):
-            raise denied("Only the channel creator may grant access")
+            raise denied("Only the channel producer may grant access")
         await self.metadata.grant(
             waiting_id,
             f"session:{target_session_id}",
@@ -591,7 +585,8 @@ class ControlService:
             raise RuntimeError(
                 "Model execution failed; check model configuration or retry"
             ) from None
-        await self.authorize_wait(context.session.id, result.wait_for)
+        if isinstance(result.output, WaitFor):
+            await self.authorize_wait(context.session.id, result.output.waiting_ids)
         return result
 
     async def recover(self) -> None:

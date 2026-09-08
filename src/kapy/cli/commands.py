@@ -211,14 +211,18 @@ def create_session(
     model: Annotated[str | None, typer.Option(help="Registered model UUID")] = None,
     config_file: Annotated[Path | None, typer.Option()] = None,
     instructions: Annotated[str, typer.Option()] = "",
+    output_mode: Annotated[str | None, typer.Option(help="text (default) or reply_to")] = None,
     request_id: Annotated[UUID | None, typer.Option()] = None,
-    waiting_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
     text = input_text(text, file, stdin, required=False)
     machines = machine or ([client(ctx).machine_id] if client(ctx).machine_id else [])
     config: JsonObject = read_json_file(config_file) if config_file else {}
     if instructions:
         config["instructions"] = instructions
+    if output_mode is not None:
+        if output_mode not in {"text", "reply_to"}:
+            raise typer.BadParameter("output-mode must be text or reply_to")
+        config["output_mode"] = output_mode
     if model:
         config["model"] = {**cast(dict, config.get("model", {})), "model_id": model}
     invoke(
@@ -231,7 +235,6 @@ def create_session(
             "default_machine_id": default_machine or (machines[0] if len(machines) == 1 else None),
             "config": config,
             "input": text,
-            "waiting_id": str(waiting_id) if waiting_id else None,
         },
     )
 
@@ -280,7 +283,8 @@ def update_session(
 
     State permits updates only while the session is waiting. Supply a registered
     model ID through --model, --config or --config-file; updates do not inherit
-    the existing model selection. Other omitted configuration fields are cleared.
+    the existing model selection. Other omitted configuration fields are cleared
+    except output_mode, which is preserved and cannot change.
     Omitting --default-machine clears the prior default machine.
     """
     configuration = read_json_file(config_file) if config_file else json.loads(config)
@@ -308,7 +312,6 @@ def input_session(
     stdin: Annotated[bool, typer.Option("--stdin")] = False,
     steer: Annotated[bool, typer.Option()] = False,
     request_id: Annotated[UUID | None, typer.Option()] = None,
-    waiting_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
     text = input_text(text, file, stdin)
     invoke(
@@ -319,7 +322,6 @@ def input_session(
             "payload": text,
             "mode": "steer" if steer else "queue",
             "request_id": rid(request_id),
-            "waiting_id": str(waiting_id) if waiting_id else None,
         },
     )
 

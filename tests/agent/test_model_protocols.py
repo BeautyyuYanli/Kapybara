@@ -435,7 +435,7 @@ async def test_responses_full_replay_and_compression_preserve_reasoning_protocol
     ]
     codec = MessageCodec(cast(AgentPayloadStore, Payloads()), uuid4())
     data = {
-        "version": 1,
+        "version": 2,
         "cycles": [
             {
                 "closed": True,
@@ -495,10 +495,41 @@ async def test_responses_full_replay_and_compression_preserve_reasoning_protocol
     assert len(requests) == 3
 
 
-def test_current_behavior_upgrades_legacy_prompt_without_changing_saved_content():
-    from kapy.agent.runner import BASE_INSTRUCTIONS, LEGACY_BASE_INSTRUCTIONS, current_instructions
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "google_ai_studio"])
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_session_output_functions_across_model_backends(protocol, explicit):
+    from kapy.state import ReplyTo, WaitFor
 
-    saved = "User-specific instructions\nAvailable skill descriptions:\n[]"
-    data = {"instructions": LEGACY_BASE_INSTRUCTIONS + "\n" + saved}
-    assert current_instructions(data) == BASE_INSTRUCTIONS + "\n" + saved
-    assert data["instructions"] == LEGACY_BASE_INSTRUCTIONS + "\n" + saved
+    address = uuid4()
+    requests = []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        text = "Complete reply" if explicit and len(requests) == 1 else None
+        tool = None if text else "reply_to" if explicit else "wait_for"
+        args = {"ids": [str(address)]}
+        if protocol == "openai_chat":
+            return response(text=text, name=tool, args=args)
+        if protocol == "openai_responses":
+            return responses_stream(text, tool, args)
+        return google_stream(text, tool, args)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
+        agent = runner(client, plugins=())
+        agent.config = replace(agent.config, model="test")
+        agent.model_backend = create_model_backend(
+            ModelConnection(protocol, "https://model.invalid/base", SecretStr("dummy")), client
+        )
+        ctx = Context(agent.initial_state(instructions="Follow user instructions", skills=[]))
+        ctx.session = replace(
+            ctx.session, config={"output_mode": "reply_to" if explicit else "text"}
+        )
+        ctx.inputs = (SessionInput(uuid4(), 1, "queue", "Question", None, address),)
+        result = await agent(ctx)
+    assert result.output == (
+        ReplyTo((address,), "Complete reply") if explicit else WaitFor((address,))
+    )
+    assert len(requests) == (2 if explicit else 1)
+    assert "history(seq bigint NOT NULL" in json.dumps(requests[0])
+    assert ("being_waited_id" in json.dumps(requests[0])) == explicit

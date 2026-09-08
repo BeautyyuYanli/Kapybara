@@ -22,8 +22,11 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 async def test_scoped_sql_join_subquery_and_functions(database: Database) -> None:
     service = await database.start(simple)
     first = await service.create_session(spec("a"), request_id=uuid4(), input="public apple")
+    assert first.submission is not None
     second = await service.create_session(spec("b"), request_id=uuid4(), input="secret orange")
+    assert second.submission is not None
     for created in (first, second):
+        assert created.submission is not None
         await database.completed(created.submission.request_id)
     answer = await service.query_history(
         first.session.id,
@@ -140,11 +143,12 @@ async def test_encoded_page_cap_and_query_limits(database: Database) -> None:
             MessageWrite(uuid4(), "model_response", "", {"escaped": payload}) for _ in range(12)
         )
         return RunResult(
-            "done", (), CheckpointWrite(1, ctx.state, messages, tuple(i.id for i in ctx.inputs))
+            "done", CheckpointWrite(1, ctx.state, messages, tuple(i.id for i in ctx.inputs))
         )
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="start")
+    assert created.submission is not None
     assert (await database.completed(created.submission.request_id))["outcome"] == "completed"
     page = await service.read_output(created.session.id)
     records = list(page.items)
@@ -178,15 +182,17 @@ async def test_backlog_payload_rejected_before_it_can_poison_future_delivery(
             uuid4(), payload, request_id=request_id, producer_session_id=None
         )
     assert not await database.rows("SELECT id FROM requests WHERE id=%s", (request_id,))
-    assert not await database.rows("SELECT id FROM events")
+    assert not await database.rows("SELECT id FROM waiting_channels")
 
 
 async def test_sql_decimal_and_complexity_limits(database: Database) -> None:
     service = await database.start(simple)
-    created = await service.create_session(spec(), request_id=uuid4())
-    assert (await service.query_history(created.session.id, "SELECT 1.5 FROM history")).rows == (
-        (1.5,),
-    )
+    created = await service.create_session(spec(), request_id=uuid4(), input="seed")
+    assert created.submission is not None
+    await database.completed(created.submission.request_id)
+    assert (
+        await service.query_history(created.session.id, "SELECT 1.5 FROM history LIMIT 1")
+    ).rows == ((1.5,),)
     with pytest.raises(InvalidArgument):
         await service.query_history(created.session.id, "SELECT " + "9" * 5000 + " FROM history")
     with pytest.raises(UnsafeQuery):

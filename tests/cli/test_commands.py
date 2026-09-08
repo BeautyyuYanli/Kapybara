@@ -268,3 +268,22 @@ def test_provider_keys_and_registered_model_selection_share_control_api(monkeypa
     assert result.exit_code == 0, result.output
     assert calls[-1][0] == "provider.model.update"
     assert calls[-1][1]["defaults"] == {"max_output_tokens": 1024}
+
+
+def test_creation_output_mode_and_removed_custom_reply_address(monkeypatch):
+    _, _, calls = configured(monkeypatch)
+    cli = CliRunner()
+    created = cli.invoke(
+        commands.app, ["control", "session", "create", "--output-mode", "reply_to", "task"]
+    )
+    assert created.exit_code == 0, created.output
+    assert calls[0][1]["config"]["output_mode"] == "reply_to"
+    assert "waiting_id" not in calls[0][1]
+    invalid = cli.invoke(
+        commands.app, ["control", "session", "create", "--output-mode", "unknown", "task"]
+    )
+    assert invalid.exit_code != 0 and len(calls) == 1
+    removed = cli.invoke(
+        commands.app, ["control", "session", "input", "--waiting-id", str(uuid4()), "task"]
+    )
+    assert removed.exit_code != 0 and len(calls) == 1

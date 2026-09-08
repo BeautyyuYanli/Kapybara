@@ -171,7 +171,8 @@ def project(records: list[dict[str, Any]], previous: dict[str, Any]) -> tuple[st
                 messages[key]["text"] for key in order if messages[key]["text"] is not None
             ]
             if kind == "final":
-                final = str(data.get("output", record.get("text", "")))
+                output = data.get("output", record.get("text", ""))
+                final = output if isinstance(output, str) else ""
                 # The final result replaces the last response, preserving tool preambles.
                 if final:
                     if completed:
