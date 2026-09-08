@@ -13,3 +13,9 @@ Telegram 复用 progress 保存最近 2000 字符的当前 thinking part，增�
 验证：指定非 root Docker Agent/Gateway 233 passed（58.95 秒），含真实 machine 专项；最后长 Unicode 定向 6 passed（2.13 秒）。Ruff/format/diff 通过，Pyrefly 0 errors；保留既有 google-genai DeprecationWarning。实际 SDK mock HTTP 验证三协议 thinking 内容、空/仅签名事件、能力门控；真实 PostgreSQL 验证 thinking 草稿重启和工具概况。无真实模型或 Telegram 测试请求。
 
 限制：只有 SDK 和供应商返回的可展示 thinking 才有内容；不会从加密材料还原或伪造摘要。工具概况是有界展示，完整记录继续由既有历史接口保存。正式发送 ACK 丢失的至少一次边界保持原样。
+
+## 部署
+
+实现提交 `713ebcf` 已部署到现有 compose control，镜像 manifest `sha256:1f9a86c82acc2a455ae18fe6964523a937f396f5838a1e5ba8d2e88083c919d5`；旧镜像保留为 `kapy-v2:before-thinking-tool-summaries`。部署前确认无活动 run、未消费输入、未处理 Telegram inbox 或待发 pending。只重建 control，未重建 daemon、PostgreSQL、Valkey 或网络，无投影/数据库迁移和数据重置。
+
+新 control 健康且 UID10001，三份修改源码哈希全部与仓库一致；daemon 已重连，日志无 traceback 或投影升级错误。部署模块固定样例实际输出 `process_start · calling · git status` 及 `process_start · returned · exited · exit 0 · stdout: working tree clean`。没有发送真实测试 Telegram 消息或调用模型，现有会话可直接继续使用。
