@@ -27,3 +27,39 @@ The branch explicitly rejects pre-v3 Agent snapshots. Deployment will retain the
 model IDs/defaults, skills, saved Telegram configuration and polling position. New Telegram
 input starts a v3 session; old conversations are archived, not replayed or converted.
 Deployment results and rollback details are recorded below after verification.
+
+## Deployed result
+
+Code merge: `1b296fe3361bf886c6252b773ff506ff936db75c`. Both main and the requested
+`feat/steer-queue-message-waiting-id` branch were fast-forwarded to this commit.
+Image manifest: `sha256:6878c4a5421ddba12bc8178e9938e18194685db8246f4ccb9b384b9b30961090`.
+Control `2f5efd1997e2` is healthy; daemon `8303b7f4d954` is running. Both are UID/GID
+10001; daemon drops ALL capabilities and uses no-new-privileges. All 51 Python source
+files in both containers match the merged working tree; no startup traceback was found.
+PostgreSQL, Valkey and the shared network container retain their original container IDs.
+
+A final drain check found no active run, unread input, unanswered input, unhandled inbox,
+unread delivery, unfinished gateway mutation or cleanup. Private backup directory:
+`/tmp/kapy-partial-reply-deploy-jjltv_3j` (0700). The previous ignored environment and
+`kapy_interaction_v2.dump` (2,208,630 bytes) are 0600. Rollback image tag:
+`kapy-v2:before-partial-reply-v3`.
+
+All 24 old-schema table counts/digests matched after copy and after deployment. The
+archive retains seven sessions, 10,643 records, 55 State requests and 43 Telegram inbox
+entries. No old business state was deleted, converted or replayed. Copied one provider,
+67 models including configured defaults/stable IDs, six provider receipts, the currently
+empty skills catalog/receipts/access tables, one Telegram poll offset and one saved route.
+Only the new schema's route session binding is empty. The ignored local .env now selects
+`kapy_interaction_v3` for schema and Valkey namespace.
+
+Live smoke verification used the deployed authenticated HTTP RPC: provider.models returns
+all 67 models; a temporary input-free reply_to session has an actual v3 snapshot; the real
+daemon is associated and its session release/payload cleanup completes after deletion.
+The temporary session was removed. No provider request or synthetic Telegram message was
+sent. Existing Docker tests cover real State partial reply continuation and recovery, as
+well as all three SDK backends and the Telegram mock send paths.
+
+Rollback must preserve any newly received v3 work first. Stop only control/daemon, restore
+the previous schema/namespace settings and rollback image, and reconcile Telegram polling
+position before restarting; do not blindly replay the archived poll offset. Both schemas
+remain intact for that operation. A v3 snapshot cannot be resumed by the old image.
