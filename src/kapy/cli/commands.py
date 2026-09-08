@@ -278,9 +278,10 @@ def update_session(
 ) -> None:
     """Replace the session title, machines and configuration completely.
 
-    State permits updates only while the session is waiting. Omitting --config
-    submits {}, clearing prior configuration. Omitting --default-machine submits
-    None, clearing the prior default machine.
+    State permits updates only while the session is waiting. Supply a registered
+    model ID through --model, --config or --config-file; updates do not inherit
+    the existing model selection. Other omitted configuration fields are cleared.
+    Omitting --default-machine clears the prior default machine.
     """
     configuration = read_json_file(config_file) if config_file else json.loads(config)
     if model:

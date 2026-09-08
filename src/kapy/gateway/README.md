@@ -81,8 +81,11 @@ kapy control --session SESSION_UUID --machine docker-machine skill upload ./exam
 kapy control --session SESSION_UUID --machine docker-machine skill download SKILL_UUID ./download
 ```
 
-`session update` replaces all settings and is allowed only while waiting. Its
-`--help` describes how omitted configuration and default-machine options clear prior values.
+`session update` replaces all settings and is allowed only while waiting. Supply a
+registered model ID through `--model`, `--config` or `--config-file`; updates do not
+inherit the existing model selection. Other omitted configuration fields are cleared,
+and omitting `--default-machine` clears the prior default machine. Only recursive
+session creation can inherit its parent's model selection.
 
 Skills preserve expected revisions and scoped idempotency. Archives move in 64 KiB chunks
 through the existing machine file protocol, with at most two concurrent exchanges and a
