@@ -1,15 +1,19 @@
 """Exercise real SDK serialization/streaming through borrowed mock HTTP transports."""
 
+import asyncio
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
+from pathlib import Path
+from uuid import uuid4
 
 import httpx2
 import pytest
 from pydantic import SecretStr
 
 from kapy.agent import ModelConnection, create_model_backend
+from kapy.state import CheckpointWrite, RunnerState, SessionInput
 
-from .test_runner import Context, response, runner
+from .test_runner import Caller, Context, response, runner
 
 
 def event(kind, **data):
@@ -83,7 +87,7 @@ def responses_stream(text=None, tool=None, args=None):
     return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body)
 
 
-def google_stream(text=None, tool=None, args=None):
+def google_stream(text=None, tool=None, args=None, *, tokens=100):
     part = (
         {"functionCall": {"name": tool, "args": args or {}}, "thoughtSignature": "c2ln"}
         if tool
@@ -94,9 +98,9 @@ def google_stream(text=None, tool=None, args=None):
             {"content": {"role": "model", "parts": [part]}, "finishReason": "STOP", "index": 0}
         ],
         "usageMetadata": {
-            "promptTokenCount": 100,
+            "promptTokenCount": tokens,
             "candidatesTokenCount": 10,
-            "totalTokenCount": 110,
+            "totalTokenCount": tokens + 10,
             "cachedContentTokenCount": 20,
         },
         "modelVersion": "test",
@@ -278,6 +282,112 @@ async def test_model_identity_change_scrubs_only_projection_and_preserves_tool_p
         assert "fc-private" not in encoded and "resp-private" not in encoded
         assert "public text" in encoded and encoded.count("call-safe") == 2
         assert ctx.state == snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["connection", "budget"])
+async def test_checkpoint_recovery_discards_stale_usage_and_scopes_signatures(
+    change: str, tmp_path: Path
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint.json"
+    requests: list[httpx2.Request] = []
+
+    class MarkedCaller(Caller):
+        async def call(self, *args, **kwargs):
+            await super().call(*args, **kwargs)
+            return {"items": [], "marker": f"restart-marker-{len(self.calls)}", "next": None}
+
+    class InterruptedContext(Context):
+        armed = False
+
+        async def checkpoint(self, write: CheckpointWrite) -> str:
+            cursor = await super().checkpoint(write)
+            checkpoint_path.write_text(
+                json.dumps({"state": asdict(write.state), "number": write.number})
+            )
+            # Stop after the actual second tool result commits, before the next
+            # model boundary can consume its response's fresh API usage.
+            if self.armed and "restart-marker-2" in json.dumps(write.state.data):
+                raise asyncio.CancelledError
+            return cursor
+
+    def first_provider(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        if len(requests) == 2:
+            return google_stream(text="previous completed answer")
+        return google_stream(tool="process_list", tokens=800 if len(requests) == 3 else 100)
+
+    caller = MarkedCaller()
+    connection = ModelConnection(
+        "google_ai_studio", "https://old.invalid/base", SecretStr("old-key")
+    )
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(first_provider)) as client:
+        agent = runner(client, caller, plugins=(), model_identity="provider:revision-1:test")
+        agent.config = replace(
+            agent.config, model="test", context_window_tokens=1000, max_output_tokens=100
+        )
+        agent.model_backend = create_model_backend(connection, client)
+        ctx = InterruptedContext(agent.initial_state(instructions="", skills=[]))
+        first = await agent(ctx)
+        await ctx.checkpoint(first.checkpoint)
+        ctx.run_id = uuid4()
+        ctx.session = replace(ctx.session, run_id=ctx.run_id)
+        ctx.inputs = (SessionInput(uuid4(), 2, "queue", "continue after restart", None),)
+        ctx.armed = True
+        with pytest.raises(asyncio.CancelledError):
+            await agent(ctx)
+        assert len(requests) == 3 and len(caller.calls) == 2
+
+    saved = json.loads(checkpoint_path.read_text())
+    usage = saved["state"]["data"]["last_usage"]
+    assert usage["input_tokens"] == 800 and usage["output_tokens"] == 10
+    assert usage["sweep_applied"] is False
+    assert saved["state"]["data"]["cycles"][0]["level"] == 0
+    assert "c2ln" in json.dumps(saved)
+
+    def recovered_provider(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return google_stream(text="restored answer")
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(recovered_provider)) as client:
+        restarted = runner(
+            client,
+            caller,
+            plugins=(),
+            model_identity="provider:revision-2:test"
+            if change == "connection"
+            else "provider:revision-1:test",
+        )
+        restarted.config = replace(
+            agent.config, context_window_tokens=1100 if change == "budget" else 1000
+        )
+        restarted.model_backend = create_model_backend(
+            ModelConnection("google_ai_studio", "https://new.invalid/base", SecretStr("new-key"))
+            if change == "connection"
+            else connection,
+            client,
+        )
+        restored = Context(RunnerState(**saved["state"]))
+        restored.session, restored.run_id = ctx.session, ctx.run_id
+        restored.checkpoint_number = saved["number"]
+        restored.attempt, restored.recovered, restored.inputs = 2, True, ()
+        result = await restarted(restored)
+
+    assert result.output == "restored answer" and len(requests) == 4
+    assert len(caller.calls) == 2  # Both committed tools survive without reexecution.
+    wire = json.loads(requests[-1].content)
+    assert requests[-1].url.path.endswith("/models/test:streamGenerateContent")
+    assert requests[-1].url.host == ("new.invalid" if change == "connection" else "old.invalid")
+    assert requests[-1].headers["x-goog-api-key"] == (
+        "new-key" if change == "connection" else "old-key"
+    )
+    parts = [part for message in wire["contents"] for part in message["parts"]]
+    returns = [part["functionResponse"] for part in parts if "functionResponse" in part]
+    assert len(returns) == 2
+    assert "restart-marker-1" in json.dumps(returns)  # A stale usage sweep would omit it.
+    assert "restart-marker-2" in json.dumps(returns)
+    assert any(part.get("thoughtSignature") == "c2ln" for part in parts) is (change == "budget")
+    assert json.loads(checkpoint_path.read_text()) == saved  # Recovery does not rewrite originals.
 
 
 @pytest.mark.asyncio

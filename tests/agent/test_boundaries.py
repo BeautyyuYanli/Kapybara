@@ -32,9 +32,9 @@ async def test_compatible_backend_preserves_endpoint_key_model_and_borrowed_clie
             http_client=client,
         )
         agent = runner(client, plugins=())
+        agent.config = replace(agent.config, model="vendor/family-17b")
         agent.model_backend = backend
         ctx = Context(agent.initial_state(instructions="original", skills=[]))
-        ctx.session = replace(ctx.session, config={"model": "vendor/family-17b"})
         result = await agent(ctx)
         assert result.output == "compatible reply" and not client.is_closed
         assert str(calls[0].url) == "https://compatible.invalid/custom/v1/chat/completions"

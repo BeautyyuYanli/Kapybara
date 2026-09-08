@@ -211,7 +211,12 @@ async def test_budget_precedence_live_defaults_and_session_selection_only(gatewa
 
 
 async def test_session_provider_capability_scope_and_child_inheritance(gateway):
-    parent = (await create(gateway))["session"]["id"]
+    parent_model = {
+        "model_id": MODEL_ID,
+        "context_window_tokens": 65536,
+        "max_output_tokens": 1024,
+    }
+    parent = (await create(gateway, config={"model": parent_model}))["session"]["id"]
     identity = Principal("session", "one", UUID(parent))
     second = await call(gateway, "provider.create", name="other", api_key="other-key")
     outsider = await call(gateway, "provider.model.create", provider_id=second["id"], name="other")
@@ -229,7 +234,20 @@ async def test_session_provider_capability_scope_and_child_inheritance(gateway):
     child = await gateway.call(
         "session.create", {"request_id": str(uuid4()), "machine_ids": ["one"]}, principal=identity
     )
-    assert child["session"]["config"]["model"]["model_id"] == MODEL_ID
+    assert child["session"]["config"]["model"] == parent_model
+    alternative = await call(
+        gateway,
+        "provider.model.create",
+        provider_id=PROVIDER_ID,
+        name="another-model",
+        defaults={"context_window_tokens": 90000, "max_output_tokens": 4096},
+    )
+    selection = {"model_id": alternative["id"], "max_output_tokens": 2048}
+    switched = await create(gateway, identity, config={"model": selection})
+    stored = switched["session"]["config"]["model"]
+    assert stored == {**selection, "context_window_tokens": None}
+    _, _, window, output = await gateway.providers.effective(parse_session_model(stored))
+    assert (window, output) == (90000, 2048)
     with pytest.raises(RpcError):
         await create(gateway, identity, config={"model": {"model_id": outsider["id"]}})
     for forbidden in (
@@ -375,8 +393,10 @@ async def test_unpaged_openai_discovery_has_stable_bounded_pages(gateway):
     assert second["next_page_token"] is None
 
 
-async def test_running_session_freezes_connection_and_next_run_uses_current_defaults(gateway):
-    from agent.test_runner import response
+async def test_running_session_freezes_connection_and_next_run_uses_current_defaults(
+    gateway, monkeypatch
+):
+    from agent.test_runner import Caller, response
 
     entered, release = asyncio.Event(), asyncio.Event()
     requests = []
@@ -386,6 +406,7 @@ async def test_running_session_freezes_connection_and_next_run_uses_current_defa
         if len(requests) == 1:
             entered.set()
             await release.wait()
+            return response(name="process_list", call_id="frozen-call")
         return response(text="completed")
 
     async def completion(session_id, request_id):
@@ -399,7 +420,9 @@ async def test_running_session_freezes_connection_and_next_run_uses_current_defa
 
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
         gateway.http_client = http
-        made = await create(gateway, input="first", machine_ids=[], default_machine_id=None)
+        caller = Caller()
+        monkeypatch.setattr(gateway.machines, "call", caller.call)
+        made = await create(gateway, input="first")
         sid = made["session"]["id"]
         async with asyncio.timeout(10):
             await entered.wait()
@@ -423,6 +446,12 @@ async def test_running_session_freezes_connection_and_next_run_uses_current_defa
         release.set()
         first = await completion(sid, made["submission"]["request_id"])
         assert first["outcome"] == "completed"
+        assert len(requests) == 2 and len(caller.calls) == 1
+        assert caller.calls[0][1] == "process.list"
+        assert any(
+            message.get("tool_call_id") == "frozen-call"
+            for message in json.loads(requests[1].content)["messages"]
+        )
         request_id = str(uuid4())
         await gateway.call(
             "session.input",
@@ -433,9 +462,14 @@ async def test_running_session_freezes_connection_and_next_run_uses_current_defa
         assert second["outcome"] == "completed"
         assert [r.headers["authorization"] for r in requests] == [
             "Bearer dummy",
+            "Bearer dummy",
             "Bearer rotated-private-key",
         ]
-        assert [json.loads(r.content)["max_completion_tokens"] for r in requests] == [16384, 2048]
+        assert [json.loads(r.content)["max_completion_tokens"] for r in requests] == [
+            16384,
+            16384,
+            2048,
+        ]
         await call(gateway, "provider.delete", provider_id=PROVIDER_ID, expected_revision=2)
         request_id = str(uuid4())
         await gateway.call(
@@ -444,7 +478,7 @@ async def test_running_session_freezes_connection_and_next_run_uses_current_defa
             principal=OPERATOR,
         )
         failed = await completion(sid, request_id)
-        assert failed["outcome"] == "failed" and len(requests) == 2
+        assert failed["outcome"] == "failed" and len(requests) == 3
         assert "select another model" in failed["output"]
         history = await gateway.sessions.read_history(UUID(sid))
         assert "rotated-private-key" not in str(history)
