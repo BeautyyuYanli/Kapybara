@@ -15,8 +15,8 @@ and installed CLI, using distinct PostgreSQL schemas and execution XDG directori
 | Files | Direct chunk transfer and presigned HTTP upload/download preserve hash for a 64 MiB file; interrupted transfer is reported without claiming success |
 | Sessions | Concurrent distinct sessions, no overlapping runs within one session, durable CRUD and default/multiple-machine selection |
 | Steer/queue | Steer enters at a model/tool boundary; queue waits for waiting; unconsumed steer is retained; error/cancel paths do not strand queued work |
-| Waiting events | Live broadcast reaches all subscribers, earlier events remain for later listeners, repeated publications wake again, own completion never wakes its producer |
-| Recursive control | Child CLI creates/inputs another session and gets session_id/waiting_id immediately; child's waiting publishes a completion that resumes the parent |
+| Waiting events | One-shot results reach their sole receiver once, publication before waiting remains durable, duplicate publication and second receivers are rejected, and waiting does not settle input replies |
+| Recursive control | Child CLI creates/inputs another session and gets session_id/waiting_id immediately; text completion or ReplyTo selecting that input hands its reply to the waiting parent once; WaitFor settles no inputs |
 | Persistence | After control-process restart, completed history replays and accepted pending work resumes under the documented interrupted-run semantics |
 | Output | Delta order and cursor pagination preserve content, replay joins live consumption without omissions; reads never cross session boundaries |
 | History | SQL, substring search and multilingual keyword examples work; malicious joins/subqueries/schema-qualified access/functions cannot read another session or mutate data |
@@ -31,7 +31,7 @@ and installed CLI, using distinct PostgreSQL schemas and execution XDG directori
 
 - State: 100 fake-runner sessions, 20 submitted inputs each; count accepted, completed
   and replayed work; verify each session's ordering. Record wall time and throughput.
-- Events: fanout to 100 listeners and publish-before-subscribe cases; count distinct
+- Events: 100 independent one-shot channels and publish-before-wait cases; count distinct
   deliveries and observe completion latency without equating wakeup hints to delivery.
 - Execution: 16 simultaneous interactive jobs, a 64 MiB output command and a 64 MiB
   file transfer; record buffer sizes, hashes, process cleanup and peak resident memory.

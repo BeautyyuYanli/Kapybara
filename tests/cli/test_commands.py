@@ -211,3 +211,22 @@ def test_stdin_file_request_option_and_record_jsonl(monkeypatch, tmp_path):
         {"cursor": "one", "text": "a"},
         {"cursor": "two", "text": "b"},
     ]
+
+
+def test_creation_output_mode_and_removed_custom_reply_address(monkeypatch):
+    _, _, calls = configured(monkeypatch)
+    cli = CliRunner()
+    created = cli.invoke(
+        commands.app, ["control", "session", "create", "--output-mode", "reply_to", "task"]
+    )
+    assert created.exit_code == 0, created.output
+    assert calls[0][1]["config"]["output_mode"] == "reply_to"
+    assert "waiting_id" not in calls[0][1]
+    invalid = cli.invoke(
+        commands.app, ["control", "session", "create", "--output-mode", "unknown", "task"]
+    )
+    assert invalid.exit_code != 0 and len(calls) == 1
+    removed = cli.invoke(
+        commands.app, ["control", "session", "input", "--waiting-id", str(uuid4()), "task"]
+    )
+    assert removed.exit_code != 0 and len(calls) == 1

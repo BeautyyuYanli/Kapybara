@@ -87,7 +87,6 @@ async def test_final_transaction_rolls_back_before_failure_completion(
     async def runner(ctx: RunContext) -> RunResult:
         return RunResult(
             "should roll back",
-            (),
             CheckpointWrite(
                 1,
                 RunnerState("new-state", {"uncommitted": True}),
@@ -97,7 +96,7 @@ async def test_final_transaction_rolls_back_before_failure_completion(
         )
 
     service = await database.start(runner)
-    original = service._event
+    original = service._completion
     injected = False
 
     async def event(*args, **kwargs):
@@ -107,11 +106,11 @@ async def test_final_transaction_rolls_back_before_failure_completion(
             raise RuntimeError("injected after final checkpoint, before waiting commits")
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(service, "_event", event)
+    monkeypatch.setattr(service, "_completion", event)
     created = await service.create_session(spec(), request_id=uuid4(), input="go")
     assert (await database.completed(created.submission.request_id))["outcome"] == "failed"
     records = await service.read_output(created.session.id)
-    assert [record.kind for record in records.items] == ["input", "error", "waiting"]
+    assert [record.kind for record in records.items] == ["input", "error"]
     assert not await database.rows("SELECT * FROM checkpoints")
     assert (await database.rows("SELECT runner_state FROM runs"))[0]["runner_state"][
         "codec"

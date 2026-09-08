@@ -205,12 +205,14 @@ def create_session(
     default_machine: Annotated[str | None, typer.Option()] = None,
     model: Annotated[str | None, typer.Option()] = None,
     instructions: Annotated[str, typer.Option()] = "",
+    output_mode: Annotated[str, typer.Option()] = "text",
     request_id: Annotated[UUID | None, typer.Option()] = None,
-    waiting_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
     text = input_text(text, file, stdin, required=False)
     machines = machine or ([client(ctx).machine_id] if client(ctx).machine_id else [])
-    config: JsonObject = {"instructions": instructions}
+    if output_mode not in {"text", "reply_to"}:
+        raise typer.BadParameter("output-mode must be text or reply_to")
+    config: JsonObject = {"instructions": instructions, "output_mode": output_mode}
     if model:
         config["model"] = model
     invoke(
@@ -223,7 +225,6 @@ def create_session(
             "default_machine_id": default_machine or (machines[0] if len(machines) == 1 else None),
             "config": config,
             "input": text,
-            "waiting_id": str(waiting_id) if waiting_id else None,
         },
     )
 
@@ -269,7 +270,8 @@ def update_session(
     """Replace the session title, machines and configuration completely.
 
     State permits updates only while the session is waiting. Omitting --config
-    submits {}, clearing prior configuration. Omitting --default-machine submits
+    submits {}, clearing mutable configuration while preserving output_mode.
+    Omitting --default-machine submits
     None, clearing the prior default machine.
     """
     invoke(
@@ -294,7 +296,6 @@ def input_session(
     stdin: Annotated[bool, typer.Option("--stdin")] = False,
     steer: Annotated[bool, typer.Option()] = False,
     request_id: Annotated[UUID | None, typer.Option()] = None,
-    waiting_id: Annotated[UUID | None, typer.Option()] = None,
 ) -> None:
     text = input_text(text, file, stdin)
     invoke(
@@ -305,7 +306,6 @@ def input_session(
             "payload": text,
             "mode": "steer" if steer else "queue",
             "request_id": rid(request_id),
-            "waiting_id": str(waiting_id) if waiting_id else None,
         },
     )
 

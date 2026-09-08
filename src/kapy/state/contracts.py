@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Literal, Protocol
 from uuid import UUID
 
+from pydantic import TypeAdapter
+
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 type InputMode = Literal["steer", "queue"]
@@ -52,14 +54,31 @@ class Submission:
 @dataclass(frozen=True, slots=True)
 class CreatedSession:
     session: SessionView
-    submission: Submission
+    submission: Submission | None
+
+
+@dataclass(frozen=True, slots=True)
+class WaitFor:
+    waiting_ids: tuple[UUID, ...]
+    kind: Literal["wait_for"] = "wait_for"
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyTo:
+    being_waited_ids: tuple[UUID, ...]
+    payload: str
+    kind: Literal["reply_to"] = "reply_to"
+
+
+type SessionOutput = str | WaitFor | ReplyTo
+SESSION_OUTPUT = TypeAdapter(SessionOutput)
 
 
 @dataclass(frozen=True, slots=True)
 class Completion:
     run_id: UUID | None
     outcome: Literal["completed", "failed", "deleted"]
-    output: str
+    output: SessionOutput | None
     cursor: Cursor
     completed_at: datetime
 
@@ -77,6 +96,13 @@ class SessionInput:
     mode: InputMode
     payload: JsonValue
     event_id: UUID | None
+    being_waited_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyAddressPage:
+    being_waited_ids: tuple[UUID, ...]
+    next_after: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +190,7 @@ class RunContext(Protocol):
     async def poll_steer(self, *, limit: int = 64) -> tuple[SessionInput, ...]: ...
     async def emit(self, delta: OutputDelta) -> Cursor: ...
     async def checkpoint(self, write: CheckpointWrite) -> Cursor: ...
+    async def unreplied_addresses(self, *, after: int = 0, limit: int = 64) -> ReplyAddressPage: ...
     async def read_history(
         self, *, after: Cursor | None = None, limit: int = 200
     ) -> RecordPage: ...
@@ -171,8 +198,7 @@ class RunContext(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
-    output: str
-    wait_for: tuple[UUID, ...]
+    output: SessionOutput
     checkpoint: CheckpointWrite
 
 

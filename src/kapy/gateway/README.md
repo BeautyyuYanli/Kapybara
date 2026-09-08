@@ -97,8 +97,11 @@ kapy control --session SESSION_UUID --machine docker-machine skill upload ./exam
 kapy control --session SESSION_UUID --machine docker-machine skill download SKILL_UUID ./download
 ```
 
-`session update` replaces all settings and is allowed only while waiting. Its
-`--help` describes how omitted configuration and default-machine options clear prior values.
+`session create --output-mode reply_to` selects explicit replies; the default is `text`.
+The chosen output mode cannot change. Every input receipt has a new one-shot waiting_id;
+empty creation has no submission. `session update` replaces mutable settings while waiting. Its
+`--help` describes how omitted configuration clears mutable values while preserving output_mode.
+Omitting default-machine clears its prior value.
 
 Skills preserve expected revisions and scoped idempotency. Archives move in 64 KiB chunks
 through the existing machine file protocol, with at most two concurrent exchanges and a

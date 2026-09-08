@@ -16,6 +16,7 @@ from kapy.state import (
     RunResult,
     ServiceUnavailable,
     SessionService,
+    WaitFor,
     migrate,
 )
 
@@ -26,8 +27,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 def result(ctx: RunContext, output: str = "done", waits: tuple[UUID, ...] = ()) -> RunResult:
     return RunResult(
-        output,
-        waits,
+        WaitFor(waits) if waits else output,
         CheckpointWrite(ctx.checkpoint_number + 1, ctx.state, (), tuple(i.id for i in ctx.inputs)),
     )
 
@@ -109,7 +109,7 @@ async def test_concurrent_sessions_and_steer_queue(database: Database) -> None:
             consumed = tuple(i.id for i in ctx.inputs)
         active.remove(ctx.session.id)
         return RunResult(
-            "done", (), CheckpointWrite(ctx.checkpoint_number + 1, ctx.state, (), consumed)
+            "done", CheckpointWrite(ctx.checkpoint_number + 1, ctx.state, (), consumed)
         )
 
     service = await database.start(runner)
@@ -161,7 +161,7 @@ async def test_checkpoint_output_idempotency_and_cursor(database: Database) -> N
             await ctx.checkpoint(replace(checkpoint, state=RunnerState("x", {})))
         emitted.set()
         await release.wait()
-        return RunResult("hello", (), CheckpointWrite(2, ctx.state, (), ()))
+        return RunResult("hello", CheckpointWrite(2, ctx.state, (), ()))
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="hello")
@@ -254,9 +254,6 @@ async def test_failed_runner_and_delete_release_pending_work(database: Database)
     await asyncio.wait_for(started.wait(), 5)
     assert await service.delete_session(blocked.session.id, request_id=uuid4())
     assert (await database.completed(blocked.submission.request_id))["outcome"] == "deleted"
-    assert not await database.rows(
-        "SELECT * FROM subscriptions WHERE session_id=%s", (blocked.session.id,)
-    )
 
 
 async def test_lease_and_lost_valkey_hints(database: Database) -> None:

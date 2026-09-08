@@ -73,7 +73,7 @@ aliases for discarded draft names.
 - Runner.initial_state returns RunnerState with the creation-time skill-description
   snapshot. Gateway invokes it.
 - wait_for authorization uses an injected Gateway capability; UUID knowledge is
-  not itself permission. State alone commits waiting and emits completion.
+  not itself permission. State alone commits waiting and selected replies; waiting does not settle requests.
 - Skills use path-based upload/download through existing execution file transfers.
   Bounded archives and metadata live in PostgreSQL; do not add another chunk-upload
   handle subsystem. CLI can operate with an explicit or inherited session context.
@@ -89,7 +89,7 @@ aliases for discarded draft names.
   State.RunResult. Construction has no I/O or background tasks.
 - AuthorizeWait accepts a session UUID and tuple of channel UUIDs, returns None
   asynchronously on success, and raises PermissionError on rejection. Gateway
-  supplies it; State remains responsible for subscribing and publishing completion.
+  supplies it; State remains responsible for one-shot waiting and result handoff.
 - AgentPayloadStore(pool, *, schema="kapy_agent") borrows Gateway's metadata pool
   and exposes initialize, put(session_id, bytes), get(session_id, ref), and
   delete_session(session_id). Immutable bytes are keyed by session UUID and SHA-256.
@@ -125,3 +125,38 @@ aliases for discarded draft names.
   apply_patch, with explicit sequence or configuration allowing removal/replacement.
 - Model tools do not include file_read/file_write. Text inspection/editing uses process
   commands and optional patch tools. Raw execution file RPCs and read_media are unchanged.
+
+## Session interaction and output
+
+Creation config accepts `output_mode: "text" | "reply_to"`, default `text`; the value is immutable.
+Text mode exposes `wait_for(ids)` and natural text completion. Reply mode exposes only
+`wait_for(ids)` and `reply_to(ids)` as Pydantic AI output functions. Normal mode does not expose
+reply addresses or its protocol instructions. The CLI accepts `session create --output-mode`.
+Create/input no longer accept `waiting_id` or `--waiting-id`; State generates one address for
+each direct input, and idempotent retries reuse it. Empty creation returns `submission: null`.
+
+State exports `WaitFor(waiting_ids: tuple[UUID, ...])`,
+`ReplyTo(being_waited_ids: tuple[UUID, ...], payload: str)` and
+`SessionOutput = str | WaitFor | ReplyTo`. `RunResult(output: SessionOutput,
+checkpoint: CheckpointWrite)` contains the framework output itself. The model's reply schema
+contains only `ids`; its output function fills payload with the latest complete visible model
+text. Persistence, history compression and waiting handoff retain the complete output DTO.
+No downstream path substitutes the payload field for output.
+
+`SessionInput.being_waited_id: UUID | None` identifies a directly submitted input's reply channel;
+waiting-result inputs leave it null. `RunContext.unreplied_addresses(*, after=0, limit=64)` returns
+`ReplyAddressPage(being_waited_ids, next_after)` for consumed unresolved inputs in input order.
+A checkpoint acknowledges consumption, while a reply settles its channel. Text settles all
+consumed unresolved inputs; ReplyTo settles only its selected IDs. Both clear active waits.
+WaitFor accepts 1–128 unique IDs, settles nothing and replaces active waits. ReplyTo accepts up
+to 128 unique IDs; `[]` requires no read unanswered inputs. Partial replies leave remaining
+obligations for later input, without implicit continuation or input replay.
+
+Channels are one-shot and one-to-one: `open → ready → delivered`. Results published before
+waiting remain ready. The sole durable handoff inserts an input with `event_id=channel_id`.
+Producer/receiver endpoints cannot be rebound, even after clearing an active wait. There is
+no default session channel, self-subscription, self-producer exclusion, broadcast, or second
+logical publication. Each selected reply address receives the complete output in a
+`{"type":"waiting","waiting_id":...,"producer_session_id":...,"output":...,"outcome":...}`
+envelope. Independent external events use the same one-shot handoff. Direct input reply
+channels reject ordinary `event.publish` calls.

@@ -102,11 +102,14 @@ kapy control --session <session-id> history query 'SELECT kind, text FROM histor
 这些命令在执行机上通过本地 socket 工作；管理员调用需要显式控制令牌。Agent
 工具启动的子进程自动获得机器、调用方会话和会话令牌，所以可以直接调用
 `kapy control`。指定 `--session` 只改变目标会话，不改变调用方身份。父会话可以
-创建子会话，把子任务的 waiting ID 交给 `wait` 工具；子任务进入 waiting 时发布
-完成事件，继续父会话。
+创建子会话，把该次提交回执的 `waiting_id` 交给 `wait_for(ids)` 输出函数。
+子任务以正常文本结束，或通过 `reply_to(ids)` 选中该输入后，回复才会一次性交接并唤醒父会话。
+`wait_for` 只等待结果，进入 waiting 状态本身不会回复输入。
 
-新任务使用创建回执返回的 `waiting_id`。`--waiting-id` 用于已有且有权访问的通道，
-不能随意生成 UUID 代替。真实父子任务验收可运行：
+每条直接输入自动获得独立回复地址，steer 和 queue 都如此；同一请求的重试复用原回执。
+不带初始输入的创建没有提交回执。创建时默认使用 `text` 模式，也可通过
+`session create --output-mode reply_to` 选择必须调用 `reply_to` 的模式。
+真实父子任务验收可运行：
 
 ```sh
 uv run --env-file .env python scripts/check_recursive.py --machine docker-machine

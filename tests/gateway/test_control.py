@@ -172,3 +172,65 @@ async def test_history_export_pagination_and_parallel_waiters(gateway):
         )
         count += len(page["items"])
     assert count > 1
+
+
+@pytest.mark.asyncio
+async def test_output_mode_fixed_at_creation_and_reply_channel_endpoints(gateway):
+    principal = Principal("operator")
+    created = await gateway.call(
+        "session.create",
+        {"request_id": str(uuid4()), "config": {"output_mode": "reply_to"}},
+        principal=principal,
+    )
+    sid = created["session"]["id"]
+    assert created["submission"] is None
+    updated = await gateway.call(
+        "session.update",
+        {"session_id": sid, "request_id": str(uuid4()), "config": {"model": "example"}},
+        principal=principal,
+    )
+    assert updated["config"] == {"model": "example", "output_mode": "reply_to"}
+    with pytest.raises(RpcError):
+        await gateway.call(
+            "session.update",
+            {"session_id": sid, "request_id": str(uuid4()), "config": {"output_mode": "text"}},
+            principal=principal,
+        )
+    with pytest.raises(RpcError):
+        await gateway.call(
+            "session.input",
+            {
+                "session_id": sid,
+                "request_id": str(uuid4()),
+                "payload": "task",
+                "waiting_id": str(uuid4()),
+            },
+            principal=principal,
+        )
+
+
+async def test_external_channel_registration_and_grant_use_producer_identity(gateway):
+    owner = Principal("frontend", frontend_id="telegram", subject="12345:-100:7")
+    parent = UUID((await create(gateway, owner))["session"]["id"])
+    producer = Principal("session", "one", parent)
+    child = UUID((await create(gateway, producer))["session"]["id"])
+    channel = uuid4()
+    await gateway.metadata.channel(channel, producer, create=True)
+    await gateway.metadata.channel(channel, producer, create=True)
+    # The owner can access the child, but is not the channel's producer.
+    with pytest.raises(RpcError, match="producer"):
+        await gateway.grant_channel(
+            channel, child, can_publish=False, can_subscribe=True, principal=owner
+        )
+    await gateway.grant_channel(
+        channel, child, can_publish=False, can_subscribe=True, principal=producer
+    )
+    await gateway.authorize_wait(child, (channel,))
+    with pytest.raises(PermissionError):
+        await gateway.authorize_wait(parent, (channel,))
+    receipt = await gateway.call(
+        "event.publish",
+        {"waiting_id": str(channel), "request_id": str(uuid4()), "payload": "external result"},
+        principal=producer,
+    )
+    assert receipt["pending"]

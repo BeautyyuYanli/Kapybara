@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx2
 import pytest
@@ -27,8 +27,10 @@ from kapy.state import (
     CheckpointWrite,
     OutputDelta,
     RecordPage,
+    ReplyAddressPage,
     SessionInput,
     SessionView,
+    WaitFor,
 )
 
 
@@ -71,6 +73,15 @@ class Context:
         self.state, self.checkpoint_number = copy.deepcopy(write.state), write.number
         self.writes.append(copy.deepcopy(write))
         return str(write.number)
+
+    async def unreplied_addresses(self, *, after: int = 0, limit: int = 64) -> ReplyAddressPage:
+        consumed = {i for write in self.writes for i in write.consumed_input_ids}
+        items = [i for i in self.inputs if i.id in consumed and i.being_waited_id and i.seq > after]
+        items.sort(key=lambda i: i.seq)
+        return ReplyAddressPage(
+            tuple(i.being_waited_id for i in items[:limit]),
+            items[limit - 1].seq if len(items) > limit else None,
+        )
 
     async def emit(self, delta: OutputDelta) -> str:
         assert len(json_bytes(delta.data)) < DELTA_LIMIT
@@ -365,7 +376,7 @@ async def test_cancelled_tool_recovery_never_replays_write_or_start(
 
 
 @pytest.mark.asyncio
-async def test_wait_authorization_and_dedup() -> None:
+async def test_wait_authorization() -> None:
     channel = str(uuid4())
     approved = []
 
@@ -373,15 +384,14 @@ async def test_wait_authorization_and_dedup() -> None:
         approved.append((session_id, channels))
 
     def handle(request: httpx2.Request) -> httpx2.Response:
-        return response(text="Waiting now", name="wait", args={"wait_for": [channel, channel]})
+        return response(text="Waiting now", name="wait_for", args={"ids": [channel]})
 
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
         agent = runner(client)
         agent.authorize_wait = permit
         ctx = Context(agent.initial_state(instructions="", skills=[]))
         result = await agent(ctx)
-    assert result.output == "Waiting now"
-    assert tuple(str(i) for i in result.wait_for) == (channel,)
+    assert result.output == WaitFor((UUID(channel),))
     assert len(approved) == 1
 
 
@@ -395,7 +405,7 @@ async def test_rejected_wait_is_correctable_and_large_media_stays_text() -> None
     def handle(request: httpx2.Request) -> httpx2.Response:
         requests.append(json.loads(request.content))
         if len(requests) == 1:
-            return response(name="wait", args={"wait_for": [str(uuid4())]})
+            return response(name="wait_for", args={"ids": [str(uuid4())]})
         if len(requests) == 2:
             return response(name="read_media", args={"path": "large.png"}, call_id="media2")
         return response(text="Handled both errors")

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -10,7 +11,7 @@ from pydantic_ai.messages import ModelMessage, RetryPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from kapy.agent import OpenAICompatibleBackend
-from kapy.state import CheckpointWrite, SessionInput
+from kapy.state import CheckpointWrite, ReplyTo, SessionInput, WaitFor
 
 from .test_runner import Caller, Context, runner  # type: ignore[missing-import]
 
@@ -21,7 +22,7 @@ class CancelAfterFinalCheckpoint(Context):
     async def checkpoint(self, write: CheckpointWrite) -> str:
         cursor = await super().checkpoint(write)
         cycle = cast(Any, write.state.data["cycles"])[-1]
-        if not self.interrupted and cycle.get("pending_final"):
+        if not self.interrupted and (cycle.get("pending_final") or cycle.get("output_candidates")):
             self.interrupted = True
             raise asyncio.CancelledError
         return cursor
@@ -48,8 +49,8 @@ async def test_recovered_final_keeps_result_and_finishes_batch_before_new_input(
             yield "Original wait output"
             yield {
                 0: DeltaToolCall(
-                    name="wait",
-                    json_args=json.dumps({"wait_for": [str(channel)]}),
+                    name="wait_for",
+                    json_args=json.dumps({"ids": [str(channel)]}),
                     tool_call_id="wait-original",
                 ),
                 1: DeltaToolCall(name="process_list", json_args="{}", tool_call_id="same-batch"),
@@ -74,15 +75,11 @@ async def test_recovered_final_keeps_result_and_finishes_batch_before_new_input(
 
     if new_input == "none":
         assert len(requests) == 1
-        assert result.output == (
-            "Original final text" if ending == "text" else "Original wait output"
-        )
-        assert result.wait_for == (() if ending == "text" else (channel,))
+        assert result.output == ("Original final text" if ending == "text" else WaitFor((channel,)))
     else:
         assert len(requests) == 2
         assert "Please also handle this" in str(requests[-1])
         assert result.output == "Handled the new input"
-        assert result.wait_for == ()
         assert any(item.id in write.consumed_input_ids for write in ctx.writes)
     if ending == "wait":
         returns = [
@@ -116,8 +113,8 @@ async def test_batch_retry_blocks_later_wait_but_new_response_can_finish(
             yield {
                 0: DeltaToolCall(name="process_list", json_args='{"limit":0}', tool_call_id="bad"),
                 1: DeltaToolCall(
-                    name="wait",
-                    json_args=json.dumps({"wait_for": [str(first_channel)]}),
+                    name="wait_for",
+                    json_args=json.dumps({"ids": [str(first_channel)]}),
                     tool_call_id="blocked-wait",
                 ),
                 2: DeltaToolCall(name="process_list", json_args="{}", tool_call_id="last-tool"),
@@ -127,8 +124,8 @@ async def test_batch_retry_blocks_later_wait_but_new_response_can_finish(
             yield "Corrected final output"
             yield {
                 0: DeltaToolCall(
-                    name="wait",
-                    json_args=json.dumps({"wait_for": [str(corrected_channel)]}),
+                    name="wait_for",
+                    json_args=json.dumps({"ids": [str(corrected_channel)]}),
                     tool_call_id="corrected-wait",
                 )
             }
@@ -138,13 +135,12 @@ async def test_batch_retry_blocks_later_wait_but_new_response_can_finish(
 
         async def checkpoint(self, write: CheckpointWrite) -> str:
             cursor = await super().checkpoint(write)
-            current = cast(Any, write.state.data["cycles"])[-1]
             retry_saved = any(
                 part["part_kind"] == "retry-prompt" and part.get("tool_call_id") == "bad"
                 for message in write.messages
                 for part in cast(Any, message.data["parts"])
             )
-            if self.interruption == 0 and current.get("pending_final"):
+            if self.interruption == 0 and any(m.kind == "model_response" for m in write.messages):
                 self.interruption = 1
                 raise asyncio.CancelledError
             if recovery == "saved_retry" and self.interruption == 1 and retry_saved:
@@ -177,8 +173,7 @@ async def test_batch_retry_blocks_later_wait_but_new_response_can_finish(
         for message in requests[1]
         for part in message.parts
     )
-    assert result.output == "Corrected final output"
-    assert result.wait_for == (corrected_channel,)
+    assert result.output == WaitFor((corrected_channel,))
     assert result.checkpoint.number == ctx.checkpoint_number + 1
 
 
@@ -200,12 +195,12 @@ async def test_output_retry_preserves_same_batch_successful_wait(
             return
         yield "Chosen wait output"
         good = DeltaToolCall(
-            name="wait",
-            json_args=json.dumps({"wait_for": [str(channel)]}),
+            name="wait_for",
+            json_args=json.dumps({"ids": [str(channel)]}),
             tool_call_id="valid-wait",
         )
         bad = DeltaToolCall(
-            name="wait", json_args='{"wait_for":["not-a-uuid"]}', tool_call_id="invalid-wait"
+            name="wait_for", json_args='{"ids":["not-a-uuid"]}', tool_call_id="invalid-wait"
         )
         calls = [good, bad] if valid_first else [bad, good]
         yield dict(enumerate(calls))
@@ -243,6 +238,150 @@ async def test_output_retry_preserves_same_batch_successful_wait(
         result = await agent(ctx)
 
     assert len(requests) == 1
-    assert result.output == "Chosen wait output"
-    assert result.wait_for == (channel,)
+    assert result.output == WaitFor((channel,))
     assert result.checkpoint.number == ctx.checkpoint_number + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["wait_for", "reply_to"])
+@pytest.mark.parametrize("recovered", [False, True])
+async def test_null_output_ids_retry_and_finish_the_batch(monkeypatch, tool_name, recovered):
+    address = uuid4()
+    requests = []
+
+    async def stream(messages, info):
+        requests.append(messages)
+        yield "Corrected answer" if len(requests) > 1 else "First answer"
+        if len(requests) == 1:
+            yield {
+                0: DeltaToolCall(name=tool_name, json_args='{"ids":null}', tool_call_id="invalid"),
+                1: DeltaToolCall(name="process_list", json_args="{}", tool_call_id="same-batch"),
+            }
+        else:
+            yield {
+                0: DeltaToolCall(
+                    name=tool_name,
+                    json_args=json.dumps({"ids": [str(address)]}),
+                    tool_call_id="corrected",
+                )
+            }
+
+    class InterruptedResponse(Context):
+        interrupted = False
+
+        async def checkpoint(self, write):
+            cursor = await super().checkpoint(write)
+            if not self.interrupted and any(m.kind == "model_response" for m in write.messages):
+                self.interrupted = True
+                raise asyncio.CancelledError
+            return cursor
+
+    monkeypatch.setattr(
+        OpenAICompatibleBackend,
+        "create_model",
+        lambda *args, **kwargs: FunctionModel(stream_function=stream),
+    )
+    caller = Caller()
+    async with httpx2.AsyncClient() as client:
+        agent = runner(client, caller)
+        ctx = (InterruptedResponse if recovered else Context)(
+            agent.initial_state(instructions="", skills=[])
+        )
+        if tool_name == "reply_to":
+            ctx.session = replace(ctx.session, config={"output_mode": "reply_to"})
+            ctx.inputs = (SessionInput(uuid4(), 1, "queue", "Question", None, address),)
+        if recovered:
+            with pytest.raises(asyncio.CancelledError):
+                await agent(ctx)
+            ctx.recovered, ctx.attempt = True, 2
+        result = await agent(ctx)
+    assert len(requests) == 2
+    assert result.output == (
+        WaitFor((address,)) if tool_name == "wait_for" else ReplyTo((address,), "Corrected answer")
+    )
+    assert any(
+        isinstance(part, RetryPromptPart) and part.tool_call_id == "invalid"
+        for message in requests[-1]
+        for part in message.parts
+    )
+    assert any(
+        part.tool_call_id == "same-batch"
+        for message in requests[-1]
+        for part in message.parts
+        if part.part_kind == "tool-return"
+    )
+    assert len(caller.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["wait_for", "reply_to"])
+@pytest.mark.parametrize(
+    "invalid_args", ["missing", "null_ids", "extra", "array", "string", "null"]
+)
+@pytest.mark.parametrize("recovered", [False, True])
+async def test_invalid_output_arguments_preserve_same_batch_exit(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, invalid_args: str, recovered: bool
+) -> None:
+    address = uuid4()
+    args = {
+        "missing": {},
+        "null_ids": {"ids": None},
+        "extra": {"ids": [str(address)], "payload": "unexpected"},
+        "array": [str(address)],
+        "string": "unexpected",
+        "null": None,
+    }[invalid_args]
+    valid_tool = "reply_to" if tool_name == "wait_for" else "wait_for"
+    requests: list[list[ModelMessage]] = []
+
+    async def stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[Any]:
+        requests.append(messages)
+        assert len(requests) == 1
+        yield "Chosen answer"
+        yield {
+            0: DeltaToolCall(name=tool_name, json_args=json.dumps(args), tool_call_id="invalid"),
+            1: DeltaToolCall(
+                name=valid_tool,
+                json_args=json.dumps({"ids": [str(address)]}),
+                tool_call_id="valid",
+            ),
+        }
+
+    class InterruptedResponse(Context):
+        interrupted = False
+
+        async def checkpoint(self, write: CheckpointWrite) -> str:
+            cursor = await super().checkpoint(write)
+            if not self.interrupted and any(m.kind == "model_response" for m in write.messages):
+                self.interrupted = True
+                raise asyncio.CancelledError
+            return cursor
+
+    monkeypatch.setattr(
+        OpenAICompatibleBackend,
+        "create_model",
+        lambda *args, **kwargs: FunctionModel(stream_function=stream),
+    )
+    async with httpx2.AsyncClient() as client:
+        agent = runner(client)
+        ctx = (InterruptedResponse if recovered else Context)(
+            agent.initial_state(instructions="", skills=[])
+        )
+        ctx.session = replace(ctx.session, config={"output_mode": "reply_to"})
+        ctx.inputs = (SessionInput(uuid4(), 1, "queue", "Question", None, address),)
+        if recovered:
+            with pytest.raises(asyncio.CancelledError):
+                await agent(ctx)
+            ctx.recovered, ctx.attempt = True, 2
+        result = await agent(ctx)
+
+    assert len(requests) == 1
+    assert result.output == (
+        ReplyTo((address,), "Chosen answer") if valid_tool == "reply_to" else WaitFor((address,))
+    )
+    assert any(
+        part["part_kind"] == "retry-prompt" and part.get("tool_call_id") == "invalid"
+        for write in [*ctx.writes, result.checkpoint]
+        for message in write.messages
+        for part in cast(Any, message.data["parts"])
+    )

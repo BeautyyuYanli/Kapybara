@@ -1,6 +1,7 @@
 """One-step degradation driven only by fresh provider usage observations."""
 
 import copy
+import json
 import math
 from typing import Any
 
@@ -59,7 +60,7 @@ def sweep(data: dict[str, Any], keep_recent_ratio: float) -> bool:
     for cycle, group in zip(cycles, blocks, strict=True):
         end = offset + len(group)
         if cycle["closed"]:
-            if end > protected_from:
+            if end > protected_from or cycle.get("unreplied", False):
                 retained.append(cycle)
             elif cycle["level"] == 0:
                 omit_results(cycle["messages"])
@@ -74,7 +75,16 @@ def sweep(data: dict[str, Any], keep_recent_ratio: float) -> bool:
                 ] + [
                     {
                         "kind": "response",
-                        "parts": [{"part_kind": "text", "content": cycle.get("output", "")}],
+                        "parts": [
+                            {
+                                "part_kind": "text",
+                                "content": (
+                                    cycle.get("output", "")
+                                    if isinstance(cycle.get("output", ""), str)
+                                    else json.dumps(cycle["output"], ensure_ascii=False)
+                                ),
+                            }
+                        ],
                     }
                 ]
                 cycle["level"] = 2

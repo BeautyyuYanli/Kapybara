@@ -7,7 +7,8 @@ I/O. The agent does not load environment files or own these resources.
 
 At session creation, call `runner.initial_state(instructions=..., skills=await
 skills.catalog())`. Store that snapshot in State's `SessionSpec.initial_state`.
-Instructions and the catalog remain fixed for the session. Each run selects the
+Business instructions and the catalog remain fixed for the session. The interaction protocol
+is assembled at each run from the creation-time output mode. Each run selects the
 optional `session.config.model`, falling back to `RunnerConfig.model`. Current session ID,
 associated machine IDs and default machine are appended for each run without rewriting
 the instruction/skill snapshot. Association does not claim that a machine is online.
@@ -21,11 +22,14 @@ clients are borrowed and never closed by Runner; application composition owns th
 
 ## Persistence and recovery
 
+Runner snapshots use `kapy.agent.v2` and state version 2. Older snapshots are rejected without
+conversion; both new text and reply_to modes use this protocol.
+
 The runner uses the actual `kapy.state` objects directly. Complete responses commit
 before tools execute, tool intents commit before RPC dispatch, and complete returns
 commit before the next model request. Raw history messages commit before projection
 compression. The final checkpoint is the next number and is returned only in
-`RunResult`; State commits it with waiting, output, subscriptions, and completion.
+`RunResult`; State commits it with waiting, full typed output, active waits, and selected replies.
 Reserved inputs are individually included and consumed in checkpoints. Polling and
 Pydantic's enqueue support insert steer at model/tool boundaries and continue a run
 that would otherwise finish with newly reserved input.
@@ -40,7 +44,9 @@ never a context-size measurement. Missing/all-zero usage is unknown.
 Each fresh high-usage response permits one persisted sweep. Old closed cycles move
 0 → omitted tool results → inputs/final output → removed. The newest complete
 interaction blocks, approximately 10% by block count, remain protected. A current
-cycle can only omit older completed tool returns. Tool batches stay paired.
+cycle can only omit older completed tool returns. Cycles holding unanswered inputs stay
+protected; level 2 retains the complete typed output, including ReplyTo IDs and payload.
+Tool batches stay paired.
 Explicit provider context-length rejection allows at most two extra compression
 retries; checkpoints retain that retry count across recovery.
 
@@ -72,6 +78,27 @@ model messages fail explicitly; tool argument JSON is never cut and then execute
 Process output has per-stream byte cursors and incremental UTF-8 decoder state;
 bounded displays include references to the machine's releasable output spool.
 
+## Output protocol
+
+Creation fixes `session.config.output_mode` to `text` (default) or `reply_to`. Explicit mode
+wraps direct input with its State-issued being_waited_id and adds the currently unanswered
+address list to each request's dynamic instruction parts. Normal mode presents raw input
+and includes neither reply tool nor reply instructions. Waiting results have no new address.
+
+`wait_for` validates 1–128 distinct IDs and produces `WaitFor`. `reply_to` accepts only an ID
+array, validates consumed unanswered addresses, and fills `ReplyTo.payload` from the latest
+complete visible model text since the latest injected input, within this State run. It returns
+the complete DTO to Pydantic AI. A candidate is checkpointed for recovery, but only the output
+selected by the framework can finish the run. Ordinary tool retries supersede final candidates;
+new steer requires another model result. Recovery finishes the old tool batch before new input
+and reuses an already filled output without rereading its payload. Full selected output is
+passed through RunResult, State handoff, serialization and compression.
+
+An empty reply list is valid only without read unanswered inputs. Unknown, already replied,
+foreign or unread queue addresses are rejected. WaitFor never settles input replies. Text
+settles all consumed unanswered inputs; ReplyTo settles the selected subset. Unselected inputs
+remain in context for later work. There is no automatic run merely because such inputs remain.
+
 ## Tools and apply_patch
 
 Machine tools call only the approved `process.*` and `file.*` RPCs, always passing
@@ -80,7 +107,9 @@ session IDs, process-start IDs, or transfer IDs. Stable process/transfer UUIDs d
 from session, State run, tool-call ID, and substep. Recovery observes known handles;
 an unconfirmable outcome remains `outcome_unknown` at the original call ID.
 Interrupted terminal writes are never automatically replayed. Built-in model tools are
-process operations, read_media and wait. Ordinary text files use shell commands rather
+process operations and read_media. Output functions are registered separately in output_type:
+`wait_for(ids)` plus text completion in text mode, or `wait_for(ids)` plus `reply_to(ids)`
+in reply mode. Ordinary text files use shell commands rather
 than extra file_read/file_write tools. An unfinished call to a removed tool gets an
 `outcome_unknown` return without replay; completed historical tool results remain intact.
 PTY/stdout/stderr cursor schemas specify byte positions. A display-truncated stdio chunk

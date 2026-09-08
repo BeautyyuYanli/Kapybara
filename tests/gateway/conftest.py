@@ -32,9 +32,8 @@ class EchoRunner:
 
     async def __call__(self, context):
         return RunResult(
-            output=" ".join(str(item.payload) for item in context.inputs),
-            wait_for=(),
-            checkpoint=CheckpointWrite(
+            " ".join(str(item.payload) for item in context.inputs),
+            CheckpointWrite(
                 context.checkpoint_number + 1,
                 context.state,
                 (),

@@ -52,9 +52,8 @@ async def benchmark(session_count: int, inputs_per_session: int) -> None:
                     raise AssertionError("Input sequence was not preserved")
                 observed[session_id].append(sequence)
             return RunResult(
-                output="accepted",
-                wait_for=(),
-                checkpoint=CheckpointWrite(
+                "accepted",
+                CheckpointWrite(
                     number=context.checkpoint_number + 1,
                     state=RunnerState(codec="acceptance-v1", data={}),
                     messages=(),

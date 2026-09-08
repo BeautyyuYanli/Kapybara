@@ -13,7 +13,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from kapy.agent import AgentResourceLimit, OpenAICompatibleBackend
 from kapy.skills import SkillDescription
-from kapy.state import JsonValue, SessionInput
+from kapy.state import JsonValue, SessionInput, WaitFor
 
 from .test_runner import Caller, Context, response, runner  # type: ignore[missing-import]
 
@@ -63,8 +63,8 @@ async def test_one_runner_overlapping_sessions_keep_creation_snapshots() -> None
         await asyncio.wait_for(barrier.wait(), 2)
         return response(
             text=f"output-{name}",
-            name="wait",
-            args={"wait_for": [str(channels[name])]},
+            name="wait_for",
+            args={"ids": [str(channels[name])]},
             call_id=f"wait-{name}",
         )
 
@@ -88,7 +88,7 @@ async def test_one_runner_overlapping_sessions_keep_creation_snapshots() -> None
         assert f"instruction-{name}" in body and f"catalog-{name}" in body
         assert f"instruction-{other}" not in body and f"catalog-{other}" not in body
         assert "changed-after-creation" not in body and f"input-{other}" not in body
-        assert result.output == f"output-{name}" and result.wait_for == (channels[name],)
+        assert result.output == WaitFor((channels[name],))
         assert (ctx.session.id, (channels[name],)) in authorized
         assert {i for w in ctx.writes for i in w.consumed_input_ids} == {ctx.inputs[0].id}
         cycles = result.checkpoint.state.data["cycles"]

@@ -25,10 +25,8 @@ TABLES = (
     "target_session_id uuid, operation jsonb NOT NULL DEFAULT '{}', result jsonb, error jsonb)",
     "gateway_skill_access (skill_id uuid PRIMARY KEY, creator_principal text NOT NULL, "
     "create_request_id uuid NOT NULL UNIQUE, deleted boolean NOT NULL DEFAULT false)",
-    "gateway_channels (waiting_id uuid PRIMARY KEY, creator_principal text NOT NULL)",
-    "gateway_channel_grants (waiting_id uuid NOT NULL, principal_id text NOT NULL, "
-    "can_publish boolean NOT NULL, can_subscribe boolean NOT NULL, "
-    "PRIMARY KEY(waiting_id,principal_id))",
+    "gateway_channels (waiting_id uuid PRIMARY KEY, "
+    "producer_principal text, receiver_principal text)",
     "gateway_session_cleanup (session_id uuid PRIMARY KEY, request_id uuid NOT NULL, "
     "pending_machine_ids jsonb NOT NULL, payload_pending boolean NOT NULL DEFAULT true, "
     "state text NOT NULL DEFAULT 'deleting')",
@@ -41,6 +39,13 @@ async def migrate(database_url: str, *, schema: str = "kapy_state") -> None:
     async with await AsyncConnection.connect(database_url) as conn:
         await conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
         await conn.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(schema)))
+        await conn.execute("""
+            DO $$ BEGIN
+                IF to_regclass('gateway_channel_grants') IS NOT NULL THEN
+                    RAISE EXCEPTION 'Old channel metadata is unsupported; use a new schema';
+                END IF;
+            END $$
+        """)
         for definition in TABLES:
             await conn.execute(sql.SQL("CREATE TABLE IF NOT EXISTS " + definition))
         await conn.execute("ALTER TABLE gateway_requests ADD COLUMN IF NOT EXISTS error jsonb")
@@ -177,6 +182,27 @@ class Metadata:
             )
         return tuple(row["session_id"] for row in rows)
 
+    async def register_channel(self, channel: UUID, *, producer: str, receiver: str | None) -> None:
+        async with self.connection() as conn:
+            await conn.execute(
+                "INSERT INTO gateway_channels(waiting_id,producer_principal,receiver_principal) "
+                "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                (channel, producer, receiver),
+            )
+            row = await (
+                await conn.execute(
+                    "SELECT producer_principal,receiver_principal "
+                    "FROM gateway_channels WHERE waiting_id=%s",
+                    (channel,),
+                )
+            ).fetchone()
+            if (
+                not row
+                or row["producer_principal"] != producer
+                or row["receiver_principal"] != receiver
+            ):
+                raise denied("Channel endpoints are immutable")
+
     async def channel(
         self,
         channel: UUID,
@@ -186,31 +212,26 @@ class Metadata:
         publish: bool = False,
         subscribe: bool = False,
     ) -> None:
+        if create:
+            await self.register_channel(channel, producer=principal.id, receiver=None)
         async with self.connection() as conn:
-            if create:
+            row = await (
                 await conn.execute(
-                    "INSERT INTO gateway_channels VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                    (channel, principal.id),
+                    "SELECT producer_principal,receiver_principal "
+                    "FROM gateway_channels WHERE waiting_id=%s",
+                    (channel,),
                 )
-            rows = await conn.execute(
-                "SELECT creator_principal FROM gateway_channels WHERE waiting_id=%s", (channel,)
-            )
-            row = await rows.fetchone()
-            if principal.kind == "operator" or row and row["creator_principal"] == principal.id:
+            ).fetchone()
+            if not row:
+                if principal.kind == "operator" and publish:
+                    return
+                raise denied("Unknown channel")
+            if principal.kind == "operator":
                 return
-            rows = await conn.execute(
-                "SELECT can_publish,can_subscribe FROM gateway_channel_grants "
-                "WHERE waiting_id=%s AND principal_id=%s",
-                (channel, principal.id),
-            )
-            grant = await rows.fetchone()
-            if (
-                not grant
-                or publish
-                and not grant["can_publish"]
-                or (subscribe and not grant["can_subscribe"])
-            ):
-                raise denied("Channel access denied")
+            if publish and row["producer_principal"] != principal.id:
+                raise denied("Channel belongs to another producer")
+            if subscribe and row["receiver_principal"] != principal.id:
+                raise denied("Channel belongs to another receiver")
 
     async def grant(
         self,
@@ -220,13 +241,31 @@ class Metadata:
         publish: bool,
         subscribe: bool,
     ) -> None:
-        await self.rows(
-            "INSERT INTO gateway_channel_grants VALUES (%s,%s,%s,%s) "
-            "ON CONFLICT(waiting_id,principal_id) DO UPDATE SET "
-            "can_publish=gateway_channel_grants.can_publish OR EXCLUDED.can_publish, "
-            "can_subscribe=gateway_channel_grants.can_subscribe OR EXCLUDED.can_subscribe",
-            (channel, principal_id, publish, subscribe),
-        )
+        # Internal registration can fill a missing endpoint, never add a second participant.
+        async with self.connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT producer_principal,receiver_principal "
+                    "FROM gateway_channels WHERE waiting_id=%s FOR UPDATE",
+                    (channel,),
+                )
+            ).fetchone()
+            if (
+                not row
+                or (publish and row["producer_principal"] not in (None, principal_id))
+                or (subscribe and row["receiver_principal"] not in (None, principal_id))
+            ):
+                raise denied("Channel endpoints are immutable")
+            if publish:
+                await conn.execute(
+                    "UPDATE gateway_channels SET producer_principal=%s WHERE waiting_id=%s",
+                    (principal_id, channel),
+                )
+            if subscribe:
+                await conn.execute(
+                    "UPDATE gateway_channels SET receiver_principal=%s WHERE waiting_id=%s",
+                    (principal_id, channel),
+                )
 
     async def begin_cleanup(
         self,

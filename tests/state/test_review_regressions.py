@@ -52,9 +52,8 @@ async def test_delete_13200_publicly_accepted_inputs_completes_every_receipt(
     created = await service.create_session(spec(), request_id=uuid4())
     session_id = created.session.id
     request_ids = [uuid4() for _ in range(13_200)]
-    # Using the default channel also verifies that batching retains every request identity there.
     for request_id in request_ids:
-        await service.submit_input(session_id, "x", request_id=request_id, waiting_id=session_id)
+        await service.submit_input(session_id, "x", request_id=request_id)
     delete_id = uuid4()
     assert await service.delete_session(session_id, request_id=delete_id)
     assert await service.delete_session(session_id, request_id=delete_id)
@@ -65,14 +64,9 @@ async def test_delete_13200_publicly_accepted_inputs_completes_every_receipt(
     )
     assert {row["id"] for row in rows} == set(request_ids)
     notifications = await database.rows(
-        "SELECT payload FROM events WHERE channel_id=%s "
-        "AND payload->>'outcome'='deleted' ORDER BY ordinal",
-        (session_id,),
+        "SELECT request_id FROM waiting_channels WHERE outcome='deleted'"
     )
-    emitted = [key for row in notifications for key in row["payload"]["request_ids"]]
-    assert all(len(row["payload"]["request_ids"]) <= 64 for row in notifications)
-    assert len(emitted) == len(set(emitted)) == 13_200
-    assert set(emitted) == {str(key) for key in request_ids}
+    assert {row["request_id"] for row in notifications} == set(request_ids)
     for request_id in (request_ids[0], request_ids[-1]):
         observed = await service.wait_submission(session_id, request_id)
         assert observed.completion is not None and observed.completion.outcome == "deleted"
@@ -97,16 +91,14 @@ async def test_many_steer_requests_complete_once_even_for_runner_state_errors(
             ids.extend(item.id for item in batch)
         if error_type:
             raise error_type("raised by the injected runner, not the State lease")
-        return RunResult("all done", (), CheckpointWrite(1, ctx.state, (), tuple(ids)))
+        return RunResult("all done", CheckpointWrite(1, ctx.state, (), tuple(ids)))
 
     service = await database.start(runner)
     created = await service.create_session(spec(), request_id=uuid4(), input="initial")
     await asyncio.wait_for(entered.wait(), 5)
     request_ids = [created.submission.request_id]
     for _ in range(193):
-        submission = await service.submit_input(
-            created.session.id, "more", request_id=uuid4(), waiting_id=created.session.id
-        )
+        submission = await service.submit_input(created.session.id, "more", request_id=uuid4())
         request_ids.append(submission.request_id)
     release.set()
     observed = await service.wait_submission(created.session.id, request_ids[-1], wait_seconds=10)
@@ -121,15 +113,9 @@ async def test_many_steer_requests_complete_once_even_for_runner_state_errors(
     while page.has_more:
         page = await service.read_output(created.session.id, after=page.next_cursor)
         waiting.extend(item for item in page.items if item.kind == "waiting")
-    emitted: list[str] = []
-    for item in waiting:
-        assert isinstance(item.data, dict)
-        keys = item.data["request_ids"]
-        assert isinstance(keys, list)
-        assert len(keys) <= 64
-        emitted.extend(str(key) for key in keys)
-    assert len(emitted) == len(set(emitted)) == len(request_ids)
-    assert set(emitted) == {str(k) for k in request_ids}
+    assert len(waiting) == (0 if error_type else 1)
+    channels = await database.rows("SELECT request_id FROM waiting_channels WHERE state='ready'")
+    assert {row["request_id"] for row in channels} == set(request_ids)
 
 
 async def test_terminal_page_actual_json_size_and_snapshot_export(database: Database) -> None:
@@ -273,10 +259,10 @@ async def test_receipt_wait_is_nonconsuming_repeatable_and_closes_promptly(
     release.set()
     # Read the durable result directly before any observer can touch a completed receipt.
     await database.completed(created.submission.request_id)
-    events = await database.rows("SELECT id,state FROM events ORDER BY ordinal")
-    assert any(event["state"] == "pending" for event in events)
+    events = await database.rows("SELECT id,state FROM waiting_channels ORDER BY id")
+    assert any(event["state"] == "ready" for event in events)
     subscriptions = await database.rows(
-        "SELECT * FROM subscriptions ORDER BY channel_id,session_id"
+        "SELECT id,receiver_session_id,active FROM waiting_channels ORDER BY id"
     )
     inputs = await database.rows("SELECT id,state,event_id FROM inputs ORDER BY id")
     observers = [
@@ -291,9 +277,11 @@ async def test_receipt_wait_is_nonconsuming_repeatable_and_closes_promptly(
     assert first == second and first.completion is not None
     assert first.completion.output == "receipt output"
     assert await service.wait_submission(created.session.id, created.submission.request_id) == first
-    assert await database.rows("SELECT id,state FROM events ORDER BY ordinal") == events
+    assert await database.rows("SELECT id,state FROM waiting_channels ORDER BY id") == events
     assert (
-        await database.rows("SELECT * FROM subscriptions ORDER BY channel_id,session_id")
+        await database.rows(
+            "SELECT id,receiver_session_id,active FROM waiting_channels ORDER BY id"
+        )
         == subscriptions
     )
     assert await database.rows("SELECT id,state,event_id FROM inputs ORDER BY id") == inputs

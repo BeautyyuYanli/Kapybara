@@ -32,7 +32,6 @@ class Create(SessionConfig):
     request_id: UUID
     input: JsonValue = None
     mode: Literal["steer", "queue"] = "queue"
-    waiting_id: UUID | None = None
 
 
 class Update(SessionConfig):
@@ -47,7 +46,6 @@ class Mutation(SessionId):
 class Input(Mutation):
     payload: JsonValue
     mode: Literal["steer", "queue"] = "queue"
-    waiting_id: UUID | None = None
 
 
 class ListSessions(Params):
