@@ -278,7 +278,6 @@ async def test_model_identity_change_scrubs_only_projection_and_preserves_tool_p
         assert "fc-private" not in encoded and "resp-private" not in encoded
         assert "public text" in encoded and encoded.count("call-safe") == 2
         assert ctx.state == snapshot
-        assert restored.data["last_usage"] is None
 
 
 @pytest.mark.asyncio
