@@ -98,7 +98,7 @@ def create_model_backend(
 
 工厂构造 Pydantic AI 的 OpenAIResponsesModel/OpenAIChatModel/GoogleModel，显式注入连接和借用 HTTP client。create_app(..., model_backend_factory=...) 支持替换适配器。Gateway 每次运行读取 provider 并创建独立 Runner；RunnerConfig 的模型名、窗口和输出预算来自 session，不共享可变配置。Runner.initial_state 改为无实例依赖的静态入口，继续保存用户 instructions 和创建时 skill catalog。
 
-Responses 使用 store=False、完整本地历史，不启用 previous_response_id/conversation 或供应商自动截断。禁用依赖原始 Responses item ID 的历史回放，保留需要的 reasoning 加密内容与工具调用配对。Google 保留 thought signature 及对应工具协议。同一连接恢复不得重做已完成工具。
+Responses 使用 store=False、完整本地历史，不启用 previous_response_id/conversation 或供应商自动截断。使用 SDK 支持的完整历史映射，保留合法 Responses item ID、reasoning 加密内容及工具配对。已安装 SDK 的 openai_send_reasoning_ids=False 会把 reasoning 转成普通文本，不能用它同时要求保留 encrypted_content。压缩保持完整协议块；不覆盖 SDK 私有序列化函数或依赖服务端存储来补历史。Google 保留 thought signature 及对应工具协议。同一连接恢复不得重做已完成工具。
 
 投影持久保存 provider_id/revision、协议、端点、模型 ID/名称和有效预算。连接或模型身份变化时，只在待发送投影中清除原供应商专有 ID、签名与不透明推理项，保留用户/assistant 正文、媒体和成对工具记录；原始历史不变。恢复若读到已更新 provider，同样处理。模型身份或有效预算改变时清掉旧 usage 的压缩触发依据；仅调整窗口不必删除供应商签名。无需转换注册框架或旧 key 保留机制。
 
