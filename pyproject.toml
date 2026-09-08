@@ -11,7 +11,7 @@ dependencies = [
     "platformdirs>=4.11.7",
     "psycopg[binary,pool]>=3.3.5",
     "pydantic>=2.13.5",
-    "pydantic-ai-slim[openai]>=2.40.0",
+    "pydantic-ai-slim[google,openai]>=2.40.0",
     "pydantic-settings>=2.15.0",
     "pyyaml>=6.0.3",
     "sqlglot>=30.18.0",
@@ -19,7 +19,7 @@ dependencies = [
     "uvicorn[standard]>=0.52.4",
     "uvloop>=0.22.1",
     "valkey>=6.1.1",
-    "websockets>=17.1",
+    "websockets>=16,<17",
 ]
 
 [project.scripts]
