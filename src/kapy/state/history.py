@@ -11,7 +11,7 @@ from sqlglot import exp
 
 from .contracts import InvalidArgument, JsonObject, UnsafeQuery
 
-HISTORY_KINDS = ("input", "model_request", "model_response", "final", "waiting", "error")
+HISTORY_KINDS = ("input", "model_request", "model_response", "reply", "final", "waiting", "error")
 
 
 def normalized(text: str) -> str:

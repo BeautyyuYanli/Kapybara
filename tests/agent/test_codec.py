@@ -30,7 +30,7 @@ async def test_media_and_large_context_roundtrip_without_machine() -> None:
     restored = await MessageCodec(cast(AgentPayloadStore, store), session).decode(encoded)
     part = cast(ToolReturnPart, restored.parts[0])
     assert cast(Any, part.content)[1].data == b"image bytes"
-    state = {"version": 2, "instructions": "x" * (2 * 1024 * 1024)}
+    state = {"version": 3, "instructions": "x" * (2 * 1024 * 1024)}
     reference = await codec.state(state)
     assert "payload" in reference.data
     assert await codec.load(reference) == state
@@ -46,10 +46,10 @@ async def test_oversized_message_is_rejected() -> None:
 @pytest.mark.asyncio
 async def test_old_snapshot_is_rejected_without_conversion() -> None:
     from kapy.agent.codec import CODEC
-    from kapy.state import RunnerState
+    from kapy.state import JsonObject, RunnerState
 
     codec = MessageCodec(cast(AgentPayloadStore, Payloads()), uuid4())
-    data = {"version": 1, "instructions": "old protocol", "cycles": []}
+    data: JsonObject = {"version": 1, "instructions": "old protocol", "cycles": []}
     with pytest.raises(ValueError, match="Unsupported runner codec"):
         await codec.load(RunnerState("kapy.agent.v1", data))
     with pytest.raises(ValueError, match="Unsupported runner state version"):

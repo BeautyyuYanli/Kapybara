@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Literal, LiteralString, cast
@@ -16,6 +17,7 @@ from valkey.asyncio import Valkey
 from valkey.exceptions import ValkeyError
 
 from .contracts import (
+    REPLY_RESULT,
     SESSION_OUTPUT,
     CheckpointWrite,
     Completion,
@@ -35,6 +37,7 @@ from .contracts import (
     Record,
     RecordPage,
     ReplyAddressPage,
+    ReplyResult,
     ReplyTo,
     RunnerState,
     RunResult,
@@ -1134,6 +1137,84 @@ class SessionService:
         self._signal()
         return cursor(context.session.id, seq)
 
+    async def _unreplied(self, conn: Connection, session_id: UUID) -> list[dict[str, Any]]:
+        return await (
+            await conn.execute(
+                "SELECT r.id,r.waiting_id FROM requests r JOIN inputs i ON i.id=r.input_id "
+                "WHERE i.session_id=%s AND i.state='consumed' "
+                "AND r.completion IS NULL ORDER BY i.seq",
+                (session_id,),
+            )
+        ).fetchall()
+
+    async def _reply(
+        self,
+        context: _Context,
+        emission_id: UUID,
+        output: ReplyTo,
+        validate_receipt: Callable[[ReplyResult], None] | None,
+    ) -> ReplyResult:
+        if context.session.config.get("output_mode", "text") != "reply_to":
+            raise InvalidArgument("reply_to is unavailable in this session")
+        ids = output.being_waited_ids
+        if len(ids) > 128 or len(ids) != len(set(ids)) or not all(isinstance(i, UUID) for i in ids):
+            raise InvalidArgument("reply_to accepts at most 128 distinct UUIDs")
+        if not output.payload.strip():
+            raise InvalidArgument("reply_to requires a nonempty model output")
+        value = SESSION_OUTPUT.dump_python(output, mode="json")
+        bounded(value)
+        digest = fingerprint(output)
+        async with self._store.write() as conn:
+            await self._attempt(conn, context)
+            prior = await (
+                await conn.execute(
+                    "SELECT * FROM records WHERE session_id=%s AND emission_id=%s",
+                    (context.session.id, emission_id),
+                )
+            ).fetchone()
+            if prior:
+                if (
+                    prior["kind"] != "reply"
+                    or prior["run_id"] != context.run_id
+                    or prior["emission_fingerprint"] != digest
+                ):
+                    raise Conflict("emission_id was used with different output")
+                receipt = REPLY_RESULT.validate_python(prior["data"])
+                if validate_receipt is not None:
+                    validate_receipt(receipt)
+                return receipt
+            requests = await self._unreplied(conn, context.session.id)
+            eligible = {request["waiting_id"] for request in requests}
+            if not set(ids) <= eligible or not ids and eligible:
+                raise InvalidArgument("Select read inputs from the current unanswered address list")
+            receipt = ReplyResult(
+                output, tuple(r["waiting_id"] for r in requests if r["waiting_id"] not in ids)
+            )
+            data = REPLY_RESULT.dump_python(receipt, mode="json")
+            bounded(data)
+            if validate_receipt is not None:
+                validate_receipt(receipt)
+            await self._append(
+                conn,
+                context.session.id,
+                "reply",
+                data,
+                run_id=context.run_id,
+                attempt=context.attempt,
+                emission_id=emission_id,
+                emission_fingerprint=digest,
+            )
+            await self._completion(
+                conn,
+                context.session.id,
+                context.run_id,
+                "completed",
+                output,
+                [r["id"] for r in requests if r["waiting_id"] in ids],
+            )
+        self._signal()
+        return receipt
+
     async def _finish(self, context: _Context, result: RunResult) -> None:
         output = result.output
         value = SESSION_OUTPUT.dump_python(output, mode="json")
@@ -1162,19 +1243,23 @@ class SessionService:
             ).fetchone()
             if reserved:
                 raise Conflict("runner returned with unconfirmed inputs")
-            requests = await (
-                await conn.execute(
-                    "SELECT r.id,r.waiting_id FROM requests r JOIN inputs i ON i.id=r.input_id "
-                    "WHERE i.session_id=%s AND i.state='consumed' "
-                    "AND r.completion IS NULL ORDER BY i.seq",
-                    (context.session.id,),
-                )
-            ).fetchall()
+            requests = await self._unreplied(conn, context.session.id)
             if isinstance(output, ReplyTo):
-                eligible = {r["waiting_id"] for r in requests}
-                if not set(ids) <= eligible or not ids and eligible:
-                    raise Conflict("reply_to must select unanswered consumed inputs")
-                requests = [r for r in requests if r["waiting_id"] in ids]
+                last = await (
+                    await conn.execute(
+                        "SELECT data FROM records WHERE session_id=%s AND run_id=%s "
+                        "AND kind='reply' ORDER BY seq DESC LIMIT 1",
+                        (context.session.id, context.run_id),
+                    )
+                ).fetchone()
+                if (
+                    requests
+                    or not last
+                    or REPLY_RESULT.validate_python(last["data"]).output != output
+                ):
+                    raise Conflict(
+                        "final reply must match the last committed reply with no remaining inputs"
+                    )
             await self._append(
                 conn,
                 context.session.id,
@@ -1203,7 +1288,7 @@ class SessionService:
             await self._wait_for(
                 conn, context.session.id, ids if isinstance(output, WaitFor) else ()
             )
-            if not isinstance(output, WaitFor):
+            if isinstance(output, str):
                 await self._completion(
                     conn,
                     context.session.id,
@@ -1539,6 +1624,15 @@ class _Context:
 
     async def poll_steer(self, *, limit: int = 64) -> tuple[SessionInput, ...]:
         return await self._service._poll(self, limit)
+
+    async def reply(
+        self,
+        *,
+        emission_id: UUID,
+        output: ReplyTo,
+        validate_receipt: Callable[[ReplyResult], None] | None = None,
+    ) -> ReplyResult:
+        return await self._service._reply(self, emission_id, output, validate_receipt)
 
     async def unreplied_addresses(self, *, after: int = 0, limit: int = 64) -> ReplyAddressPage:
         page_limit(limit)

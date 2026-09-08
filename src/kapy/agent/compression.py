@@ -35,6 +35,7 @@ def omit_results(messages: list[dict[str, Any]]) -> bool:
         for part in message["parts"]:
             if (
                 part["part_kind"] == "tool-return"
+                and part.get("tool_name") != "reply_to"
                 and (part.get("metadata") or {}).get("kapy_compression") != 1
             ):
                 part["content"] = (
@@ -79,13 +80,14 @@ def sweep(data: dict[str, Any], keep_recent_ratio: float) -> bool:
                             {
                                 "part_kind": "text",
                                 "content": (
-                                    cycle.get("output", "")
-                                    if isinstance(cycle.get("output", ""), str)
-                                    else json.dumps(cycle["output"], ensure_ascii=False)
+                                    output
+                                    if isinstance(output, str)
+                                    else json.dumps(output, ensure_ascii=False)
                                 ),
                             }
                         ],
                     }
+                    for output in cycle["outputs"]
                 ]
                 cycle["level"] = 2
                 retained.append(cycle)

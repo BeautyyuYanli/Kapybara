@@ -70,6 +70,13 @@ class ReplyTo:
     kind: Literal["reply_to"] = "reply_to"
 
 
+@dataclass(frozen=True, slots=True)
+class ReplyResult:
+    output: ReplyTo
+    remaining_being_waited_ids: tuple[UUID, ...]
+
+
+REPLY_RESULT = TypeAdapter(ReplyResult)
 type SessionOutput = str | WaitFor | ReplyTo
 SESSION_OUTPUT = TypeAdapter(SessionOutput)
 
@@ -190,6 +197,13 @@ class RunContext(Protocol):
     async def poll_steer(self, *, limit: int = 64) -> tuple[SessionInput, ...]: ...
     async def emit(self, delta: OutputDelta) -> Cursor: ...
     async def checkpoint(self, write: CheckpointWrite) -> Cursor: ...
+    async def reply(
+        self,
+        *,
+        emission_id: UUID,
+        output: ReplyTo,
+        validate_receipt: Callable[[ReplyResult], None] | None = None,
+    ) -> ReplyResult: ...
     async def unreplied_addresses(self, *, after: int = 0, limit: int = 64) -> ReplyAddressPage: ...
     async def read_history(
         self, *, after: Cursor | None = None, limit: int = 200

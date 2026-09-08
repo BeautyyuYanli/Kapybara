@@ -25,9 +25,12 @@ from kapy.agent.codec import DELTA_LIMIT, json_bytes
 from kapy.rpc import MachineCaller
 from kapy.state import (
     CheckpointWrite,
+    InvalidArgument,
     OutputDelta,
     RecordPage,
     ReplyAddressPage,
+    ReplyResult,
+    ReplyTo,
     SessionInput,
     SessionView,
     WaitFor,
@@ -62,9 +65,13 @@ class Context:
         self.writes: list[CheckpointWrite] = []
         self.deltas: list[OutputDelta] = []
         self.steer: list[SessionInput] = []
+        self.reply_receipts: dict[UUID, ReplyResult] = {}
+        self.replied: set[UUID] = set()
+        self.accepted_inputs: list[SessionInput] = []
 
     async def poll_steer(self, *, limit: int = 64) -> tuple[SessionInput, ...]:
         values = tuple(self.steer[:limit])
+        self.accepted_inputs.extend(values)
         del self.steer[:limit]
         return values
 
@@ -76,12 +83,44 @@ class Context:
 
     async def unreplied_addresses(self, *, after: int = 0, limit: int = 64) -> ReplyAddressPage:
         consumed = {i for write in self.writes for i in write.consumed_input_ids}
-        items = [i for i in self.inputs if i.id in consumed and i.being_waited_id and i.seq > after]
+        items = [
+            i
+            for i in [*self.inputs, *self.accepted_inputs]
+            if i.id in consumed
+            and i.being_waited_id
+            and i.seq > after
+            and i.being_waited_id not in self.replied
+        ]
         items.sort(key=lambda i: i.seq)
         return ReplyAddressPage(
             tuple(i.being_waited_id for i in items[:limit]),
             items[limit - 1].seq if len(items) > limit else None,
         )
+
+    async def reply(
+        self, *, emission_id: UUID, output: ReplyTo, validate_receipt=None
+    ) -> ReplyResult:
+        if emission_id in self.reply_receipts:
+            receipt = self.reply_receipts[emission_id]
+            assert receipt.output == output
+            if validate_receipt is not None:
+                validate_receipt(receipt)
+            return receipt
+        remaining = (await self.unreplied_addresses(limit=1000)).being_waited_ids
+        if (
+            not set(output.being_waited_ids) <= set(remaining)
+            or not output.being_waited_ids
+            and remaining
+        ):
+            raise InvalidArgument("Select read inputs from the current unanswered address list")
+        receipt = ReplyResult(
+            output, tuple(i for i in remaining if i not in output.being_waited_ids)
+        )
+        if validate_receipt is not None:
+            validate_receipt(receipt)
+        self.replied.update(output.being_waited_ids)
+        self.reply_receipts[emission_id] = receipt
+        return receipt
 
     async def emit(self, delta: OutputDelta) -> str:
         assert len(json_bytes(delta.data)) < DELTA_LIMIT
@@ -449,7 +488,7 @@ async def test_explicit_context_rejection_is_bounded_across_recovery() -> None:
                     "closed": True,
                     "level": 0,
                     "inputs": [f"old input {index}"],
-                    "output": "old answer",
+                    "outputs": ["old answer"],
                     "messages": [
                         {
                             "kind": "request",

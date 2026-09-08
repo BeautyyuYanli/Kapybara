@@ -3,12 +3,13 @@
 from collections.abc import AsyncIterable, Sequence
 from dataclasses import asdict
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
-from pydantic_ai import Agent, ModelRetry, ToolOutput, ToolReturn
+from pydantic_ai import Agent, ModelRetry, Tool, ToolOutput, ToolReturn
 from pydantic_ai import RunContext as AIRunContext
+from pydantic_ai._agent_graph import CallToolsNode, ModelRequestNode
 from pydantic_ai._output import ObjectOutputProcessor
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, AgentNode, NodeResult
 from pydantic_ai.messages import (
     InstructionPart,
     ModelMessage,
@@ -24,16 +25,21 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext
+from pydantic_ai.result import FinalResult
 from pydantic_ai.run import AgentRunResultEvent
+from pydantic_graph import End
 
 from kapy.rpc import MachineCaller
 from kapy.skills import SkillDescription
 from kapy.state import (
+    REPLY_RESULT,
     SESSION_OUTPUT,
     CheckpointWrite,
+    InvalidArgument,
     JsonObject,
     MessageWrite,
     OutputDelta,
+    ReplyResult,
     ReplyTo,
     RunContext,
     RunnerState,
@@ -47,10 +53,11 @@ from .codec import (
     CODEC,
     DELTA_LIMIT,
     INLINE_LIMIT,
-    MESSAGE_LIMIT,
     MessageCodec,
     check_checkpoint,
+    encode_message,
     json_bytes,
+    message_write,
 )
 from .compression import projection, sweep, usage_sweep
 from .machine import BUILTINS, MachineTools
@@ -111,7 +118,9 @@ The most recent visible model text is filled into the output automatically; do n
 in tool arguments. Each input can be replied to once; the same reply may answer several inputs.
 Use wait_for when awaiting other results; waiting does not reply to any inputs. Waiting results
 have no new reply address. Text alone cannot finish the turn. Use reply_to([]) only when there
-are no read inputs awaiting a reply. Unselected inputs remain unanswered until later work.
+are no read inputs awaiting a reply. The tool returns your reply and the remaining unanswered
+addresses. Continue working while addresses remain; the turn ends automatically after all read
+inputs are answered. Unread queue inputs are left for the next turn.
 """
 
 
@@ -142,7 +151,7 @@ class Runner:
     ) -> RunnerState:
         descriptions = [asdict(skill) for skill in skills]
         data = {
-            "version": 2,
+            "version": 3,
             "instructions": instructions,
             "skill_descriptions": descriptions,
             "last_usage": None,
@@ -173,23 +182,21 @@ class Runner:
             await runtime.tool_result("wait_for", ctx.tool_call_id or "", output)
             return output
 
-        async def reply_to(ctx: AIRunContext, ids: list[UUID]) -> ReplyTo:
-            """Finish by replying to these inputs with your most recent complete visible text.
+        async def reply_to(ctx: AIRunContext, ids: list[UUID]) -> ReplyResult:
+            """Reply to these inputs with your most recent complete visible text.
 
             Only supply being_waited_ids belonging to read, unanswered inputs. Supply no payload.
-            An empty list is allowed only if no read inputs await a reply.
+            Returns the complete reply and remaining addresses. Continue if addresses remain;
+            otherwise the turn ends after this tool batch. An empty list requires no pending inputs.
             """
-            output = runtime.reply(ids)
-            await runtime.tool_result("reply_to", ctx.tool_call_id or "", output)
-            return output
+            return await runtime.submit_reply(ctx.tool_call_id or "", runtime.reply(ids))
 
+        reply_tool = Tool(reply_to, sequential=True)
         # Use the same complete function-argument validator as live output processing.
         await runtime.recover_tools(
             machine,
-            {
-                "wait_for": ObjectOutputProcessor(wait_for),
-                "reply_to": ObjectOutputProcessor(reply_to),
-            },
+            ObjectOutputProcessor(wait_for),
+            reply_tool,
         )
         if runtime.current.get("pending_final") is not None:
             recovered_result = await runtime.finish_pending()
@@ -197,9 +204,8 @@ class Runner:
                 return recovered_result
 
         output_type: list[Any] = [ToolOutput(wait_for, name="wait_for", sequential=True)]
-        output_type.append(
-            ToolOutput(reply_to, name="reply_to", sequential=True) if runtime.explicit else str
-        )
+        if not runtime.explicit:
+            output_type.append(str)
         agent = Agent(
             self.model_backend.create_model(model),
             instructions=(
@@ -214,7 +220,7 @@ class Runner:
                 + f"Default machine: {context.session.default_machine_id or 'none'}\n"
                 + "Association does not guarantee that a machine is online.\n"
             ),
-            tools=machine.tools(),
+            tools=[*machine.tools(), *([reply_tool] if runtime.explicit else [])],
             output_type=output_type,
             end_strategy="exhaustive",
             capabilities=[Boundaries(runtime)],
@@ -261,10 +267,13 @@ class Runtime:
         self.data: dict[str, Any] = {}
         self.current: dict[str, Any] = {}
         self.messages: list[MessageWrite] = []
+        self.reply_messages: dict[str, MessageWrite] = {}
         self.consumed: list[UUID] = []
         self.attempt_id = str(uuid4())
         self.message_id = uuid4()
         self.function_tool_names = set(BUILTINS) | {plugin.name for plugin in runner.plugins}
+        if self.explicit:
+            self.function_tool_names.add("reply_to")
 
     async def initialize(self) -> None:
         self.data = await self.codec.load(self.context.state)
@@ -281,7 +290,7 @@ class Runtime:
                 "messages": [],
                 "inputs": [],
                 "input_ids": [],
-                "output": "",
+                "outputs": [],
             }
             cycles.append(self.current)
             self.data["context_retries"] = 0
@@ -336,6 +345,7 @@ class Runtime:
             # Newly accepted input needs a fresh final result from the model.
             self.current.pop("pending_final", None)
             self.current.pop("output_candidates", None)
+            self.current.pop("batch_replies", None)
             item = self.data["reserved_inputs"][0]
             request = ModelRequest(
                 [UserPromptPart(item["content"])], metadata={"kapy_input_id": item["id"]}
@@ -377,8 +387,6 @@ class Runtime:
             raise ModelRetry("reply_to is unavailable in this session")
         if len(ids) > 128 or len(ids) != len(set(ids)):
             raise ModelRetry("reply_to accepts at most 128 distinct IDs")
-        if not set(ids) <= self.reply_addresses or not ids and self.reply_addresses:
-            raise ModelRetry("Select read inputs from the current unanswered address list")
         for message in reversed(self.current["messages"]):
             if (message.get("metadata") or {}).get("kapy_input_id"):
                 break
@@ -389,7 +397,51 @@ class Runtime:
                 return ReplyTo(tuple(ids), text)
         raise ModelRetry("Write the complete reply text before calling reply_to")
 
-    def batch_has_function_retry(self) -> bool:
+    async def submit_reply(self, call_id: str, output: ReplyTo) -> ReplyResult:
+        response = next(
+            message
+            for message in reversed(self.current["messages"])
+            if message["kind"] == "response"
+            and any(
+                p["part_kind"] == "tool-call" and p["tool_call_id"] == call_id
+                for p in message["parts"]
+            )
+        )
+        emission_id = uuid5(UUID(response["metadata"]["kapy_message_id"]), "reply:" + call_id)
+
+        def validate_receipt(receipt: ReplyResult) -> None:
+            message = ModelRequest(
+                [
+                    ToolReturnPart(
+                        "reply_to", REPLY_RESULT.dump_python(receipt, mode="json"), call_id
+                    )
+                ],
+                metadata={"kapy_message_id": str(uuid4())},
+            )
+            self.reply_messages[call_id] = message_write(encode_message(message))
+
+        try:
+            return await self.context.reply(
+                emission_id=emission_id,
+                output=output,
+                validate_receipt=validate_receipt,
+            )
+        except (InvalidArgument, AgentResourceLimit) as exc:
+            self.reply_messages.pop(call_id, None)
+            raise ModelRetry(str(exc)) from exc
+
+    async def completed_reply(self) -> tuple[str, ReplyResult] | None:
+        replies = self.current.get("batch_replies", {})
+        if not replies or self.batch_has_function_retry(include_output=True):
+            return None
+        await self.reserve()
+        await self.refresh_addresses()
+        if self.data["reserved_inputs"] or self.reply_addresses:
+            return None
+        call_id = next(reversed(replies))
+        return call_id, REPLY_RESULT.validate_python(replies[call_id])
+
+    def batch_has_function_retry(self, *, include_output: bool = False) -> bool:
         messages = self.current["messages"]
         for index in range(len(messages) - 1, -1, -1):
             response = messages[index]
@@ -399,7 +451,7 @@ class Runtime:
                 part["tool_call_id"]
                 for part in response["parts"]
                 if part["part_kind"] == "tool-call"
-                and part["tool_name"] in self.function_tool_names
+                and (include_output or part["tool_name"] in self.function_tool_names)
             }
             return any(
                 part["part_kind"] == "retry-prompt"
@@ -419,32 +471,21 @@ class Runtime:
             return None
         pending = self.current["pending_final"]
         self.current["closed"] = True
-        self.current["output"] = pending["output"]
-        return RunResult(
-            SESSION_OUTPUT.validate_python(pending["output"]), await self.make_checkpoint()
-        )
+        output = SESSION_OUTPUT.validate_python(pending["output"])
+        if not isinstance(output, ReplyTo):
+            self.current["outputs"].append(pending["output"])
+        return RunResult(output, await self.make_checkpoint())
 
     async def record(self, message: ModelMessage, *, commit: bool = True) -> None:
         metadata = message.metadata or {}
         message_id = UUID(metadata.get("kapy_message_id", str(uuid4())))
         message.metadata = {**metadata, "kapy_message_id": str(message_id)}
         encoded = await self.codec.encode(message)
-        text = "\n".join(
-            cast(str, part.content)
-            for part in message.parts
-            if isinstance(part, TextPart)
-            or (isinstance(part, UserPromptPart) and isinstance(part.content, str))
-        )
-        write = MessageWrite(
-            message_id,
-            "model_request" if isinstance(message, ModelRequest) else "model_response",
-            text,
-            cast(JsonObject, encoded),
-        )
-        if len(json_bytes({**asdict(write), "message_id": str(message_id)})) > MESSAGE_LIMIT:
-            raise AgentResourceLimit("Complete message envelope exceeds 256 KiB")
+        await self.record_write(message_write(encoded), commit=commit)
+
+    async def record_write(self, write: MessageWrite, *, commit: bool = True) -> None:
         self.messages.append(write)
-        self.current["messages"].append(encoded)
+        self.current["messages"].append(write.data)
         if commit:
             await self.checkpoint()
 
@@ -535,24 +576,31 @@ class Runtime:
         return WaitFor(ids)
 
     async def tool_result(self, name: str, call_id: str, result: Any) -> None:
-        if isinstance(result, ToolReturn):
-            part = ToolReturnPart(name, result.return_value, call_id, metadata=result.metadata)
-        elif isinstance(result, (WaitFor, ReplyTo)):
-            self.current.setdefault("output_candidates", {})[call_id] = SESSION_OUTPUT.dump_python(
-                result, mode="json"
-            )
-            part = ToolReturnPart(name, "Final result processed.", call_id)
-        else:
-            part = ToolReturnPart(name, result, call_id)
         self.data["pending_tools"] = [
             p for p in self.data["pending_tools"] if p["tool_call_id"] != call_id
         ]
-        await self.record(ModelRequest([part]))
+        if isinstance(result, ReplyResult):
+            value = REPLY_RESULT.dump_python(result, mode="json")
+            self.current.setdefault("batch_replies", {})[call_id] = value
+            self.current["outputs"].append(SESSION_OUTPUT.dump_python(result.output, mode="json"))
+            # Reuse the exact complete message checked before the reply transaction committed.
+            await self.record_write(self.reply_messages.pop(call_id))
+        else:
+            if isinstance(result, ToolReturn):
+                part = ToolReturnPart(name, result.return_value, call_id, metadata=result.metadata)
+            elif isinstance(result, WaitFor):
+                self.current.setdefault("output_candidates", {})[call_id] = (
+                    SESSION_OUTPUT.dump_python(result, mode="json")
+                )
+                part = ToolReturnPart(name, "Final result processed.", call_id)
+            else:
+                part = ToolReturnPart(name, result, call_id)
+            await self.record(ModelRequest([part]))
         encoded = self.current["messages"][-1]["parts"][0]
         await self.emit("tool_result", {"tool_call_id": call_id, "result": encoded["content"]})
 
     async def recover_tools(
-        self, tools: MachineTools, outputs: dict[str, ObjectOutputProcessor[Any]]
+        self, tools: MachineTools, wait_output: ObjectOutputProcessor[Any], reply_tool: Tool
     ) -> None:
         await self.refresh_addresses()
         messages = await self.history()
@@ -583,15 +631,19 @@ class Runtime:
                     )
                     continue
                 try:
-                    if part.tool_name in outputs:
-                        values = outputs[part.tool_name].validate(
-                            cast(str | dict[str, Any] | None, part.args)
+                    if part.tool_name == "wait_for":
+                        values = wait_output.validate(cast(str | dict[str, Any] | None, part.args))[
+                            "ids"
+                        ]
+                        result = await self.authorize(values)
+                    elif part.tool_name == "reply_to":
+                        validator = reply_tool.function_schema.validator
+                        values = (
+                            validator.validate_json(part.args)
+                            if isinstance(part.args, str)
+                            else validator.validate_python(part.args)
                         )["ids"]
-                        result = (
-                            await self.authorize(values)
-                            if part.tool_name == "wait_for"
-                            else self.reply(values)
-                        )
+                        result = await self.submit_reply(part.tool_call_id, self.reply(values))
                     else:
                         result = await tools.execute(
                             part.tool_name, part.args_as_dict(), part.tool_call_id
@@ -624,6 +676,9 @@ class Runtime:
                         )
                         return
                 break
+        completed = await self.completed_reply()
+        if completed is not None:
+            self.set_pending_final(completed[1].output)
 
     async def repair(self, error: Exception) -> bool:
         failure = self.runner.model_backend.classify_error(error)
@@ -737,6 +792,7 @@ class Boundaries(AbstractCapability):
         text = "\n".join(part.content for part in response.parts if isinstance(part, TextPart))
         runtime.current.pop("pending_final", None)
         runtime.current.pop("output_candidates", None)
+        runtime.current.pop("batch_replies", None)
         await runtime.record(response, commit=False)
         if (
             not runtime.explicit
@@ -763,6 +819,24 @@ class Boundaries(AbstractCapability):
     ) -> Any:
         await self.runtime.reserve(ctx)
         return args
+
+    async def after_node_run(
+        self, ctx: AIRunContext, *, node: AgentNode, result: NodeResult
+    ) -> NodeResult:
+        if not isinstance(node, CallToolsNode) or not isinstance(result, ModelRequestNode):
+            return result
+        runtime = self.runtime
+        await runtime.ingest([*ctx.messages, result.request])
+        completed = await runtime.completed_reply()
+        if completed is None:
+            return result
+        call_id, receipt = completed
+        # The next model-request node normally archives these returns. When ending here,
+        # preserve them in the framework history as well as the durable checkpoint.
+        ctx.messages.append(result.request)
+        runtime.set_pending_final(receipt.output)
+        await runtime.checkpoint()
+        return End(FinalResult(receipt.output, tool_name="reply_to", tool_call_id=call_id))
 
     async def after_tool_execute(
         self, ctx: AIRunContext, *, call: ToolCallPart, tool_def: Any, args: Any, result: Any

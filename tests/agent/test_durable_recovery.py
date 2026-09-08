@@ -76,7 +76,7 @@ async def test_postgres_media_and_external_context_survive_full_resource_restart
                         "level": 0,
                         "inputs": [prompt],
                         "input_ids": [str(uuid4())],
-                        "output": "prior reply",
+                        "outputs": ["prior reply"],
                         "messages": [
                             await codec.encode(ModelRequest.user_text_prompt(prompt)),
                             await codec.encode(ModelResponse([TextPart("prior reply")])),

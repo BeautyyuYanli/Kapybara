@@ -1,14 +1,14 @@
 """The model emits addresses; Pydantic AI returns the complete output DTO."""
 
-import asyncio
 import json
 from dataclasses import replace
+from typing import Any, cast
 from uuid import uuid4
 
 import httpx2
 import pytest
 
-from kapy.state import CheckpointWrite, ReplyTo, SessionInput, WaitFor
+from kapy.state import ReplyTo, SessionInput, WaitFor
 
 from .test_runner import Context, response, runner
 
@@ -34,13 +34,15 @@ async def test_reply_schema_prompt_and_complete_framework_output() -> None:
     assert set(tools["reply_to"]["parameters"]["properties"]) == {"ids"}
     assert "being_waited_id" in json.dumps(requests[0]["messages"])
     assert requests[0]["tool_choice"] == "required"
-    cycle = result.checkpoint.state.data["cycles"][-1]
-    assert cycle["output"] == {
-        "kind": "reply_to",
-        "being_waited_ids": [str(address)],
-        "payload": "The complete answer",
-    }
-    assert cycle["pending_final"]["output"] == cycle["output"]
+    cycle = cast(dict[str, Any], result.checkpoint.state.data)["cycles"][-1]
+    assert cycle["outputs"] == [
+        {
+            "kind": "reply_to",
+            "being_waited_ids": [str(address)],
+            "payload": "The complete answer",
+        }
+    ]
+    assert cycle["pending_final"]["output"] == cycle["outputs"][-1]
 
 
 @pytest.mark.asyncio
@@ -136,38 +138,3 @@ async def test_wait_rejects_empty_ids() -> None:
         result = await agent(Context(agent.initial_state(instructions="", skills=[])))
     assert calls == 2
     assert result.output == WaitFor((channel,))
-
-
-@pytest.mark.asyncio
-async def test_reply_candidate_recovers_without_recomputing_body() -> None:
-    address = uuid4()
-    calls = 0
-
-    class Interrupted(Context):
-        interrupted = False
-
-        async def checkpoint(self, write: CheckpointWrite) -> str:
-            cursor = await super().checkpoint(write)
-            if not self.interrupted and write.state.data["cycles"][-1].get("output_candidates"):
-                self.interrupted = True
-                raise asyncio.CancelledError
-            return cursor
-
-    def handle(request: httpx2.Request) -> httpx2.Response:
-        nonlocal calls
-        calls += 1
-        return response(
-            text="Original immutable body", name="reply_to", args={"ids": [str(address)]}
-        )
-
-    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
-        agent = runner(client)
-        ctx = Interrupted(agent.initial_state(instructions="", skills=[]))
-        ctx.session = replace(ctx.session, config={"output_mode": "reply_to"})
-        ctx.inputs = (SessionInput(uuid4(), 1, "queue", "Question", None, address),)
-        with pytest.raises(asyncio.CancelledError):
-            await agent(ctx)
-        ctx.attempt, ctx.recovered = 2, True
-        result = await agent(ctx)
-    assert calls == 1
-    assert result.output == ReplyTo((address,), "Original immutable body")

@@ -129,8 +129,10 @@ aliases for discarded draft names.
 ## Session interaction and output
 
 Creation config accepts `output_mode: "text" | "reply_to"`, default `text`; the value is immutable.
-Text mode exposes `wait_for(ids)` and natural text completion. Reply mode exposes only
-`wait_for(ids)` and `reply_to(ids)` as Pydantic AI output functions. Normal mode does not expose
+Text mode exposes `wait_for(ids)` and natural text completion. Reply mode exposes
+`wait_for(ids)` as an output function and `reply_to(ids)` as a sequential function tool.
+Partial replies continue the same loop; a full tool batch with no unanswered consumed inputs
+can end with its last committed ReplyTo. Normal mode does not expose
 reply addresses or its protocol instructions. The CLI accepts `session create --output-mode`.
 Create/input no longer accept `waiting_id` or `--waiting-id`; State generates one address for
 each direct input, and idempotent retries reuse it. Empty creation returns `submission: null`.
@@ -139,18 +141,33 @@ State exports `WaitFor(waiting_ids: tuple[UUID, ...])`,
 `ReplyTo(being_waited_ids: tuple[UUID, ...], payload: str)` and
 `SessionOutput = str | WaitFor | ReplyTo`. `RunResult(output: SessionOutput,
 checkpoint: CheckpointWrite)` contains the framework output itself. The model's reply schema
-contains only `ids`; its output function fills payload with the latest complete visible model
+contains only `ids`; its function fills payload with the latest complete visible model
 text. Persistence, history compression and waiting handoff retain the complete output DTO.
 No downstream path substitutes the payload field for output.
 
 `SessionInput.being_waited_id: UUID | None` identifies a directly submitted input's reply channel;
 waiting-result inputs leave it null. `RunContext.unreplied_addresses(*, after=0, limit=64)` returns
 `ReplyAddressPage(being_waited_ids, next_after)` for consumed unresolved inputs in input order.
-A checkpoint acknowledges consumption, while a reply settles its channel. Text settles all
-consumed unresolved inputs; ReplyTo settles only its selected IDs. Both clear active waits.
+A checkpoint acknowledges consumption, while a reply settles its channel.
+`RunContext.reply(*, emission_id: UUID, output: ReplyTo,
+validate_receipt: Callable[[ReplyResult], None] | None = None) -> ReplyResult` commits while running.
+The optional internal callback synchronously validates the caller's complete receipt envelope
+before publication, including on idempotent replay. Runner uses the same real message encoder
+and MessageWrite validation as persistence, then saves that exact prepared message. State
+validates its own history and channel envelopes. No callback or payload parameter is model-visible.
+`ReplyResult(output: ReplyTo, remaining_being_waited_ids: tuple[UUID, ...])` is its complete tool
+return. The internal emission ID is derived from the persisted model response and tool call;
+replay returns the original receipt before validating current address eligibility.
+Text settles all consumed unresolved inputs. A reply call settles only its selected IDs and
+preserves active waits; a final text or ReplyTo clears active waits.
 WaitFor accepts 1–128 unique IDs, settles nothing and replaces active waits. ReplyTo accepts up
 to 128 unique IDs; `[]` requires no read unanswered inputs. Partial replies leave remaining
-obligations for later input, without implicit continuation or input replay.
+obligations in the same loop. The tool returns remaining addresses and the model continues;
+unread queue inputs do not prevent completion. New steer requires fresh model text.
+WaitFor can pause a loop with unanswered inputs. Already committed replies survive later
+failure, deletion and recovery. Finishing with ReplyTo validates the last reply record and an
+empty unresolved set without republishing any result. Cycles retain every complete output
+in order, with the final ReplyTo present only once.
 
 Channels are one-shot and one-to-one: `open → ready → delivered`. Results published before
 waiting remain ready. The sole durable handoff inserts an input with `event_id=channel_id`.

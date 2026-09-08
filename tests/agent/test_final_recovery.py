@@ -319,7 +319,7 @@ async def test_null_output_ids_retry_and_finish_the_batch(monkeypatch, tool_name
     "invalid_args", ["missing", "null_ids", "extra", "array", "string", "null"]
 )
 @pytest.mark.parametrize("recovered", [False, True])
-async def test_invalid_output_arguments_preserve_same_batch_exit(
+async def test_invalid_reply_arguments_retry_consistently_after_recovery(
     monkeypatch: pytest.MonkeyPatch, tool_name: str, invalid_args: str, recovered: bool
 ) -> None:
     address = uuid4()
@@ -336,6 +336,15 @@ async def test_invalid_output_arguments_preserve_same_batch_exit(
 
     async def stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[Any]:
         requests.append(messages)
+        if len(requests) == 2:
+            yield {
+                0: DeltaToolCall(
+                    name="wait_for",
+                    json_args=json.dumps({"ids": [str(address)]}),
+                    tool_call_id="corrected",
+                )
+            }
+            return
         assert len(requests) == 1
         yield "Chosen answer"
         yield {
@@ -375,10 +384,12 @@ async def test_invalid_output_arguments_preserve_same_batch_exit(
             ctx.recovered, ctx.attempt = True, 2
         result = await agent(ctx)
 
-    assert len(requests) == 1
-    assert result.output == (
-        ReplyTo((address,), "Chosen answer") if valid_tool == "reply_to" else WaitFor((address,))
-    )
+    assert len(requests) == 2
+    assert result.output == WaitFor((address,))
+    if valid_tool == "reply_to":
+        assert [r.output for r in ctx.reply_receipts.values()] == [
+            ReplyTo((address,), "Chosen answer")
+        ]
     assert any(
         part["part_kind"] == "retry-prompt" and part.get("tool_call_id") == "invalid"
         for write in [*ctx.writes, result.checkpoint]

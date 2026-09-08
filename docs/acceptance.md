@@ -16,7 +16,7 @@ and installed CLI, using distinct PostgreSQL schemas and execution XDG directori
 | Sessions | Concurrent distinct sessions, no overlapping runs within one session, durable CRUD and default/multiple-machine selection |
 | Steer/queue | Steer enters at a model/tool boundary; queue waits for waiting; unconsumed steer is retained; error/cancel paths do not strand queued work |
 | Waiting events | One-shot results reach their sole receiver once, publication before waiting remains durable, duplicate publication and second receivers are rejected, and waiting does not settle input replies |
-| Recursive control | Child CLI creates/inputs another session and gets session_id/waiting_id immediately; text completion or ReplyTo selecting that input hands its reply to the waiting parent once; WaitFor settles no inputs |
+| Recursive control | Child CLI creates/inputs another session and gets session_id/waiting_id immediately; text completion or an in-loop ReplyTo hands its reply to the waiting parent once; partial replies return remaining addresses and continue the same loop, committed replies survive later failure/recovery; WaitFor settles no inputs |
 | Persistence | After control-process restart, completed history replays and accepted pending work resumes under the documented interrupted-run semantics |
 | Output | Delta order and cursor pagination preserve content, replay joins live consumption without omissions; reads never cross session boundaries |
 | History | SQL, substring search and multilingual keyword examples work; malicious joins/subqueries/schema-qualified access/functions cannot read another session or mutate data |

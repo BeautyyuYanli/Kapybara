@@ -1,6 +1,7 @@
 """Durable sessions, events, and isolated history."""
 
 from .contracts import (
+    REPLY_RESULT,
     SESSION_OUTPUT,
     CheckpointWrite,
     Completion,
@@ -21,6 +22,7 @@ from .contracts import (
     Record,
     RecordPage,
     ReplyAddressPage,
+    ReplyResult,
     ReplyTo,
     RunContext,
     RunnerState,
@@ -68,6 +70,8 @@ __all__ = [
     "RunContext",
     "RunResult",
     "ReplyAddressPage",
+    "ReplyResult",
+    "REPLY_RESULT",
     "ReplyTo",
     "WaitFor",
     "SessionOutput",

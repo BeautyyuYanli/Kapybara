@@ -109,6 +109,8 @@ kapy control --session <session-id> history query 'SELECT kind, text FROM histor
 每条直接输入自动获得独立回复地址，steer 和 queue 都如此；同一请求的重试复用原回执。
 不带初始输入的创建没有提交回执。创建时默认使用 `text` 模式，也可通过
 `session create --output-mode reply_to` 选择必须调用 `reply_to` 的模式。
+`reply_to(ids)` 立即回复选中的输入，返回完整回复及剩余地址；有剩余时继续同一个 loop，
+全部已读输入回复完成后在完整工具批次边界结束。普通模式的最终文本等价于回复全部已读输入。
 真实父子任务验收可运行：
 
 ```sh

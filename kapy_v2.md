@@ -9,9 +9,9 @@
 
 控制面的角度，首先我们谈 agent loop。它基于 pydantic-ai 去做，提供的 tool 包括我们刚才说的进程管理器。除此之外有一个 read media tool，给 path，通过刚才说的这个文件管理器去读媒体文件，传到大模型调用（注意大模型调用不保证支持哪些媒体文件，所以出错的话要把模型侧的报错信息作为文字形成 tool response，而不是让报错的多模态 tool response 弄坏 loop）。然后有一个接口化插件化的可自定义参数/description 的 tool 插件管理器，要求内部实现是把 tool 参数转换成相应的命令脚本。然后进入标准的进程管理器 tools 的处理流程。第一个插件是 apply patch tool 里面包的是 https://github.com/BeautyyuYanli/codex-apply-patch ，用它的 skill.md 作为 description。Agent 的基础 prompt 和 tool description 要站在 agent 的角度去写，描述清楚行为细节而不暴露无关技术细节。
 
-Session 创建时固定输出模式，默认是 `text`：模型可以调用 `wait_for(ids)`，或以正常文本结束。另一种模式是 `reply_to`：利用 Pydantic AI 输出函数保证只有 `wait_for(ids)` 和 `reply_to(ids)` 两个出口，普通文本本身不能结束本轮。`wait_for` 接受 1 至 128 个互不重复的 waiting ID，替换当前等待集合，禁用空数组；它只等待结果，不回复任何输入。`reply_to` 的模型参数只有一个 ID 数组，表示最近一条完整可见输出正文回复了哪些已读且尚未回复的输入。输出函数把正文填入 `ReplyTo(being_waited_ids, payload)`，将完整 DTO 作为 Pydantic AI output 返回；持久化、历史压缩和事件交接正常处理这个完整 output，不能在后续处理中用单独的 payload 替代它。`reply_to([])` 仅在没有已读待回复输入时合法。
+Session 创建时固定输出模式，默认是 `text`：模型可以调用 `wait_for(ids)`，或以正常文本结束。另一种模式是 `reply_to`：普通文本本身不能结束本轮，模型通过顺序工具 `reply_to(ids)` 逐次回复输入，或使用 Pydantic AI 输出函数 `wait_for(ids)` 等待结果。`wait_for` 接受 1 至 128 个互不重复的 waiting ID，替换当前等待集合，禁用空数组；它只等待结果，不回复任何输入。`reply_to` 的模型参数只有一个 ID 数组，表示最近一条完整可见输出正文回复了哪些已读且尚未回复的输入。工具把正文填入 `ReplyTo(being_waited_ids, payload)` 并立即结算，返回 `ReplyResult(output, remaining_being_waited_ids)`。还有待回复输入时继续同一个 loop；完整工具批次结束、全部已读输入都已回复且没有待处理 steer 或工具重试时，以最后一次完整 ReplyTo 作为 Pydantic AI output 结束本轮。持久化、历史压缩和事件交接正常处理完整 output，不能在后续处理中用单独的 payload 替代它。`reply_to([])` 仅在没有已读待回复输入时合法。
 
-在 `reply_to` 模式下，直接输入的 `being_waited_id` 随输入进入 prompt，模型还会看到持久保存的已读待回复地址；prompt 要解释 reply_to 与最近正文的对应关系。`text` 模式不向模型注入这些地址，也不暴露 reply_to 工具或相应 prompt。正常文本回复所有已读且尚未回复的输入，ReplyTo 只回复选中的输入；未选中的输入留待后续工作处理。Agent loop 结束后 session 进入 waiting 状态，但这与输入是否已获回复是两个独立状态。新的直接输入总能继续 session。
+在 `reply_to` 模式下，直接输入的 `being_waited_id` 随输入进入 prompt，模型还会看到持久保存的已读待回复地址；prompt 要解释 reply_to 与最近正文的对应关系。`text` 模式不向模型注入这些地址，也不暴露 reply_to 工具或相应 prompt。正常文本回复所有已读且尚未回复的输入，业务上等价于 reply_to 全部待回复输入，最终 output 仍为 str。每次 ReplyTo 只回复选中的输入；模型根据工具回执在当前 loop 中继续处理其余输入，或通过 WaitFor 暂停等待。尚未读入的 queue 不阻止本轮结束。回复提交的幂等记录与通道交接在一个事务中保存，之后失败、删除或恢复都不能撤回已回复结果。Agent loop 结束后 session 进入 waiting 状态，但这与输入是否已获回复是两个独立状态。新的直接输入总能继续 session。
 
 然后 agent 是以 session 为单位的。session 就是一个连续的 agent 上下文和相应的执行层环境嘛。不同的 session 当然可以并发并行，但一个 session 内部是串行的，它提供两个缓冲区来保存输入，一个是 steer，就是说 agent loop 工作的间隙去把这个缓冲区的信息插入进入然后继续 loop；另一个是 queue，就是说进入 waiting 状态后再用这个缓冲区的信息发进去开启新一轮 loop，当然这里肯定也包括没来得及发的 steer 缓冲区。输出呢，一方面提供缓冲区供实时消费实时输出，另一方面就是要整理好 delta 了变成历史记录以供持久化和回放，比方说回放完了再进入实时输出的信息，这里面当然有一些 cursor 系统之类的。注意 session 是逻辑隔离不是落到存储层的物理隔离，所以所有涉及 session 内部运算的操作，都需要程序式地转换一下去筛选那个 session。
 
@@ -25,7 +25,7 @@ Waiting 系统中的一个 waiting ID 对应一个一对一、一次性的 chann
 
 说回 session 接口，这里面还有一个重要成分就是历史记录的查询，我这里的想法是历史记录就存主数据库 postgres，然后提供一个按 session 筛选过的子视图去给 agent 查询。比方说 cli 运行一个命令写 SQL 语句，在自己的历史里运行查询 SQL，这个 SQL 就是在按 session 筛选过的子视图里运行的。这里你自己做一下技术选型，至少应该支持子串匹配和全文索引关键词匹配（多语言优先）。
 
-有了这个历史记录管理的工具的话，放在 agent loop 里的历史上下文就可以做压缩了。我预想的压缩策略是 model 有它的 context window 的值嘛这个值是可变的，按一个比例设置阈值， 70% 吧。然后有三级压缩策略，0 级是原始信息，1 级是所有的 tool call 只保留 call 的内容不保留 response 的内容，2 级是只保留两次 waiting 状态之间的 input 和进入后面这个 waiting 状态时的output ，再然后就是丢弃了。当触发阈值的时候，保留最新 10% 左右的仍不变处于 0 级，10% 开外的 0 级降到 1 级，1 级降到 2 级，2 级就丢弃了。阈值依据供应商 API 返回的用量判断。已读但尚未回复的输入所在轮次保留上下文，等待结果唤醒后仍能看到原问题和回复地址；2 级中的结构化 output 保留完整 ReplyTo DTO，包括其 payload。
+有了这个历史记录管理的工具的话，放在 agent loop 里的历史上下文就可以做压缩了。我预想的压缩策略是 model 有它的 context window 的值嘛这个值是可变的，按一个比例设置阈值， 70% 吧。然后有三级压缩策略，0 级是原始信息，1 级是普通 tool call 只保留 call 的内容不保留 response 的内容，但保留 reply_to 的结构化回复，2 级是只保留两次 waiting 状态之间的 input 和按发生顺序排列的全部 outputs，再然后就是丢弃了。当触发阈值的时候，保留最新 10% 左右的仍不变处于 0 级，10% 开外的 0 级降到 1 级，1 级降到 2 级，2 级就丢弃了。阈值依据供应商 API 返回的用量判断。已读但尚未回复的输入所在轮次保留上下文，等待结果唤醒后仍能看到原问题和回复地址；每次成功 reply_to 的完整 ReplyTo DTO 都进入 outputs，包括其 payload，作为最终出口的最后一次 ReplyTo 不重复追加。
 
 说到 session 和 machine 的映射关系了。一个 session 是支持多个 machine 的，所以那些 tools 和 machine 有关的话应该有参数指定是哪个 machine。当然可以有一个默认 machine 不指定的话就是它了。一个 machine 可以去运行多个 session，所以前面说的这个 proxy 它虽然知道请求来自哪个 machine，但还要有个 token 传递去表达请求来自哪个 session。每个 machine 都应该在符合 XDG 规范的地方新建一个文件夹作为这个 session 的 working directory 或称 cwd。
 

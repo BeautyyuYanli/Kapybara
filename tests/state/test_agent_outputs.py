@@ -12,6 +12,7 @@ from agent.test_runner import response, runner
 from kapy.state import ReplyTo
 
 from .conftest import Database, spec
+from .test_events import waiting
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -75,6 +76,7 @@ async def test_waiting_input_survives_usage_compression_and_replies_after_restar
             created.session.id, created.submission.request_id, wait_seconds=10
         )
         assert first.completion and first.completion.outcome == "completed"
+        await waiting(database, created.session.id)
         pending = await service.submit_input(created.session.id, question, request_id=uuid4())
         async with asyncio.timeout(10):
             while not await database.rows(  # noqa: ASYNC110 - bounded DB observation
@@ -126,7 +128,7 @@ async def test_waiting_input_survives_usage_compression_and_replies_after_restar
     }
     assert any(
         message["role"] == "assistant"
-        and message.get("content", "").startswith("{")
+        and (message.get("content") or "").startswith("{")
         and json.loads(message["content"]) == old_output
         for message in projected
     )

@@ -12,7 +12,7 @@ def cycle(index: int, *, closed: bool = True) -> dict[str, Any]:
         "closed": closed,
         "level": 0,
         "inputs": [f"input {index}"],
-        "output": f"answer {index}",
+        "outputs": [f"answer {index}"],
         "messages": [
             {
                 "kind": "request",
@@ -130,4 +130,27 @@ def test_open_cycle_only_omits_older_completed_blocks() -> None:
     assert sweep(data, 0.10)
     assert old["level"] == 0
     assert "new steer" in str(old["messages"][-1])
+    paired(data)
+
+
+def test_every_partial_reply_survives_both_compression_levels() -> None:
+    old = cycle(1)
+    outputs = [
+        {"kind": "reply_to", "being_waited_ids": [f"address-{i}"], "payload": f"body-{i}"}
+        for i in range(2)
+    ]
+    old["outputs"] = outputs
+    for i, part in enumerate(old["messages"][2]["parts"]):
+        part["tool_name"] = "reply_to"
+        old["messages"][1]["parts"][i]["tool_name"] = "reply_to"
+        part["content"] = {"output": outputs[i], "remaining_being_waited_ids": []}
+    data = {"cycles": [old, cycle(2)]}
+    sweep(data, 0.1)
+    assert [p["content"]["output"] for p in old["messages"][2]["parts"]] == outputs
+    sweep(data, 0.1)
+    import json
+
+    assert [
+        json.loads(m["parts"][0]["content"]) for m in old["messages"] if m["kind"] == "response"
+    ] == outputs
     paired(data)

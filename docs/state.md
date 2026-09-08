@@ -68,20 +68,33 @@ Retries with the same request ID and arguments return the same address.
 `RunResult(output, checkpoint)` carries a `SessionOutput`: `str | WaitFor | ReplyTo`.
 `WaitFor(waiting_ids)` requires 1–128 distinct UUIDs and replaces the active waiting set.
 It never settles input replies. Text mode ends with text and settles every consumed unresolved
-input, including earlier runs. Reply mode ends with `ReplyTo(being_waited_ids, payload)` and
-settles only the selected consumed unresolved inputs. The maximum is 128 distinct addresses;
-an empty reply selection is valid only when no read inputs await reply. Unselected inputs
-remain unresolved until future direct input or waiting results continue the session; they do
-not cause automatic runs. Waiting inputs have no new reply address.
+input, including earlier runs. Reply mode calls `RunContext.reply(emission_id=..., output=ReplyTo(...))`
+while running to settle selected consumed unresolved inputs. Its `ReplyResult` returns the complete
+output and `remaining_being_waited_ids` in input order. Partial replies continue the same loop;
+the last committed ReplyTo can end the loop after all read inputs are answered and the full tool
+batch has settled. The maximum selection is 128 distinct addresses; an empty selection requires
+no read unanswered inputs. Waiting inputs have no new reply address and unread queue inputs do
+not prevent this completion. WaitFor may suspend work with unresolved inputs.
 
-Pydantic AI output functions expose only an `ids` array to the model. The reply function fills
-its DTO from the latest complete visible model text in this run and returns the complete DTO
-as framework output. State routes by its type and addresses and persists the entire output;
+The model sees only an `ids` array on wait_for and reply_to. The sequential reply tool fills
+its DTO from the latest complete visible model text in this run and returns ReplyResult.
+Conditional loop completion uses the final complete ReplyTo as framework output.
+State routes by type and addresses and persists the entire output;
 it does not unwrap `ReplyTo.payload`. Text and reply endings clear active waits. A waiting
 record marks a run boundary and by itself never publishes a result.
 
-Successful finish atomically commits the checkpoint, complete output, run boundary, selected
-request completions and ready-channel handoffs. Consumption means an input is in a durable
+Reply transactions atomically commit a `reply` history record, request completions and channel
+handoffs while leaving the producer running and preserving active waits. The existing records
+emission key and fingerprint provide idempotency across attempts; retries return the original
+receipt before testing current reply eligibility. The optional synchronous `validate_receipt`
+callback checks the actual caller envelope before committing or returning an idempotent receipt;
+it cannot perform asynchronous operations within the transaction. Runner checks and reuses the
+complete encoded tool-return MessageWrite, including its actual tool-call ID and metadata.
+Successful finish commits the checkpoint,
+complete output and run boundary. A final ReplyTo must match the last reply record with no
+remaining consumed inputs; it does not publish again. Text settles all remaining inputs within
+its finish transaction. Subsequent failure/deletion settles only still unresolved inputs.
+Consumption means an input is in a durable
 checkpoint; it does not mean the input was replied to. Runner's paged
 `unreplied_addresses(after=0, limit=64)` reads only this session's consumed unresolved addresses,
 ordered by input sequence. Reply mode puts these addresses in the model instructions. Text
@@ -115,15 +128,15 @@ receiver principals. A waiting input contains:
 `outcome` is `completed`, `failed` or `deleted`. Failures/deletion have a null output; they are
 control outcomes rather than a third model output tool. Replies enter the receiver as steer;
 external publication may explicitly choose queue. Already handed-off inputs survive wait
-replacement and are never retracted. Remaining active waits survive a wake until the next
-successful output replaces or clears them.
+replacement and are never retracted. Remaining active waits survive a wake and partial replies.
+Only a final str or ReplyTo clears them; a final WaitFor replaces them.
 
 Completion output has one authoritative copy in `waiting_channels.output`; request rows
 retain only completion metadata. `wait_submission` joins the channel and never consumes it.
 Migration 002 installs the new schema only when there are no old sessions, requests or channel
 rows. Existing old business state is unsupported and causes the migration transaction to fail;
 it is neither converted nor cleared. Old Gateway channel metadata is likewise rejected.
-Runner accepts only `kapy.agent.v2` snapshots. Use a new schema for the new protocol; no runtime
+Runner accepts only `kapy.agent.v3` snapshots. Use a new schema for the new protocol; no runtime
 adapter interprets old prompts, final outputs, wait calls or receipt payloads.
 
 A normal runner exception, including a runner-raised NotFound or ServiceUnavailable, produces
@@ -149,7 +162,7 @@ message id for frontend replacement. Raw history is append-only, unaffected by m
 Database read rows are assembled into dataclasses without ORM or Pydantic validation.
 
 `read_history`, `search_history`, `export_history`, and the logical relation available to
-`query_history` include only `input`, `model_request`, `model_response`, `final`, `waiting`,
+`query_history` include only `input`, `model_request`, `model_response`, `reply`, `final`, `waiting`,
 and `error` records. They omit delta/notice/tool-stream records and `interrupted` markers.
 Use `read_output` for complete output replay, including deltas and interrupted attempts.
 Filtered history pages share the session sequence space and may advance their cursor across

@@ -22,14 +22,16 @@ clients are borrowed and never closed by Runner; application composition owns th
 
 ## Persistence and recovery
 
-Runner snapshots use `kapy.agent.v2` and state version 2. Older snapshots are rejected without
+Runner snapshots use `kapy.agent.v3` and state version 3. Older snapshots are rejected without
 conversion; both new text and reply_to modes use this protocol.
 
 The runner uses the actual `kapy.state` objects directly. Complete responses commit
 before tools execute, tool intents commit before RPC dispatch, and complete returns
 commit before the next model request. Raw history messages commit before projection
 compression. The final checkpoint is the next number and is returned only in
-`RunResult`; State commits it with waiting, full typed output, active waits, and selected replies.
+`RunResult`; State commits it with waiting, full typed output and active waits. Text completion
+settles unanswered inputs in this transaction. ReplyTo was already committed while running;
+the final transaction validates that reply without publishing it again.
 Reserved inputs are individually included and consumed in checkpoints. Polling and
 Pydantic's enqueue support insert steer at model/tool boundaries and continue a run
 that would otherwise finish with newly reserved input.
@@ -42,10 +44,12 @@ it is neither subtracted nor added again. Cumulative `result.usage` is a report,
 never a context-size measurement. Missing/all-zero usage is unknown.
 
 Each fresh high-usage response permits one persisted sweep. Old closed cycles move
-0 → omitted tool results → inputs/final output → removed. The newest complete
+0 → omitted ordinary tool results → inputs/all outputs → removed. The newest complete
 interaction blocks, approximately 10% by block count, remain protected. A current
 cycle can only omit older completed tool returns. Cycles holding unanswered inputs stay
-protected; level 2 retains the complete typed output, including ReplyTo IDs and payload.
+protected; level 1 keeps reply_to returns and level 2 retains every complete typed output,
+including ReplyTo IDs and payload. A cycle stores an ordered `outputs` list, with the final
+ReplyTo already present as its last reply rather than duplicated.
 Tool batches stay paired.
 Explicit provider context-length rejection allows at most two extra compression
 retries; checkpoints retain that retry count across recovery.
@@ -87,17 +91,26 @@ and includes neither reply tool nor reply instructions. Waiting results have no 
 
 `wait_for` validates 1–128 distinct IDs and produces `WaitFor`. `reply_to` accepts only an ID
 array, validates consumed unanswered addresses, and fills `ReplyTo.payload` from the latest
-complete visible model text since the latest injected input, within this State run. It returns
-the complete DTO to Pydantic AI. A candidate is checkpointed for recovery, but only the output
-selected by the framework can finish the run. Ordinary tool retries supersede final candidates;
-new steer requires another model result. Recovery finishes the old tool batch before new input
-and reuses an already filled output without rereading its payload. Full selected output is
-passed through RunResult, State handoff, serialization and compression.
+complete visible model text since the latest injected input, within this State run. It is a
+sequential ordinary tool: State commits the full ReplyTo immediately and returns ReplyResult
+with remaining addresses. Partial replies continue the same Agent run. The after_node_run
+hook may return End(FinalResult(full_reply)) after a complete CallToolsNode batch only when
+all consumed inputs have replies, no retry remains, and no steer awaits injection. A selected
+WaitFor keeps its framework exit. Tool returns enter framework and durable history before
+conditional completion. Recovery finishes old tools before injecting input, replays the stable
+reply emission ID, and obtains the original receipt even though its targets are already replied.
+Before a new reply commits or a receipt is replayed, Runner synchronously encodes its complete
+tool-return MessageWrite through the ordinary persistence encoder and checks both message and
+State envelope limits. It saves that exact prepared message after success. Newly injected
+inputs clear prior batch-completion markers in the consumption checkpoint while preserving outputs.
+All function arguments use the same full Pydantic schema on live and recovered calls. Complete
+outputs pass through RunResult, State handoff, serialization and compression.
 
 An empty reply list is valid only without read unanswered inputs. Unknown, already replied,
 foreign or unread queue addresses are rejected. WaitFor never settles input replies. Text
 settles all consumed unanswered inputs; ReplyTo settles the selected subset. Unselected inputs
-remain in context for later work. There is no automatic run merely because such inputs remain.
+remain in the same loop, unless the model chooses WaitFor. An already committed reply survives
+later model failure, cancellation or deletion independently of the loop's final outcome.
 
 ## Tools and apply_patch
 
@@ -107,9 +120,9 @@ session IDs, process-start IDs, or transfer IDs. Stable process/transfer UUIDs d
 from session, State run, tool-call ID, and substep. Recovery observes known handles;
 an unconfirmable outcome remains `outcome_unknown` at the original call ID.
 Interrupted terminal writes are never automatically replayed. Built-in model tools are
-process operations and read_media. Output functions are registered separately in output_type:
-`wait_for(ids)` plus text completion in text mode, or `wait_for(ids)` plus `reply_to(ids)`
-in reply mode. Ordinary text files use shell commands rather
+process operations and read_media, plus sequential `reply_to(ids)` in reply mode. The separate
+output_type contains `wait_for(ids)` and additionally str in text mode. Reply mode ends
+conditionally with the last committed ReplyTo through a framework node hook. Ordinary text files use shell commands rather
 than extra file_read/file_write tools. An unfinished call to a removed tool gets an
 `outcome_unknown` return without replay; completed historical tool results remain intact.
 PTY/stdout/stderr cursor schemas specify byte positions. A display-truncated stdio chunk

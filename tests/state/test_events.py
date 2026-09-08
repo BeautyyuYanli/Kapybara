@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from kapy.state import CheckpointWrite, Conflict, ReplyTo, RunContext, RunResult
+from kapy.state import CheckpointWrite, Conflict, ReplyTo, RunContext, RunResult, WaitFor
 
 from .conftest import Database, spec
 from .test_service import result
@@ -120,8 +120,9 @@ async def test_reply_to_selects_old_input_and_preserves_full_output(database: Da
         assert first_address is not None
         assert (first_address in page.being_waited_ids) == (ctx.inputs[0].payload == "second")
         targets = (first_address,) if ctx.inputs[0].payload == "second" else page.being_waited_ids
+        reply = await ctx.reply(emission_id=uuid4(), output=ReplyTo(targets, "complete body"))
         return RunResult(
-            ReplyTo(targets, "complete body"),
+            WaitFor((channel,)) if reply.remaining_being_waited_ids else reply.output,
             CheckpointWrite(ctx.checkpoint_number + 1, ctx.state, (), ()),
         )
 
@@ -182,11 +183,14 @@ async def test_mixed_reply_targets_reject_the_whole_completion(
         else:
             await asyncio.Event().wait()
             raise AssertionError("unrelated input must remain unfinished")
-        return RunResult(
-            ReplyTo(targets, "successful reply"),
+        await ctx.checkpoint(
             CheckpointWrite(
                 ctx.checkpoint_number + 1, ctx.state, (), tuple(i.id for i in ctx.inputs)
-            ),
+            )
+        )
+        reply = await ctx.reply(emission_id=uuid4(), output=ReplyTo(targets, "successful reply"))
+        return RunResult(
+            reply.output, CheckpointWrite(ctx.checkpoint_number + 1, ctx.state, (), ())
         )
 
     service = await database.start(runner)
@@ -238,16 +242,14 @@ async def test_mixed_reply_targets_reject_the_whole_completion(
         == before
     )
     assert await service.wait_submission(invalid.session_id, invalid.request_id) == before_status
-    # The final checkpoint and final output share the rejected completion transaction.
-    assert (
-        await database.rows(
-            "SELECT 1 FROM checkpoints WHERE run_id=%s", (failed.completion.run_id,)
-        )
-        == []
+    # Input consumption commits before replying, but a rejected reply leaves no reply record.
+    assert await database.rows(
+        "SELECT 1 FROM checkpoints WHERE run_id=%s", (failed.completion.run_id,)
     )
     assert (
         await database.rows(
-            "SELECT 1 FROM records WHERE run_id=%s AND kind='final'", (failed.completion.run_id,)
+            "SELECT 1 FROM records WHERE run_id=%s AND kind IN ('reply','final')",
+            (failed.completion.run_id,),
         )
         == []
     )
@@ -492,11 +494,16 @@ async def test_completion_backlog_is_validated_before_producer_commits(database,
     async def runner(ctx):
         if ctx.session.title == "producer":
             output = ReplyTo((ctx.inputs[0].being_waited_id,), body) if explicit else body
-            return RunResult(
-                output,
+            await ctx.checkpoint(
                 CheckpointWrite(
                     ctx.checkpoint_number + 1, ctx.state, (), tuple(i.id for i in ctx.inputs)
-                ),
+                )
+            )
+            if explicit:
+                await ctx.reply(emission_id=uuid4(), output=output)
+            return RunResult(
+                output,
+                CheckpointWrite(ctx.checkpoint_number + 1, ctx.state, (), ()),
             )
         if ctx.inputs[0].event_id is None:
             return result(ctx, waits=(address,))

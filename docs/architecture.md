@@ -39,8 +39,11 @@ operations to it. State owns per-session serialization, durable input buffers,
 one-shot waiting-channel handoffs, output cursors and state transitions. Intelligence
 provides an injected runner callback: it receives a State RunContext containing inputs and durable runner state; emits deltas/messages through that context; polls steer input at model/tool
 boundaries; and returns a typed output plus its final checkpoint. Creation fixes output mode: text or
-WaitFor, versus ReplyTo or WaitFor. State alone enters waiting and atomically settles the
-selected reply channels. Waiting itself does not complete inputs. Sessions have no default
+WaitFor, versus sequential reply_to with conditional completion or WaitFor. A reply_to call
+atomically settles selected channels through RunContext.reply while the same loop continues.
+Its tool return contains the complete ReplyTo and remaining unanswered addresses. The complete
+tool batch ends the loop only after all consumed inputs are answered, or the model selects WaitFor.
+State alone enters waiting; waiting itself does not complete inputs. Sessions have no default
 channel or automatic self-listener. The shared RunContext/RunResult types are exported by State. Output/history reads always scope by session.
 
 PostgreSQL stores authoritative sessions, inputs, outputs/history and one-shot result channels.

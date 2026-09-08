@@ -14,12 +14,13 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 
-from kapy.state import CheckpointWrite, JsonObject, RunnerState
+from kapy.state import CheckpointWrite, JsonObject, MessageWrite, RunnerState
+from kapy.state.encoding import bounded
 
 from .payloads import AgentPayloadStore, PayloadRef
 from .types import AgentResourceLimit
 
-CODEC = "kapy.agent.v2"
+CODEC = "kapy.agent.v3"
 MESSAGE_LIMIT = 256 * 1024
 DELTA_LIMIT = 16 * 1024
 CHECKPOINT_LIMIT = 4 * 1024 * 1024
@@ -28,6 +29,34 @@ INLINE_LIMIT = 2 * 1024 * 1024
 
 def json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+
+
+def encode_message(message: ModelMessage) -> dict[str, Any]:
+    """Encode a message whose media has already been externalized, if any."""
+    data = ModelMessagesTypeAdapter.dump_python([message], mode="json")[0]
+    if len(json_bytes(data)) > MESSAGE_LIMIT:
+        raise AgentResourceLimit("Complete model message exceeds 256 KiB")
+    return data
+
+
+def message_write(encoded: dict[str, Any]) -> MessageWrite:
+    """Build and check the actual State envelope, including metadata and tool-call IDs."""
+    message_id = UUID(encoded["metadata"]["kapy_message_id"])
+    text = "\n".join(
+        part["content"]
+        for part in encoded["parts"]
+        if part["part_kind"] in {"text", "user-prompt"} and isinstance(part["content"], str)
+    )
+    write = MessageWrite(
+        message_id,
+        "model_request" if encoded["kind"] == "request" else "model_response",
+        text,
+        cast(JsonObject, encoded),
+    )
+    if len(json_bytes({**asdict(write), "message_id": str(message_id)})) > MESSAGE_LIMIT:
+        raise AgentResourceLimit("Complete message envelope exceeds 256 KiB")
+    bounded(write)  # State checks this same envelope using its conservative wire encoding.
+    return write
 
 
 class MessageCodec:
@@ -56,10 +85,7 @@ class MessageCodec:
                         part.content[position] = f"[media payload {ref.sha256}; {ref.bytes} bytes]"
                 if refs:
                     part.metadata = {**(part.metadata or {}), "kapy_media_refs": refs}
-        data = ModelMessagesTypeAdapter.dump_python([message], mode="json")[0]
-        if len(json_bytes(data)) > MESSAGE_LIMIT:
-            raise AgentResourceLimit("Complete model message exceeds 256 KiB")
-        return data
+        return encode_message(message)
 
     async def decode(self, data: dict[str, Any]) -> ModelMessage:
         message = ModelMessagesTypeAdapter.validate_python([data])[0]
@@ -81,7 +107,7 @@ class MessageCodec:
         raw = json_bytes(data)
         if len(raw) > INLINE_LIMIT:
             ref = await self.store.put(self.session_id, raw)
-            return RunnerState(CODEC, {"version": 2, "payload": cast(JsonObject, asdict(ref))})
+            return RunnerState(CODEC, {"version": 3, "payload": cast(JsonObject, asdict(ref))})
         return RunnerState(CODEC, cast(JsonObject, copy.deepcopy(data)))
 
     async def load(self, state: RunnerState) -> dict[str, Any]:
@@ -91,7 +117,7 @@ class MessageCodec:
         if "payload" in data:
             ref = PayloadRef(**cast(dict[str, Any], data["payload"]))
             data = json.loads(await self.store.get(self.session_id, ref))
-        if data.get("version") != 2:
+        if data.get("version") != 3:
             raise ValueError("Unsupported runner state version")
         return data
 
