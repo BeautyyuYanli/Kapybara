@@ -17,3 +17,4 @@ build/
 *.sqlite3
 *.sqlite3-*
 *.log
+.context/
