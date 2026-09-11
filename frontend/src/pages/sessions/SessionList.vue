@@ -45,11 +45,7 @@ function page(value: number) {
 </script>
 <template>
   <div class="page-heading">
-    <div>
-      <span class="eyebrow">03 / SESSIONS</span>
-      <h1>Session</h1>
-      <p class="muted">配置会话使用的模型与摘要策略</p>
-    </div>
+    <h1>Session</h1>
     <RouterLink class="button primary" to="/sessions/new">
       <span aria-hidden="true">＋</span>创建 Session
     </RouterLink>
@@ -70,28 +66,17 @@ function page(value: number) {
     <button @click="refresh">重试</button>
   </div>
   <template v-else-if="data">
-    <div class="collection-heading">
-      <span>会话配置</span><span>本页 {{ String(data.items.length).padStart(2, "0") }} 项</span>
-    </div>
     <p v-if="!data.items.length" class="panel">暂无匹配的 Session 配置。</p>
     <ul v-else class="records">
-      <li v-for="(item, index) in data.items" :key="item.id" class="record">
-        <span class="record-index" aria-hidden="true">
-          {{ String(offset + index + 1).padStart(2, "0") }}
-        </span>
+      <li v-for="item in data.items" :key="item.id" class="record">
         <div>
           <h2>
             <RouterLink :to="`/sessions/${item.id}`">{{
               item.title || "未命名 Session"
             }}</RouterLink>
           </h2>
-          <p>{{ item.model_name }}</p>
-          <small>{{ item.id }}</small>
+          <p v-if="item.model_name !== item.title" class="muted">{{ item.model_name }}</p>
         </div>
-        <p class="muted record-note">
-          阈值 {{ item.compaction_threshold_tokens ?? "自动" }} · 回放
-          {{ item.compaction_replay_turns }} 轮
-        </p>
       </li>
     </ul>
     <PageNavigation

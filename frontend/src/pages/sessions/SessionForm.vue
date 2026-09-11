@@ -139,11 +139,8 @@ async function save() {
   <section class="form-page">
     <RouterLink class="back-link" to="/sessions"><span aria-hidden="true">← </span>返回列表</RouterLink>
     <div class="page-heading">
-      <span class="eyebrow">03 / SESSIONS</span>
       <h1>{{ id ? "编辑 Session" : "创建 Session" }}</h1>
-      <p class="muted">选择模型，设定会话的上下文策略。</p>
     </div>
-    <p class="muted">配置更新对下次启动生效。</p>
     <p v-if="resource.pending.value" role="status">加载中…</p>
     <div v-else-if="resource.error.value" role="alert">
       <p class="error">{{ resource.error.value }}</p>
@@ -217,7 +214,7 @@ async function save() {
         <FormField
           id="compaction_replay_turns"
           label="回放轮数"
-          help="默认 10，允许 0。"
+          help="设为 0 时不回放摘要前的对话。"
           :error="fields.compaction_replay_turns"
           v-slot="f"
           ><input
@@ -230,6 +227,7 @@ async function save() {
             :aria-describedby="f.describedby"
             :aria-invalid="f.invalid"
         /></FormField>
+        <small v-if="id">配置更新对下次启动生效。</small>
         <button class="primary" type="submit">{{ saving ? "保存中…" : "保存 Session" }}</button>
       </fieldset>
     </form>
