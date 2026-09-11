@@ -46,10 +46,13 @@ function page(value: number) {
 <template>
   <div class="page-heading">
     <div>
+      <span class="eyebrow">03 / SESSIONS</span>
       <h1>Session</h1>
       <p class="muted">配置会话使用的模型与摘要策略</p>
     </div>
-    <RouterLink class="button primary" to="/sessions/new">创建 Session</RouterLink>
+    <RouterLink class="button primary" to="/sessions/new">
+      <span aria-hidden="true">＋</span>创建 Session
+    </RouterLink>
   </div>
   <div class="filters">
     <div class="field">
@@ -66,10 +69,16 @@ function page(value: number) {
     <p class="error">{{ error }}</p>
     <button @click="refresh">重试</button>
   </div>
-  <template v-else-if="data"
-    ><p v-if="!data.items.length" class="panel">暂无匹配的 Session 配置。</p>
+  <template v-else-if="data">
+    <div class="collection-heading">
+      <span>会话配置</span><span>本页 {{ String(data.items.length).padStart(2, "0") }} 项</span>
+    </div>
+    <p v-if="!data.items.length" class="panel">暂无匹配的 Session 配置。</p>
     <ul v-else class="records">
-      <li v-for="item in data.items" :key="item.id" class="record">
+      <li v-for="(item, index) in data.items" :key="item.id" class="record">
+        <span class="record-index" aria-hidden="true">
+          {{ String(offset + index + 1).padStart(2, "0") }}
+        </span>
         <div>
           <h2>
             <RouterLink :to="`/sessions/${item.id}`">{{
@@ -79,7 +88,7 @@ function page(value: number) {
           <p>{{ item.model_name }}</p>
           <small>{{ item.id }}</small>
         </div>
-        <p class="muted">
+        <p class="muted record-note">
           阈值 {{ item.compaction_threshold_tokens ?? "自动" }} · 回放
           {{ item.compaction_replay_turns }} 轮
         </p>

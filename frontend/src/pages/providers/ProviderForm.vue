@@ -125,9 +125,11 @@ async function save() {
 </script>
 <template>
   <section class="form-page">
+    <RouterLink class="back-link" to="/providers"><span aria-hidden="true">← </span>返回列表</RouterLink>
     <div class="page-heading">
+      <span class="eyebrow">01 / CONNECTIONS</span>
       <h1>{{ id ? "编辑 Provider" : "创建 Provider" }}</h1>
-      <RouterLink to="/providers">返回列表</RouterLink>
+      <p class="muted">连接模型服务，从这里开始。</p>
     </div>
     <p v-if="resource.pending.value" role="status">加载中…</p>
     <div v-else-if="resource.error.value" role="alert">
@@ -157,7 +159,7 @@ async function save() {
         <FormField
           id="api_key"
           label="API key"
-          :help="id ? '留空保持不变。密钥只保存在当前表单内存中。' : '连接服务所需的 API key。'"
+          :help="id ? '留空保持原有密钥。' : '连接服务所需的 API key。'"
           :error="fields.api_key"
           v-slot="f"
           ><input

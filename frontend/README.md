@@ -7,6 +7,15 @@ The scaffold's conflicting redundant Oxlint integration and devtools were remove
 ESLint checks handwritten source. Reka UI owns confirmation-dialog focus/keyboard
 behavior. Native CSS tokens flow primitive → semantic → component.
 
+The interface uses a monochrome palette, square controls, and ruled navigation.
+Lists use the full content width; forms keep a readable maximum width. Mobile
+navigation stays fixed at the bottom, with content and focus scrolling reserving
+its height and the device safe area. Desktop navigation stays at the top. There
+is no footer. Mobile record actions sit below their content. Destructive
+confirmations and errors retain semantic labels and a restrained red accent.
+All layout styles are handwritten;
+the generated API client is independent of the visual design.
+
 Use Node 24 LTS (verified with 24.21.0) and npm 12 (verified with 12.0.2);
 package-lock.json locks dependencies. The generator pins an older js-yaml; a
 compatible 4.3.2 override includes its CPU-exhaustion fixes.

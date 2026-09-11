@@ -50,13 +50,14 @@ async function remove(item: ModelRecord) {
 <template>
   <div class="page-heading">
     <div>
+      <span class="eyebrow">02 / MODEL LIBRARY</span>
       <h1>Model</h1>
       <p class="muted">管理本地模型目录和请求预设</p>
     </div>
     <RouterLink
       class="button primary"
       :to="{ path: '/models/new', query: { provider_id: provider || undefined } }"
-      >创建 Model</RouterLink
+      ><span aria-hidden="true">＋</span>创建 Model</RouterLink
     >
   </div>
   <div class="filters">
@@ -71,14 +72,20 @@ async function remove(item: ModelRecord) {
     <p class="error">{{ error }}</p>
     <button @click="refresh">重试</button>
   </div>
-  <template v-else-if="data"
-    ><p v-if="!data.items.length" class="panel">暂无匹配的 Model 配置。</p>
+  <template v-else-if="data">
+    <div class="collection-heading">
+      <span>模型目录</span><span>本页 {{ String(data.items.length).padStart(2, "0") }} 项</span>
+    </div>
+    <p v-if="!data.items.length" class="panel">暂无匹配的 Model 配置。</p>
     <ul v-else class="records">
       <li
-        v-for="item in data.items"
+        v-for="(item, index) in data.items"
         :key="JSON.stringify([item.provider_id, item.model_name])"
         class="record"
       >
+        <span class="record-index" aria-hidden="true">
+          {{ String(offset + index + 1).padStart(2, "0") }}
+        </span>
         <div>
           <h2>
             <RouterLink
