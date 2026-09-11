@@ -20,9 +20,11 @@ from kapy.tmpv2.control.sessions import SessionService
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-async def test_exact_consumption_and_binary_roundtrip(database):
+async def test_exact_consumption_and_binary_roundtrip(database, seed_session):
     sessions = SessionService(database.sessions)
     session_id, other_session_id = uuid4(), uuid4()
+    await seed_session(other_session_id)
+    await seed_session(session_id)
     assert await sessions.read_inputs(session_id, "steer") == ()
     first = await sessions.enqueue_input(
         session_id, "steer", ["binary\x00", BinaryContent(data=b"\x00\xff", media_type="image/png")]
@@ -53,13 +55,15 @@ async def test_exact_consumption_and_binary_roundtrip(database):
     assert remaining[0].content == "another session"
 
 
-async def test_cancel_coalesces_read_does_not_consume_and_rollback_restores(database):
+async def test_cancel_coalesces_read_does_not_consume_and_rollback_restores(database, seed_session):
     sessions = SessionService(database.sessions)
     session_id = uuid4()
+    await seed_session(session_id)
     assert not await sessions.read_cancel(session_id)
     await sessions.request_cancel(session_id)
     await sessions.request_cancel(session_id)
     other_session_id = uuid4()
+    await seed_session(other_session_id)
     await sessions.request_cancel(other_session_id)
     assert await sessions.read_cancel(session_id)
     with pytest.raises(RuntimeError):
@@ -74,9 +78,12 @@ async def test_cancel_coalesces_read_does_not_consume_and_rollback_restores(data
     assert await sessions.read_cancel(other_session_id)
 
 
-async def test_steer_then_queued_then_cancel_preserves_finished_output(database):
+async def test_steer_then_queued_then_cancel_preserves_finished_output(
+    database, seed_session, session_model
+):
     sessions = SessionService(database.sessions)
     session_id = uuid4()
+    await seed_session(session_id)
     received = []
 
     async def model(messages, info):
@@ -95,6 +102,7 @@ async def test_steer_then_queued_then_cancel_preserves_finished_output(database)
 
     await sessions.enqueue_input(session_id, "steer", "first steer")
     await sessions.enqueue_input(session_id, "queued", "queued")
+    session_model(Agent(FunctionModel(model)).model)
     result = await sessions.start_runner(session_id, agent=Agent(FunctionModel(model)))
     assert result.finished and result.output == "3"
     assert received == [
@@ -107,9 +115,12 @@ async def test_steer_then_queued_then_cancel_preserves_finished_output(database)
     assert not await sessions.read_inputs(session_id, "queued")
 
 
-async def test_cancelled_unfinished_run_still_starts_queued_run(database):
+async def test_cancelled_unfinished_run_still_starts_queued_run(
+    database, seed_session, session_model
+):
     sessions = SessionService(database.sessions)
     session_id = uuid4()
+    await seed_session(session_id)
     agent = Agent("test")
 
     @agent.tool_plain
@@ -119,6 +130,7 @@ async def test_cancelled_unfinished_run_still_starts_queued_run(database):
         return "ok"
 
     await sessions.enqueue_input(session_id, "steer", "go")
+    session_model(agent.model)
     result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished
     assert not await sessions.read_inputs(session_id, "queued")
@@ -136,9 +148,12 @@ async def test_cancelled_unfinished_run_still_starts_queued_run(database):
     )
 
 
-async def test_first_dynamic_system_prompt_prepared_outside_transaction(database):
+async def test_first_dynamic_system_prompt_prepared_outside_transaction(
+    database, seed_session, session_model
+):
     sessions = SessionService(database.sessions)
     session_id = uuid4()
+    await seed_session(session_id)
     agent = Agent("test", system_prompt="static")
 
     @agent.system_prompt(dynamic=True)
@@ -155,6 +170,7 @@ async def test_first_dynamic_system_prompt_prepared_outside_transaction(database
 
     await sessions.enqueue_input(session_id, "steer", "one")
     await sessions.enqueue_input(session_id, "steer", "two")
+    session_model(agent.model)
     result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished
     async with database.sessions.begin() as db:

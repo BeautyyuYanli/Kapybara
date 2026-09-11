@@ -134,3 +134,46 @@ def heartbeat_observation(monkeypatch):
 
     monkeypatch.setattr(AgentRepository, "heartbeat", observe)
     return tasks, called
+
+
+@pytest.fixture
+def seed_session(database):
+    """Give user-facing service tests a business row; bare runner tests need none."""
+    from kapy.tmpv2.control.models.models import ModelRow, ProviderRow
+    from kapy.tmpv2.control.sessions.models import SessionRow
+
+    async def seed(session_id):
+        async with database.sessions.begin() as db:
+            provider = ProviderRow(
+                name="test",
+                api_key="test-key",
+                provider_class="pydantic_ai.providers.openai:OpenAIProvider",
+                model_class="pydantic_ai.models.openai:OpenAIChatModel",
+            )
+            db.add(provider)
+            db.add(
+                ModelRow(
+                    provider_id=provider.id, model_name="test", name="test", context_window=10**9
+                )
+            )
+            db.add(SessionRow(id=session_id, provider_id=provider.id, model_name="test"))
+
+    return seed
+
+
+@pytest.fixture
+def session_model(monkeypatch):
+    """Replace only SDK model construction for existing runner-behavior scenarios.
+
+    Catalog integration tests separately exercise the configured SDK constructor
+    and real protocol requests. These tests retain their FunctionModel/TestModel.
+    """
+    from pydantic_ai.models import infer_model
+
+    from kapy.tmpv2.control.sessions import service
+
+    def use(model):
+        model = infer_model(model)
+        monkeypatch.setattr(service, "build_model", lambda *args, **kwargs: model)
+
+    return use

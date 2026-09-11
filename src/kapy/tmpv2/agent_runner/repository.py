@@ -54,6 +54,24 @@ class AgentRepository:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
+    async def is_runner_running(self, session_id: UUID, *, heartbeat_timeout: float) -> bool:
+        """Observe the current live lease without locking or renewing it.
+
+        This uses the same database clock/timeout as acquire. It neither proves
+        process liveness nor reserves execution; callers still need acquire.
+        """
+        statement = select(
+            select(AgentStateRow.session_id)
+            .where(
+                col(AgentStateRow.session_id) == session_id,
+                col(AgentStateRow.lock_token).is_not(None),
+                col(AgentStateRow.heartbeat_at)
+                > func.clock_timestamp() - timedelta(seconds=heartbeat_timeout),
+            )
+            .exists()
+        )
+        return (await self._db.execute(statement)).scalar_one()
+
     async def acquire(
         self, session_id: UUID, lock_token: UUID, *, heartbeat_timeout: float
     ) -> ResumeState:

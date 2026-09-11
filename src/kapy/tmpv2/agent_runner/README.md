@@ -13,10 +13,9 @@ The repository currently relies on PostgreSQL READ COMMITTED row locks, conditio
 upsert and `clock_timestamp()`. Table declarations use the connection's default
 schema and deliberately contain no physical foreign keys.
 
-Import `SessionService` before creating the control tables: its repository import
-registers the input and cancel models. Importing only `ControlTable` does not
-register them. For a fresh database, this complete example uses the local SDK test
-model; pass a `postgresql+psycopg://...` URL for an application-owned database:
+The runner can execute independently of business session configuration. For a
+fresh database, this example uses the local SDK test model; pass an
+application-owned `postgresql+psycopg://...` database URL:
 
 ```python
 from uuid import uuid4
@@ -24,9 +23,8 @@ from uuid import uuid4
 from pydantic_ai import Agent
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from kapy.tmpv2.agent_runner import open_runner
 from kapy.tmpv2.agent_runner.models import agent_metadata
-from kapy.tmpv2.control.database import ControlTable
-from kapy.tmpv2.control.sessions import SessionService
 
 
 async def example(database_url: str):
@@ -34,22 +32,29 @@ async def example(database_url: str):
     try:
         async with engine.begin() as connection:
             await connection.run_sync(agent_metadata.create_all)
-            await connection.run_sync(ControlTable.metadata.create_all)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        sessions = SessionService(session_factory)
-        session_id = uuid4()
-        await sessions.enqueue_input(session_id, "queued", "Hello")
-        return await sessions.start_runner(session_id, agent=Agent("test"))
+        async with open_runner(
+            uuid4(), agent=Agent("test"), session_factory=session_factory
+        ) as runner:
+            await runner.rebuild_context()
+            result = await runner.turn(steer=["Hello"])
+            while not result.finished:
+                result = await runner.turn()
+            return result
     finally:
         await engine.dispose()
 ```
 
-`SessionService.start_runner` composes the complete input loop. Steer is accepted
-at request boundaries; queued input starts another run after a normal return;
-cancel ends the current run without modifying its checkpoint. A cancellation
-signal is the presence of a `session_cancels` row. Session identifiers require no
-business session row. Input consumption borrows the same fenced transaction that
-appends the accepted request to history; there is no separate acknowledgement.
+[SessionService](../control/README.md) is the higher-level user entry point. It
+stores session configuration, resolves the model, then composes the input loop.
+Steer is accepted at request boundaries; queued input starts another run after a
+normal return; cancel ends the current run without modifying its checkpoint. A
+cancellation signal is the presence of a `session_cancels` row. SessionService's
+user operations require a business session row, except for read_inputs. The runner
+itself knows only an identifier, model-independent input callbacks and heartbeat
+values; it does not import the service or read its configuration tables. Input
+consumption borrows the fenced transaction that appends the accepted request to
+history; there is no separate acknowledgement.
 
 History contains complete requests and responses, plus their message metadata and
 finish reason. Normalized input/output token counts are stored in separate nullable
@@ -86,14 +91,18 @@ handle; reopening recovers its committed checkpoint and any saved summary.
 Keep Agent-level `max_concurrency=None` (the SDK default). Its built-in limiter
 holds a token for the entire `Agent.iter()` lifetime and rejects the same task's
 nested compaction run, even with a limit greater than one. This lifecycle therefore
-does not support Agent-level concurrency limits. For request limits, configure
-`Agent(ConcurrencyLimitedModel(model, limiter=N))` using
-`pydantic_ai.models.concurrency.ConcurrencyLimitedModel`; its token covers each
-model request, so the paused main graph does not hold it. Worker limits can instead
-wrap the complete `start_runner()` call. The runner never changes these settings.
+does not support Agent-level concurrency limits. When calling the lower-level
+runner directly, request limits can use `Agent(ConcurrencyLimitedModel(model, limiter=N))`
+from `pydantic_ai.models.concurrency`; its token covers each model request, so the
+paused main graph does not hold it. `SessionService.start_runner` overrides the
+Agent's original model with the session-configured model, so a concurrency wrapper
+on that original model does not apply. Worker limits can wrap the complete
+`start_runner()` call for either entry point.
 
-`run()` and both `start_runner()` entry points accept
-`compaction_threshold_tokens=None` and `compaction_replay_turns=10`. A positive
+`run()` and the runner module's `start_runner()` accept
+`compaction_threshold_tokens=None` and `compaction_replay_turns=10`.
+SessionService instead reads these values from the session: a stored None threshold
+resolves to 70% of model capacity, or rejects startup if capacity is unknown. A positive
 threshold enables automatic summaries at safe boundaries, including done. The
 latest business response's input+output count must exceed it and lie after the
 latest summary anchor. Unknown usage suppresses triggering, cache counts are not

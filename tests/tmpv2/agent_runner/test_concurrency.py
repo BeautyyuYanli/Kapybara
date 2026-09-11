@@ -405,8 +405,9 @@ async def test_heartbeat_error_remains_visible_when_foreground_also_fails(
 
 
 @pytest.mark.parametrize("takeover_at", ["input_preparation", "cancel_boundary"])
-async def test_runner_rejects_consumption_after_takeover(database, takeover_at):
+async def test_runner_rejects_consumption_after_takeover(database, takeover_at, seed_session):
     session_id, new_token = uuid4(), uuid4()
+    await seed_session(session_id)
     sessions = SessionService(database.sessions)
     pending = await sessions.enqueue_input(session_id, "steer", "keep pending")
     agent = Agent(TestModel())

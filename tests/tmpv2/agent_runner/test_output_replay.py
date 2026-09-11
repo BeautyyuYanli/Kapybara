@@ -45,8 +45,11 @@ async def append(database, session_id, messages, start_seq):
     return entries
 
 
-async def test_session_start_runner_opens_output_across_queued_runs(database, valkey_client):
+async def test_session_start_runner_opens_output_across_queued_runs(
+    database, valkey_client, seed_session, session_model
+):
     session_id = uuid4()
+    await seed_session(session_id)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
 
@@ -57,6 +60,7 @@ async def test_session_start_runner_opens_output_across_queued_runs(database, va
     await sessions.enqueue_input(session_id, "steer", "first")
     await sessions.enqueue_input(session_id, "queued", "second")
     async with outputs.subscribe(session_id) as events:
+        session_model(Agent(FunctionModel(stream_function=streamed)).model)
         result = await sessions.start_runner(
             session_id,
             agent=Agent(FunctionModel(stream_function=streamed)),
@@ -69,8 +73,11 @@ async def test_session_start_runner_opens_output_across_queued_runs(database, va
     assert [item.response_seq for item in seen if isinstance(item, TextDelta)] == [1, 1, 3, 3]
 
 
-async def test_subscribe_before_history_deduplicates_overlap(database, valkey_client, monkeypatch):
+async def test_subscribe_before_history_deduplicates_overlap(
+    database, valkey_client, monkeypatch, seed_session
+):
     session_id = uuid4()
+    await seed_session(session_id)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     initial = await append(database, session_id, [ModelRequest(parts=[UserPromptPart("go")])], 0)
@@ -106,9 +113,10 @@ async def test_subscribe_before_history_deduplicates_overlap(database, valkey_cl
 
 @pytest.mark.parametrize("trigger", ["commit", "delta", "covered_delta"])
 async def test_missing_notifications_backfill_history_once(
-    database, valkey_client, monkeypatch, trigger
+    database, valkey_client, monkeypatch, trigger, seed_session
 ):
     session_id = uuid4()
+    await seed_session(session_id)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     await append(database, session_id, [ModelRequest(parts=[UserPromptPart("go")])], 0)
@@ -145,8 +153,11 @@ async def test_missing_notifications_backfill_history_once(
     assert reads == [-1, 0]
 
 
-async def test_start_cursor_and_reconnect_recover_unpublished_tail(database, valkey_client):
+async def test_start_cursor_and_reconnect_recover_unpublished_tail(
+    database, valkey_client, seed_session
+):
     session_id = uuid4()
+    await seed_session(session_id)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     stored = await append(
@@ -163,9 +174,10 @@ async def test_start_cursor_and_reconnect_recover_unpublished_tail(database, val
 
 
 async def test_replay_releases_only_database_connection_while_yielding_and_listening(
-    database, valkey_client
+    database, valkey_client, seed_session
 ):
     session_id = uuid4()
+    await seed_session(session_id)
     await append(database, session_id, [response()], 0)
     engine = create_async_engine(
         database.engine.url,
@@ -203,8 +215,11 @@ async def test_replay_releases_only_database_connection_while_yielding_and_liste
         await engine.dispose()
 
 
-async def test_unstarted_session_can_follow_new_execution(database, valkey_client, monkeypatch):
+async def test_unstarted_session_can_follow_new_execution(
+    database, valkey_client, monkeypatch, seed_session, session_model
+):
     session_id = uuid4()
+    await seed_session(session_id)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     replayed = asyncio.Event()
@@ -220,6 +235,7 @@ async def test_unstarted_session_can_follow_new_execution(database, valkey_clien
     async def produce():
         await replayed.wait()
         await sessions.enqueue_input(session_id, "steer", "go")
+        session_model(Agent("test").model)
         await sessions.start_runner(session_id, agent=Agent("test"), realtime_output=True)
 
     task = asyncio.create_task(produce())
@@ -238,8 +254,11 @@ async def test_unstarted_session_can_follow_new_execution(database, valkey_clien
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_unfilled_predecessor_gap_fails_and_closes_subscription(database, valkey_client):
+async def test_unfilled_predecessor_gap_fails_and_closes_subscription(
+    database, valkey_client, seed_session
+):
     session_id = uuid4()
+    await seed_session(session_id)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     await append(database, session_id, [response()], 0)

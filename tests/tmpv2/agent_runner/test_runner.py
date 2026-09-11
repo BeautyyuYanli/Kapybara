@@ -372,8 +372,14 @@ async def test_cross_task_and_reentrant_calls_rejected(database):
 
 
 @pytest.mark.parametrize("failure_at", ["prepare", "before_commit", "after_commit"])
-async def test_input_acceptance_fault_preserves_atomic_recoverable_state(database, failure_at):
+async def test_input_acceptance_fault_preserves_atomic_recoverable_state(
+    database,
+    failure_at,
+    seed_session,
+    session_model,
+):
     session_id = uuid4()
+    await seed_session(session_id)
     sessions = SessionService(database.sessions)
     await sessions.enqueue_input(session_id, "steer", "accept once")
 
@@ -463,6 +469,7 @@ async def test_input_acceptance_fault_preserves_atomic_recoverable_state(databas
             )
         ).scalar_one() == ("model_request" if committed else "done")
     fail_preparation = False
+    session_model(agent.model)
     result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output == "ok"
     assert not await sessions.read_inputs(session_id, "steer")
@@ -487,8 +494,11 @@ async def test_input_acceptance_fault_preserves_atomic_recoverable_state(databas
     assert seqs == list(range(len(restored)))
 
 
-async def test_initial_and_steer_wait_for_saved_response_then_accept_exact_snapshot(database):
+async def test_initial_and_steer_wait_for_saved_response_then_accept_exact_snapshot(
+    database, seed_session
+):
     session_id = uuid4()
+    await seed_session(session_id)
     sessions = SessionService(database.sessions)
     entered, finish = asyncio.Event(), asyncio.Event()
     model_prompts = []

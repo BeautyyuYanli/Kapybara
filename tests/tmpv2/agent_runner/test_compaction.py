@@ -30,7 +30,7 @@ from kapy.tmpv2.agent_runner.compaction import (
     COMPACTION_RESUME_PROMPT,
 )
 from kapy.tmpv2.agent_runner.repository import AgentRepository
-from kapy.tmpv2.control.sessions import SessionService
+from kapy.tmpv2.control.sessions import SessionService, UpdateSession
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -227,9 +227,10 @@ async def test_rebuild_reads_only_anchor_window_and_tail_and_preserves_resume_bo
 
 
 async def test_threshold_persists_normalized_usage_and_restarts_without_recompacting_anchor(
-    database,
+    database, seed_session, session_model
 ):
     session_id = uuid4()
+    await seed_session(session_id)
     sessions = SessionService(database.sessions)
     calls = []
     summaries = 0
@@ -261,9 +262,11 @@ async def test_threshold_persists_normalized_usage_and_restarts_without_recompac
 
     await sessions.enqueue_input(session_id, "steer", "start")
     agent = Agent(FunctionModel(model))
-    result = await sessions.start_runner(
-        session_id, agent=agent, compaction_threshold_tokens=119, compaction_replay_turns=0
+    await sessions.update_session(
+        session_id, UpdateSession(compaction_threshold_tokens=119, compaction_replay_turns=0)
     )
+    session_model(agent.model)
+    result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output == "queued output"
     assert [summary for summary, _ in calls] == [False, True, False, True, False]
     assert user_texts(calls[-1][1]) == [
@@ -271,15 +274,11 @@ async def test_threshold_persists_normalized_usage_and_restarts_without_recompac
         COMPACTION_RESUME_PROMPT,
         "queued after summary 2",
     ]
-    result = await sessions.start_runner(
-        session_id, agent=agent, compaction_threshold_tokens=119, compaction_replay_turns=0
-    )
+    result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output is None
     assert len(calls) == 5
     await sessions.enqueue_input(session_id, "steer", "after restart")
-    result = await sessions.start_runner(
-        session_id, agent=agent, compaction_threshold_tokens=119, compaction_replay_turns=0
-    )
+    result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output == "queued output"
     assert len(calls) == 6 and summaries == 2
     assert user_texts(calls[-1][1]) == [
@@ -325,7 +324,7 @@ async def test_threshold_persists_normalized_usage_and_restarts_without_recompac
     ],
 )
 async def test_threshold_restores_latest_response_observation(
-    database, seed_history, tokens, threshold, expected
+    database, seed_history, tokens, threshold, expected, seed_session, session_model
 ):
     session_id = await seed_history(
         [
@@ -336,6 +335,7 @@ async def test_threshold_restores_latest_response_observation(
             ),
         ]
     )
+    await seed_session(session_id)
     calls = []
 
     def model(messages, info):
@@ -343,9 +343,9 @@ async def test_threshold_restores_latest_response_observation(
         return ModelResponse(parts=[TextPart("summary")])
 
     sessions = SessionService(database.sessions)
-    result = await sessions.start_runner(
-        session_id, agent=Agent(FunctionModel(model)), compaction_threshold_tokens=threshold
-    )
+    await sessions.update_session(session_id, UpdateSession(compaction_threshold_tokens=threshold))
+    session_model(Agent(FunctionModel(model)).model)
+    result = await sessions.start_runner(session_id, agent=Agent(FunctionModel(model)))
     assert result.finished and result.output is None
     assert len(calls) == int(expected)
     _, compaction = await snapshot(database, session_id)
@@ -353,7 +353,9 @@ async def test_threshold_restores_latest_response_observation(
 
 
 @pytest.mark.parametrize("reopen", [False, True])
-async def test_latest_unknown_usage_supersedes_older_high_usage(database, seed_history, reopen):
+async def test_latest_unknown_usage_supersedes_older_high_usage(
+    database, seed_history, reopen, seed_session, session_model
+):
     session_id = await seed_history(
         [
             ModelRequest(parts=[UserPromptPart("old")]),
@@ -363,6 +365,7 @@ async def test_latest_unknown_usage_supersedes_older_high_usage(database, seed_h
             ),
         ]
     )
+    await seed_session(session_id)
     calls = []
 
     def model(messages, info):
@@ -391,9 +394,11 @@ async def test_latest_unknown_usage_supersedes_older_high_usage(database, seed_h
                 )
             ).finished
     if reopen:
-        result = await SessionService(database.sessions).start_runner(
-            session_id, agent=agent, compaction_threshold_tokens=10
+        await SessionService(database.sessions).update_session(
+            session_id, UpdateSession(compaction_threshold_tokens=10)
         )
+        session_model(agent.model)
+        result = await SessionService(database.sessions).start_runner(session_id, agent=agent)
         assert result.finished
     assert len(calls) == 1
     rows, compaction = await snapshot(database, session_id)
@@ -525,7 +530,7 @@ async def test_summary_commit_failure_recovers_from_saved_anchor(
 
 
 async def test_automatic_summary_finishes_saved_tools_before_compacting_and_honors_cancel(
-    database, seed_history
+    database, seed_history, seed_session, session_model
 ):
     session_id = await seed_history(
         [
@@ -537,6 +542,7 @@ async def test_automatic_summary_finishes_saved_tools_before_compacting_and_hono
         ],
         "handle_response",
     )
+    await seed_session(session_id)
     sessions = SessionService(database.sessions)
     events = []
 
@@ -559,16 +565,16 @@ async def test_automatic_summary_finishes_saved_tools_before_compacting_and_hono
         events.append("tool")
         return "ok"
 
-    result = await sessions.start_runner(
-        session_id, agent=agent, compaction_threshold_tokens=100, compaction_replay_turns=0
+    await sessions.update_session(
+        session_id, UpdateSession(compaction_threshold_tokens=100, compaction_replay_turns=0)
     )
+    session_model(agent.model)
+    result = await sessions.start_runner(session_id, agent=agent)
     assert not result.finished and result.output is None
     assert events == ["tool", "summary"]
     rows, summary = await snapshot(database, session_id)
     assert len(rows) == 3 and summary is not None and summary.last_message_seq == 2
-    result = await sessions.start_runner(
-        session_id, agent=agent, compaction_threshold_tokens=100, compaction_replay_turns=0
-    )
+    result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output == "done"
     assert events == ["tool", "summary", "business"]
 
