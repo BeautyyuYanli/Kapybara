@@ -2,7 +2,8 @@
 
 Only a complete message advances after_seq. Persist one pending body before any
 send, then acknowledge character offsets; a lost remote acknowledgement may replay
-one chunk. Drafts sample the latest provisional state and never block live reads.
+one chunk. Each live batch is delivered before requesting the next; draft state
+only renders text already consumed from live, which owns output buffering.
 No database transaction spans sending, sleeping or generator iteration.
 """
 
@@ -68,8 +69,6 @@ class TelegramDelivery:
         sessions: SessionService,
         repository: TelegramRepository,
         bot_id: int,
-        *,
-        preview_interval: float = 0.5,
     ) -> None:
         self.client, self.sessions, self.repository, self.bot_id = (
             client,
@@ -77,7 +76,6 @@ class TelegramDelivery:
             repository,
             bot_id,
         )
-        self.preview_interval = preview_interval
 
     async def send_pending(self, row: DeliveryRow) -> None:
         """Attempt one persisted chunk; save retry/fallback/progress before returning."""
@@ -119,127 +117,80 @@ class TelegramDelivery:
     async def send_preview(self, row: DeliveryRow, preview: Preview) -> None:
         if row.chat_type != "private" or preview.unavailable:
             return
-        text, rich = preview.content()
-        if not text:
-            return
-        chunk = rich_chunk(text)[0] if rich else text_chunk(text)[0]
-        if rich and not chunk:
-            preview.plain, rich = True, False
-            chunk = text_chunk(text)[0]
-        if preview.sent == (chunk, rich) and time.monotonic() - preview.sent_at < 20:
-            return
-        try:
-            await self.client.send(
-                row.chat_id,
-                row.thread_id,
-                chunk,
-                rich=rich,
-                draft_id=preview.draft_id,
-            )
-        except TelegramFailure as error:
-            if error.code == 401:
-                raise
-            if rich and error.rich_content_rejected:
-                preview.plain = True
-            elif error.code in {400, 403}:
-                preview.unavailable = True
-            else:
-                await asyncio.sleep(retry_delay(error))
-            return
-        preview.sent, preview.sent_at = (chunk, rich), time.monotonic()
-
-    async def _refresh_preview(self, row: DeliveryRow, preview: Preview) -> None:
-        """Sample at the publisher cadence, including send time; refresh unchanged drafts at 20s."""
-        # Coalesce the first batch too, so a quick commit can replace the draft entirely.
-        await asyncio.sleep(self.preview_interval)
         while not preview.unavailable:
-            started = time.monotonic()
-            await self.send_preview(row, preview)
-            await asyncio.sleep(max(0, self.preview_interval - (time.monotonic() - started)))
+            text, rich = preview.content()
+            if not text:
+                return
+            chunk = rich_chunk(text)[0] if rich else text_chunk(text)[0]
+            if rich and not chunk:
+                preview.plain, rich = True, False
+                chunk = text_chunk(text)[0]
+            if preview.sent == (chunk, rich) and time.monotonic() - preview.sent_at < 20:
+                return
+            try:
+                await self.client.send(
+                    row.chat_id,
+                    row.thread_id,
+                    chunk,
+                    rich=rich,
+                    draft_id=preview.draft_id,
+                )
+            except TelegramFailure as error:
+                if error.code == 401:
+                    raise
+                if rich and error.rich_content_rejected:
+                    preview.plain = True
+                elif error.code in {400, 403}:
+                    preview.unavailable = True
+                else:
+                    await asyncio.sleep(retry_delay(error))
+                continue
+            preview.sent, preview.sent_at = (chunk, rich), time.monotonic()
+            return
 
     async def consume(self, row: DeliveryRow) -> None:
-        """Apply each live batch in order; commits cancel stale draft work before sending."""
+        """Deliver each live batch before reading again, including retries and chat pacing."""
         while row.pending is not None and not row.blocked_error:
             await self.send_pending(row)
         if row.blocked_error:
             return
         preview = Preview()
         async with aclosing(self.sessions.live(row.session_id, after_seq=row.after_seq)) as batches:
-            pending_read = asyncio.create_task(anext(batches))
-            draft_task: asyncio.Task[None] | None = None
-            try:
-                while True:
-                    waiting = {pending_read} if draft_task is None else {pending_read, draft_task}
-                    done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
-                    if draft_task in done:
-                        assert draft_task is not None
-                        draft_task.result()
-                        draft_task = None
-                    if pending_read not in done:
-                        continue
-                    try:
-                        batch = pending_read.result()
-                    except StopAsyncIteration:
-                        return
-                    for event in batch:
-                        if isinstance(event, TextDelta):
-                            preview.apply(event)
-                        elif isinstance(event, MessageCommitted):
-                            # A draft may be waiting for the chat limiter or the network.
-                            # Join its cancellation before queuing this committed response.
-                            if draft_task is not None:
-                                draft_task.cancel()
-                                await asyncio.gather(draft_task, return_exceptions=True)
-                                draft_task = None
-                            preview = Preview(unavailable=preview.unavailable)
-                            message = event.message.message
-                            text = (
-                                "".join(
-                                    part.content
-                                    for part in message.parts
-                                    if isinstance(part, TextPart)
-                                )
-                                if isinstance(message, ModelResponse)
-                                else ""
+            async for batch in batches:
+                for event in batch:
+                    if isinstance(event, TextDelta):
+                        preview.apply(event)
+                    elif isinstance(event, MessageCommitted):
+                        preview = Preview(unavailable=preview.unavailable)
+                        message = event.message.message
+                        text = (
+                            "".join(
+                                part.content for part in message.parts if isinstance(part, TextPart)
                             )
-                            if text:
-                                row.pending = {
-                                    "seq": event.message.seq,
-                                    "text": text,
-                                    "format": "rich",
-                                }
-                                row.item_offset = 0
-                                await self.repository.save_delivery(row)
-                                while row.pending is not None and not row.blocked_error:
-                                    await self.send_pending(row)
-                                if row.blocked_error:
-                                    return
-                            else:
-                                row.after_seq = event.message.seq
-                                await self.repository.save_delivery(row)
-                                for part in message.parts:
-                                    if isinstance(part, ToolCallPart):
-                                        preview.progress = f"Calling tool: {part.tool_name}"
-                                    elif isinstance(part, ToolReturnPart):
-                                        preview.progress = f"Tool finished: {part.tool_name}"
-                    if (
-                        draft_task is None
-                        and row.chat_type == "private"
-                        and not preview.unavailable
-                        and preview.content()[0]
-                    ):
-                        draft_task = asyncio.create_task(self._refresh_preview(row, preview))
-                    # Do not request another complete message while a send is pending.
-                    pending_read = asyncio.create_task(anext(batches))
-            finally:
-                pending_read.cancel()
-                if draft_task is not None:
-                    draft_task.cancel()
-                await asyncio.gather(
-                    pending_read,
-                    *([draft_task] if draft_task is not None else []),
-                    return_exceptions=True,
-                )
+                            if isinstance(message, ModelResponse)
+                            else ""
+                        )
+                        if text:
+                            row.pending = {
+                                "seq": event.message.seq,
+                                "text": text,
+                                "format": "rich",
+                            }
+                            row.item_offset = 0
+                            await self.repository.save_delivery(row)
+                            while row.pending is not None and not row.blocked_error:
+                                await self.send_pending(row)
+                            if row.blocked_error:
+                                return
+                        else:
+                            row.after_seq = event.message.seq
+                            await self.repository.save_delivery(row)
+                            for part in message.parts:
+                                if isinstance(part, ToolCallPart):
+                                    preview.progress = f"Calling tool: {part.tool_name}"
+                                elif isinstance(part, ToolReturnPart):
+                                    preview.progress = f"Tool finished: {part.tool_name}"
+                await self.send_preview(row, preview)
 
     async def follow(self, key: DeliveryKey) -> None:
         failures = 0

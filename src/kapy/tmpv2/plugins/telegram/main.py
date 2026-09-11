@@ -40,13 +40,13 @@ async def serve(settings: TelegramSettings) -> None:
         open_storage(settings.database_path) as storage,
         httpx2.AsyncClient(timeout=settings.poll_timeout + 10, trust_env=False) as http,
     ):
-        # Unbatched publishing (zero) must not turn idle draft refresh into a busy loop.
-        preview_interval = settings.common.output_flush_interval or 0.5
+        # Keep chat pacing when publisher batching is disabled.
+        draft_interval = settings.common.output_flush_interval or 0.5
         client = TelegramClient(
             http,
             settings.bot_token.get_secret_value(),
             settings.api_base,
-            draft_interval=preview_interval,
+            draft_interval=draft_interval,
         )
         repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
         sessions = SessionService(
@@ -121,7 +121,6 @@ async def serve(settings: TelegramSettings) -> None:
                         sessions,
                         repository,
                         bot["id"],
-                        preview_interval=preview_interval,
                     ).run()
                 )
                 await asyncio.Future()

@@ -96,15 +96,17 @@ crashes before scheduling. No global session scan or output polling is introduce
 Each durable delivery consumes SessionService.live batches in order, with its
 committed after_seq. Pending sends finish before the next event in the batch;
 only confirmed complete messages advance the persisted cursor.
-Private chats (including topics) receive replace/append draft previews sampled
-from the latest state at `KAPY_OUTPUT_FLUSH_INTERVAL` (default 0.5 seconds), including
-request time in each cycle. The first sample also coalesces one interval. Zero
-(unbatched publishing) uses a 0.5-second preview interval to avoid idle busy loops.
-The Bot API client uses the same interval between draft request starts; complete
-messages retain one-second spacing. Network latency and Telegram rate-limit backoff
-can slow delivery. Unchanged drafts refresh after 20 seconds.
-Live consumption continues while a draft waits on chat pacing;
-a committed message cancels and joins that provisional send before delivery. Groups only
+Private chats (including topics) receive replace/append draft previews rendered once
+per consumed batch. Delivery awaits that send, including retries and chat pacing,
+before reading the next batch. SessionService/AgentOutput retain incoming output
+and merge pending deltas during this wait; the plugin has no read-ahead task,
+coalescing timer or output queue. Preview state only retains the text and draft ID
+needed for rendering. The Bot API client paces draft requests using
+`KAPY_OUTPUT_FLUSH_INTERVAL` (default 0.5 seconds; zero uses 0.5 seconds for pacing);
+complete messages retain one-second spacing. Unchanged drafts are suppressed for
+20 seconds and may refresh on a subsequent batch; there is no idle refresh task.
+Network latency and Telegram rate-limit backoff can slow delivery, including a
+complete message arriving while a draft is still being sent. Groups only
 receive complete text responses. Thinking/tools are provisional. Complete requests
 are not echoed and complete messages are not interpreted as run-finished signals.
 One pending response is persisted before sending, with rich/plain mode and confirmed
@@ -119,7 +121,6 @@ discovery errors back off without cancelling existing session followers.
 
 Switching /new preserves old deliveries. Ordering is per session; replies from
 separate sessions in one topic can interleave. Reconnection drops provisional
-preview state. Cancellation joins the outstanding live read before closing the
-generator. SIGINT/SIGTERM stop all input, delivery and runner tasks before closing
+preview state. Cancellation unwinds the current read or send and closes the live generator. SIGINT/SIGTERM stop all input, delivery and runner tasks before closing
 Bot API, SQLite, Valkey and core PostgreSQL resources; exit does not set a user
 cancel flag. Existing legacy Telegram state is not imported.
