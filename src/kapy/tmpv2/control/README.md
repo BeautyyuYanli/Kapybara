@@ -147,7 +147,8 @@ This closes the final queue-check/release handoff window without a persistent jo
 queue. Cancel ends the current run at a boundary and leaves queued inputs intact.
 
 `live(id, after_seq=-1)` owns a confirmed Pub/Sub subscription before replaying
-history and following complete messages/deltas. Only complete messages advance
-the cursor; history pagination uses before_seq independently. Use aclosing when
+history and following complete messages/deltas in nonempty event lists. Consumers
+apply each batch in order; only complete messages advance the cursor. History
+pagination uses before_seq independently. Use aclosing when
 stopping early. See [HTTP adapters](../plugins/http/README.md) for application wiring,
 background scheduling and WebSocket lifetime.

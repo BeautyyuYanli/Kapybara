@@ -509,10 +509,9 @@ async def test_telegram_serve_preview_cadence_uses_publisher_setting(
     async def live(self, target, *, after_seq):
         times.append(time.monotonic())
         for index in range(3):
-            yield TextDelta(target, 0, 0, "text", "replace", "superseded")
-            yield TextDelta(target, 0, 0, "text", "replace", str(index))
+            yield [TextDelta(target, 0, 0, "text", "replace", str(index))]
             await sent[index].wait()
-        yield MessageCommitted(HistoryMessage(target, 0, ModelResponse([TextPart("final")])))
+        yield [MessageCommitted(HistoryMessage(target, 0, ModelResponse([TextPart("final")])))]
         settled.set()
         await asyncio.Future()
 
@@ -526,8 +525,7 @@ async def test_telegram_serve_preview_cadence_uses_publisher_setting(
             await asyncio.wait_for(settled.wait(), 4)
             assert drafts == ["0", "1", "2"]
             assert all(
-                interval - 0.02 <= end - start < interval + 0.12
-                for start, end in pairwise(times)
+                interval - 0.02 <= end - start < interval + 0.12 for start, end in pairwise(times)
             )
             assert messages == ["final"]
             assert (await repository.get_delivery(delivery_key(row))).after_seq == 0

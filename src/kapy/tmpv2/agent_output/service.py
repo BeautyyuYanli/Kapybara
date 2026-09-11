@@ -1,8 +1,9 @@
 """Transient session broadcasts; no database access, replay, or shared-client ownership.
 
 Each publisher owns one bounded buffer and one background send/recovery task. Each subscriber
-borrows a dedicated PubSub connection until its context exits, even before its
-iterator is first used. Channels are not isolated by Valkey database number.
+owns one background receiver and a bounded, merged list of pending events.
+The receiver owns its dedicated PubSub connection, including failure cleanup.
+Channels are not isolated by Valkey database number.
 """
 
 import asyncio
@@ -10,6 +11,7 @@ import logging
 import math
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import cast
 from uuid import UUID
 
@@ -21,11 +23,12 @@ from valkey.exceptions import AuthenticationError, AuthorizationError
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
-from kapy.tmpv2.agent_runner.types import MessageCommitted, OutputCallback, OutputEvent
+from kapy.tmpv2.agent_runner.types import MessageCommitted, OutputCallback, OutputEvent, TextDelta
 
 logger = logging.getLogger(__name__)
 _BATCH_ADAPTER = TypeAdapter(list[OutputEvent])
 _MAX_BATCH_BYTES = 64 * 1024
+_MAX_SUBSCRIBER_BYTES = 1024 * 1024
 
 
 class AgentOutputService:
@@ -77,52 +80,140 @@ class AgentOutputService:
         await self._command("PUBLISH", f"{self._channel_prefix}:{session_id}", payload)
 
     @asynccontextmanager
-    async def subscribe(self, session_id: UUID) -> AsyncIterator[AsyncIterator[OutputEvent]]:
-        """Yield events only after SUBSCRIBE acknowledgement; errors end this subscription.
+    async def subscribe(self, session_id: UUID) -> AsyncIterator[AsyncIterator[list[OutputEvent]]]:
+        """Yield whole merged batches after acknowledgement, independently of network reads.
 
-        Idle reads have no timeout. Disable retries on this exclusively borrowed
-        connection, restoring its settings before returning it to the shared pool.
-        Reconnecting requires a new history replay by the caller.
+        One receiver owns the connection and releases it even while consumers pause.
+        Pending output is bounded to 1 MiB of JSON; overflowing deltas are dropped,
+        but commits that cannot fit without deltas fail with BufferError. Errors
+        precede buffered data on the next read. Idle reads have no timeout or retry.
+        The context cancels and joins its receiver even if iteration never starts.
         """
-        async with self._client.pubsub() as pubsub:
-            async with asyncio.timeout(1.0):
-                await pubsub.connect()
-            connection = pubsub.connection
-            assert connection is not None
-            retry, socket_timeout = connection.retry, connection.socket_timeout
-            connection.retry = Retry(NoBackoff(), 0)
-            connection.socket_timeout = None
+        ready, changed = asyncio.Event(), asyncio.Event()
+        buffer: list[OutputEvent] = []
+        complete_seq = -1
+        failure: Exception | None = None
+        finished = False
+
+        async def receive() -> None:
+            nonlocal buffer, complete_seq, failure, finished
             try:
-                async with asyncio.timeout(1.0):
-                    await pubsub.subscribe(f"{self._channel_prefix}:{session_id}")
-                    while True:
-                        message = await pubsub.get_message(timeout=None)
-                        if message is not None and message["type"] == "subscribe":
-                            break
-
-                async def events() -> AsyncGenerator[OutputEvent]:
-                    async for message in pubsub.listen():
-                        if message["type"] != "message":
-                            continue
-                        batch = _BATCH_ADAPTER.validate_json(message["data"])
-                        if not batch:
-                            raise ValueError("Output batches must not be empty")
-                        for event in batch:
-                            if _session_id(event) != session_id:
-                                raise ValueError("Output event belongs to another session")
-                            yield event
-
-                iterator = events()
-                try:
-                    yield iterator
-                finally:
-                    await iterator.aclose()
+                async with self._client.pubsub() as pubsub:
+                    async with asyncio.timeout(1.0):
+                        await pubsub.connect()
+                    connection = pubsub.connection
+                    assert connection is not None
+                    retry, socket_timeout = connection.retry, connection.socket_timeout
+                    connection.retry = Retry(NoBackoff(), 0)
+                    connection.socket_timeout = None
+                    try:
+                        async with asyncio.timeout(1.0):
+                            await pubsub.subscribe(f"{self._channel_prefix}:{session_id}")
+                            while True:
+                                message = await pubsub.get_message(timeout=None)
+                                if message is not None and message["type"] == "subscribe":
+                                    break
+                        ready.set()
+                        async for message in pubsub.listen():
+                            if message["type"] != "message":
+                                continue
+                            batch = _BATCH_ADAPTER.validate_json(message["data"])
+                            if not batch:
+                                raise ValueError("Output batches must not be empty")
+                            for event in batch:
+                                if _session_id(event) != session_id:
+                                    raise ValueError("Output event belongs to another session")
+                                candidate, complete_seq = _merge(buffer, event, complete_seq)
+                                if len(_BATCH_ADAPTER.dump_json(candidate)) > _MAX_SUBSCRIBER_BYTES:
+                                    if isinstance(event, TextDelta):
+                                        continue
+                                    commits: list[OutputEvent] = [
+                                        item
+                                        for item in candidate
+                                        if isinstance(item, MessageCommitted)
+                                    ]
+                                    candidate = commits
+                                    if (
+                                        len(_BATCH_ADAPTER.dump_json(candidate))
+                                        > _MAX_SUBSCRIBER_BYTES
+                                    ):
+                                        raise BufferError("Output subscription buffer is full")
+                                buffer = candidate
+                            changed.set()
+                    finally:
+                        connection.retry, connection.socket_timeout = retry, socket_timeout
+            except Exception as error:
+                failure = error
             finally:
-                connection.retry, connection.socket_timeout = retry, socket_timeout
+                finished = True
+                ready.set()
+                changed.set()
+
+        async def batches() -> AsyncGenerator[list[OutputEvent]]:
+            nonlocal buffer
+            while True:
+                if failure is not None:
+                    raise failure
+                if buffer:
+                    batch, buffer = buffer, []
+                    yield batch
+                    continue
+                if finished:
+                    return
+                # Checking state and clearing the signal do not await, so a writer
+                # cannot slip between them and lose a wakeup.
+                changed.clear()
+                await changed.wait()
+
+        task = asyncio.create_task(receive(), name=f"agent-output-subscribe:{session_id}")
+        iterator = batches()
+        try:
+            await ready.wait()
+            if failure is not None:
+                raise failure
+            yield iterator
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await iterator.aclose()
+            buffer.clear()
 
 
 def _session_id(event: OutputEvent) -> UUID:
     return event.message.session_id if isinstance(event, MessageCommitted) else event.session_id
+
+
+def _merge(
+    buffer: list[OutputEvent], event: OutputEvent, complete_seq: int
+) -> tuple[list[OutputEvent], int]:
+    """Build a candidate without mutating a buffer that may reject it for capacity.
+
+    Only undelivered parts merge; replacing with empty text remains meaningful.
+    Moving a merged part to the tail preserves the latest arrival position, while
+    complete messages retain their relative order. No delivery cursor lives here.
+    """
+    if isinstance(event, MessageCommitted):
+        complete_seq = max(complete_seq, event.message.seq)
+        return [
+            item
+            for item in buffer
+            if isinstance(item, MessageCommitted) or item.response_seq > complete_seq
+        ] + [event], complete_seq
+    if event.response_seq <= complete_seq:
+        return buffer, complete_seq
+    candidate: list[OutputEvent] = []
+    for item in buffer:
+        if isinstance(item, TextDelta) and (item.response_seq, item.part_index, item.part_kind) == (
+            event.response_seq,
+            event.part_index,
+            event.part_kind,
+        ):
+            if event.op == "append":
+                event = replace(event, text=item.text + event.text, op=item.op)
+        else:
+            candidate.append(item)
+    candidate.append(event)
+    return candidate, complete_seq
 
 
 class _Publisher:
@@ -136,7 +227,7 @@ class _Publisher:
         self._service = service
         self._session_id = session_id
         self._interval = interval
-        self._buffer: list[bytes] = []
+        self._buffer: list[OutputEvent] = []
         self._size = 2
         self._deadline = 0.0
         self._wake = asyncio.Event()
@@ -159,7 +250,7 @@ class _Publisher:
                 return
             if not self._buffer:
                 self._deadline = asyncio.get_running_loop().time() + self._interval
-            self._buffer.append(encoded)
+            self._buffer.append(event)
             self._size = size
             if size == _MAX_BATCH_BYTES or isinstance(event, MessageCommitted):
                 self._deadline = 0.0
@@ -187,8 +278,17 @@ class _Publisher:
                         pass
                     else:
                         continue
-                payload = b"[" + b",".join(self._buffer) + b"]"
+                batch, self._buffer = self._buffer, []
                 self._clear()
+                merged: list[OutputEvent] = []
+                complete_seq = -1
+                for event in batch:
+                    merged, complete_seq = _merge(merged, event, complete_seq)
+                if not merged:
+                    continue
+                payload = _BATCH_ADAPTER.dump_json(merged)
+                if len(payload) > _MAX_BATCH_BYTES:
+                    continue
                 try:
                     await self._service._publish(self._session_id, payload)
                 except AuthenticationError, AuthorizationError:

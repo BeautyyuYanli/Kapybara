@@ -33,6 +33,21 @@ async def direct_publisher(client, session_id):
     yield publish
 
 
+@asynccontextmanager
+async def individual_events(sessions, session_id, **kwargs):
+    """Assert stream semantics independently of scheduling-dependent batch boundaries."""
+    async with aclosing(sessions.live(session_id, **kwargs)) as batches:
+
+        async def flatten():
+            async for batch in batches:
+                assert batch
+                for event in batch:
+                    yield event
+
+        async with aclosing(flatten()) as events:
+            yield events
+
+
 async def next_committed(events):
     event = await anext(events)
     assert isinstance(event, MessageCommitted)
@@ -80,7 +95,7 @@ async def test_live_replays_history_after_queued_runs_finish(
         realtime_output=True,
     )
     assert result.output == "one two"
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         async with asyncio.timeout(2):
             assert [(await next_committed(events)).seq for _ in range(4)] == [0, 1, 2, 3]
 
@@ -110,7 +125,7 @@ async def test_subscribe_before_history_deduplicates_overlap(
         return await original(repo, requested_session, after_seq=after_seq)
 
     monkeypatch.setattr(AgentRepository, "read_history_entries", overlap)
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         async with asyncio.timeout(2):
             assert (await next_committed(events)) == initial[0]
             assert (await next_committed(events)).seq == 1
@@ -140,7 +155,7 @@ async def test_missing_notifications_backfill_history_once(
         return await original(repo, requested_session, after_seq=after_seq)
 
     monkeypatch.setattr(AgentRepository, "read_history_entries", observe)
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
         missing = [response("first"), ModelRequest(parts=[UserPromptPart("next")])]
         if trigger == "covered_delta":
@@ -175,12 +190,12 @@ async def test_start_cursor_and_reconnect_recover_unpublished_tail(
     stored = await append(
         database, session_id, [ModelRequest(parts=[UserPromptPart("go")]), response()], 0
     )
-    async with aclosing(sessions.live(session_id, after_seq=0)) as events:
+    async with individual_events(sessions, session_id, after_seq=0) as events:
         assert (await next_committed(events)) == stored[1]
     tail = await append(
         database, session_id, [ModelRequest(parts=[UserPromptPart("later")]), response("tail")], 2
     )
-    async with aclosing(sessions.live(session_id, after_seq=1)) as events:
+    async with individual_events(sessions, session_id, after_seq=1) as events:
         assert [(await next_committed(events)) for _ in tail] == list(tail)
     assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
 
@@ -207,7 +222,7 @@ async def test_replay_releases_only_database_connection_while_yielding_and_liste
             assert (await db.execute(text("SELECT 1"))).scalar_one() == 1
 
     try:
-        async with aclosing(sessions.live(session_id)) as events:
+        async with individual_events(sessions, session_id) as events:
             assert (await next_committed(events)).seq == 0
             await independent_transaction()  # Generator is paused at its history yield.
             waiting = asyncio.ensure_future(anext(events))
@@ -253,7 +268,7 @@ async def test_unstarted_session_can_follow_new_execution(
     task = asyncio.create_task(produce())
     try:
         async with asyncio.timeout(2):
-            async with aclosing(sessions.live(session_id)) as events:
+            async with individual_events(sessions, session_id) as events:
                 first = await anext(events)
                 assert isinstance(first, MessageCommitted) and first.message.seq == 0
                 while True:
@@ -275,7 +290,7 @@ async def test_unfilled_predecessor_gap_waits_then_polls_contiguous_history(
         database.sessions, output_service=AgentOutputService(valkey_client), live_poll_interval=0.02
     )
     await append(database, session_id, [response()], 0)
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
         async with direct_publisher(valkey_client, session_id) as callback:
             await callback(MessageCommitted(HistoryMessage(session_id, 2, response())))
@@ -299,7 +314,7 @@ async def test_poll_recovers_silent_tail_without_cancelling_subscription(databas
         database.sessions, output_service=AgentOutputService(valkey_client), live_poll_interval=0.02
     )
     await append(database, session_id, [response()], 0)
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
         waiting = asyncio.create_task(anext(events))
         try:
@@ -344,7 +359,7 @@ async def test_delta_traffic_does_not_postpone_poll(database, valkey_client):
                 await callback(TextDelta(session_id, 1, 0, "text", "append", "preview"))
                 await asyncio.sleep(0.001)
 
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
         producer = asyncio.create_task(previews())
         try:
@@ -366,7 +381,7 @@ async def test_poll_error_propagates_and_cleans_pending_subscription(
         database.sessions, output_service=AgentOutputService(valkey_client), live_poll_interval=0.02
     )
     await append(database, session_id, [response()], 0)
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
 
         async def failed_read(*args, **kwargs):
@@ -391,7 +406,7 @@ async def test_live_subscription_disconnect_propagates_and_cleans_up(database, v
             output_service=AgentOutputService(subscriber_client),
             live_poll_interval=0.02,
         )
-        async with aclosing(sessions.live(session_id)) as events:
+        async with individual_events(sessions, session_id) as events:
             assert (await next_committed(events)).seq == 0
             waiting = asyncio.create_task(anext(events))
             try:
@@ -436,10 +451,29 @@ async def test_live_subscriber_timeout_is_not_poll_timeout(database, valkey_clie
                 yield iterator
 
     monkeypatch.setattr(outputs, "subscribe", failing_subscription)
-    async with aclosing(sessions.live(session_id)) as events:
+    async with individual_events(sessions, session_id) as events:
         async with asyncio.timeout(1):
             with pytest.raises(TimeoutError) as caught:
                 await anext(events)
         assert raised.is_set()
         assert caught.value is failure
     assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
+
+
+async def test_live_hands_off_whole_history_and_backfilled_batch(database, valkey_client):
+    session_id = uuid4()
+    initial = await append(database, session_id, [response("zero"), response("one")], 0)
+    sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
+    async with aclosing(sessions.live(session_id)) as batches:
+        assert await anext(batches) == [MessageCommitted(entry) for entry in initial]
+        tail = await append(database, session_id, [response("two"), response("three")], 2)
+        # Sub retains the preview because it has not seen the commits. live's gap
+        # backfill must remove that preview from its still-undelivered result list.
+        preview = TextDelta(session_id, 2, 0, "text", "replace", "temporary")
+        future = TextDelta(session_id, 4, 0, "text", "append", "next")
+        await valkey_client.publish(
+            f"kapy:agent-output:{session_id}",
+            TypeAdapter(list[OutputEvent]).dump_json([preview, future]),
+        )
+        async with asyncio.timeout(2):
+            assert await anext(batches) == [*[MessageCommitted(entry) for entry in tail], future]

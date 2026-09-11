@@ -93,7 +93,9 @@ scheduling after submit_input. The input loop checks known Telegram sessions at
 startup and periodically for queued/steer input without a valid lease, covering
 crashes before scheduling. No global session scan or output polling is introduced.
 
-Each durable delivery consumes SessionService.live, with its committed after_seq.
+Each durable delivery consumes SessionService.live batches in order, with its
+committed after_seq. Pending sends finish before the next event in the batch;
+only confirmed complete messages advance the persisted cursor.
 Private chats (including topics) receive replace/append draft previews sampled
 from the latest state at `KAPY_OUTPUT_FLUSH_INTERVAL` (default 0.5 seconds), including
 request time in each cycle. The first sample also coalesces one interval. Zero
@@ -111,7 +113,8 @@ chunks; other 400/403 errors block that delivery for operator investigation. Lim
 and transport failures back off. Losing the remote send acknowledgement may repeat
 a chunk. Pending sends finish before further live consumption or resuming history.
 
-Live subscription timeouts reconnect from the persisted cursor. Temporary SQLite
+Live subscription timeouts and subscriber-buffer overflow reconnect from the
+persisted cursor. Temporary SQLite
 discovery errors back off without cancelling existing session followers.
 
 Switching /new preserves old deliveries. Ordering is per session; replies from

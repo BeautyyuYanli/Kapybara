@@ -416,16 +416,26 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
     async def live(session_id, *, after_seq):
         assert after_seq == -1
         try:
-            yield MessageCommitted(
-                HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("input")]))
-            )
-            yield TextDelta(session_id, 1, 0, "text", "replace", "old")
-            yield TextDelta(session_id, 1, 0, "text", "replace", "new")
-            yield TextDelta(session_id, 1, 0, "text", "append", " preview")
+            yield [
+                MessageCommitted(
+                    HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("input")]))
+                ),
+                TextDelta(session_id, 1, 0, "text", "replace", "old"),
+            ]
+            yield [TextDelta(session_id, 1, 0, "text", "replace", "new")]
+            yield [TextDelta(session_id, 1, 0, "text", "append", " preview")]
             await preview_sent.wait()
-            yield MessageCommitted(
-                HistoryMessage(session_id, 1, ModelResponse([TextPart("complete")]))
-            )
+            yield [
+                MessageCommitted(
+                    HistoryMessage(session_id, 1, ModelResponse([TextPart("complete")]))
+                ),
+                MessageCommitted(
+                    HistoryMessage(session_id, 2, ModelRequest([UserPromptPart("next")]))
+                ),
+                MessageCommitted(
+                    HistoryMessage(session_id, 3, ModelResponse([TextPart("second")]))
+                ),
+            ]
             replayed.set()
             await asyncio.Future()
         finally:
@@ -443,7 +453,11 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
         await asyncio.gather(task, return_exceptions=True)
     assert closed.is_set()
     calls = client.send.call_args_list
-    assert [call.args[2] for call in calls if call.kwargs.get("draft_id") is None] == ["complete"]
+    assert [call.args[2] for call in calls if call.kwargs.get("draft_id") is None] == [
+        "complete",
+        "second",
+    ]
+    assert (await repository.get_delivery(delivery_key(row))).after_seq == 3
     assert [call.args[2] for call in calls if call.kwargs.get("draft_id") is not None] == [
         "new preview",
     ]
@@ -466,8 +480,8 @@ async def test_delta_burst_does_not_queue_paced_drafts_ahead_of_final(repository
 
     async def live(session_id, *, after_seq):
         for index in range(5):
-            yield TextDelta(session_id, 0, 0, "text", "append", str(index))
-        yield MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))
+            yield [TextDelta(session_id, 0, 0, "text", "append", str(index))]
+        yield [MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))]
 
     sessions = AsyncMock(spec=SessionService)
     sessions.live = live
@@ -529,9 +543,9 @@ async def test_commit_cancels_inflight_draft_before_sending_final(repository):
         return httpx2.Response(200, json={"ok": True, "result": {}})
 
     async def live(session_id, *, after_seq):
-        yield TextDelta(session_id, 0, 0, "text", "replace", "preview")
+        yield [TextDelta(session_id, 0, 0, "text", "replace", "preview")]
         await draft_started.wait()
-        yield MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))
+        yield [MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))]
 
     sessions = AsyncMock(spec=SessionService)
     sessions.live = live
@@ -682,17 +696,19 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
 
     async def live(session_id, *, after_seq):
         name = "group" if session_id == group.session_id else "private"
-        yield TextDelta(session_id, 0, 0, "text", "replace", name + " preview")
+        yield [TextDelta(session_id, 0, 0, "text", "replace", name + " preview")]
         if session_id == group.session_id:
             group_ready.set()
         await commit.wait()
-        yield MessageCommitted(
-            HistoryMessage(
-                session_id,
-                0,
-                ModelResponse([TextPart(name + " final")]),
+        yield [
+            MessageCommitted(
+                HistoryMessage(
+                    session_id,
+                    0,
+                    ModelResponse([TextPart(name + " final")]),
+                )
             )
-        )
+        ]
 
     sessions = AsyncMock(spec=SessionService)
     sessions.live = live

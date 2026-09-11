@@ -52,7 +52,7 @@ Session routes are:
 | POST /sessions/{id}/cancel | request_cancel | 202 empty body |
 | GET /sessions/{id}/cancel | read_cancel | bool |
 | GET /sessions/{id}/history | read_history | Page[HistoryMessage] |
-| WS /sessions/{id}/live?after_seq=N | live_ws | one OutputEvent per text frame |
+| WS /sessions/{id}/live?after_seq=N | live_ws | one nonempty OutputEvent[] per text frame |
 
 CreateSessionAndSchedule extends the existing CreateSession fields with optional
 `input: {content, channel="queued"}`. No input means configuration only. With input,
@@ -73,7 +73,10 @@ with the last applied complete message's seq, or -1 for empty history. after_seq
 required on WebSocket; it is an exclusive cursor, unchanged by upward pagination.
 The service subscribes before history replay and handles overlaps/backfill.
 
-WebSocket only sends existing delta and message DTOs using the SDK message codec.
+WebSocket sends each live batch as a JSON array of existing delta and message DTOs
+using the SDK message codec. Apply items in order; frames are neither transactions
+nor completion markers. Pending deltas may merge before delivery. The subscriber
+continues receiving into its bounded buffer while a frame is being sent.
 It does not poll history or signal execution completion. Client business frames
 close it with 1003; accepted-connection failures close it with 1011. Disconnect
 closes the generator and subscription even when idle, without cancelling the runner.

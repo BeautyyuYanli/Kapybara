@@ -80,13 +80,14 @@ async def check(
     tool_calls = 0
 
     async def observe() -> None:
-        async with aclosing(sessions.live(session_id)) as events:
-            async for event in events:
-                if isinstance(event, MessageCommitted):
-                    committed.append(event.message)
-                    changed.set()
-                else:
-                    deltas.append(event)
+        async with aclosing(sessions.live(session_id)) as batches:
+            async for batch in batches:
+                for event in batch:
+                    if isinstance(event, MessageCommitted):
+                        committed.append(event.message)
+                        changed.set()
+                    else:
+                        deltas.append(event)
 
     with TemporaryDirectory(prefix="kapy-tmpv2-") as directory:
         root = Path(directory)
@@ -156,21 +157,20 @@ async def check(
             output = await processes.read_output(process_id, stream="stdout")
             assert output.data.decode().strip() == marker
 
-        assert deltas and any(event.part_kind == "text" for event in deltas)
+        # Commits supersede undelivered deltas; received previews may end before the final text.
         parts: dict[tuple[int, int], str] = {}
         for event in deltas:
             key = (event.response_seq, event.part_index)
             parts[key] = event.text if event.op == "replace" else parts.get(key, "") + event.text
         for (seq, index), content in parts.items():
             part = history[seq].message.parts[index]
-            assert isinstance(part, TextPart | ThinkingPart) and content == part.content
+            assert isinstance(part, TextPart | ThinkingPart) and part.content.startswith(content)
         assert any(isinstance(part, ToolCallPart) for row in history for part in row.message.parts)
         assert any(
             isinstance(part, ToolReturnPart) for row in history for part in row.message.parts
         )
-        async with aclosing(sessions.live(session_id, after_seq=0)) as events:
-            for row in history[1:]:
-                assert await anext(events) == MessageCommitted(row)
+        async with aclosing(sessions.live(session_id, after_seq=0)) as batches:
+            assert await anext(batches) == [MessageCommitted(row) for row in history[1:]]
 
         print("Checking manual compaction, restart and automatic compaction...", flush=True)
         async with open_runner(session_id, agent=agent, session_factory=factory) as runner:
@@ -200,9 +200,10 @@ async def check(
         assert automatic is not None and automatic.last_message_seq == final_history[-1].seq
         assert not await sessions.read_inputs(session_id, "queued")
         # Disabled broadcasting still checkpoints; reconnect recovers that durable tail.
-        async with aclosing(sessions.live(session_id, after_seq=len(history) - 1)) as events:
-            for row in final_history[len(history) :]:
-                assert await anext(events) == MessageCommitted(row)
+        async with aclosing(sessions.live(session_id, after_seq=len(history) - 1)) as batches:
+            assert await anext(batches) == [
+                MessageCommitted(row) for row in final_history[len(history) :]
+            ]
         assert (await client.pubsub_numsub(f"{prefix}:{session_id}"))[0][1] == 0
 
     print(
