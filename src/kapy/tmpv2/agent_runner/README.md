@@ -149,12 +149,14 @@ sessions = SessionService(
 await sessions.start_runner(session_id, agent=agent, realtime_output=True)
 
 # Observer: run independently; this stream continues across runner lifetimes.
-async with aclosing(sessions.live(session_id, after_seq=-1)) as events:
-    async for event in events:
-        if isinstance(event, MessageCommitted):
-            ...  # Save/replace the complete message at event.message.seq.
-        else:
-            ...  # Apply the provisional text part's replace/append operation.
+async with aclosing(sessions.live(session_id, after_seq=-1)) as batches:
+    async for batch in batches:
+        ...  # Send the whole list as one JSON array frame.
+        for event in batch:
+            if isinstance(event, MessageCommitted):
+                ...  # Save/replace the complete message at event.message.seq.
+            else:
+                ...  # Apply the provisional text part's replace/append operation.
 ```
 
 `realtime_output=False` (default) needs no output service, starts no publisher and
@@ -182,7 +184,10 @@ missing predecessors when later events expose a gap. It also polls history every
 5 seconds, configurable through `SessionService(live_poll_interval=...)`, so lost
 final notifications are recovered without another event or reconnect. Only the
 contiguous prefix advances the cursor; unresolved gaps wait for another read.
-Each short transaction ends before yielding. Consumer backpressure pauses polling;
+History and each subscription read produce nonempty lists, not individual events.
+The WebSocket controller sends one JSON array per batch. Batch boundaries are not
+transaction boundaries or acknowledgements. Each short transaction ends before
+yielding. Consumer backpressure pauses polling, but not background reception;
 incoming traffic does not postpone it. Each live call owns at most one pending
 subscription read and joins it before closing its subscription. Database and
 subscription errors end the generator; runner completion does not. Reconnect from
@@ -197,15 +202,32 @@ encodes and buffers locally: it never waits on network I/O and drops ordinary er
 overflow, oversized events, and events during recovery or after close. First arrival
 starts the batching deadline; commits, capacity and zero interval wake the background
 task immediately. `SessionService.start_runner(output_flush_interval=...)` forwards
-this interval. One task sends and recovers connections, including with zero interval.
+this interval. Before encoding each batch, the sender merges pending deltas by
+(response_seq, part_index, part_kind): append joins text, replace discards earlier
+text (including an empty replacement), and commits remove deltas through their seq.
+Only this unsent batch participates; already delivered text is not retained.
+One task sends and recovers connections, including with zero interval.
 Each network attempt has a one-second deadline. Failed batches are discarded;
 recoverable failures trigger a one-second delay and a bounded PING probe until
 recovery, independently of new events. Unrecoverable errors disable that publisher.
 Every context exit drops pending output and cancels/joins the task without a final
 flush, so the final commit notification may be recovered through database polling.
-`subscribe()` yields individual events after acknowledgement, allows backpressure,
-and propagates connection/decode errors without automatic resubscription. Idle reads
-have no timeout. Shared clients stay open.
+`subscribe()` starts one receiver that owns connection setup, acknowledgement and
+cleanup. The outer context waits for readiness and always cancels/joins the receiver,
+even before the first iterator read. The receiver keeps merging incoming events
+into one flat list while the consumer is busy. Each read takes the whole list and
+replaces it with an empty one, without waiting to fill a batch. Previously delivered
+lists are never mutated. No busy polling or additional database task is involved.
+
+The subscriber uses the same merge rules across all undelivered network batches;
+its maximum observed commit seq also rejects late covered deltas. Pending JSON is
+limited to 1 MiB: overflowing delta updates leave the old buffer intact; commits
+first evict deltas, then raise BufferError if complete messages alone cannot fit.
+The limit excludes decoded network input and batches already handed to consumers.
+Connection/decode/capacity errors release the connection immediately and take priority
+over buffered output on the next read; there is no automatic resubscription. Idle
+reads have no timeout. Exiting the context joins the receiver before closing the
+iterator. Shared clients stay open.
 
 The channel is `{channel_prefix}:{session_id}` and carries nonempty JSON arrays of
 these two events. Prefixes must isolate environments because Pub/Sub ignores the

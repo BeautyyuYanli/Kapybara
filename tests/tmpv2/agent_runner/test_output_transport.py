@@ -41,8 +41,8 @@ async def test_ready_subscription_broadcast_batch_order_and_cleanup(valkey_clien
             await callback(second)
             await callback(committed)
             async with asyncio.timeout(2):
-                assert [await anext(left) for _ in range(3)] == [first, second, committed]
-                assert [await anext(right) for _ in range(3)] == [first, second, committed]
+                assert await anext(left) == [committed]
+                assert await anext(right) == [committed]
     assert (await valkey_client.pubsub_numsub(channel))[0][1] == 0
     assert await valkey_client.ping()
 
@@ -60,8 +60,7 @@ async def test_interval_batches_once_without_waiting_for_next_event(valkey_clien
             async with asyncio.timeout(2):
                 message = await raw.get_message(timeout=None)
             assert ADAPTER.validate_json(message["data"]) == [
-                delta(session_id, "one"),
-                delta(session_id, "two"),
+                delta(session_id, "onetwo"),
             ]
             assert await raw.get_message(timeout=0.02) is None
 
@@ -116,7 +115,7 @@ async def test_no_subscriber_drops_previous_messages(valkey_client):
         async with outputs.subscribe(session_id) as events:
             await callback(delta(session_id, "live"))
             async with asyncio.timeout(1):
-                assert await anext(events) == delta(session_id, "live")
+                assert await anext(events) == [delta(session_id, "live")]
 
 
 async def test_unstarted_iterator_and_cancelled_listener_release_subscription(valkey_client):
@@ -367,3 +366,208 @@ async def test_unrecoverable_publish_error_disables_without_reaching_producer(
         await callback(delta(session_id))
     assert "Agent output disabled (AuthenticationError)" in caplog.text
     assert "secret must not appear" not in caplog.text
+
+
+@pytest.mark.parametrize("transport", ["publisher", "subscriber"])
+async def test_merge_replace_append_parts_and_complete_coverage(valkey_client, transport):
+    session_id = uuid4()
+    commit = MessageCommitted(HistoryMessage(session_id, 1, ModelResponse(parts=[])))
+    empty = TextDelta(session_id, 2, 0, "text", "replace", "")
+    thinking = TextDelta(session_id, 2, 0, "thinking", "append", "thought")
+    text = TextDelta(session_id, 2, 1, "text", "append", "ab")
+    batch = [
+        delta(session_id, "covered"),
+        commit,
+        delta(session_id, "late"),
+        TextDelta(session_id, 2, 0, "text", "append", "old"),
+        TextDelta(session_id, 2, 0, "text", "replace", "new"),
+        thinking,
+        TextDelta(session_id, 2, 0, "text", "append", "tail"),
+        empty,
+        TextDelta(session_id, 2, 1, "text", "append", "a"),
+        TextDelta(session_id, 2, 1, "text", "append", "b"),
+    ]
+    expected = [commit, thinking, empty, text]
+    outputs = AgentOutputService(valkey_client)
+    channel = f"kapy:agent-output:{session_id}"
+    async with asyncio.timeout(2):
+        if transport == "publisher":
+            async with valkey_client.pubsub() as raw:
+                await raw.subscribe(channel)
+                await raw.get_message(timeout=None)
+                async with outputs.publisher(session_id, flush_interval=60) as callback:
+                    for event in batch:
+                        await callback(event)
+                    message = await raw.get_message(timeout=None)
+                    assert ADAPTER.validate_json(message["data"]) == expected
+        else:
+            async with outputs.subscribe(session_id) as events:
+                await valkey_client.publish(channel, ADAPTER.dump_json(batch))
+                assert await anext(events) == expected
+                # Whole-list handoff must leave no text state for future appends.
+                following = TextDelta(session_id, 2, 0, "text", "append", "following")
+                await valkey_client.publish(
+                    channel, ADAPTER.dump_json([delta(session_id), following])
+                )
+                assert await anext(events) == [following]
+
+
+async def test_subscriber_receives_and_releases_failed_connection_without_consumption(
+    valkey_client,
+):
+    session_id = uuid4()
+    outputs = AgentOutputService(valkey_client)
+    channel = f"kapy:agent-output:{session_id}"
+    async with outputs.subscribe(session_id) as events:
+        await valkey_client.publish(channel, ADAPTER.dump_json([delta(session_id)]))
+        await valkey_client.publish(channel, b"[]")
+        # No anext: the background task must still detect the invalid frame and
+        # release the connection. The server exposes no unsubscribe notification.
+        async with asyncio.timeout(2):
+            while (await valkey_client.pubsub_numsub(channel))[0][1]:  # noqa: ASYNC110
+                await asyncio.sleep(0.01)
+        with pytest.raises(ValueError, match="must not be empty"):
+            await anext(events)
+    assert not any(
+        task.get_name() == f"agent-output-subscribe:{session_id}" for task in asyncio.all_tasks()
+    )
+
+
+async def test_subscriber_capacity_drops_delta_update_but_preserves_complete_messages(
+    valkey_client,
+):
+    session_id = uuid4()
+    outputs = AgentOutputService(valkey_client)
+    channel = f"kapy:agent-output:{session_id}"
+    original = delta(session_id, "original", op="replace")
+    async with outputs.subscribe(session_id) as events:
+        # One network batch is processed before consumer handoff. Oversized append
+        # must preserve the accepted replacement rather than partially modifying it.
+        await valkey_client.publish(
+            channel, ADAPTER.dump_json([original, delta(session_id, "x" * (1024 * 1024))])
+        )
+        assert await anext(events) == [original]
+        commit = MessageCommitted(
+            HistoryMessage(session_id, 1, ModelResponse(parts=[TextPart("x" * 600_000)]))
+        )
+        future = TextDelta(session_id, 2, 0, "text", "append", "y" * 600_000)
+        await valkey_client.publish(channel, ADAPTER.dump_json([future, commit]))
+        assert await anext(events) == [commit]
+        too_big = MessageCommitted(
+            HistoryMessage(session_id, 2, ModelResponse(parts=[TextPart("x" * (1024 * 1024))]))
+        )
+        await valkey_client.publish(channel, ADAPTER.dump_json([too_big]))
+        with pytest.raises(BufferError):
+            await anext(events)
+    assert (await valkey_client.pubsub_numsub(channel))[0][1] == 0
+
+
+async def test_subscriber_accumulated_commits_overflow_without_silent_eviction(valkey_client):
+    session_id = uuid4()
+    channel = f"kapy:agent-output:{session_id}"
+    commits = [
+        MessageCommitted(
+            HistoryMessage(session_id, seq, ModelResponse(parts=[TextPart("x" * 600_000)]))
+        )
+        for seq in range(2)
+    ]
+    assert all(len(ADAPTER.dump_json([commit])) < 1024 * 1024 for commit in commits)
+    async with AgentOutputService(valkey_client).subscribe(session_id) as events:
+        # Both commits individually fit; together they cannot remain buffered.
+        # Processing one received batch does not yield to the consumer midway.
+        await valkey_client.publish(channel, ADAPTER.dump_json(commits))
+        async with asyncio.timeout(2):
+            with pytest.raises(BufferError):
+                await anext(events)
+        assert (await valkey_client.pubsub_numsub(channel))[0][1] == 0
+
+
+async def test_subscriber_setup_failure_propagates_and_joins_receiver():
+    session_id = uuid4()
+    async with Valkey(host="127.0.0.1", port=0) as client:
+        with pytest.raises(ValkeyConnectionError):
+            async with AgentOutputService(client).subscribe(session_id):
+                pytest.fail("Unconfirmed subscription became ready")
+    assert not any(
+        task.get_name() == f"agent-output-subscribe:{session_id}" for task in asyncio.all_tasks()
+    )
+
+
+async def test_slow_subscriber_merges_across_network_batches_before_first_read(valkey_client):
+    session_id = uuid4()
+    processed = asyncio.Event()
+
+    class ObservedConnection(Connection):
+        received_message = False
+
+        async def read_response(self, *args, **kwargs):
+            # Entering the next network read proves the preceding batch was
+            # processed, without requiring the public iterator to advance.
+            if self.received_message:
+                self.received_message = False
+                processed.set()
+            result = await super().read_response(*args, **kwargs)
+            if isinstance(result, list) and result and result[0] == b"message":
+                self.received_message = True
+            return result
+
+    async with (
+        Valkey.from_url(
+            os.environ.get("KAPY_VALKEY_URL", "valkey://127.0.0.1:56379/0"),
+            connection_class=ObservedConnection,
+        ) as client,
+        AgentOutputService(client).subscribe(session_id) as events,
+    ):
+        async with asyncio.timeout(2):
+            for event in [delta(session_id, "a", op="replace"), delta(session_id, "b")]:
+                processed.clear()
+                await valkey_client.publish(
+                    f"kapy:agent-output:{session_id}", ADAPTER.dump_json([event])
+                )
+                await processed.wait()
+            handed_off = await anext(events)
+            assert handed_off == [delta(session_id, "ab", op="replace")]
+            processed.clear()
+            await valkey_client.publish(
+                f"kapy:agent-output:{session_id}", ADAPTER.dump_json([delta(session_id, "c")])
+            )
+            await processed.wait()
+            assert handed_off == [delta(session_id, "ab", op="replace")]
+            assert await anext(events) == [delta(session_id, "c")]
+
+
+async def test_cancellation_during_subscription_confirmation_joins_receiver(valkey_client):
+    session_id = uuid4()
+    confirming = asyncio.Event()
+
+    class BlockConfirmation(Connection):
+        async def read_response(self, *args, **kwargs):
+            response = await super().read_response(*args, **kwargs)
+            if isinstance(response, list) and response and response[0] == b"subscribe":
+                confirming.set()
+                await asyncio.Event().wait()
+            return response
+
+    async with Valkey.from_url(
+        os.environ.get("KAPY_VALKEY_URL", "valkey://127.0.0.1:56379/0"),
+        connection_class=BlockConfirmation,
+    ) as client:
+
+        async def enter():
+            async with AgentOutputService(client).subscribe(session_id):
+                pytest.fail("Blocked confirmation became ready")
+
+        task = asyncio.create_task(enter())
+        try:
+            async with asyncio.timeout(2):
+                await confirming.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
+    assert not any(
+        task.get_name() == f"agent-output-subscribe:{session_id}" for task in asyncio.all_tasks()
+    )

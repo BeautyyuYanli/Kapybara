@@ -236,25 +236,31 @@ async def test_http_accepts_input_before_background_runner_finishes(
 async def test_websocket_replay_live_frames_and_idle_subscription_cleanup(
     database, valkey_client, seed_history
 ):
-    session_id = await seed_history([ModelRequest(parts=[UserPromptPart("history")])])
+    session_id = await seed_history(
+        [
+            ModelRequest(parts=[UserPromptPart("first")]),
+            ModelRequest(parts=[UserPromptPart("second")]),
+        ]
+    )
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     app = application(database, sessions)
-    adapter = TypeAdapter(OutputEvent)
+    adapter = TypeAdapter(list[OutputEvent])
     async with serve(app) as base:
         async with websockets.connect(f"{base}/api/sessions/{session_id}/live?after_seq=-1") as ws:
-            first = adapter.validate_json(await ws.recv())
+            first, second = adapter.validate_json(await ws.recv())
             assert isinstance(first, MessageCommitted) and first.message.seq == 0
-            delta = TextDelta(session_id, 1, 0, "text", "replace", "live")
+            assert isinstance(second, MessageCommitted) and second.message.seq == 1
+            delta = TextDelta(session_id, 2, 0, "text", "replace", "live")
             async with outputs.publisher(session_id, flush_interval=0) as publish:
                 await publish(delta)
                 async with asyncio.timeout(2):
-                    assert adapter.validate_json(await ws.recv()) == delta
+                    assert adapter.validate_json(await ws.recv()) == [delta]
         async with asyncio.timeout(2):
             # Valkey has no notification API for another connection unsubscribing.
             while (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1]:  # noqa: ASYNC110
                 await asyncio.sleep(0.01)
-        async with websockets.connect(f"{base}/api/sessions/{session_id}/live?after_seq=0") as ws:
+        async with websockets.connect(f"{base}/api/sessions/{session_id}/live?after_seq=1") as ws:
             await ws.send("unsupported")
             with pytest.raises(ConnectionClosedError) as closed:
                 await ws.recv()

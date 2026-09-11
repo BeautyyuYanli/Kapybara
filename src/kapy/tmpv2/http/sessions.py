@@ -32,7 +32,7 @@ from .errors import ControlRoute
 from .types import CreateSessionAndSchedule
 
 _logger = logging.getLogger(__name__)
-_output_adapter = TypeAdapter(OutputEvent)
+_output_adapter = TypeAdapter(list[OutputEvent])
 
 
 def create_session_router[DepsT, OutputT](
@@ -135,9 +135,9 @@ def create_session_router[DepsT, OutputT](
 
         async def send() -> None:
             # The task that iterates owns generator cleanup, including idle disconnects.
-            async with aclosing(sessions.live(session_id, after_seq=after_seq)) as events:
-                async for event in events:
-                    await websocket.send_text(_output_adapter.dump_json(event).decode("utf-8"))
+            async with aclosing(sessions.live(session_id, after_seq=after_seq)) as batches:
+                async for batch in batches:
+                    await websocket.send_text(_output_adapter.dump_json(batch).decode("utf-8"))
 
         async def receive() -> None:
             message = await websocket.receive()

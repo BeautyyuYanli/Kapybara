@@ -305,8 +305,10 @@ class SessionService:
                         ):
                             return result
 
-    async def live(self, session_id: UUID, *, after_seq: int = -1) -> AsyncGenerator[OutputEvent]:
-        """Replay original history after the last applied complete seq, then follow live events.
+    async def live(
+        self, session_id: UUID, *, after_seq: int = -1
+    ) -> AsyncGenerator[list[OutputEvent]]:
+        """Yield nonempty batches of original history and live output after the applied seq.
 
         after_seq must be an integer >= -1, otherwise ValueError is raised.
         An output_service is required even for history replay, otherwise RuntimeError
@@ -317,8 +319,9 @@ class SessionService:
         messages advance the cursor. Gaps trigger a short read; unresolved gaps wait
         for later events or the next poll without skipping predecessors. Polling uses
         live_poll_interval, independent of incoming traffic. No transaction spans a
-        yield, and consumer backpressure pauses polling. Database/subscription errors
-        end the stream; runner completion does not. Use aclosing when stopping early.
+        yield. Consumer backpressure pauses polling but not transport reception.
+        Database/subscription errors end the stream; runner completion does not.
+        Use aclosing when stopping early.
         """
         if type(after_seq) is not int or after_seq < -1:
             raise ValueError("after_seq must be an integer >= -1")
@@ -341,11 +344,14 @@ class SessionService:
                     if loop.time() >= next_poll_at:
                         entries = await read_history()
                         next_poll_at = loop.time() + self._live_poll_interval
+                        replay: list[OutputEvent] = []
                         for entry in entries:
                             if entry.seq != last_seq + 1:
                                 break
                             last_seq = entry.seq
-                            yield MessageCommitted(entry)
+                            replay.append(MessageCommitted(entry))
+                        if replay:
+                            yield replay
 
                     if pending is None:
                         pending = asyncio.ensure_future(anext(events))
@@ -357,28 +363,39 @@ class SessionService:
                     if not done or loop.time() >= next_poll_at:
                         continue
                     try:
-                        event = pending.result()
+                        batch = pending.result()
                     except StopAsyncIteration:
                         return
                     pending = None
-                    seq = (
-                        event.message.seq
-                        if isinstance(event, MessageCommitted)
-                        else event.response_seq
-                    )
-                    if seq > last_seq + 1:
-                        entries = await read_history()
-                        next_poll_at = loop.time() + self._live_poll_interval
-                        for entry in entries:
-                            if entry.seq != last_seq + 1:
-                                break
-                            last_seq = entry.seq
-                            yield MessageCommitted(entry)
-                    if seq != last_seq + 1:
-                        continue
-                    if isinstance(event, MessageCommitted):
-                        last_seq = seq
-                    yield event
+                    result: list[OutputEvent] = []
+                    for event in batch:
+                        seq = (
+                            event.message.seq
+                            if isinstance(event, MessageCommitted)
+                            else event.response_seq
+                        )
+                        if seq > last_seq + 1:
+                            entries = await read_history()
+                            next_poll_at = loop.time() + self._live_poll_interval
+                            for entry in entries:
+                                if entry.seq != last_seq + 1:
+                                    break
+                                last_seq = entry.seq
+                                result.append(MessageCommitted(entry))
+                        if seq != last_seq + 1:
+                            continue
+                        if isinstance(event, MessageCommitted):
+                            last_seq = seq
+                        result.append(event)
+                    # Commits later in this batch (including backfill) supersede
+                    # previews that have not yet reached the consumer.
+                    result = [
+                        item
+                        for item in result
+                        if isinstance(item, MessageCommitted) or item.response_seq > last_seq
+                    ]
+                    if result:
+                        yield result
             finally:
                 # Finish anext before subscribe closes its underlying iterator.
                 if pending is not None:
