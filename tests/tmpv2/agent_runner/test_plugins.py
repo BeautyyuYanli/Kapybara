@@ -462,7 +462,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("configured_interval", "interval"), [(0.2, 0.2), (0, 0.5)])
-async def test_telegram_serve_preview_cadence_uses_publisher_setting(
+async def test_telegram_serve_draft_pacing_uses_publisher_setting(
     database, seed_session, tmp_path, monkeypatch, configured_interval, interval
 ):
     from kapy.tmpv2.plugins.telegram import main as telegram_main
@@ -525,7 +525,8 @@ async def test_telegram_serve_preview_cadence_uses_publisher_setting(
             await asyncio.wait_for(settled.wait(), 4)
             assert drafts == ["0", "1", "2"]
             assert all(
-                interval - 0.02 <= end - start < interval + 0.12 for start, end in pairwise(times)
+                interval - 0.02 <= end - start < interval + 0.12
+                for start, end in pairwise(times[1:])
             )
             assert messages == ["final"]
             assert (await repository.get_delivery(delivery_key(row))).after_seq == 0

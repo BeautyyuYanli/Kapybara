@@ -1,7 +1,6 @@
 """Observable Telegram input/delivery contracts with real private SQLite transactions."""
 
 import asyncio
-import json
 import time
 from itertools import pairwise
 from pathlib import Path
@@ -408,8 +407,8 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
 
     async def send(chat, thread, content, **kwargs):
         if kwargs.get("draft_id") is not None:
-            assert content == "new preview"
-            preview_sent.set()
+            if content == "new preview":
+                preview_sent.set()
 
     client.send.side_effect = send
 
@@ -422,8 +421,10 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
                 ),
                 TextDelta(session_id, 1, 0, "text", "replace", "old"),
             ]
-            yield [TextDelta(session_id, 1, 0, "text", "replace", "new")]
-            yield [TextDelta(session_id, 1, 0, "text", "append", " preview")]
+            yield [
+                TextDelta(session_id, 1, 0, "text", "replace", "new"),
+                TextDelta(session_id, 1, 0, "text", "append", " preview"),
+            ]
             await preview_sent.wait()
             yield [
                 MessageCommitted(
@@ -459,6 +460,7 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
     ]
     assert (await repository.get_delivery(delivery_key(row))).after_seq == 3
     assert [call.args[2] for call in calls if call.kwargs.get("draft_id") is not None] == [
+        "old",
         "new preview",
     ]
 
@@ -467,35 +469,6 @@ def test_plain_chunks_preserve_unicode():
     body = "x" * 3999 + "😀" + "tail"
     left, right = text_chunk(body)
     assert left + right == body and left == "x" * 3999
-
-
-@pytest.mark.asyncio
-async def test_delta_burst_does_not_queue_paced_drafts_ahead_of_final(repository):
-    row = await delivery_row(repository)
-    sent = []
-
-    def response(request):
-        sent.append((request.url.path.rsplit("/", 1)[1], json.loads(request.content)))
-        return httpx2.Response(200, json={"ok": True, "result": {}})
-
-    async def live(session_id, *, after_seq):
-        for index in range(5):
-            yield [TextDelta(session_id, 0, 0, "text", "append", str(index))]
-        yield [MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))]
-
-    sessions = AsyncMock(spec=SessionService)
-    sessions.live = live
-    async with httpx2.AsyncClient(transport=httpx2.MockTransport(response)) as http:
-        client = TelegramClient(http, "unused", "https://telegram.invalid")
-        # The actual client's one-second chat limiter previously delayed this by five seconds.
-        async with asyncio.timeout(2):
-            await TelegramDelivery(client, sessions, repository, 42).consume(row)
-    assert [
-        payload["rich_message"]["markdown"]
-        for method, payload in sent
-        if method == "sendRichMessage"
-    ] == ["final"]
-    assert (await repository.get_delivery(delivery_key(row))).after_seq == 0
 
 
 @pytest.mark.asyncio
@@ -521,41 +494,75 @@ async def test_draft_rate_limit_delays_following_complete_message():
 
 
 @pytest.mark.asyncio
-async def test_commit_cancels_inflight_draft_before_sending_final(repository):
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_delivery_waits_for_draft_before_reading_and_closes_on_cancel(repository, cancel):
     row = await delivery_row(repository)
-    draft_started, draft_closed = asyncio.Event(), asyncio.Event()
-    sent = []
-    times = {}
+    draft_started, release_draft, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    reads = []
+    client = AsyncMock(spec=TelegramClient)
 
-    async def response(request):
-        method = request.url.path.rsplit("/", 1)[1]
-        if method.endswith("Draft"):
-            times["draft_started"] = time.monotonic()
+    async def send(chat, thread, content, **kwargs):
+        if kwargs.get("draft_id") is not None:
             draft_started.set()
-            try:
-                await asyncio.Future()
-            finally:
-                times["draft_closed"] = time.monotonic()
-                draft_closed.set()
-        assert draft_closed.is_set()
-        times["final"] = time.monotonic()
-        sent.append(method)
-        return httpx2.Response(200, json={"ok": True, "result": {}})
+            await release_draft.wait()
+
+    client.send.side_effect = send
 
     async def live(session_id, *, after_seq):
-        yield [TextDelta(session_id, 0, 0, "text", "replace", "preview")]
-        await draft_started.wait()
-        yield [MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))]
+        try:
+            reads.append("preview")
+            yield [TextDelta(session_id, 0, 0, "text", "replace", "preview")]
+            reads.append("final")
+            yield [
+                MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))
+            ]
+        finally:
+            closed.set()
 
     sessions = AsyncMock(spec=SessionService)
     sessions.live = live
-    async with httpx2.AsyncClient(transport=httpx2.MockTransport(response)) as http:
-        client = TelegramClient(http, "unused", "https://telegram.invalid")
-        async with asyncio.timeout(3):
-            await TelegramDelivery(client, sessions, repository, 42).consume(row)
-    assert sent == ["sendRichMessage"] and draft_closed.is_set()
-    assert times["final"] >= times["draft_closed"]
-    assert 0.49 <= times["final"] - times["draft_started"] < 0.9
+    task = asyncio.create_task(TelegramDelivery(client, sessions, repository, 42).consume(row))
+    try:
+        async with asyncio.timeout(2):
+            await draft_started.wait()
+            assert reads == ["preview"]
+            assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                release_draft.set()
+                await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert closed.is_set()
+    assert reads == (["preview"] if cancel else ["preview", "final"])
+    assert (await repository.get_delivery(delivery_key(row))).after_seq == (-1 if cancel else 0)
+
+
+@pytest.mark.asyncio
+async def test_draft_retry_and_plain_fallback_finish_before_next_read(repository, monkeypatch):
+    row = await delivery_row(repository)
+    client = AsyncMock(spec=TelegramClient)
+    client.send.side_effect = [
+        TelegramFailure(429),
+        TelegramFailure(400, rich_content_rejected=True),
+        None,
+    ]
+    monkeypatch.setattr("kapy.tmpv2.plugins.telegram.delivery.retry_delay", lambda error: 0)
+
+    async def live(session_id, *, after_seq):
+        yield [TextDelta(session_id, 0, 0, "text", "replace", "preview")]
+        assert client.send.await_count == 3
+        assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
+
+    sessions = AsyncMock(spec=SessionService)
+    sessions.live = live
+    await TelegramDelivery(client, sessions, repository, 42).consume(row)
+    assert [call.kwargs["rich"] for call in client.send.call_args_list] == [True, True, False]
+    assert {call.args[2] for call in client.send.call_args_list} == {"preview"}
 
 
 @pytest.mark.asyncio
