@@ -10,8 +10,11 @@ behavior. Native CSS tokens flow primitive → semantic → component.
 The interface uses a monochrome palette, square controls, and ruled navigation.
 Lists use the full content width; forms keep a readable maximum width. Mobile
 navigation stays fixed at the bottom, with content and focus scrolling reserving
-its height and the device safe area. Desktop navigation stays at the top. There
-is no footer. Mobile record actions sit below their content. Destructive
+its height and the maximum device safe area. Navigation cells extend through the
+safe area, and the bar's bottom offset follows the dynamic inset as browser
+controls expand or retract; its height stays stable. This avoids an empty strip
+below the dividers and keeps labels clear of system gestures. Desktop navigation
+stays at the top. There is no footer. Mobile record actions sit below their content. Destructive
 confirmations and errors retain semantic labels and a restrained red accent.
 All layout styles are handwritten;
 the generated API client is independent of the visual design.
