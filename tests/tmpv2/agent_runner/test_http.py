@@ -26,7 +26,7 @@ from kapy.tmpv2.agent_runner import (
 from kapy.tmpv2.agent_runner.repository import AgentRepository
 from kapy.tmpv2.control.models import ModelService
 from kapy.tmpv2.control.sessions import SessionService
-from kapy.tmpv2.http import create_router
+from kapy.tmpv2.plugins.http import create_router
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 

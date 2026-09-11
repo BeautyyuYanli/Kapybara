@@ -11,15 +11,15 @@ tables use the connection's default schema, generic JSON and application-checked
 references without physical foreign keys. The runner's execution repository still
 requires PostgreSQL row locking and database-clock lease checks.
 
-For a fresh application database:
+Application commands initialize the core database with `kapy db upgrade`; see
+[database migrations](../database/README.md). The following in-process example
+assumes that migration has already run:
 
 ```python
 from pydantic import SecretStr
 from pydantic_ai import Agent
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from kapy.tmpv2.agent_runner.models import agent_metadata
-from kapy.tmpv2.control.database import ControlTable
 from kapy.tmpv2.control.models import CreateModel, CreateProvider, ModelService
 from kapy.tmpv2.control.sessions import CreateSession, SessionService
 
@@ -27,9 +27,6 @@ from kapy.tmpv2.control.sessions import CreateSession, SessionService
 async def example(database_url: str, api_key: str, model_name: str):
     engine = create_async_engine(database_url)
     try:
-        async with engine.begin() as connection:
-            await connection.run_sync(ControlTable.metadata.create_all)
-            await connection.run_sync(agent_metadata.create_all)
         factory = async_sessionmaker(engine, expire_on_commit=False)
         models = ModelService(factory)
         sessions = SessionService(factory, heartbeat_interval=10, heartbeat_timeout=60)
@@ -152,5 +149,5 @@ queue. Cancel ends the current run at a boundary and leaves queued inputs intact
 `live(id, after_seq=-1)` owns a confirmed Pub/Sub subscription before replaying
 history and following complete messages/deltas. Only complete messages advance
 the cursor; history pagination uses before_seq independently. Use aclosing when
-stopping early. See [HTTP adapters](../http/README.md) for application wiring,
+stopping early. See [HTTP adapters](../plugins/http/README.md) for application wiring,
 background scheduling and WebSocket lifetime.

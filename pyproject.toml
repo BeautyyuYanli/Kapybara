@@ -5,6 +5,7 @@ description = "An agent control plane with remote execution and Telegram session
 requires-python = ">=3.14"
 dependencies = [
     "aiosqlite>=0.22.1",
+    "alembic>=1.16",
     "anyio>=4.15.1",
     "fastapi>=0.141.1",
     "httpx2>=2.12.0",

@@ -1,6 +1,7 @@
 """Durable Telegram long polling, route configuration and output replay.
 
 Bot API calls are injectable for tests. Production never logs token-bearing URLs.
+Protocol errors and text splitting are shared with the standalone Telegram plugin.
 """
 
 import asyncio
@@ -11,7 +12,6 @@ import logging
 import random
 import re
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -20,6 +20,13 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from kapy.rpc import JsonObject, RpcError
+from kapy.tmpv2.plugins.telegram.client import (
+    TelegramFailure,
+    retry_delay,
+    rich_chunk,
+    rich_rejection,
+    text_chunk,
+)
 
 from .auth import Principal
 from .storage import Metadata
@@ -47,74 +54,8 @@ COMMANDS = {
 }
 
 
-@dataclass
-class TelegramFailure(Exception):
-    code: int
-    retry_after: float = 1
-    rich_content_rejected: bool = False
-
-
 def request_id(bot_id: int, update_id: int, action: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"kapy:telegram:{bot_id}:{update_id}:{action}"))
-
-
-def retry_delay(error: TelegramFailure, attempt: int = 0) -> float:
-    if error.code == 429:
-        return max(1, error.retry_after)
-    return min(30, 2 ** min(attempt, 5) + random.uniform(0, 1))
-
-
-def text_chunk(text: str, units: int = 4000) -> tuple[str, str]:
-    """Split at Unicode scalar boundaries while respecting Telegram UTF-16 limits."""
-    count = 0
-    for index, char in enumerate(text):
-        width = 2 if ord(char) > 0xFFFF else 1
-        if count + width > units:
-            boundary = text.rfind("\n\n", 0, index)
-            if boundary >= index // 2:
-                index = boundary + 2
-            return text[:index], text[index:]
-        count += width
-    return text, ""
-
-
-def rich_chunk(text: str) -> tuple[str, str]:
-    """Conservative 32 KiB raw budget; split only on blank lines outside fences."""
-    if len(text.encode("utf-8")) <= 32768:
-        return text, ""
-    position = size = boundary = 0
-    fence = ""
-    for line in text.splitlines(keepends=True):
-        size += len(line.encode("utf-8"))
-        if size > 32768:
-            break
-        position += len(line)
-        content = line.rstrip("\r\n")
-        marker = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", content)
-        if marker:
-            run, tail = marker.groups()
-            if fence:
-                if run[0] == fence[0] and len(run) >= len(fence) and not tail.strip():
-                    fence = ""
-            elif run[0] == "~" or "`" not in tail:
-                fence = run
-        elif not fence and not content.strip():
-            boundary = position
-    return text[:boundary], text[boundary:]
-
-
-def rich_rejection(description: Any) -> bool:
-    """Recognize explicit content failures only; never retain the API description."""
-    if not isinstance(description, str):
-        return False
-    description = description.lower().removeprefix("bad request: ")
-    # Architect's rejected-request samples: .context/delivery.md, commit ec34cc0.
-    return description in {
-        "rich_message_text_too_long",
-        "rich_message_blocks_too_many",
-        "rich_message_table_cols_too_many",
-        "rich_message_depth_invalid",
-    }
 
 
 def empty_projection() -> dict[str, Any]:

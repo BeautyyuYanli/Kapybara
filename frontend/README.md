@@ -45,8 +45,18 @@ Normal build uses these committed files without contacting the API.
 
 ## Hosting
 
+The independent HTTP plugin can mount the existing build alongside `/api`:
+
+```sh
+kapy plugin http serve --frontend-dist /absolute/path/to/frontend/dist
+```
+
+`KAPY_HTTP_FRONTEND_DIST` provides the same setting. The existing frontend has no
+login/token UI; HTTP/WS bearer authentication belongs to the HTTP host or its
+trusted reverse proxy. The SPA keeps its existing same-origin request behavior.
+
 ```python
-from kapy.tmpv2.http import create_frontend_router, create_router
+from kapy.tmpv2.plugins.http import create_frontend_router, create_router
 
 app.include_router(create_router(models, sessions, agent=agent))
 app.include_router(create_frontend_router(frontend_dist_dir))

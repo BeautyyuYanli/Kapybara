@@ -7,8 +7,9 @@ cancel scopes. All handle operations reject concurrent, reentrant or cross-task 
 The separate heartbeat task only uses its own short database transactions.
 
 The application owns the configured Agent, deps, PostgreSQL engine and async
-session factory. It creates tables from `agent_metadata` and, for session inputs,
-`ControlTable.metadata`; the services never create tables or close shared clients.
+session factory. `kapy db upgrade` migrates `agent_metadata` and the control tables;
+the services never create tables or close shared clients. Isolated tests can
+initialize disposable schemas directly from their metadata.
 The repository currently relies on PostgreSQL READ COMMITTED row locks, conditional
 upsert and `clock_timestamp()`. Table declarations use the connection's default
 schema and deliberately contain no physical foreign keys.

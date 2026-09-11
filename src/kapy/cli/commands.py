@@ -132,6 +132,38 @@ def configure_control(
     ctx.obj = Client(settings, session_id or settings.session_id, machine or settings.machine_id)
 
 
+@app.command(
+    "plugin",
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        "allow_interspersed_args": False,
+    },
+)
+def plugin_command(ctx: typer.Context, name: str) -> None:
+    """Run one interface plugin; remaining arguments belong to its entry point."""
+    from kapy.tmpv2.plugins.registry import PLUGIN_ENTRIES, dispatch
+
+    if name not in PLUGIN_ENTRIES:
+        raise typer.BadParameter(f"Unknown plugin; choose: {', '.join(PLUGIN_ENTRIES)}")
+    raise typer.Exit(dispatch(name, list(ctx.args)))
+
+
+@app.command(
+    "db",
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        "allow_interspersed_args": False,
+    },
+)
+def database_command(ctx: typer.Context, operation: str) -> None:
+    """Upgrade or inspect the core PostgreSQL schema independently of plugins."""
+    from kapy.tmpv2.database.schema import main as database_main
+
+    raise typer.Exit(database_main([operation, *ctx.args]))
+
+
 @app.command("server")
 def server() -> None:
     """Run the execution daemon in the project machine container."""

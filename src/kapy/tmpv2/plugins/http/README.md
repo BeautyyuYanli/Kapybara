@@ -1,9 +1,20 @@
-# tmpv2 HTTP controllers
+# HTTP interface plugin
 
 `create_router(models, sessions, *, agent, deps=None, realtime_output=True,
 output_flush_interval=0.5)` returns an APIRouter under `/api`. The separate
 `create_model_router` and `create_session_router` omit the prefix, for custom mounts.
 All constructors borrow their services, configured Agent and dependencies.
+
+`kapy plugin http serve` runs the standalone application. Set `KAPY_CONTROL_TOKEN`
+for the existing operator bearer authentication on both HTTP and WebSocket routes.
+`KAPY_HTTP_HOST` defaults to 127.0.0.1, `KAPY_HTTP_PORT` to 8000, and
+`KAPY_HTTP_SHUTDOWN_TIMEOUT` to 15 seconds. `--host` and `--port` override those
+values. Optionally set `KAPY_HTTP_FRONTEND_DIST` or `--frontend-dist` to an existing
+Vite build directory to mount the existing frontend at `/app/`.
+Run `kapy db upgrade` independently before serving; no schema changes occur at startup.
+Shared database/Valkey/runner settings are listed in [plugins/README.md](../README.md).
+The application drains or cancels full ASGI calls, including BackgroundTasks,
+before disposing process-owned connections. It does not load Telegram configuration.
 
 The hosting FastAPI application owns engine/session factory, Valkey client and
 Agent resources through its lifespan. Finish or cancel request/background tasks
@@ -15,7 +26,7 @@ gateway integration is provided.
 ```python
 from fastapi import FastAPI
 
-from kapy.tmpv2.http import create_router
+from kapy.tmpv2.plugins.http import create_router
 
 # Inside application setup, using resources owned by the application's lifespan:
 app = FastAPI(lifespan=lifespan)
