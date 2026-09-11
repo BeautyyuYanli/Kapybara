@@ -1,6 +1,6 @@
-"""Initial core business schema
+"""Initial core schema
 
-Revision ID: c83583313120
+Revision ID: 12fd53fd60d5
 Revises:
 """
 
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "c83583313120"
+revision: str = "12fd53fd60d5"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

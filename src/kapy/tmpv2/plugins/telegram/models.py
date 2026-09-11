@@ -17,6 +17,15 @@ class PollRow(TelegramTable, table=True):
     next_update_id: int = 0
 
 
+class DefaultModelRow(TelegramTable, table=True):
+    """One bot-wide model selection for future sessions, independent of chat routes."""
+
+    __tablename__ = "plugin_telegram_defaults"  # pyrefly: ignore[bad-override]
+    bot_id: int = Field(primary_key=True)
+    provider_id: UUID
+    model_name: str = Field(sa_type=Text)
+
+
 class InboxRow(TelegramTable, table=True):
     __tablename__ = "plugin_telegram_inbox"  # pyrefly: ignore[bad-override]
     bot_id: int = Field(primary_key=True)

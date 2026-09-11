@@ -1,7 +1,7 @@
 """Core PostgreSQL migrations; this catalog never imports interface plugins.
 
 Keep removed/renamed table names in OWNED_TABLES so autogeneration can see their
-removal. Existing unversioned schemas require an operator-reviewed baseline;
+removal. Pre-baseline development databases are discarded and initialized afresh;
 upgrade deliberately does not silently stamp or skip existing tables.
 """
 

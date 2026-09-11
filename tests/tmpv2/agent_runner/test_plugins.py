@@ -2,6 +2,8 @@
 
 import asyncio
 import os
+import time
+from itertools import pairwise
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -13,11 +15,13 @@ from alembic import command
 from dotenv import dotenv_values
 from psycopg import sql
 from pydantic import SecretStr
+from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kapy.tmpv2.agent_output import AgentOutputService
+from kapy.tmpv2.agent_runner import HistoryMessage, MessageCommitted, TextDelta
 from kapy.tmpv2.agent_runner.models import agent_metadata
 from kapy.tmpv2.application.agent import create_agent
 from kapy.tmpv2.application.resources import open_core_database
@@ -32,6 +36,7 @@ from kapy.tmpv2.plugins.http.settings import HttpSettings
 from kapy.tmpv2.plugins.telegram.client import TelegramClient
 from kapy.tmpv2.plugins.telegram.controller import TelegramController
 from kapy.tmpv2.plugins.telegram.delivery import TelegramDelivery
+from kapy.tmpv2.plugins.telegram.models import DeliveryRow
 from kapy.tmpv2.plugins.telegram.repository import TelegramRepository, delivery_key
 from kapy.tmpv2.plugins.telegram.schema import migrate as migrate_telegram
 from kapy.tmpv2.plugins.telegram.settings import TelegramSettings
@@ -125,6 +130,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
         controller = TelegramController(
             client=client,
             sessions=sessions,
+            models=models,
             repository=repository,
             settings=config,
             bot_id=42,
@@ -187,6 +193,95 @@ async def test_telegram_core_runner_live_round_trip(
     await session_round_trip(database, valkey_client, tmp_path)
 
 
+@pytest.mark.asyncio
+async def test_telegram_model_command_updates_only_bound_session_and_new_defaults(
+    database, tmp_path
+):
+    models = ModelService(database.sessions)
+    providers = []
+    for name in ("old", "new"):
+        provider = await models.create_provider(
+            CreateProvider(
+                name=name,
+                provider_class="pydantic_ai.providers.openai:OpenAIProvider",
+                model_class="pydantic_ai.models.openai:OpenAIResponsesModel",
+                api_key=SecretStr("local-test"),
+            )
+        )
+        await models.create_model(
+            CreateModel(provider_id=provider.id, model_name=name, context_window=10000)
+        )
+        providers.append(provider)
+    old_provider, new_provider = providers
+    sessions = SessionService(database.sessions)
+    path = tmp_path / "telegram.sqlite3"
+    await migrate_telegram(path, "upgrade")
+    async with open_storage(path) as engine:
+        repository = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
+        scheduled = []
+        controller = TelegramController(
+            client=AsyncMock(spec=TelegramClient),
+            sessions=sessions,
+            models=models,
+            repository=repository,
+            settings=TelegramSettings(
+                bot_token="unused",
+                allowed_chat_ids={123},
+                database_path=path,
+                session_template=CreateSession(
+                    provider_id=old_provider.id,
+                    model_name="old",
+                    title="keep title",
+                    model_settings={"temperature": 0.3},
+                    compaction_replay_turns=4,
+                ),
+            ),
+            bot_id=42,
+            username="kapy_bot",
+            schedule_runner=scheduled.append,
+        )
+
+        async def send(update_id, text, thread=0):
+            await repository.ingest(
+                42,
+                [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "chat": {"id": 123, "type": "private"},
+                            "from": {"id": 1, "is_bot": False},
+                            "message_thread_id": thread,
+                            "text": text,
+                        },
+                    }
+                ],
+            )
+            assert await controller.process_once()
+
+        await send(1, "/new")
+        await send(2, "/new", thread=9)
+        target = await repository.route(42, 123, 0)
+        other = await repository.route(42, 123, 9)
+        assert target is not None and other is not None
+        await sessions.enqueue_input(target, "queued", "keep pending input")
+        await send(3, f"/model {new_provider.id} new")
+        changed = await sessions.get_session(target)
+        assert (changed.provider_id, changed.model_name) == (new_provider.id, "new")
+        assert changed.title == "keep title" and changed.model_settings == {"temperature": 0.3}
+        assert changed.compaction_replay_turns == 4
+        assert (await sessions.read_inputs(target, "queued"))[0].content == "keep pending input"
+        assert (await sessions.get_session(other)).provider_id == old_provider.id
+        assert await repository.route(42, 123, 0) == target
+        await send(4, "/new", thread=18)
+        created_id = await repository.route(42, 123, 18)
+        assert created_id is not None
+        created = await sessions.get_session(created_id)
+        assert (created.provider_id, created.model_name) == (new_provider.id, "new")
+        assert created.model_settings == {}
+        assert len((await models.list_models()).items) == 2
+        assert not scheduled
+
+
 @pytest.mark.live
 @pytest.mark.skipif(
     os.environ.get("KAPY_PLUGIN_LIVE_CHECK") != "1", reason="Explicit paid-model opt-in"
@@ -201,23 +296,23 @@ async def test_real_model_telegram_round_trip(database, valkey_client, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_http_plugin_authorizes_before_business_work(database):
+async def test_http_plugin_serves_http_without_credentials(database, monkeypatch):
+    monkeypatch.delenv("KAPY_CONTROL_TOKEN", raising=False)
     settings = HttpSettings(
         common=CommonSettings(
-            database_url=SecretStr(database.url), database_schema=database.schema
+            database_url=SecretStr(database.url),
+            database_schema=database.schema,
         ),
-        control_token="operator-secret",
     )
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://test"
         ) as client:
-            assert (await client.get("/api/sessions")).status_code == 401
-            result = await client.get(
-                "/api/sessions", headers={"Authorization": "Bearer operator-secret"}
-            )
-            assert result.status_code == 200 and result.json() == {"items": [], "has_more": False}
+            for path in ("/api/providers", "/api/models", "/api/sessions"):
+                result = await client.get(path)
+                assert result.status_code == 200
+                assert result.json() == {"items": [], "has_more": False}
 
 
 @pytest.mark.asyncio
@@ -255,7 +350,6 @@ async def test_http_shutdown_joins_background_runner_before_resources_close(
             common=CommonSettings(
                 database_url=SecretStr(database.url), database_schema=database.schema
             ),
-            control_token="operator-secret",
         )
     )
     async with httpx.AsyncClient(
@@ -266,7 +360,6 @@ async def test_http_shutdown_joins_background_runner_before_resources_close(
                 client.post(
                     f"/api/sessions/{session_id}/inputs",
                     json={"content": "test"},
-                    headers={"Authorization": "Bearer operator-secret"},
                 )
             )
             await asyncio.wait_for(started.wait(), 2)
@@ -328,6 +421,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
                 "steer",
                 "status",
                 "cancel",
+                "model",
                 "help",
             }
             return True
@@ -367,6 +461,83 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("configured_interval", "interval"), [(0.2, 0.2), (0, 0.5)])
+async def test_telegram_serve_preview_cadence_uses_publisher_setting(
+    database, seed_session, tmp_path, monkeypatch, configured_interval, interval
+):
+    from kapy.tmpv2.plugins.telegram import main as telegram_main
+
+    session_id = uuid4()
+    await seed_session(session_id)
+    path = tmp_path / "telegram.sqlite3"
+    await migrate_telegram(path, "upgrade")
+    monkeypatch.setenv("KAPY_DATABASE_URL", database.url)
+    monkeypatch.setenv("KAPY_DATABASE_SCHEMA", database.schema)
+    monkeypatch.setenv("KAPY_OUTPUT_FLUSH_INTERVAL", str(configured_interval))
+    settings = TelegramSettings(
+        database_path=path,
+        bot_token="unused",
+        allowed_chat_ids={123},
+        session_template=None,
+    )
+    row = DeliveryRow(
+        bot_id=42, chat_id=123, thread_id=0, session_id=session_id, chat_type="private"
+    )
+    sent = [asyncio.Event() for _ in range(3)]
+    settled = asyncio.Event()
+    drafts, messages, times = [], [], []
+
+    async def api(self, method, params):
+        if method == "getMe":
+            return {"id": 42, "username": "kapy_bot"}
+        if method == "setMyCommands":
+            return True
+        if method == "getUpdates":
+            await asyncio.Future()
+        content = params["rich_message"]["markdown"]
+        if method == "sendRichMessageDraft":
+            drafts.append(content)
+            times.append(time.monotonic())
+            # Network work consumes part of the period rather than extending it.
+            await asyncio.sleep(0.15)
+            sent[int(content)].set()
+        else:
+            assert method == "sendRichMessage"
+            messages.append(content)
+        return {}
+
+    async def live(self, target, *, after_seq):
+        times.append(time.monotonic())
+        for index in range(3):
+            yield TextDelta(target, 0, 0, "text", "replace", "superseded")
+            yield TextDelta(target, 0, 0, "text", "replace", str(index))
+            await sent[index].wait()
+        yield MessageCommitted(HistoryMessage(target, 0, ModelResponse([TextPart("final")])))
+        settled.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(TelegramClient, "api", api)
+    monkeypatch.setattr(SessionService, "live", live)
+    async with open_storage(path) as engine:
+        repository = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
+        await repository.save_delivery(row)
+        task = asyncio.create_task(telegram_main.serve(settings))
+        try:
+            await asyncio.wait_for(settled.wait(), 4)
+            assert drafts == ["0", "1", "2"]
+            assert all(
+                interval - 0.02 <= end - start < interval + 0.12
+                for start, end in pairwise(times)
+            )
+            assert messages == ["final"]
+            assert (await repository.get_delivery(delivery_key(row))).after_seq == 0
+        finally:
+            task.cancel()
+            (result,) = await asyncio.gather(task, return_exceptions=True)
+        assert isinstance(result, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
 async def test_http_plugin_mounts_existing_frontend_with_api(database, tmp_path):
     (tmp_path / "index.html").write_text("<main>existing frontend</main>")
     (tmp_path / "assets").mkdir()
@@ -376,7 +547,6 @@ async def test_http_plugin_mounts_existing_frontend_with_api(database, tmp_path)
             common=CommonSettings(
                 database_url=SecretStr(database.url), database_schema=database.schema
             ),
-            control_token="operator-secret",
             frontend_dist=tmp_path,
         )
     )
@@ -390,16 +560,14 @@ async def test_http_plugin_mounts_existing_frontend_with_api(database, tmp_path)
             assert (await client.get("/app/assets/app.js")).status_code == 200
             assert (await client.get("/app/assets/missing.js")).status_code == 404
             assert (await client.get("/api/missing")).status_code == 404
-            result = await client.get(
-                "/api/sessions", headers={"Authorization": "Bearer operator-secret"}
-            )
+            result = await client.get("/api/sessions")
             assert result.status_code == 200
             assert (await client.get("/openapi.json")).json()["paths"]["/api/sessions"]
 
 
 @pytest.mark.asyncio
 async def test_http_plugin_rejects_missing_frontend_entry(tmp_path):
-    app = create_app(HttpSettings(control_token="test", frontend_dist=tmp_path))
+    app = create_app(HttpSettings(frontend_dist=tmp_path))
     with pytest.raises(RuntimeError, match="Frontend entry point"):
         async with app.router.lifespan_context(app):
             pytest.fail("A missing frontend entry must fail application setup")

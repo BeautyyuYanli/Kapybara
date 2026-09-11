@@ -68,6 +68,8 @@ class TelegramDelivery:
         sessions: SessionService,
         repository: TelegramRepository,
         bot_id: int,
+        *,
+        preview_interval: float = 0.5,
     ) -> None:
         self.client, self.sessions, self.repository, self.bot_id = (
             client,
@@ -75,6 +77,7 @@ class TelegramDelivery:
             repository,
             bot_id,
         )
+        self.preview_interval = preview_interval
 
     async def send_pending(self, row: DeliveryRow) -> None:
         """Attempt one persisted chunk; save retry/fallback/progress before returning."""
@@ -146,10 +149,13 @@ class TelegramDelivery:
         preview.sent, preview.sent_at = (chunk, rich), time.monotonic()
 
     async def _refresh_preview(self, row: DeliveryRow, preview: Preview) -> None:
-        """Coalesce changes at most once a second; unchanged drafts refresh after 20 seconds."""
+        """Sample at the publisher cadence, including send time; refresh unchanged drafts at 20s."""
+        # Coalesce the first batch too, so a quick commit can replace the draft entirely.
+        await asyncio.sleep(self.preview_interval)
         while not preview.unavailable:
-            await asyncio.sleep(1)
+            started = time.monotonic()
             await self.send_preview(row, preview)
+            await asyncio.sleep(max(0, self.preview_interval - (time.monotonic() - started)))
 
     async def consume(self, row: DeliveryRow) -> None:
         """Own one live read and at most one draft task; commits cancel stale draft work."""

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -17,12 +18,14 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kapy.tmpv2.agent_runner import HistoryMessage, MessageCommitted, TextDelta
+from kapy.tmpv2.control.models import ModelService
 from kapy.tmpv2.control.sessions import (
     CreateSession,
     InputSubmission,
     SessionInput,
     SessionService,
     SubmitInput,
+    UpdateSession,
 )
 from kapy.tmpv2.plugins.telegram.client import TelegramClient, TelegramFailure, text_chunk
 from kapy.tmpv2.plugins.telegram.controller import TelegramController
@@ -78,6 +81,7 @@ def controller(repository, tmp_path):
     result = TelegramController(
         client=client,
         sessions=sessions,
+        models=AsyncMock(spec=ModelService),
         repository=repository,
         settings=settings(tmp_path),
         bot_id=42,
@@ -123,6 +127,7 @@ async def test_sqlite_upgrade_is_idempotent_and_transactions_rollback(tmp_path):
                 "plugin_telegram_inbox",
                 "plugin_telegram_routes",
                 "plugin_telegram_delivery",
+                "plugin_telegram_defaults",
                 "plugin_telegram_schema_version",
             }
         with pytest.raises(RuntimeError):
@@ -133,6 +138,141 @@ async def test_sqlite_upgrade_is_idempotent_and_transactions_rollback(tmp_path):
             assert not await db.run_sync(
                 lambda connection: inspect(connection).has_table("rollback_test")
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["/new", "hello"])
+async def test_unconfigured_model_keeps_bot_available_without_creating_session(
+    repository, tmp_path, message
+):
+    app, sessions, client, scheduled = controller(repository, tmp_path)
+    app.settings = TelegramSettings(
+        bot_token="secret", allowed_chat_ids={123}, database_path=tmp_path / "state.sqlite3"
+    )
+    await repository.ingest(42, [update(1, message), update(2, "/help")])
+    assert await app.process_once()
+    assert await app.process_once()
+    assert "/model <provider UUID> <model name>" in client.send.call_args_list[0].args[2]
+    assert "/help" in client.send.call_args_list[1].args[2]
+    sessions.create_session.assert_not_awaited()
+    assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_model_command_without_session_only_saves_default(repository, tmp_path):
+    app, sessions, _, scheduled = controller(repository, tmp_path)
+    app.settings = app.settings.model_copy(update={"session_template": None})
+    provider_id = uuid4()
+    await repository.ingest(42, [update(1, f"/model {provider_id} new-model")])
+    await app.process_once()
+    sessions.update_session.assert_not_awaited()
+    sessions.create_session.assert_not_awaited()
+    assert await repository.route(42, 123, 0) is None
+    await repository.ingest(42, [update(2, "/new")])
+    await app.process_once()
+    sessions.create_session.assert_awaited_once_with(
+        CreateSession(provider_id=provider_id, model_name="new-model")
+    )
+    assert not scheduled
+
+
+@pytest.mark.asyncio
+async def test_model_command_updates_session_and_persists_default_after_restart(
+    repository, tmp_path
+):
+    app, sessions, client, scheduled = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/new", thread=17)])
+    await app.process_once()
+    target = await repository.route(42, 123, 17)
+    provider_id, model_name = uuid4(), "vendor/new-model"
+    await repository.ingest(42, [update(2, f"/model {provider_id} {model_name}", thread=17)])
+    await app.process_once()
+    sessions.update_session.assert_awaited_once_with(
+        target, UpdateSession(provider_id=provider_id, model_name=model_name)
+    )
+    assert "Current session updated" in client.send.call_args_list[-1].args[2]
+    assert await repository.route(42, 123, 17) == target
+    assert not scheduled
+
+    async with open_storage(tmp_path / "telegram.sqlite3") as engine:
+        restored = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
+        restarted, new_sessions, new_client, new_scheduled = controller(restored, tmp_path)
+        await restored.ingest(42, [update(3, "/model"), update(4, "/new", thread=18)])
+        await restarted.process_once()
+        assert str(provider_id) in new_client.send.call_args.args[2]
+        assert model_name in new_client.send.call_args.args[2]
+        await restarted.process_once()
+        new_sessions.create_session.assert_awaited_once_with(
+            CreateSession(provider_id=provider_id, model_name=model_name)
+        )
+        new_sessions.update_session.assert_not_awaited()
+        assert not new_scheduled
+        assert await restored.default_model(99) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["malformed", "unknown", "unauthorized", "session-update"])
+async def test_failed_model_choice_preserves_previous_default(repository, tmp_path, failure):
+    app, sessions, _, scheduled = controller(repository, tmp_path)
+    models = AsyncMock(spec=ModelService)
+    app.models = models
+    old_provider, old_model = uuid4(), "old-model"
+    await repository.set_default_model(42, old_provider, old_model)
+    provider_id = uuid4()
+    message = f"/model {provider_id} missing-model"
+    chat = 123
+    if failure == "malformed":
+        message = "/model invalid-uuid model"
+    elif failure == "unknown":
+        models.get_model.side_effect = LookupError("not configured")
+    elif failure == "unauthorized":
+        chat = 456
+    else:
+        await repository.ingest(42, [update(1, "/new")])
+        await app.process_once()
+        sessions.update_session.side_effect = ValueError("incompatible settings")
+    await repository.ingest(42, [update(2, message, chat=chat)])
+    await app.process_once()
+    default = await repository.default_model(42)
+    assert default is not None and (default.provider_id, default.model_name) == (
+        old_provider,
+        old_model,
+    )
+    if failure in {"malformed", "unauthorized"}:
+        models.get_model.assert_not_awaited()
+    if failure != "session-update":
+        sessions.update_session.assert_not_awaited()
+        sessions.create_session.assert_not_awaited()
+    assert not scheduled
+
+
+@pytest.mark.asyncio
+async def test_model_retry_keeps_session_progress_before_saving_default(repository, tmp_path):
+    app, sessions, client, _ = controller(repository, tmp_path)
+    models = AsyncMock(spec=ModelService)
+    app.models = models
+    await repository.ingest(42, [update(1, "/new")])
+    await app.process_once()
+    provider_id = uuid4()
+    await repository.ingest(42, [update(2, f"/model {provider_id} new-model")])
+    original = repository.set_default_model
+    repository.set_default_model = AsyncMock(
+        side_effect=OperationalError("save default", {}, Exception("temporary failure"))
+    )
+    with pytest.raises(OperationalError):
+        await app.process_once()
+    assert await repository.default_model(42) is None
+    repository.set_default_model = original
+    client.send.side_effect = TelegramFailure(503)
+    await app.process_once()
+    item = await repository.next_inbox(42)
+    assert item is not None and item.resolved_action is not None
+    await repository.save_action(item, item.resolved_action)
+    client.send.side_effect = None
+    await app.process_once()
+    sessions.update_session.assert_awaited_once()
+    models.get_model.assert_awaited_once_with(provider_id, "new-model")
+    assert await repository.next_inbox(42) is None
 
 
 @pytest.mark.asyncio
@@ -345,6 +485,28 @@ async def test_delta_burst_does_not_queue_paced_drafts_ahead_of_final(repository
 
 
 @pytest.mark.asyncio
+async def test_draft_rate_limit_delays_following_complete_message():
+    calls = []
+
+    def response(request):
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            return httpx2.Response(
+                429, json={"ok": False, "error_code": 429, "parameters": {"retry_after": 1}}
+            )
+        return httpx2.Response(200, json={"ok": True, "result": {}})
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(response)) as http:
+        client = TelegramClient(http, "unused", "https://telegram.invalid")
+        with pytest.raises(TelegramFailure):
+            await client.send(123, 0, "preview", draft_id=1)
+        await client.send(123, 0, "final")
+        await client.send(123, 0, "next message")
+    assert len(calls) == 3
+    assert all(end - start >= 0.99 for start, end in pairwise(calls))
+
+
+@pytest.mark.asyncio
 async def test_commit_cancels_inflight_draft_before_sending_final(repository):
     row = await delivery_row(repository)
     draft_started, draft_closed = asyncio.Event(), asyncio.Event()
@@ -354,6 +516,7 @@ async def test_commit_cancels_inflight_draft_before_sending_final(repository):
     async def response(request):
         method = request.url.path.rsplit("/", 1)[1]
         if method.endswith("Draft"):
+            times["draft_started"] = time.monotonic()
             draft_started.set()
             try:
                 await asyncio.Future()
@@ -377,7 +540,8 @@ async def test_commit_cancels_inflight_draft_before_sending_final(repository):
         async with asyncio.timeout(3):
             await TelegramDelivery(client, sessions, repository, 42).consume(row)
     assert sent == ["sendRichMessage"] and draft_closed.is_set()
-    assert times["final"] - times["draft_closed"] >= 0.9
+    assert times["final"] >= times["draft_closed"]
+    assert 0.49 <= times["final"] - times["draft_started"] < 0.9
 
 
 @pytest.mark.asyncio
@@ -484,6 +648,7 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
         restarted = TelegramController(
             client=AsyncMock(spec=TelegramClient),
             sessions=sessions,
+            models=app.models,
             repository=restored,
             settings=settings(tmp_path),
             bot_id=42,

@@ -79,15 +79,11 @@ Blocking filesystem operations finish before their dependent descriptors close.
 The context joins GC, accepted operations and execution before disposing the
 engine and releasing the lock, including initialization and cancellation failures.
 
-Real process tests run in the disposable Docker machine, with source and tests
+Real process tests run in the Docker runtime, with source and tests
 mounted read-only and writable fixtures in its temporary directory:
 
 ```sh
-docker build -f Dockerfile.machine -t kapy-v2-machine:process-manager .
-docker run --rm --init --network none --memory 1g --pids-limit 128 \
-  -e PYTHONPATH=/workspace/src -w /workspace \
-  -v "$PWD/src:/workspace/src:ro" -v "$PWD/tests:/workspace/tests:ro" \
-  -v "$PWD/pyproject.toml:/workspace/pyproject.toml:ro" \
-  kapy-v2-machine:process-manager /app/.venv/bin/python -m pytest \
+docker compose up -d --build --wait
+docker compose exec -T runtime python -m pytest \
   -q -p no:cacheprovider tests/tmpv2/processes
 ```

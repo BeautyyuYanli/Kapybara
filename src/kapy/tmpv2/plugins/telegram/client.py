@@ -1,7 +1,8 @@
 """Telegram protocol and safe error categories, independent of the legacy gateway.
 
 The caller owns the HTTP client. Exceptions never retain Bot API descriptions,
-request objects or token-bearing URLs. Per-chat pacing also covers retries/drafts.
+request objects or token-bearing URLs. Per-chat pacing also covers retries/drafts;
+drafts use the publisher cadence while complete messages retain one-second spacing.
 """
 
 import asyncio
@@ -81,10 +82,18 @@ def rich_rejection(description: Any) -> bool:
 
 
 class TelegramClient:
-    def __init__(self, client: httpx2.AsyncClient, token: str, api_base: str) -> None:
+    def __init__(
+        self,
+        client: httpx2.AsyncClient,
+        token: str,
+        api_base: str,
+        *,
+        draft_interval: float = 0.5,
+    ) -> None:
         self.client = client
         self.token = token
         self.api_base = api_base.rstrip("/")
+        self.draft_interval = draft_interval
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._chat_ready: dict[int, float] = {}
 
@@ -133,6 +142,8 @@ class TelegramClient:
             delay = self._chat_ready.get(chat, 0) - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
+            started = time.monotonic()
+            interval = self.draft_interval if draft_id is not None else 1
             try:
                 await self.api(method, params)
             except TelegramFailure as error:
@@ -141,6 +152,6 @@ class TelegramClient:
             except asyncio.CancelledError:
                 # A cancelled in-flight draft may already have reached Telegram.
                 # Keep the pacing slot; cancelling while waiting above sends nothing.
-                self._chat_ready[chat] = time.monotonic() + 1
+                self._chat_ready[chat] = started + interval
                 raise
-            self._chat_ready[chat] = time.monotonic() + 1
+            self._chat_ready[chat] = started + interval

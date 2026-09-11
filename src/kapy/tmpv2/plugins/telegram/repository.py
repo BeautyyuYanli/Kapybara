@@ -12,7 +12,7 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import col, select
 
-from .models import DeliveryRow, InboxRow, PollRow, RouteRow
+from .models import DefaultModelRow, DeliveryRow, InboxRow, PollRow, RouteRow
 
 type DeliveryKey = tuple[int, int, int, UUID]
 
@@ -24,6 +24,22 @@ def delivery_key(row: DeliveryRow) -> DeliveryKey:
 class TelegramRepository:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self.sessions = sessions
+
+    async def default_model(self, bot_id: int) -> DefaultModelRow | None:
+        async with self.sessions.begin() as db:
+            return await db.get(DefaultModelRow, bot_id)
+
+    async def set_default_model(self, bot_id: int, provider_id: UUID, model_name: str) -> None:
+        """Replace the pair atomically; repeating a resolved inbox command is idempotent."""
+        async with self.sessions.begin() as db:
+            await db.execute(
+                insert(DefaultModelRow)
+                .values(bot_id=bot_id, provider_id=provider_id, model_name=model_name)
+                .on_conflict_do_update(
+                    index_elements=["bot_id"],
+                    set_={"provider_id": provider_id, "model_name": model_name},
+                )
+            )
 
     async def offset(self, bot_id: int) -> int:
         async with self.sessions.begin() as db:

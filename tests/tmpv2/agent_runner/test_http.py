@@ -1,6 +1,7 @@
 """Public control HTTP contracts exercise real services and PostgreSQL storage."""
 
 import asyncio
+import os
 import socket
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -9,11 +10,10 @@ import httpx
 import pytest
 import uvicorn
 import websockets
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import TypeAdapter
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, UserPromptPart
-from starlette.requests import HTTPConnection
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from kapy.tmpv2.agent_output import AgentOutputService
@@ -24,18 +24,20 @@ from kapy.tmpv2.agent_runner import (
     TextDelta,
 )
 from kapy.tmpv2.agent_runner.repository import AgentRepository
+from kapy.tmpv2.application.settings import CommonSettings
 from kapy.tmpv2.control.models import ModelService
 from kapy.tmpv2.control.sessions import SessionService
 from kapy.tmpv2.plugins.http import create_router
+from kapy.tmpv2.plugins.http.app import create_app
+from kapy.tmpv2.plugins.http.settings import HttpSettings
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-def application(database, sessions, *, dependencies=()):
+def application(database, sessions):
     app = FastAPI()
     app.include_router(
         create_router(ModelService(database.sessions), sessions, agent=Agent("test")),
-        dependencies=list(dependencies),
     )
     return app
 
@@ -265,20 +267,32 @@ async def test_websocket_replay_live_frames_and_idle_subscription_cleanup(
                 pass
 
 
-async def test_websocket_failure_and_host_authentication(database):
+async def test_http_plugin_websocket_without_credentials(
+    database, seed_history, seed_session, monkeypatch
+):
+    monkeypatch.delenv("KAPY_CONTROL_TOKEN", raising=False)
+    session_id = await seed_history([ModelRequest([UserPromptPart("history")])])
+    await seed_session(session_id)
+    settings = CommonSettings.model_validate(
+        {
+            **os.environ,
+            "KAPY_DATABASE_URL": database.url,
+            "KAPY_DATABASE_SCHEMA": database.schema,
+        }
+    )
+    app = create_app(HttpSettings(common=settings))
+    async with app.router.lifespan_context(app), serve(app) as base:
+        async with websockets.connect(f"{base}/api/sessions/{session_id}/live?after_seq=-1") as ws:
+            event = TypeAdapter(OutputEvent).validate_json(await asyncio.wait_for(ws.recv(), 2))
+            assert isinstance(event, MessageCommitted) and event.message.seq == 0
+
+
+async def test_websocket_without_transport_closes_with_internal_error(database):
     sessions = SessionService(database.sessions)  # Iteration cannot subscribe without transport.
-
-    async def authenticate(connection: HTTPConnection):
-        if connection.query_params.get("authorized") != "yes":
-            raise HTTPException(status_code=403)
-
-    app = application(database, sessions, dependencies=[Depends(authenticate)])
+    app = application(database, sessions)
     async with serve(app) as base:
         path = f"{base}/api/sessions/{uuid4()}/live?after_seq=-1"
-        with pytest.raises(InvalidStatus):
-            async with websockets.connect(path):
-                pass
-        async with websockets.connect(path + "&authorized=yes") as ws:
+        async with websockets.connect(path) as ws:
             with pytest.raises(ConnectionClosedError) as closed:
                 await ws.recv()
             assert closed.value.rcvd is not None

@@ -27,7 +27,7 @@ def main(argv: list[str]) -> int:
         }
         settings = HttpSettings(**values)
     except ValidationError:
-        parser.error("Invalid HTTP configuration; check KAPY_HTTP_* and KAPY_CONTROL_TOKEN")
+        parser.error("Invalid HTTP configuration; check KAPY_HTTP_* and shared settings")
     logging.basicConfig(level=settings.common.log_level)
     uvicorn.run(
         create_app(settings),

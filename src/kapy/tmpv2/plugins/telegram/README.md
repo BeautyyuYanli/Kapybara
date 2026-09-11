@@ -5,19 +5,31 @@ SessionService for session business; it never loads the old gateway, ControlAPI,
 principal/machine RPC or State output protocol.
 
 ```sh
-# Core schema and an existing provider/model are prerequisites for serving.
+# Initialize both independent schemas before serving.
 kapy db upgrade
 kapy plugin telegram db upgrade
 kapy plugin telegram serve
 ```
 
 `TELEGRAM_BOT_TOKEN` is required for serving. Set
-`KAPY_TELEGRAM_ALLOWED_CHAT_IDS` to a JSON integer list, for example `[123456]`, and
-`KAPY_TELEGRAM_SESSION_TEMPLATE` to an existing model identity, for example
+`KAPY_TELEGRAM_ALLOWED_CHAT_IDS` to a JSON integer list, for example `[123456]`.
+Serving does not require a model: help/status work without a session template,
+and requests that would create a session receive a configuration notice.
+After configuring the provider/model through HTTP, send
+`/model <provider UUID> <model name>` to select it for this bot. With a bound session,
+the command also updates that session's provider/model pair. `/model` without
+arguments shows the default and usage. The selection is saved in private SQLite
+and takes effect immediately without restarting the plugin.
+
+The optional `KAPY_TELEGRAM_SESSION_TEMPLATE` supplies the initial fallback, for example
 `{"provider_id":"00000000-0000-0000-0000-000000000001","model_name":"your-model"}`.
 The template accepts the existing CreateSession fields, including compaction values.
-Provider credentials stay in the core catalog. Chat/model configuration cannot be
-changed from Telegram. Optional `KAPY_TELEGRAM_API_BASE` defaults to
+An omitted template or JSON `null` requires selecting a model before creating a
+session. A saved choice takes precedence over the entire environment template and
+uses normal CreateSession defaults; model presets continue to come from the catalog.
+Adding a model to the catalog does not automatically choose a Telegram default.
+Provider credentials and catalog editing stay in the frontend; the Telegram command
+only reads an existing model identity. Optional `KAPY_TELEGRAM_API_BASE` defaults to
 `https://api.telegram.org`, `KAPY_TELEGRAM_POLL_TIMEOUT` to 25 seconds and
 `KAPY_TELEGRAM_RECOVERY_INTERVAL` to 5 seconds.
 
@@ -32,7 +44,8 @@ value takes precedence. Mount this directory persistently, including WAL/SHM fil
 Database commands need only this path, not core/Valkey/model/bot configuration.
 
 The plugin owns `plugin_telegram_poll`, `plugin_telegram_inbox`,
-`plugin_telegram_routes`, `plugin_telegram_delivery`, and the independent migration
+`plugin_telegram_routes`, `plugin_telegram_delivery`, `plugin_telegram_defaults`,
+and the independent migration
 version table `plugin_telegram_schema_version`. SQLite uses one queued connection,
 WAL, FULL synchronization, a 5-second busy timeout and explicit transactions.
 No runtime create_all, cross-database foreign keys, joins or transactions are used.
@@ -44,12 +57,29 @@ No runtime create_all, cross-database foreign keys, joins or transactions are us
 | /steer text | Submit steer input; create a session if unbound |
 | /status | Current UUID, active lease, cancel flag and channel queue sizes |
 | /cancel | Request cancellation, without claiming the runner already stopped |
+| /model [provider UUID model name] | Show the bot default; with arguments, update the bound session and save the default |
 | /help | List these session commands |
 
 Routes are keyed by bot/chat/topic (topic 0 when absent). Only allowed chats and
 non-bot senders are handled. Media receives an unsupported notice; unknown commands
 are never forwarded to the model. Status/cancel on an unbound route do not create
 a session. A missing session clears its route; infrastructure errors do not.
+
+The default is shared by all allowed chats for that bot. A model command changes
+only the current chat/topic's bound session and the bot default; other existing
+sessions retain their configuration. Session updates preserve history, inputs,
+model-setting overrides, title and compaction configuration. The service validates
+those overrides against the selected model; failure leaves the default unchanged.
+A running runner retains its model snapshot until its next start. The command
+does not start or cancel execution, and an unbound chat does not create a session.
+
+Session updates commit first, then the plugin records that progress and saves the
+default. These are separate database transactions. A transient SQLite failure
+after the session update is retried before replying; there is no cross-database
+rollback. Retries reuse the resolved session and model pair, and skip a session
+update whose progress is already saved. Confirmation-send retries do not reapply
+completed configuration. A crash before progress is saved can repeat the same
+session update, following the inbox's existing at-least-once contract.
 
 Polling persists every batch and offset together before the next poll. Inbox
 processing records the resolved target/template and creation/submission progress.
@@ -65,8 +95,13 @@ crashes before scheduling. No global session scan or output polling is introduce
 
 Each durable delivery consumes SessionService.live, with its committed after_seq.
 Private chats (including topics) receive replace/append draft previews sampled
-from the latest state at most once per second, with unchanged drafts refreshed
-after 20 seconds. Live consumption continues while a draft waits on chat pacing;
+from the latest state at `KAPY_OUTPUT_FLUSH_INTERVAL` (default 0.5 seconds), including
+request time in each cycle. The first sample also coalesces one interval. Zero
+(unbatched publishing) uses a 0.5-second preview interval to avoid idle busy loops.
+The Bot API client uses the same interval between draft request starts; complete
+messages retain one-second spacing. Network latency and Telegram rate-limit backoff
+can slow delivery. Unchanged drafts refresh after 20 seconds.
+Live consumption continues while a draft waits on chat pacing;
 a committed message cancels and joins that provisional send before delivery. Groups only
 receive complete text responses. Thinking/tools are provisional. Complete requests
 are not echoed and complete messages are not interpreted as run-finished signals.

@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from kapy.tmpv2.application.settings import CommonSettings
@@ -18,6 +18,5 @@ class HttpSettings(BaseSettings):
     )
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
-    control_token: SecretStr = Field(validation_alias="KAPY_CONTROL_TOKEN", min_length=1)
     frontend_dist: Path | None = None
     shutdown_timeout: float = Field(default=15, gt=0, allow_inf_nan=False)

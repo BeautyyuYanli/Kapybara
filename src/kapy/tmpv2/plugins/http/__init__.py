@@ -1,4 +1,4 @@
-"""Mountable tmpv2 control routers; the application owns resources and authentication."""
+"""Mountable tmpv2 control routers; the application owns their resource lifecycle."""
 
 from pathlib import Path
 
@@ -28,7 +28,7 @@ def create_router[DepsT, OutputT](
     realtime_output: bool = True,
     output_flush_interval: float = 0.5,
 ) -> APIRouter:
-    """Compose /api routes; host dependencies must authorize both HTTP and WebSocket."""
+    """Compose HTTP and WebSocket routes under /api using the borrowed services."""
     router = APIRouter(prefix="/api")
     router.include_router(create_model_router(models))
     router.include_router(

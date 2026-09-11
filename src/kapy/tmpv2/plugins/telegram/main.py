@@ -20,6 +20,7 @@ from kapy.tmpv2.agent_output import AgentOutputService
 from kapy.tmpv2.agent_runner import SessionBusy
 from kapy.tmpv2.application.agent import create_agent
 from kapy.tmpv2.application.resources import open_resources
+from kapy.tmpv2.control.models import ModelService
 from kapy.tmpv2.control.sessions import SessionService
 
 from .client import TelegramClient, TelegramFailure, retry_delay
@@ -39,7 +40,14 @@ async def serve(settings: TelegramSettings) -> None:
         open_storage(settings.database_path) as storage,
         httpx2.AsyncClient(timeout=settings.poll_timeout + 10, trust_env=False) as http,
     ):
-        client = TelegramClient(http, settings.bot_token.get_secret_value(), settings.api_base)
+        # Unbatched publishing (zero) must not turn idle draft refresh into a busy loop.
+        preview_interval = settings.common.output_flush_interval or 0.5
+        client = TelegramClient(
+            http,
+            settings.bot_token.get_secret_value(),
+            settings.api_base,
+            draft_interval=preview_interval,
+        )
         repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
         sessions = SessionService(
             resources.core_session_factory,
@@ -97,6 +105,7 @@ async def serve(settings: TelegramSettings) -> None:
             controller = TelegramController(
                 client=client,
                 sessions=sessions,
+                models=ModelService(resources.core_session_factory),
                 repository=repository,
                 settings=settings,
                 bot_id=bot["id"],
@@ -106,7 +115,15 @@ async def serve(settings: TelegramSettings) -> None:
             try:
                 tasks.create_task(controller.poll())
                 tasks.create_task(controller.process())
-                tasks.create_task(TelegramDelivery(client, sessions, repository, bot["id"]).run())
+                tasks.create_task(
+                    TelegramDelivery(
+                        client,
+                        sessions,
+                        repository,
+                        bot["id"],
+                        preview_interval=preview_interval,
+                    ).run()
+                )
                 await asyncio.Future()
             finally:
                 accepting = False

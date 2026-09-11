@@ -17,118 +17,79 @@ services:
       retries: 30
   valkey:
     image: valkey/valkey:8-alpine
-    command: ["valkey-server", "--appendonly", "yes"]
+    # tmpv2 only uses Pub/Sub: there are no messages to persist or expire.
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
     ports:
       - "127.0.0.1:${KAPY_VALKEY_PORT:-56379}:6379"
-    volumes:
-      - valkey-data:/data
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 30
-  machine:
-    profiles: ["dev"]
-    image: kapy-v2-machine:dev
-    build:
-      context: .
-      dockerfile: Dockerfile.machine
+  runtime:
+    image: kapy-v2:tmpv2
+    build: .
     init: true
+    command: ["kapy", "plugin", "http", "serve", "--host", "0.0.0.0", "--port", "8000", "--frontend-dist", "/app/frontend/dist"]
+    ports:
+      - "0.0.0.0:${KAPY_HTTP_PORT:-8000}:8000"
     user: "10001:10001"
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
-    working_dir: /workspace
     environment:
-      PYTHONPATH: /workspace/src
-      KAPY_DOCKER_TEST: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      XDG_STATE_HOME: /var/lib/kapy/state
       KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
+      KAPY_DATABASE_SCHEMA: ${KAPY_DATABASE_SCHEMA:-kapy_tmpv2}
       KAPY_VALKEY_URL: redis://valkey:6379/0
+      KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_tmpv2}
+      KAPY_OUTPUT_FLUSH_INTERVAL: ${KAPY_OUTPUT_FLUSH_INTERVAL:-0.5}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
     volumes:
-      - ./src:/workspace/src:ro
-      - ./tests:/workspace/tests:ro
-      - ./scripts:/workspace/scripts:ro
-      - ./pyproject.toml:/workspace/pyproject.toml:ro
-    mem_limit: 2g
-    pids_limit: 256
-  network:
-    profiles: ["app"]
-    image: python:3.14-slim
-    init: true
-    command: ["sleep", "infinity"]
-    # Keep loopback stable while either application container restarts.
-    ports:
-      - "127.0.0.1:${KAPY_CONTROL_PORT:-8000}:8000"
-    mem_limit: 32m
-    pids_limit: 16
-  control:
-    profiles: ["app"]
-    image: kapy-v2:dev
-    build:
-      context: .
-      dockerfile: Dockerfile
-    init: true
-    network_mode: service:network
-    environment:
-      KAPY_COMPRESSION_RATIO: ${KAPY_COMPRESSION_RATIO:-0.70}
-      KAPY_KEEP_RECENT_RATIO: ${KAPY_KEEP_RECENT_RATIO:-0.10}
-      KAPY_MEDIA_MAX_BYTES: ${KAPY_MEDIA_MAX_BYTES:-20971520}
-      KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
-      KAPY_DATABASE_SCHEMA: ${KAPY_DATABASE_SCHEMA:-kapy_state}
-      KAPY_VALKEY_URL: redis://valkey:6379/0
-      KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_state}
-      KAPY_CONTROL_TOKEN: ${KAPY_CONTROL_TOKEN:-}
-      KAPY_SESSION_SIGNING_KEY: ${KAPY_SESSION_SIGNING_KEY:-}
-      KAPY_MACHINE_TOKENS: ${KAPY_MACHINE_TOKENS:-}
-      KAPY_TOOL_PLUGINS: ${KAPY_TOOL_PLUGINS:-["apply_patch"]}
-      KAPY_FRONTENDS: ${KAPY_FRONTENDS:-null}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./scripts:/app/scripts:ro
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - runtime-data:/var/lib/kapy
     depends_on:
-      network:
-        condition: service_started
       postgres:
         condition: service_healthy
       valkey:
         condition: service_healthy
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=2).close()"
-      interval: 3s
-      timeout: 3s
-      retries: 20
     mem_limit: 2g
     pids_limit: 256
-  daemon:
-    profiles: ["app"]
-    image: kapy-v2:dev
+  telegram:
+    image: kapy-v2:tmpv2
+    build: .
     init: true
+    command: ["kapy", "plugin", "telegram", "serve"]
     user: "10001:10001"
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
-    command: ["kapy", "server"]
-    # Separate filesystems/PID namespaces; loopback transport for local development.
-    network_mode: service:network
     environment:
-      KAPY_CONTROL_URL: http://127.0.0.1:8000
-      KAPY_MACHINE_ID: ${KAPY_MACHINE_ID:-docker-machine}
-      KAPY_MACHINE_TOKEN: ${KAPY_MACHINE_TOKEN:-}
-      KAPY_EXECUTION_STATE_DIR: /var/lib/kapy/state
-      KAPY_EXECUTION_DATA_DIR: /var/lib/kapy/data
-      KAPY_EXECUTION_RUNTIME_DIR: /run/kapy
-      KAPY_CHILD_ENV: '{"PATH":"/app/.venv/bin:/usr/local/bin:/usr/bin:/bin","LANG":"C.UTF-8"}'
+      PYTHONDONTWRITEBYTECODE: "1"
+      XDG_STATE_HOME: /var/lib/kapy/state
+      KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
+      KAPY_DATABASE_SCHEMA: ${KAPY_DATABASE_SCHEMA:-kapy_tmpv2}
+      KAPY_VALKEY_URL: redis://valkey:6379/0
+      KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_tmpv2}
+      KAPY_OUTPUT_FLUSH_INTERVAL: ${KAPY_OUTPUT_FLUSH_INTERVAL:-0.5}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required}
+      KAPY_TELEGRAM_ALLOWED_CHAT_IDS: ${KAPY_TELEGRAM_ALLOWED_CHAT_IDS:-[${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID is required}]}
+      KAPY_TELEGRAM_SESSION_TEMPLATE: ${KAPY_TELEGRAM_SESSION_TEMPLATE:-null}
     volumes:
-      - machine-data:/var/lib/kapy
-    tmpfs:
-      - /run/kapy:uid=10001,gid=10001,mode=0700
+      - ./src:/app/src:ro
+      - telegram-data:/var/lib/kapy
     depends_on:
-      control:
+      postgres:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     mem_limit: 2g
     pids_limit: 256
 volumes:
   postgres-data:
-  valkey-data:
-  machine-data:
+  runtime-data:
+  telegram-data:

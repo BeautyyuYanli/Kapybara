@@ -39,7 +39,7 @@ class TelegramSettings(StorageSettings):
     )
     bot_token: SecretStr = Field(validation_alias="TELEGRAM_BOT_TOKEN", min_length=1)
     allowed_chat_ids: set[int] = Field(min_length=1)
-    session_template: CreateSession
+    session_template: CreateSession | None = None
     api_base: str = "https://api.telegram.org"
     poll_timeout: int = Field(default=25, ge=1, le=50)
     recovery_interval: float = Field(default=5, gt=0, allow_inf_nan=False)

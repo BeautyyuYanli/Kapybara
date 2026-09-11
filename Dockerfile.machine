@@ -1,8 +1,0 @@
-FROM kapy-v2:dev
-USER root
-COPY pyproject.toml uv.lock /app/
-RUN uv sync --project /app --locked
-ENV PYTHONPATH=/workspace/src
-WORKDIR /workspace
-USER 10001:10001
-CMD ["sleep", "infinity"]

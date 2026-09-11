@@ -1,11 +1,9 @@
 """The HTTP process owns its resources through lifespan; Uvicorn drains requests first."""
 
 import asyncio
-import hmac
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocketException
-from starlette.requests import HTTPConnection
+from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from kapy.tmpv2.agent_output import AgentOutputService
@@ -37,17 +35,7 @@ class _InflightRequests:
 
 
 def create_app(settings: HttpSettings) -> FastAPI:
-    """Protect HTTP and WebSocket with the existing operator bearer-token convention."""
-
-    async def authorize(connection: HTTPConnection) -> None:
-        scheme, _, token = connection.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(
-            token, settings.control_token.get_secret_value()
-        ):
-            if connection.scope["type"] == "websocket":
-                raise WebSocketException(code=1008)
-            raise HTTPException(status_code=401, detail="Bearer authentication required")
-
+    """Serve HTTP, WebSocket and the optional frontend without access authentication."""
     active: set[asyncio.Task] = set()
 
     @asynccontextmanager
@@ -69,7 +57,7 @@ def create_app(settings: HttpSettings) -> FastAPI:
                 realtime_output=settings.common.realtime_output,
                 output_flush_interval=settings.common.output_flush_interval,
             )
-            app.include_router(router, dependencies=[Depends(authorize)])
+            app.include_router(router)
             if settings.frontend_dist is not None:
                 app.include_router(create_frontend_router(settings.frontend_dist))
             try:

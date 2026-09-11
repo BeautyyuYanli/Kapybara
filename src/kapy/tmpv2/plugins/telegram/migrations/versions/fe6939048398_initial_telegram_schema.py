@@ -1,6 +1,6 @@
-"""Initial Telegram state
+"""Initial Telegram schema
 
-Revision ID: fb493ef4330c
+Revision ID: fe6939048398
 Revises:
 """
 
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "fb493ef4330c"
+revision: str = "fe6939048398"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

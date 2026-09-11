@@ -1,192 +1,106 @@
 # Kapy v2
 
-Kapy 将 Pydantic AI 控制面与 Linux 执行机分开：控制面保存会话、历史、事件和
-Skills；执行机通过主动建立的 WebSocket 接收命令，管理 stdio、PTY 和文件传输。
-Telegram 和 `kapy control` 使用同一套会话接口。
-
-```mermaid
-flowchart LR
-  TG[Telegram chat / topic] --> CP[控制面：Gateway + Agent + State]
-  CLI[kapy control] --> DA[执行机：kapy server]
-  DA <-->|双向 JSON-RPC / WebSocket| CP
-  CP --> PG[(PostgreSQL：会话 / 历史 / 事件 / Skills)]
-  CP --> VK[(Valkey：唤醒提示)]
-  DA --> EX[进程 / PTY / 文件 / 会话工作目录]
-  DA --> SQ[(SQLite：执行机状态)]
-```
+当前开发栈围绕 `src/kapy/tmpv2` 的 Python 模块：本地进程与 PTY、文件传输、
+Agent Runner、上下文压缩，以及基于 Valkey Pub/Sub 的实时输出和历史回放。
+HTTP 和 Telegram 作为独立进程插件，直接调用这些服务。HTTP 同时挂载配置前端。
 
 ## 本地启动
 
-需要 Docker Compose 和 uv。源码使用 Python 3.14；Docker 镜像提供对应运行环境。
-
-1. 使用 `.env.example` 创建 `.env`。本工作区已有 `.env` 时直接沿用。
-2. 模型连接启动后通过 provider API 配置；无需在服务环境填写模型 key 或窗口。
-3. 分别为 `KAPY_CONTROL_TOKEN`、`KAPY_SESSION_SIGNING_KEY`、
-   `KAPY_MACHINE_TOKEN` 设置随机值。可重复执行
-   `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` 生成。
-4. 在控制面的映射中填写同一个机器 ID 和机器令牌，保留外层单引号：
-
-   ```dotenv
-   KAPY_MACHINE_ID=docker-machine
-   KAPY_MACHINE_TOKEN=replace-with-machine-token
-   KAPY_MACHINE_TOKENS='{"docker-machine":"replace-with-machine-token"}'
-   ```
-
-启动不连接 Telegram 的本地栈：
+需要 Docker Compose。镜像提供 Python 3.14 和锁定版本的开发依赖。
+首次配置可以复制 `.env.example` 为 `.env`；已有 `.env` 直接复用。
+填写 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID`。
+镜像构建时使用 npm 生成前端产物，无需手动维护 `dist`。
 
 ```sh
-KAPY_FRONTENDS='[]' docker compose --profile app up -d --build
-docker compose --profile app ps
+docker compose build runtime
+docker compose up -d --wait postgres valkey
+# 首次启动：核心和 Telegram 数据库分别升级，serve 不自动迁移。
+docker compose run --rm runtime kapy db upgrade
+docker compose run --rm telegram kapy plugin telegram db upgrade
+docker compose up -d runtime telegram
+docker compose ps
 ```
 
-控制接口位于 `http://127.0.0.1:8000/rpc`，API 文档位于 `/docs`。控制面和
-daemon 使用独立文件系统与 PID 空间，由常驻 `network` 服务提供稳定的本地回环
-网络，使控制容器重启不改变 daemon 的网络空间；PostgreSQL、Valkey 和
-机器数据使用命名卷。`docker compose --profile app down` 停止栈并保留这些卷。
+| 服务 | 用途 | 宿主机入口 |
+| --- | --- | --- |
+| `postgres` | Runner checkpoint、原始 history、compaction、输入队列及取消状态 | `127.0.0.1:55432` |
+| `valkey` | 按 session 广播临时输出；无离线消息、TTL 或持久化 | `127.0.0.1:56379` |
+| `runtime` | 非 root 的 HTTP 插件和配置前端 | `0.0.0.0:8000`，前端 `/app/` |
+| `telegram` | 独立 Telegram session 插件，通过 Bot API 长轮询 | 无入站端口 |
 
-执行机 daemon 和开发 machine 以 `kapy` 用户（UID/GID `10001:10001`）运行，
-移除全部 Linux capabilities，并启用 `no-new-privileges`。Agent 启动的命令继承
-这个普通用户身份。镜像中的应用和虚拟环境由 root 所有，执行机只能读取和执行。
-会话数据目录与运行时 socket 目录由 kapy 所有，权限为 `0700`。
+源码、测试和脚本挂载为只读；更新依赖或前端后需要重新构建。
+PostgreSQL、runtime 和 Telegram 状态目录分别保存在 `postgres-data`、
+`runtime-data`、`telegram-data` 命名卷。ProcessManager 默认使用
+`/var/lib/kapy/state/kapy` 保存 SQLite 和进程输出；Telegram 使用独立卷中的
+`/var/lib/kapy/state/kapy/plugins/telegram/telegram.sqlite3`。
 
-从旧版 root 容器升级时，先停止 daemon，将已有 machine-data 卷内数据的所有权
-迁移到 `10001:10001`，保留文件权限，再启动新镜像；不能用放宽为 `0777` 代替。
-新建数据卷自动使用镜像中正确的目录所有权。直接在 Linux 安装时，也应以普通用户
-运行 `kapy server`，不授予 sudo、容器管理权限或额外 capabilities。
+Compose 从 `.env` 读取 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`、
+`KAPY_DATABASE_SCHEMA` 和 `KAPY_VALKEY_NAMESPACE`。容器内数据库和 Valkey URL
+使用 Compose 服务名；`.env.example` 的 URL 用于宿主机直接调用模块。
+Telegram 复用 `.env` 中的 bot token 和 chat ID，
+也可用 `KAPY_TELEGRAM_ALLOWED_CHAT_IDS` JSON 列表配置多个 chat。
+启动不创建 provider 或 model。配置前端在 `http://localhost:8000/app/`。
+HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
+创建模型后在 Telegram 发送 `/model <provider UUID> <model name>`，同时更新当前
+聊天/话题的 session 模型并保存 bot 默认选择，后续新会话也使用它；选择重启后保留。
+`/model` 不带参数显示当前默认值。尚未选择模型时 bot 仍可启动，并提示配置命令。
+`KAPY_TELEGRAM_SESSION_TEMPLATE` 可作为没有已保存选择时的初始默认模板。
+可用 `KAPY_HTTP_PORT` / `KAPY_POSTGRES_PORT` / `KAPY_VALKEY_PORT` 更改映射端口。
 
-执行一条真实模型和机器工具验收任务：
+## 验证
+
+全部 tmpv2 测试使用真实 PostgreSQL、Valkey、子进程、PTY 和本地 HTTP 服务；
+模型行为使用 SDK 的确定性测试模型，不调用外部模型 API。
+进程和文件测试要求在容器中运行，避免在宿主机跳过。
 
 ```sh
-uv sync --locked
-uv run --env-file .env python scripts/check_system.py --machine docker-machine --model-id MODEL_ID
+docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests/tmpv2
 ```
 
-该脚本创建临时会话，让模型调用执行机生成随机结果，核对最终回复与持久化工具
-记录，然后删除临时会话。测量及其适用范围见 [验收结果](docs/acceptance-results.md)。
-
-## 模型与前端配置
-
-调用协议由独立 provider 选择：默认 OpenAI Responses，也支持 Chat Completions 和
-Google AI Studio。provider 管端点与只写 key，持久模型目录保存稳定 ID、探测 metadata
-与手工 defaults。session 选择模型 ID，可覆盖预算；优先级为 session → model defaults →
-探测结果 → 262144/16384。实际 token 数仅用 API usage。
-完整 API、CLI 与配置示例见 [Provider 与模型配置](docs/models.md)。
-
-Python 应用可通过 `create_app(settings, model_backend_factory=..., frontend_factories=..., plugins=...)`
-注入模型适配器、注册可信前端工厂和选择脚本插件。`ModelBackend` 构造 Pydantic AI Model
-并分类可安全展示的错误；Runner 不拥有供应商客户端。前端只需实现 `run()`，并使用
-`FrontendContext.control.call(...)` 操作会话。`KAPY_FRONTENDS='["terminal"]'` 选择已注册的名称。
-显式 `plugins=()` 关闭脚本插件；`plugins=None` 使用 `KAPY_TOOL_PLUGINS` 的本地默认清单。
-接口及借用资源规则见 [Agent](docs/agent-skills.md) 和 [Gateway](src/kapy/gateway/README.md)。
-
-## CLI 与递归会话
-
-从本地管理员环境，经 Docker daemon 的代理创建会话：
+使用 `.env` 的模型端点和凭据运行真实模型验收：
 
 ```sh
-uv run --env-file .env docker compose --profile app exec -e KAPY_CONTROL_TOKEN daemon \
-  kapy control session create '请检查当前工作目录' --model MODEL_ID --machine docker-machine
+docker compose exec -T runtime python scripts/check_tmpv2.py
 ```
 
-返回值包含会话 ID 和提交回执。后续命令可以使用 `--session <session-id>`：
+该脚本使用 OpenAI Responses 协议，会产生数次模型请求。运行前需按上方步骤
+执行 `kapy db upgrade` 初始化配置的 PostgreSQL schema；脚本保留一个独立
+session 供检查，每次运行使用新的 session ID。
+
+验收内容：
+
+- 模型调用工具，通过 ProcessManager 启动进程生成文件；检查输出、文件原子写入，
+  并重新打开 ProcessManager 读取保留的进程结果。
+- SessionService 开启实时输出（默认每 0.5 秒批量发送 delta）；消费端先订阅，
+  再读历史。检查完整消息 DTO 与数据库一致，delta 能按 part 还原最终文本。
+- 从指定 history seq 回放；手动压缩保持原始 history 不变；重启后仅用摘要恢复，
+  验证模型仍记得先前工具结果，并触发基于 usage 的自动压缩。
+- 关闭实时输出仍正常落库；重新连接补齐未广播的历史，退出后释放订阅。
+
+真实模型是否返回可见的 thinking delta 取决于提供方；脚本单独输出其数量。
+工具调用及结果从完整消息读取，不使用文本 delta 表达工具参数。
+测试套件另外覆盖竞争租约、心跳丢失、checkpoint 恢复、取消、失败清理等边界。
+
+## 模块入口
+
+- [进程管理 API](src/kapy/tmpv2/processes/README.md)
+- [文件传输](src/kapy/tmpv2/file_transfer.py)
+- [Runner、压缩和实时输出契约](src/kapy/tmpv2/agent_runner/README.md)
+- [Valkey 输出服务](src/kapy/tmpv2/agent_output/service.py)
+- [SessionService：生产侧与历史回放](src/kapy/tmpv2/control/sessions/service.py)
+- [独立进程接口插件](src/kapy/tmpv2/plugins/README.md)
+- [核心与插件数据库迁移](src/kapy/tmpv2/database/README.md)
+- [控制面 FastAPI HTTP / WebSocket API](src/kapy/tmpv2/plugins/http/README.md)
+
+调用方负责 engine、数据库 schema、模型 Agent 和 Valkey client 的生命周期。
+`SessionService.start_runner(..., realtime_output=True)` 需要注入
+`AgentOutputService`；默认关闭实时输出。`live(session_id, after_seq=-1)`
+返回从最后已应用完整消息序号之后回放、再继续监听的异步 generator，提前结束时使用 `aclosing`。
+Pub/Sub 是尽力广播，断线后用最后一条完整消息的 `seq` 作为 `after_seq` 续接历史。
 
 ```sh
-kapy control --session <session-id> session input '下一项任务'
-kapy control --session <session-id> session input --steer '补充当前任务的要求'
-kapy control --session <session-id> session output --follow
-kapy control --session <session-id> session wait <request-id> --timeout 120
-kapy control --session <session-id> history search '关键词' --substring
-kapy control --session <session-id> history query 'SELECT kind, text FROM history ORDER BY seq DESC LIMIT 10'
+# 停止并保留 PostgreSQL 和 runtime 数据
+docker compose down
+# 清空本项目的容器和数据
+docker compose down --volumes --remove-orphans
 ```
-
-这些命令在执行机上通过本地 socket 工作；管理员调用需要显式控制令牌。Agent
-工具启动的子进程自动获得机器、调用方会话和会话令牌，所以可以直接调用
-`kapy control`。指定 `--session` 只改变目标会话，不改变调用方身份。父会话可以
-创建子会话，把该次提交回执的 `waiting_id` 交给 `wait_for(ids)` 输出函数。
-子任务以正常文本结束，或通过 `reply_to(ids)` 选中该输入后，回复才会一次性交接并唤醒父会话。
-`wait_for` 只等待结果，进入 waiting 状态本身不会回复输入。
-
-每条直接输入自动获得独立回复地址，steer 和 queue 都如此；同一请求的重试复用原回执。
-不带初始输入的创建没有提交回执。创建时默认使用 `text` 模式，也可通过
-`session create --output-mode reply_to` 选择必须调用 `reply_to` 的模式。
-`reply_to(ids)` 立即回复选中的输入，返回完整回复及剩余地址；有剩余时继续同一个 loop，
-全部已读输入回复完成后在完整工具批次边界结束。普通模式的最终文本等价于回复全部已读输入。
-真实父子任务验收可运行：
-
-```sh
-uv run --env-file .env python scripts/check_recursive.py --machine docker-machine --model-id MODEL_ID
-```
-
-`queue` 在下一轮处理；`steer` 在当前模型或工具边界处理。完整历史保存在
-PostgreSQL，模型上下文压缩不会删掉原始历史。压缩依据 API 返回的单次用量。
-
-## Telegram
-
-在 `.env` 中配置 `TELEGRAM_BOT_TOKEN` 和允许使用的 `TELEGRAM_CHAT_ID`，然后执行
-`docker compose --profile app up -d control daemon`，控制面即加载 Telegram 插件。
-支持 topic 的聊天按 topic 区分会话；其他聊天按 chat 区分。
-`KAPY_FRONTENDS` 未设置时按 token 自动启用 Telegram；显式 `[]` 关闭所有前端插件。
-
-- `/machine docker-machine`：保存默认执行机。
-- `/providers`、`/provider ID`：查看并选择模型连接。
-- `/discover`、`/models`：刷新、读取持久模型目录。
-- `/model ID`：选择已登记模型；`/modeldefaults JSON` 配置共享默认预算。
-- `/instructions ...`：保存新会话的基础指令。
-- `/new`：按已保存设置创建新会话。
-- `/steer ...`、`/queue ...`：选择输入方式；普通消息使用 queue。
-- `/settings`、`/status`、`/help`：查看设置、会话和命令说明。
-
-模型回复使用 Telegram 原生 Rich Markdown，直接渲染标题、列表、表格和代码块。
-私聊使用富文本流式草稿：生成时更新同一条预览，完成后发送完整富文本正文。
-普通回复不展示 session 前缀、工具日志或 waiting 状态；长回复按段落和消息上限分段。
-群组只发送完成后的正文。旧版会话需先通过 session.update 选择模型 ID，历史保留。
-命令和错误提示使用纯文本；无法安全拆分的超长 Markdown 块或已确认的内容上限拒绝
-会降级为完整纯文本源码，避免丢掉正文。格式降级不会用于网络错误或发送结果未知。
-
-自动验收使用假的 Bot API；2026-09-08 已在用户授权的 Bot 上通过实际生产发送方法
-验证富文本草稿更新两次、最终发送一条完整富文本消息。
-
-## Skills 与插件
-
-Skills 使用包含 `SKILL.md` 的 ZIP，保存于控制面 PostgreSQL。会话创建时载入
-Skill ID/description 目录，后续可以通过 CLI 查询和下载新 Skill：
-
-```sh
-kapy control skill list
-kapy control skill upload ./my-skill
-kapy control skill read <skill-id>
-kapy control skill download <skill-id> ./downloaded-skill
-```
-
-Agent 内置进程、媒体和等待工具；`apply_patch` 由应用默认装配为可选脚本插件。
-`KAPY_TOOL_PLUGINS='[]'` 可关闭默认插件。脚本插件声明参数模式、描述及可选准备函数，
-通过同一个执行机进程管理器运行。普通文件通过 shell 命令读取、命令或补丁工具修改。`apply_patch` 二进制及清单由对应资源生成脚本
-维护，不能手工改动生成文件。
-
-## 开发和检查
-
-```sh
-uv sync --locked
-uv run ruff check src tests scripts
-uv run pyrefly check
-uv build
-docker build -t kapy-v2:dev .
-docker build -f Dockerfile.machine -t kapy-v2-machine:dev .
-docker compose up -d postgres valkey
-docker compose --profile dev run --rm machine /app/.venv/bin/pytest -q -p no:cacheprovider
-```
-
-真实进程、PTY、文件和执行机恢复检查全部在 Docker 中运行。测试使用独立
-PostgreSQL schema 和 Valkey namespace，可通过 `KAPY_DATABASE_URL`、
-`KAPY_VALKEY_URL` 指定服务地址。负载与产品验收入口见 [验收清单](docs/acceptance.md)。
-
-构建的 wheel 提供 `kapy` 命令，可用
-`uvx --from ./dist/kapy-0.1.0-py3-none-any.whl kapy --help` 调用。本项目尚未发布到
-PyPI。远程执行机配置自己的机器 ID、令牌及控制面 HTTPS 地址；控制面的
-`KAPY_MACHINE_TOKENS` 必须包含对应映射。`KAPY_CHILD_ENV` 显式提供工具需要的
-PATH 等环境，包括已安装的 `kapy` 路径。远程机器连接使用 WSS；回环地址允许 WS。
-
-当前面向单控制进程、多会话、多执行机。进程清理采用普通进程组和 best effort；
-PTY 保留 8192 字节尾部，stdio 输出写入磁盘。会话是逻辑隔离；同一执行机中的
-命令具有该 daemon 用户的文件访问权限。详细所有权和边界见
-[架构](docs/architecture.md)、[接口契约](docs/contracts.md)、[State 说明](docs/state.md)。

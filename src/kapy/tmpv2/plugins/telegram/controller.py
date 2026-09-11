@@ -3,6 +3,10 @@
 The inbox consumer is serial. Resolved targets and templates survive retries;
 core commits and private SQLite progress deliberately remain separate transactions.
 Polling and recovery never hold a transaction during a network or runner call.
+The model catalog is read only: /model changes the bound session's model pair and
+persists the bot's default in private storage. Session progress is saved before
+changing the default; retries keep their resolved target. Running agents retain
+their existing model snapshot until the next run.
 """
 
 import asyncio
@@ -14,7 +18,8 @@ from uuid import UUID
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from kapy.tmpv2.control.sessions import CreateSession, SessionService, SubmitInput
+from kapy.tmpv2.control.models import ModelService
+from kapy.tmpv2.control.sessions import CreateSession, SessionService, SubmitInput, UpdateSession
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .models import InboxRow
@@ -28,9 +33,11 @@ COMMANDS = {
     "steer": "Steer the current run",
     "status": "Show session status",
     "cancel": "Request cancellation",
+    "model": "Set the session model and bot default, or show the default",
     "help": "Show commands",
 }
 HELP = "\n".join(f"/{command} — {description}" for command, description in COMMANDS.items())
+MODEL_USAGE = "Usage: /model <provider UUID> <model name>"
 
 
 class TelegramController:
@@ -39,6 +46,7 @@ class TelegramController:
         *,
         client: TelegramClient,
         sessions: SessionService,
+        models: ModelService,
         repository: TelegramRepository,
         settings: TelegramSettings,
         bot_id: int,
@@ -46,6 +54,7 @@ class TelegramController:
         schedule_runner: Callable[[UUID], None],
     ) -> None:
         self.client, self.sessions, self.repository = client, sessions, repository
+        self.models = models
         self.settings, self.bot_id, self.username = settings, bot_id, username
         self.schedule_runner = schedule_runner
 
@@ -72,6 +81,52 @@ class TelegramController:
                 logger.warning("Telegram polling storage unavailable")
                 await asyncio.sleep(retry_delay(TelegramFailure(503), failures))
                 failures += 1
+
+    async def session_template(self) -> CreateSession | None:
+        """Saved selection overrides the environment template using normal session defaults."""
+        default = await self.repository.default_model(self.bot_id)
+        if default is not None:
+            return CreateSession(provider_id=default.provider_id, model_name=default.model_name)
+        return self.settings.session_template
+
+    async def resolve_model(self, text: str, session_id: UUID | None) -> dict[str, Any]:
+        """Validate a complete model identity before recording a repeatable selection action."""
+        if not text.strip():
+            template = await self.session_template()
+            current = (
+                f"Default provider: {template.provider_id}\nDefault model: {template.model_name}"
+                if template is not None
+                else "No default session model is configured."
+            )
+            return {"command": "reply", "reply": f"{current}\n{MODEL_USAGE}"}
+        parts = text.split(maxsplit=1)
+        try:
+            if len(parts) != 2:
+                raise ValueError("A provider and model are required")
+            choice = CreateSession(provider_id=UUID(parts[0]), model_name=parts[1])
+        except ValueError:
+            return {"command": "reply", "reply": MODEL_USAGE}
+        try:
+            await self.models.get_model(choice.provider_id, choice.model_name)
+        except LookupError:
+            return {
+                "command": "reply",
+                "reply": "That provider/model is not configured. Choose an existing model.",
+            }
+        return {
+            "command": "model",
+            "session_id": str(session_id) if session_id is not None else None,
+            "provider_id": str(choice.provider_id),
+            "model_name": choice.model_name,
+            "reply": (
+                f"Default provider: {choice.provider_id}\nDefault model: {choice.model_name}\n"
+                + (
+                    "Current session updated; the new model applies on its next run."
+                    if session_id is not None
+                    else "Saved for this bot's new sessions. Use /new to start one."
+                )
+            ),
+        }
 
     async def resolve(self, item: InboxRow) -> dict[str, Any]:
         message = item.payload.get("message") or {}
@@ -104,14 +159,24 @@ class TelegramController:
                     self.bot_id, item.chat_id, item.thread_id, session_id
                 )
                 session_id = None
+        if command == "model":
+            return await self.resolve_model(text, session_id)
         if command in {"status", "cancel"} and session_id is None:
             return {"command": "reply", "reply": "No current session. Use /new or send text."}
         create = command == "new" or session_id is None
+        template = await self.session_template() if create else None
+        if create and template is None:
+            return {
+                "command": "reply",
+                "reply": f"No default session model is configured.\n{MODEL_USAGE}",
+            }
         return {
             "command": command,
             "text": text,
             "session_id": None if create else str(session_id),
-            "template": self.settings.session_template.model_dump(mode="json") if create else None,
+            "template": template.model_dump(mode="json")
+            if create and template is not None
+            else None,
         }
 
     async def handle(self, item: InboxRow) -> None:
@@ -121,6 +186,21 @@ class TelegramController:
             await self.repository.save_action(item, action)
         action = dict(action)
         command = action["command"]
+        if command == "model" and not action.get("completed"):
+            if action["session_id"] is not None and not action.get("session_updated"):
+                await self.sessions.update_session(
+                    UUID(action["session_id"]),
+                    UpdateSession(
+                        provider_id=UUID(action["provider_id"]), model_name=action["model_name"]
+                    ),
+                )
+                action["session_updated"] = True
+                await self.repository.save_action(item, action)
+            await self.repository.set_default_model(
+                self.bot_id, UUID(action["provider_id"]), action["model_name"]
+            )
+            action["completed"] = True
+            await self.repository.save_action(item, action)
         if command not in {"ignore", "reply"} and not action.get("completed"):
             if action["session_id"] is None:
                 session = await self.sessions.create_session(

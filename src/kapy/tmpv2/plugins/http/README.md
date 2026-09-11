@@ -5,8 +5,8 @@ output_flush_interval=0.5)` returns an APIRouter under `/api`. The separate
 `create_model_router` and `create_session_router` omit the prefix, for custom mounts.
 All constructors borrow their services, configured Agent and dependencies.
 
-`kapy plugin http serve` runs the standalone application. Set `KAPY_CONTROL_TOKEN`
-for the existing operator bearer authentication on both HTTP and WebSocket routes.
+`kapy plugin http serve` runs the standalone application. HTTP and WebSocket
+routes are directly accessible without login or an access token.
 `KAPY_HTTP_HOST` defaults to 127.0.0.1, `KAPY_HTTP_PORT` to 8000, and
 `KAPY_HTTP_SHUTDOWN_TIMEOUT` to 15 seconds. `--host` and `--port` override those
 values. Optionally set `KAPY_HTTP_FRONTEND_DIST` or `--frontend-dist` to an existing
@@ -18,10 +18,8 @@ before disposing process-owned connections. It does not load Telegram configurat
 
 The hosting FastAPI application owns engine/session factory, Valkey client and
 Agent resources through its lifespan. Finish or cancel request/background tasks
-before closing those resources. Authentication is supplied by the host through
-router dependencies that support both HTTP and WebSocket (for example using
-HTTPConnection), not only Request. No accounts, runner process manager or old
-gateway integration is provided.
+before closing those resources. No authentication, accounts, runner process manager
+or old gateway integration is provided.
 
 ```python
 from fastapi import FastAPI
