@@ -1,6 +1,6 @@
-"""Transient session broadcasts; no database access, replay, retries, or shared-client ownership.
+"""Transient session broadcasts; no database access, replay, or shared-client ownership.
 
-Each publisher owns one bounded batch and at most one flush task. Each subscriber
+Each publisher owns one bounded buffer and one background send/recovery task. Each subscriber
 borrows a dedicated PubSub connection until its context exits, even before its
 iterator is first used. Channels are not isolated by Valkey database number.
 """
@@ -17,6 +17,7 @@ from pydantic import TypeAdapter
 from valkey.asyncio import ConnectionPool, Valkey
 from valkey.asyncio.retry import Retry
 from valkey.backoff import NoBackoff
+from valkey.exceptions import AuthenticationError, AuthorizationError
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
@@ -42,42 +43,38 @@ class AgentOutputService:
     async def publisher(
         self, session_id: UUID, *, flush_interval: float = 0.5
     ) -> AsyncIterator[OutputCallback]:
-        """Yield a session-bound callback; 0 disables batching, not publication.
+        """Yield a fast, lossy callback; all network work runs in one background task.
 
-        A finite nonnegative interval limits batch waiting. Normal exit flushes;
-        exceptional exit drops pending deltas and joins the task. Transport failures
-        drop the attempted batch, while cancellation and programming errors propagate.
+        A finite nonnegative interval bounds batching; zero wakes the task at once.
+        Ordinary callback/transport failures never reach the producer. Full buffers,
+        recovery and closing discard events. Every exit cancels sending without a
+        final flush; cancellation and errors in the context body still propagate.
         """
         if not math.isfinite(flush_interval) or flush_interval < 0:
             raise ValueError("flush_interval must be finite and nonnegative")
         publisher = _Publisher(self, session_id, flush_interval)
         try:
             yield publisher.write
-        except BaseException:
-            await publisher.close(failed=True)
-            raise
-        else:
-            await publisher.close(failed=False)
+        finally:
+            await publisher.close()
+
+    async def _command(self, *args: str | bytes) -> None:
+        # Borrow independently of subscriber settings, with one deadline for the
+        # connection, command and reply. Failed attempts never retain a connection.
+        pool = cast(ConnectionPool, self._client.connection_pool)
+        async with asyncio.timeout(1.0):
+            connection = await pool.get_connection(args[0])
+            try:
+                await connection.send_command(*args)
+                await connection.read_response()
+            except BaseException:
+                await connection.disconnect()
+                raise
+            finally:
+                await pool.release(connection)
 
     async def _publish(self, session_id: UUID, payload: bytes) -> None:
-        # Send the command directly on a borrowed pool connection: client-level
-        # retry settings must never turn an uncertain PUBLISH into a duplicate.
-        pool = cast(ConnectionPool, self._client.connection_pool)
-        try:
-            async with asyncio.timeout(1.0):
-                connection = await pool.get_connection("PUBLISH")
-                try:
-                    await connection.send_command(
-                        "PUBLISH", f"{self._channel_prefix}:{session_id}", payload
-                    )
-                    await connection.read_response()
-                except BaseException:
-                    await connection.disconnect()
-                    raise
-                finally:
-                    await pool.release(connection)
-        except ValkeyConnectionError, ValkeyTimeoutError, TimeoutError:
-            logger.warning("Dropped agent output batch for session %s", session_id, exc_info=True)
+        await self._command("PUBLISH", f"{self._channel_prefix}:{session_id}", payload)
 
     @asynccontextmanager
     async def subscribe(self, session_id: UUID) -> AsyncIterator[AsyncIterator[OutputEvent]]:
@@ -129,80 +126,98 @@ def _session_id(event: OutputEvent) -> UUID:
 
 
 class _Publisher:
-    """One context's serialized sends and bounded buffer; never shared across sessions."""
+    """One event-loop-local buffer plus at most one in-flight batch, each <= 64 KiB.
+
+    Buffer mutations never await. Only the worker owns network I/O; recovery drops
+    new events and probes independently of traffic. No failed batch is replayed.
+    """
 
     def __init__(self, service: AgentOutputService, session_id: UUID, interval: float) -> None:
         self._service = service
         self._session_id = session_id
         self._interval = interval
         self._buffer: list[bytes] = []
-        self._size = 2  # JSON array brackets, plus encoded items and separators below.
-        self._lock = asyncio.Lock()
-        self._pending = asyncio.Event()
-        self._stopping = asyncio.Event()
+        self._size = 2
+        self._deadline = 0.0
+        self._wake = asyncio.Event()
         self._closed = False
-        self._task = (
-            asyncio.create_task(self._run(), name=f"agent-output:{session_id}")
-            if interval > 0
-            else None
-        )
+        self._accepting = True
+        self._task = asyncio.create_task(self._run(), name=f"agent-output:{session_id}")
 
     async def write(self, event: OutputEvent) -> None:
-        if self._closed:
-            raise RuntimeError("Output publisher is closed")
-        if self._task is not None and self._task.done():
-            self._task.result()
-        if _session_id(event) != self._session_id:
-            raise ValueError("Output event belongs to another session")
-        encoded = _BATCH_ADAPTER.dump_json([event])[1:-1]
-        async with self._lock:
-            self._size += len(encoded) + bool(self._buffer)
-            self._buffer.append(encoded)
-            self._pending.set()
-            if (
-                self._interval == 0
-                or self._size >= _MAX_BATCH_BYTES
-                or isinstance(event, MessageCommitted)
-            ):
-                await self._flush()
-
-    async def _flush(self) -> None:
-        # All callers hold _lock, including during the bounded network attempt.
-        if not self._buffer:
+        if self._closed or not self._accepting:
             return
-        payload = b"[" + b",".join(self._buffer) + b"]"
+        try:
+            if _session_id(event) != self._session_id:
+                raise ValueError("Output event belongs to another session")
+            encoded = _BATCH_ADAPTER.dump_json([event])[1:-1]
+            size = self._size + len(encoded) + bool(self._buffer)
+            if size > _MAX_BATCH_BYTES:
+                if self._buffer:
+                    self._deadline = 0.0
+                    self._wake.set()
+                return
+            if not self._buffer:
+                self._deadline = asyncio.get_running_loop().time() + self._interval
+            self._buffer.append(encoded)
+            self._size = size
+            if size == _MAX_BATCH_BYTES or isinstance(event, MessageCommitted):
+                self._deadline = 0.0
+            self._wake.set()
+        except Exception as error:
+            logger.warning("Dropped invalid agent output (%s)", type(error).__name__)
+
+    def _clear(self) -> None:
         self._buffer.clear()
         self._size = 2
-        self._pending.clear()
-        await self._service._publish(self._session_id, payload)
 
     async def _run(self) -> None:
-        while True:
-            await self._pending.wait()
-            try:
-                async with asyncio.timeout(self._interval):
-                    await self._stopping.wait()
-            except TimeoutError:
-                pass
-            async with self._lock:
-                await self._flush()
-            if self._stopping.is_set():
-                return
-
-    async def close(self, *, failed: bool) -> None:
-        self._closed = True
-        task = self._task
         try:
-            if task is not None:
-                if failed:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                else:
-                    self._stopping.set()
-                    self._pending.set()
-                    await task
-            elif not failed:
-                async with self._lock:
-                    await self._flush()
-        finally:
-            self._buffer.clear()
+            while True:
+                await self._wake.wait()
+                self._wake.clear()
+                if not self._buffer:
+                    continue
+                delay = self._deadline - asyncio.get_running_loop().time()
+                if delay > 0:
+                    try:
+                        async with asyncio.timeout(delay):
+                            await self._wake.wait()
+                    except TimeoutError:
+                        pass
+                    else:
+                        continue
+                payload = b"[" + b",".join(self._buffer) + b"]"
+                self._clear()
+                try:
+                    await self._service._publish(self._session_id, payload)
+                except AuthenticationError, AuthorizationError:
+                    raise
+                except ValkeyConnectionError, ValkeyTimeoutError, TimeoutError, OSError:
+                    self._accepting = False
+                    self._clear()
+                    logger.warning("Agent output recovering for session %s", self._session_id)
+                    await self._recover()
+                    self._accepting = True
+                    logger.info("Agent output recovered for session %s", self._session_id)
+        except Exception as error:
+            self._accepting = False
+            self._clear()
+            logger.warning("Agent output disabled (%s)", type(error).__name__)
+
+    async def _recover(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                await self._service._command("PING")
+            except AuthenticationError, AuthorizationError:
+                raise
+            except ValkeyConnectionError, ValkeyTimeoutError, TimeoutError, OSError:
+                continue
+            return
+
+    async def close(self) -> None:
+        self._closed = True
+        self._clear()
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
