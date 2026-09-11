@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from psycopg import sql
 from pydantic_ai.toolsets import FunctionToolset
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -177,3 +178,27 @@ def session_model(monkeypatch):
         monkeypatch.setattr(service, "build_model", lambda *args, **kwargs: model)
 
     return use
+
+
+@pytest.fixture
+def wait_for_lock(database):
+    """Wait for an independently identified backend to block on a PostgreSQL lock."""
+
+    async def wait(pid):
+        async with asyncio.timeout(5):
+            while True:
+                async with database.sessions.begin() as db:
+                    waiting = (
+                        await db.execute(
+                            text(
+                                "SELECT wait_event_type = 'Lock' "
+                                "FROM pg_stat_activity WHERE pid=:pid"
+                            ),
+                            {"pid": pid},
+                        )
+                    ).scalar_one()
+                if waiting:
+                    return
+                await asyncio.sleep(0.01)
+
+    return wait

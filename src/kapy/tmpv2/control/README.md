@@ -96,7 +96,10 @@ reject unknown fields. Updates preserve omitted fields and replace supplied JSON
 objects as a whole; `{}` clears a preset/override. Explicit None is accepted only
 for provider base_url, model context_window and session compaction_threshold_tokens.
 Model switches must supply both provider_id and model_name. Lists use stable
-creation-time/identity order with offset >= 0 and limit between 1 and 200.
+creation-time/identity order with offset >= 0 and limit between 1 and 200, returning
+`Page(items, has_more)`. `read_history(id, before_seq=None, limit=100)` returns the
+latest matching page in ascending seq order; before_seq is exclusive and has_more
+means older history exists. History and ordinary lists share tmpv2.pagination.
 
 At startup, SessionService reads session/model/provider configuration once in a
 short transaction, then releases it before constructing SDK resources. It merges
@@ -123,9 +126,31 @@ start_runner still atomically acquires the lease and raises SessionBusy if occup
 Input is enqueued with `enqueue_input(id, "queued", content)` for the next run, or
 `"steer"` to supplement the current run at its next input boundary. Enqueue does
 not launch a runner. `read_inputs` returns a FIFO snapshot without consuming it and
-without requiring a business session row. Other public session operations check
-that the session exists. Runner-side consume callbacks borrow its fenced checkpoint
-transaction, transferring the accepted snapshot to history atomically. SessionService
+without requiring a business session row. `submit_input(id, SubmitInput(...))`
+commits input first, then returns InputSubmission(input, should_start_runner); this
+is only a lease observation, not execution ownership. The caller schedules work.
+`delete_input(id, input_id)` returns whether it withdrew a still-pending input.
+It races with checkpoint consumption through the same queue row: True means the
+input cannot enter a later checkpoint, False means no matching pending row remained.
+Consumption uses DELETE RETURNING, so only actually consumed input enters history
+and the SDK request. Queue deletion and checkpoint commit remain atomic.
+Read-only inputs/history/live/cancel/lease queries do not precheck business sessions;
+get/update/start read the configuration they require, and enqueue/request_cancel
+validate their own references. Empty queue/history/cancel/lease queries return
+empty results or False. Full AgentState and its lease internals stay in the runner. SessionService
 never keeps a database transaction open across model/tool work or output iteration.
 SDK Provider and Model contexts cover the complete startup call and close their
 owned clients after the runner and output publisher exit.
+
+After each lower runner returns and releases its lease, SessionService checks both
+input channels again. Pending input triggers reacquisition under the same SDK and
+publisher contexts; losing this later race returns the preceding result, whereas
+an initial SessionBusy propagates. Execution/cleanup failures are not retried.
+This closes the final queue-check/release handoff window without a persistent job
+queue. Cancel ends the current run at a boundary and leaves queued inputs intact.
+
+`live(id, after_seq=-1)` owns a confirmed Pub/Sub subscription before replaying
+history and following complete messages/deltas. Only complete messages advance
+the cursor; history pagination uses before_seq independently. Use aclosing when
+stopping early. See [HTTP adapters](../http/README.md) for application wiring,
+background scheduling and WebSocket lifetime.

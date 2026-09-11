@@ -28,10 +28,3 @@ class UpdateDTO(DTO):
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
-
-
-def validate_pagination(offset: int, limit: int) -> None:
-    if type(offset) is not int or offset < 0:
-        raise ValueError("offset must be a nonnegative integer")
-    if type(limit) is not int or not 1 <= limit <= 200:
-        raise ValueError("limit must be an integer between 1 and 200")

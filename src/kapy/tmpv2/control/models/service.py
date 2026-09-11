@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kapy.tmpv2.control.sessions.repository import SessionRepository
-from kapy.tmpv2.control.types import validate_pagination
+from kapy.tmpv2.pagination import Page, validate_pagination
 
 from .models import ModelRow
 from .repository import ModelRepository
@@ -53,9 +53,7 @@ class ModelService:
         async with self._session_factory.begin() as db:
             return await ModelRepository(db).get_provider(provider_id)
 
-    async def list_providers(
-        self, *, offset: int = 0, limit: int = 100
-    ) -> tuple[ProviderRecord, ...]:
+    async def list_providers(self, *, offset: int = 0, limit: int = 100) -> Page[ProviderRecord]:
         validate_pagination(offset, limit)
         async with self._session_factory.begin() as db:
             return await ModelRepository(db).list_providers(offset=offset, limit=limit)
@@ -97,7 +95,7 @@ class ModelService:
 
     async def list_models(
         self, *, provider_id: UUID | None = None, offset: int = 0, limit: int = 100
-    ) -> tuple[ModelRecord, ...]:
+    ) -> Page[ModelRecord]:
         validate_pagination(offset, limit)
         async with self._session_factory.begin() as db:
             return await ModelRepository(db).list_models(

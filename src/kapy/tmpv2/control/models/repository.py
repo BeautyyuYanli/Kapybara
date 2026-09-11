@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
 from kapy.tmpv2.control.types import utc_now
+from kapy.tmpv2.pagination import Page, paginate
 
 from .models import ModelRow, ProviderRow
 from .types import CreateProvider, ModelRecord, ProviderConfig, ProviderRecord, UpdateProvider
@@ -48,16 +49,17 @@ class ModelRepository:
     async def get_provider_config(self, provider_id: UUID) -> ProviderConfig:
         return ProviderConfig.model_validate(await self._provider(provider_id))
 
-    async def list_providers(self, *, offset: int, limit: int) -> tuple[ProviderRecord, ...]:
+    async def list_providers(self, *, offset: int, limit: int) -> Page[ProviderRecord]:
         statement = (
             select(ProviderRow)
             .order_by(col(ProviderRow.created_at), col(ProviderRow.id))
             .offset(offset)
-            .limit(limit)
         )
-        return tuple(
-            ProviderRecord.model_validate(row)
-            for row in (await self._db.execute(statement)).scalars()
+        return await paginate(
+            self._db,
+            statement,
+            limit=limit,
+            decode_rows=lambda rows: [ProviderRecord.model_validate(row) for row in rows],
         )
 
     async def update_provider(self, provider_id: UUID, data: UpdateProvider) -> ProviderRecord:
@@ -103,19 +105,18 @@ class ModelRepository:
 
     async def list_models(
         self, *, provider_id: UUID | None, offset: int, limit: int
-    ) -> tuple[ModelRecord, ...]:
+    ) -> Page[ModelRecord]:
         statement = select(ModelRow)
         if provider_id is not None:
             statement = statement.where(col(ModelRow.provider_id) == provider_id)
-        statement = (
-            statement.order_by(
-                col(ModelRow.created_at), col(ModelRow.provider_id), col(ModelRow.model_name)
-            )
-            .offset(offset)
-            .limit(limit)
-        )
-        return tuple(
-            ModelRecord.model_validate(row) for row in (await self._db.execute(statement)).scalars()
+        statement = statement.order_by(
+            col(ModelRow.created_at), col(ModelRow.provider_id), col(ModelRow.model_name)
+        ).offset(offset)
+        return await paginate(
+            self._db,
+            statement,
+            limit=limit,
+            decode_rows=lambda rows: [ModelRecord.model_validate(row) for row in rows],
         )
 
     async def update_model(

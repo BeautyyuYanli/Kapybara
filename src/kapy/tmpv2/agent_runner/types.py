@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 type UserInput = str | Sequence[UserContent]
 type NextStep = Literal["model_request", "handle_response", "done"]
-type ConsumeInputs = Callable[[AsyncSession], Awaitable[None]]
+type ConsumeInputs = Callable[[AsyncSession], Awaitable[tuple[UserInput, ...]]]
 type ConsumeCancel = Callable[[AsyncSession], Awaitable[bool]]
 
 
@@ -65,8 +65,11 @@ class RunnerLost(RuntimeError):
 class InputBatch:
     """Nonempty read snapshot; consume borrows the runner's fenced transaction.
 
-    The callback must delete only this snapshot's rows using the provided session.
+    inputs are candidates for SDK preparation. consume deletes only this snapshot's
+    rows and returns the actually accepted contents in the same order. Concurrent
+    withdrawal can only shrink that result: rows are immutable and IDs not reused.
     It must not commit, open another transaction, or access an external queue.
+    Preparation may retry consumption after rolling back when candidates shrink.
     """
 
     inputs: tuple[UserInput, ...]

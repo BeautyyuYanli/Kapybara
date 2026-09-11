@@ -87,7 +87,7 @@ async def test_subscribe_before_history_deduplicates_overlap(
     async def overlap(repo, requested_session, *, after_seq=-1):
         calls.append(after_seq)
         if len(calls) == 1:
-            # stream_output must already hold a confirmed subscription, so a
+            # live must already hold a confirmed subscription, so a
             # concurrent commit belongs to both this snapshot and the channel.
             channel = f"kapy:agent-output:{session_id}"
             assert (await valkey_client.pubsub_numsub(channel))[0][1] == 1
@@ -98,7 +98,7 @@ async def test_subscribe_before_history_deduplicates_overlap(
         return await original(repo, requested_session, after_seq=after_seq)
 
     monkeypatch.setattr(AgentRepository, "read_history_entries", overlap)
-    async with aclosing(sessions.stream_output(session_id)) as events:
+    async with aclosing(sessions.live(session_id)) as events:
         async with asyncio.timeout(2):
             assert (await next_committed(events)) == initial[0]
             assert (await next_committed(events)).seq == 1
@@ -128,7 +128,7 @@ async def test_missing_notifications_backfill_history_once(
         return await original(repo, requested_session, after_seq=after_seq)
 
     monkeypatch.setattr(AgentRepository, "read_history_entries", observe)
-    async with aclosing(sessions.stream_output(session_id)) as events:
+    async with aclosing(sessions.live(session_id)) as events:
         assert (await next_committed(events)).seq == 0
         missing = [response("first"), ModelRequest(parts=[UserPromptPart("next")])]
         if trigger == "covered_delta":
@@ -163,12 +163,12 @@ async def test_start_cursor_and_reconnect_recover_unpublished_tail(
     stored = await append(
         database, session_id, [ModelRequest(parts=[UserPromptPart("go")]), response()], 0
     )
-    async with aclosing(sessions.stream_output(session_id, start_seq=1)) as events:
+    async with aclosing(sessions.live(session_id, after_seq=0)) as events:
         assert (await next_committed(events)) == stored[1]
     tail = await append(
         database, session_id, [ModelRequest(parts=[UserPromptPart("later")]), response("tail")], 2
     )
-    async with aclosing(sessions.stream_output(session_id, start_seq=2)) as events:
+    async with aclosing(sessions.live(session_id, after_seq=1)) as events:
         assert [(await next_committed(events)) for _ in tail] == list(tail)
     assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
 
@@ -195,7 +195,7 @@ async def test_replay_releases_only_database_connection_while_yielding_and_liste
             assert (await db.execute(text("SELECT 1"))).scalar_one() == 1
 
     try:
-        async with aclosing(sessions.stream_output(session_id)) as events:
+        async with aclosing(sessions.live(session_id)) as events:
             assert (await next_committed(events)).seq == 0
             await independent_transaction()  # Generator is paused at its history yield.
             waiting = asyncio.ensure_future(anext(events))
@@ -241,7 +241,7 @@ async def test_unstarted_session_can_follow_new_execution(
     task = asyncio.create_task(produce())
     try:
         async with asyncio.timeout(2):
-            async with aclosing(sessions.stream_output(session_id)) as events:
+            async with aclosing(sessions.live(session_id)) as events:
                 first = await anext(events)
                 assert isinstance(first, MessageCommitted) and first.message.seq == 0
                 while True:
@@ -262,7 +262,7 @@ async def test_unfilled_predecessor_gap_fails_and_closes_subscription(
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     await append(database, session_id, [response()], 0)
-    async with aclosing(sessions.stream_output(session_id)) as events:
+    async with aclosing(sessions.live(session_id)) as events:
         assert (await next_committed(events)).seq == 0
         async with outputs.publisher(session_id, flush_interval=0) as callback:
             await callback(MessageCommitted(HistoryMessage(session_id, 2, response())))
@@ -272,8 +272,8 @@ async def test_unfilled_predecessor_gap_fails_and_closes_subscription(
     assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
 
 
-@pytest.mark.parametrize("start_seq", [-1, True, 1.5])
-async def test_invalid_history_cursor_rejected_at_iteration(database, valkey_client, start_seq):
+@pytest.mark.parametrize("after_seq", [-2, True, 1.5])
+async def test_invalid_history_cursor_rejected_at_iteration(database, valkey_client, after_seq):
     sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
     with pytest.raises(ValueError):
-        await anext(sessions.stream_output(uuid4(), start_seq=start_seq))
+        await anext(sessions.live(uuid4(), after_seq=after_seq))

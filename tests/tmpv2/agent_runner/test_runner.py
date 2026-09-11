@@ -436,8 +436,11 @@ async def test_input_acceptance_fault_preserves_atomic_recoverable_state(
             return None
 
         async def consume(db):
-            await sessions.consume_inputs(session_id, "steer", db=db, ids=[row.id for row in rows])
+            accepted = await sessions.consume_inputs(
+                session_id, "steer", db=db, ids=[row.id for row in rows]
+            )
             db.info["accepting_input"] = True
+            return tuple(row.content for row in accepted)
 
         return InputBatch(tuple(row.content for row in rows), consume)
 
@@ -541,7 +544,10 @@ async def test_initial_and_steer_wait_for_saved_response_then_accept_exact_snaps
 
     async def consume_initial(db):
         consumed.append("queued")
-        await sessions.consume_inputs(session_id, "queued", db=db, ids=[row.id for row in snapshot])
+        accepted = await sessions.consume_inputs(
+            session_id, "queued", db=db, ids=[row.id for row in snapshot]
+        )
+        return tuple(row.content for row in accepted)
 
     initial = InputBatch(tuple(row.content for row in snapshot), consume_initial)
 
@@ -553,7 +559,10 @@ async def test_initial_and_steer_wait_for_saved_response_then_accept_exact_snaps
 
         async def consume(db):
             consumed.append("steer")
-            await sessions.consume_inputs(session_id, "steer", db=db, ids=[row.id for row in rows])
+            accepted = await sessions.consume_inputs(
+                session_id, "steer", db=db, ids=[row.id for row in rows]
+            )
+            return tuple(row.content for row in accepted)
 
         return InputBatch(tuple(row.content for row in rows), consume)
 

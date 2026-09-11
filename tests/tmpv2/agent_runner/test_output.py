@@ -43,7 +43,7 @@ async def no_cancel(db):
 
 
 async def consume(db):
-    pass
+    return ("go",)
 
 
 async def history(database, session_id):
@@ -231,6 +231,7 @@ async def test_failures_publish_no_uncommitted_response(database, failure):
     async def accept(db):
         if failure == "consume":
             raise RuntimeError("consume failure")
+        return ("go",)
 
     async def model(messages, info):
         yield "partial"
@@ -309,4 +310,4 @@ async def test_missing_transport_rejected_before_acquiring_lease(database):
 
         assert (await db.execute(text("SELECT count(*) FROM agent_states"))).scalar_one() == 0
     with pytest.raises(RuntimeError, match="output service"):
-        await anext(sessions.stream_output(session_id))
+        await anext(sessions.live(session_id))

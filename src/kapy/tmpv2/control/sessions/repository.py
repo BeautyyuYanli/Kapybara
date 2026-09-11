@@ -12,6 +12,7 @@ from sqlmodel import col, select
 
 from kapy.tmpv2.agent_runner.types import UserInput
 from kapy.tmpv2.control.types import utc_now
+from kapy.tmpv2.pagination import Page, paginate
 
 from .models import SessionCancelRow, SessionInputRow, SessionRow
 from .types import CreateSession, InputChannel, SessionInput, SessionRecord
@@ -40,20 +41,20 @@ class SessionRepository:
 
     async def list_sessions(
         self, *, provider_id: UUID | None, model_name: str | None, offset: int, limit: int
-    ) -> tuple[SessionRecord, ...]:
+    ) -> Page[SessionRecord]:
         statement = select(SessionRow)
         if provider_id is not None:
             statement = statement.where(col(SessionRow.provider_id) == provider_id)
         if model_name is not None:
             statement = statement.where(col(SessionRow.model_name) == model_name)
-        statement = (
-            statement.order_by(col(SessionRow.created_at), col(SessionRow.id))
-            .offset(offset)
-            .limit(limit)
+        statement = statement.order_by(col(SessionRow.created_at), col(SessionRow.id)).offset(
+            offset
         )
-        return tuple(
-            SessionRecord.model_validate(row)
-            for row in (await self._db.execute(statement)).scalars()
+        return await paginate(
+            self._db,
+            statement,
+            limit=limit,
+            decode_rows=lambda rows: [SessionRecord.model_validate(row) for row in rows],
         )
 
     async def update_session(self, session_id: UUID, values: dict[str, Any]) -> SessionRecord:
@@ -111,17 +112,36 @@ class SessionRepository:
             if row.id is not None
         )
 
+    async def delete_input(self, session_id: UUID, input_id: int) -> bool:
+        statement = (
+            delete(SessionInputRow)
+            .where(
+                col(SessionInputRow.session_id) == session_id, col(SessionInputRow.id) == input_id
+            )
+            .returning(col(SessionInputRow.id))
+        )
+        return (await self._db.execute(statement)).scalar_one_or_none() is not None
+
     async def consume_inputs(
         self, session_id: UUID, channel: InputChannel, *, ids: Sequence[int]
-    ) -> None:
-        if ids:
-            await self._db.execute(
-                delete(SessionInputRow).where(
-                    col(SessionInputRow.session_id) == session_id,
-                    col(SessionInputRow.channel) == channel,
-                    col(SessionInputRow.id).in_(ids),
-                )
+    ) -> tuple[SessionInput, ...]:
+        """Return only rows actually removed, in FIFO order, in the borrowed transaction."""
+        if not ids:
+            return ()
+        statement = (
+            delete(SessionInputRow)
+            .where(
+                col(SessionInputRow.session_id) == session_id,
+                col(SessionInputRow.channel) == channel,
+                col(SessionInputRow.id).in_(ids),
             )
+            .returning(col(SessionInputRow.id), col(SessionInputRow.content))
+        )
+        rows = (await self._db.execute(statement)).all()
+        return tuple(
+            SessionInput(row.id, _input_adapter.validate_python(row.content))
+            for row in sorted(rows, key=lambda row: row.id)
+        )
 
     async def set_cancel(self, session_id: UUID) -> None:
         await self._db.execute(

@@ -34,23 +34,6 @@ async def acquire(database, session_id, token):
         return await AgentRepository(db).acquire(session_id, token, heartbeat_timeout=60)
 
 
-async def wait_for_lock(database, pid):
-    async with asyncio.timeout(5):
-        while True:
-            async with database.sessions.begin() as db:
-                waiting = (
-                    await db.execute(
-                        text(
-                            "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid=:pid"
-                        ),
-                        {"pid": pid},
-                    )
-                ).scalar_one()
-            if waiting:
-                return
-            await asyncio.sleep(0.01)
-
-
 async def test_concurrent_claim_only_one_winner_and_other_session_independent(database):
     session_id = uuid4()
     results = await asyncio.gather(
@@ -88,7 +71,7 @@ async def test_expiration_does_not_revoke_and_takeover_rejects_old_token(databas
         await repo.lock_owned(session_id, new)
 
 
-async def test_lock_owned_protects_transaction_until_commit(database):
+async def test_lock_owned_protects_transaction_until_commit(database, wait_for_lock):
     session_id, old, new = uuid4(), uuid4(), uuid4()
     await acquire(database, session_id, old)
     await expire(database, session_id)
@@ -104,7 +87,7 @@ async def test_lock_owned_protects_transaction_until_commit(database):
         await repo.lock_owned(session_id, old)
         task = asyncio.create_task(take_over())
         pid = await pid_ready
-        await wait_for_lock(database, pid)
+        await wait_for_lock(pid)
         assert not task.done()
         await repo.save_checkpoint(
             session_id,
@@ -122,7 +105,7 @@ async def test_lock_owned_protects_transaction_until_commit(database):
     assert part.content == "protected"
 
 
-async def test_waiting_lock_owned_rechecks_replaced_token(database):
+async def test_waiting_lock_owned_rechecks_replaced_token(database, wait_for_lock):
     session_id, old, new = uuid4(), uuid4(), uuid4()
     await acquire(database, session_id, old)
     await expire(database, session_id)
@@ -136,7 +119,7 @@ async def test_waiting_lock_owned_rechecks_replaced_token(database):
     async with database.sessions.begin() as db:
         await AgentRepository(db).acquire(session_id, new, heartbeat_timeout=60)
         task = asyncio.create_task(stale_write())
-        await wait_for_lock(database, await pid_ready)
+        await wait_for_lock(await pid_ready)
     with pytest.raises(RunnerLost):
         await task
 
@@ -443,7 +426,10 @@ async def test_runner_rejects_consumption_after_takeover(database, takeover_at, 
 
         async def consume(db):
             input_consumptions.append(True)
-            await sessions.consume_inputs(session_id, "steer", db=db, ids=[row.id for row in rows])
+            accepted = await sessions.consume_inputs(
+                session_id, "steer", db=db, ids=[row.id for row in rows]
+            )
+            return tuple(row.content for row in accepted)
 
         return InputBatch(tuple(row.content for row in rows), consume)
 

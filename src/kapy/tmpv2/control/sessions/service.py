@@ -3,7 +3,7 @@
 Ordinary methods own short transactions. Consumption borrows the runner's already
 fenced transaction, preserving atomic queue-to-history transfer. This service
 owns no long-lived ORM session, Agent, task, or engine. Optional output transport
-is borrowed from agent_output; stream_output owns each subscription and joins
+is borrowed from agent_output; live owns each subscription and joins
 original history to live events without holding a transaction during iteration.
 """
 
@@ -24,11 +24,11 @@ from kapy.tmpv2.agent_runner import (
     InputBatch,
     MessageCommitted,
     OutputEvent,
+    SessionBusy,
     TurnResult,
     UserInput,
 )
 from kapy.tmpv2.agent_runner import start_runner as run_agent_session
-from kapy.tmpv2.agent_runner.compaction import require_nonnegative_int
 from kapy.tmpv2.agent_runner.repository import AgentRepository
 from kapy.tmpv2.control.models.repository import ModelRepository
 from kapy.tmpv2.control.models.runtime import (
@@ -37,10 +37,18 @@ from kapy.tmpv2.control.models.runtime import (
     resolve_classes,
     validate_settings,
 )
-from kapy.tmpv2.control.types import validate_pagination
+from kapy.tmpv2.pagination import BeforeSeqPagination, Page, validate_pagination
 
 from .repository import SessionRepository
-from .types import CreateSession, InputChannel, SessionInput, SessionRecord, UpdateSession
+from .types import (
+    CreateSession,
+    InputChannel,
+    InputSubmission,
+    SessionInput,
+    SessionRecord,
+    SubmitInput,
+    UpdateSession,
+)
 
 
 class SessionService:
@@ -93,7 +101,7 @@ class SessionService:
         model_name: str | None = None,
         offset: int = 0,
         limit: int = 100,
-    ) -> tuple[SessionRecord, ...]:
+    ) -> Page[SessionRecord]:
         validate_pagination(offset, limit)
         async with self._session_factory.begin() as db:
             return await SessionRepository(db).list_sessions(
@@ -118,7 +126,6 @@ class SessionService:
     async def is_runner_running(self, session_id: UUID) -> bool:
         """Observe a live lease using this service's timeout, including a still-owned done state."""
         async with self._session_factory.begin() as db:
-            await SessionRepository(db).get_session(session_id)
             return await AgentRepository(db).is_runner_running(
                 session_id, heartbeat_timeout=self._heartbeat_timeout
             )
@@ -131,6 +138,29 @@ class SessionService:
             await repo.get_session(session_id)
             item = await repo.enqueue_input(session_id, channel, content)
         return item
+
+    async def submit_input(self, session_id: UUID, data: SubmitInput) -> InputSubmission:
+        """Commit input before observing the lease; callers choose how to schedule execution."""
+        item = await self.enqueue_input(session_id, data.channel, data.content)
+        running = await self.is_runner_running(session_id)
+        return InputSubmission(input=item, should_start_runner=not running)
+
+    async def delete_input(self, session_id: UUID, input_id: int) -> bool:
+        """Withdraw a pending input; False means it was consumed, deleted or never present."""
+        if type(input_id) is not int or input_id <= 0:
+            raise ValueError("input_id must be a positive integer")
+        async with self._session_factory.begin() as db:
+            return await SessionRepository(db).delete_input(session_id, input_id)
+
+    async def read_history(
+        self, session_id: UUID, *, before_seq: int | None = None, limit: int = 100
+    ) -> Page[HistoryMessage]:
+        """Read the latest page before an exclusive cursor, ordered oldest to newest."""
+        BeforeSeqPagination(before_seq=before_seq, limit=limit)
+        async with self._session_factory.begin() as db:
+            return await AgentRepository(db).read_history_page(
+                session_id, before_seq=before_seq, limit=limit
+            )
 
     async def read_inputs(
         self, session_id: UUID, channel: InputChannel
@@ -147,9 +177,7 @@ class SessionService:
 
     async def read_cancel(self, session_id: UUID) -> bool:
         async with self._session_factory.begin() as db:
-            repo = SessionRepository(db)
-            await repo.get_session(session_id)
-            return await repo.read_cancel(session_id)
+            return await SessionRepository(db).read_cancel(session_id)
 
     async def consume_inputs(
         self,
@@ -158,9 +186,9 @@ class SessionService:
         *,
         db: AsyncSession,
         ids: Sequence[int],
-    ) -> None:
-        """Borrow the input checkpoint transaction; never independently commit."""
-        await SessionRepository(db).consume_inputs(session_id, channel, ids=ids)
+    ) -> tuple[SessionInput, ...]:
+        """Return actual consumption in the borrowed checkpoint transaction; never commit."""
+        return await SessionRepository(db).consume_inputs(session_id, channel, ids=ids)
 
     async def consume_cancel(self, session_id: UUID, *, db: AsyncSession) -> bool:
         """Borrow the runner transaction after its lock_owned check."""
@@ -185,6 +213,12 @@ class SessionService:
         a task-local override supplies the stored model and merged request settings.
         Configuration errors precede output publication, lease acquisition and input
         consumption. Provider and Model contexts outlive the complete runner loop.
+        After lease release, pending inputs trigger reacquisition with the same
+        configuration. Across the entire call, output retains the last non-None
+        output, while finished comes from the last normally returned result. Later
+        empty runs or fully withdrawn inputs do not clear an earlier output.
+        A later SessionBusy returns the preceding successful aggregate; an initial
+        SessionBusy and all other failures propagate. No background task is created here.
         """
         if realtime_output and self._output_service is None:
             raise RuntimeError("Realtime output requires an output service")
@@ -206,8 +240,9 @@ class SessionService:
                 return None
             ids = tuple(row.id for row in rows)
 
-            async def consume(db: AsyncSession) -> None:
-                await self.consume_inputs(session_id, channel, db=db, ids=ids)
+            async def consume(db: AsyncSession) -> tuple[UserInput, ...]:
+                accepted = await self.consume_inputs(session_id, channel, db=db, ids=ids)
+                return tuple(row.content for row in accepted)
 
             return InputBatch(tuple(row.content for row in rows), consume)
 
@@ -230,27 +265,44 @@ class SessionService:
         ):
             with agent.override(model=sdk_model, model_settings=cast(ModelSettings, settings)):
                 async with publisher as on_output:
-                    return await run_agent_session(
-                        session_id,
-                        agent=agent,
-                        session_factory=self._session_factory,
-                        deps=deps,
-                        read_steer=partial(read_batch, "steer"),
-                        read_queued=partial(read_batch, "queued"),
-                        consume_cancel=consume_cancel,
-                        heartbeat_interval=self._heartbeat_interval,
-                        heartbeat_timeout=self._heartbeat_timeout,
-                        compaction_threshold_tokens=threshold,
-                        compaction_replay_turns=session.compaction_replay_turns,
-                        on_output=on_output,
-                    )
+                    result: TurnResult[OutputT] | None = None
+                    while True:
+                        try:
+                            current = await run_agent_session(
+                                session_id,
+                                agent=agent,
+                                session_factory=self._session_factory,
+                                deps=deps,
+                                read_steer=partial(read_batch, "steer"),
+                                read_queued=partial(read_batch, "queued"),
+                                consume_cancel=consume_cancel,
+                                heartbeat_interval=self._heartbeat_interval,
+                                heartbeat_timeout=self._heartbeat_timeout,
+                                compaction_threshold_tokens=threshold,
+                                compaction_replay_turns=session.compaction_replay_turns,
+                                on_output=on_output,
+                            )
+                        except SessionBusy:
+                            if result is None:
+                                raise
+                            return result
+                        result = TurnResult(
+                            current.finished,
+                            current.output
+                            if current.output is not None
+                            else (result.output if result is not None else None),
+                        )
+                        # run_agent_session returns only after its lease release commits.
+                        if not (
+                            await self.read_inputs(session_id, "queued")
+                            or await self.read_inputs(session_id, "steer")
+                        ):
+                            return result
 
-    async def stream_output(
-        self, session_id: UUID, *, start_seq: int = 0
-    ) -> AsyncGenerator[OutputEvent]:
-        """Replay original history from inclusive start_seq, then follow live events.
+    async def live(self, session_id: UUID, *, after_seq: int = -1) -> AsyncGenerator[OutputEvent]:
+        """Replay original history after the last applied complete seq, then follow live events.
 
-        start_seq must be a nonnegative integer, otherwise ValueError is raised.
+        after_seq must be an integer >= -1, otherwise ValueError is raised.
         An output_service is required even for history replay, otherwise RuntimeError
         is raised. Validation, subscription and history reads begin on iteration.
         Live continuation requires the producer to enable realtime_output.
@@ -260,13 +312,13 @@ class SessionService:
         No transaction survives a yield. Missing predecessors raise RuntimeError.
         This stream continues across runner lifetimes, with no polling or guaranteed
         delivery of a lost final notification. Reconnect from the last committed
-        seq + 1 and discard provisional text. Use aclosing when stopping early.
+        seq and discard provisional text. Use aclosing when stopping early.
         """
-        require_nonnegative_int(start_seq, "start_seq")
+        if type(after_seq) is not int or after_seq < -1:
+            raise ValueError("after_seq must be an integer >= -1")
         if self._output_service is None:
             raise RuntimeError("Streaming output requires an output service")
-        await self.get_session(session_id)
-        last_seq = start_seq - 1
+        last_seq = after_seq
 
         async def read_history() -> tuple[HistoryMessage, ...]:
             async with self._session_factory.begin() as db:

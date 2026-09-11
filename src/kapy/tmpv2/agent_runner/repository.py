@@ -18,6 +18,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
+from kapy.tmpv2.pagination import Page, paginate
+
 from .models import AgentCompactionRow, AgentHistoryRow, AgentStateRow
 from .types import Compaction, HistoryMessage, NextStep, ResumeState, RunnerLost, SessionBusy
 
@@ -175,6 +177,20 @@ class AgentRepository:
             .order_by(col(AgentHistoryRow.seq))
         )
         return _decode_history((await self._db.execute(statement)).scalars().all())
+
+    async def read_history_page(
+        self, session_id: UUID, *, before_seq: int | None, limit: int
+    ) -> Page[HistoryMessage]:
+        """Latest matching window, returned ascending; has_more means older rows exist."""
+        statement = select(AgentHistoryRow).where(col(AgentHistoryRow.session_id) == session_id)
+        if before_seq is not None:
+            statement = statement.where(col(AgentHistoryRow.seq) < before_seq)
+        return await paginate(
+            self._db,
+            statement.order_by(col(AgentHistoryRow.seq).desc()),
+            limit=limit,
+            decode_rows=lambda rows: list(reversed(_decode_history(rows))),
+        )
 
     async def read_history_before(
         self, session_id: UUID, *, through_seq: int, limit: int

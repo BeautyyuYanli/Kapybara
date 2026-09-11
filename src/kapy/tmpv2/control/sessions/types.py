@@ -19,6 +19,18 @@ class SessionInput:
     content: UserInput
 
 
+class SubmitInput(DTO):
+    content: UserInput
+    channel: InputChannel = "queued"
+
+
+class InputSubmission(DTO):
+    """The start intention observes a lease; it does not reserve execution."""
+
+    input: SessionInput
+    should_start_runner: bool
+
+
 class CreateSession(DTO):
     provider_id: UUID
     model_name: Name

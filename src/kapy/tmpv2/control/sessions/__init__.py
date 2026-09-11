@@ -3,7 +3,15 @@
 from kapy.tmpv2.agent_runner.types import HistoryMessage, MessageCommitted, OutputEvent, TextDelta
 
 from .service import SessionService
-from .types import CreateSession, InputChannel, SessionInput, SessionRecord, UpdateSession
+from .types import (
+    CreateSession,
+    InputChannel,
+    InputSubmission,
+    SessionInput,
+    SessionRecord,
+    SubmitInput,
+    UpdateSession,
+)
 
 __all__ = [
     "CreateSession",
@@ -14,6 +22,8 @@ __all__ = [
     "OutputEvent",
     "TextDelta",
     "InputChannel",
+    "InputSubmission",
+    "SubmitInput",
     "SessionInput",
     "SessionService",
 ]

@@ -143,10 +143,12 @@ async def test_catalog_crud_references_and_session_settings(database, sdk_http):
         updated_session.model_settings == {} and updated_session.compaction_threshold_tokens is None
     )
     assert updated_session.compaction_replay_turns == 0
-    assert await sessions.list_sessions(provider_id=provider.id) == (updated_session,)
-    assert await sessions.list_sessions(model_name=first.model_name) == (updated_session,)
-    assert await sessions.list_sessions(provider_id=uuid4(), model_name=first.model_name) == ()
-    assert await catalog.list_models(provider_id=provider.id, offset=1) == (unknown,)
+    assert (await sessions.list_sessions(provider_id=provider.id)).items == [updated_session]
+    assert (await sessions.list_sessions(model_name=first.model_name)).items == [updated_session]
+    assert (
+        await sessions.list_sessions(provider_id=uuid4(), model_name=first.model_name)
+    ).items == []
+    assert (await catalog.list_models(provider_id=provider.id, offset=1)).items == [unknown]
     with pytest.raises(ResourceInUse):
         await catalog.delete_model(provider.id, first.model_name)
     with pytest.raises(ResourceInUse):
@@ -161,8 +163,8 @@ async def test_catalog_crud_references_and_session_settings(database, sdk_http):
     )
     await catalog.delete_provider(provider.id)
     await catalog.delete_provider(provider.id)
-    assert await catalog.list_models(provider_id=provider.id) == ()
-    assert await catalog.list_providers() == (other,)
+    assert (await catalog.list_models(provider_id=provider.id)).items == []
+    assert (await catalog.list_providers()).items == [other]
     with pytest.raises(LookupError):
         await catalog.get_provider(provider.id)
 
@@ -300,7 +302,7 @@ async def test_discovery_uses_sdk_profiles_preserves_edits_and_rolls_back_failed
     fail = True
     with pytest.raises(ModelDiscoveryError):
         await catalog.discover_models(provider.id)
-    assert await catalog.list_models(provider_id=provider.id) == (manual,)
+    assert (await catalog.list_models(provider_id=provider.id)).items == [manual]
     fail = False
     assert len(await catalog.discover_models(provider.id)) == 2
     assert all(client.is_closed for client in clients)
@@ -474,8 +476,7 @@ async def test_running_status_observes_fresh_done_and_expired_leases(database):
                 {"id": session.id},
             )
         assert not await sessions.is_runner_running(session.id)
-    with pytest.raises(LookupError):
-        await sessions.is_runner_running(uuid4())
+    assert not await sessions.is_runner_running(uuid4())
     assert await sessions.read_inputs(uuid4(), "queued") == ()
     with pytest.raises(LookupError):
         await sessions.enqueue_input(uuid4(), "queued", "orphan")

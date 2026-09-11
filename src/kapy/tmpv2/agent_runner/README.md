@@ -49,12 +49,22 @@ async def example(database_url: str):
 stores session configuration, resolves the model, then composes the input loop.
 Steer is accepted at request boundaries; queued input starts another run after a
 normal return; cancel ends the current run without modifying its checkpoint. A
-cancellation signal is the presence of a `session_cancels` row. SessionService's
-user operations require a business session row, except for read_inputs. The runner
-itself knows only an identifier, model-independent input callbacks and heartbeat
-values; it does not import the service or read its configuration tables. Input
-consumption borrows the fenced transaction that appends the accepted request to
-history; there is no separate acknowledgement.
+cancellation signal is the presence of a `session_cancels` row. Each service operation
+owns its required checks; see the [control service boundaries](../control/README.md).
+The runner itself knows only an identifier, model-independent input callbacks and
+heartbeat values; it does not import the service or read its configuration tables.
+Input consumption borrows the fenced transaction that appends the accepted request
+to history; there is no separate acknowledgement.
+
+InputBatch snapshots contain candidates, not a guarantee that every input is still
+pending. Its consume callback returns only the actual contents deleted by the
+checkpoint transaction, preserving snapshot order. Withdrawn inputs are excluded
+from both history and the SDK request. A new run prepares dynamic prompts outside
+the transaction; if consumption finds fewer candidates, it rolls back and rebuilds
+the SDK graph from that smaller set before trying again. No model or tool is retried.
+An entirely withdrawn batch creates no history and starts no model request; an
+already-pending checkpoint continues normally. Callbacks must remain limited to
+the original immutable input IDs, so each preparation retry strictly shrinks.
 
 History contains complete requests and responses, plus their message metadata and
 finish reason. Normalized input/output token counts are stored in separate nullable
@@ -139,7 +149,7 @@ sessions = SessionService(
 await sessions.start_runner(session_id, agent=agent, realtime_output=True)
 
 # Observer: run independently; this stream continues across runner lifetimes.
-async with aclosing(sessions.stream_output(session_id, start_seq=0)) as events:
+async with aclosing(sessions.live(session_id, after_seq=-1)) as events:
     async for event in events:
         if isinstance(event, MessageCommitted):
             ...  # Save/replace the complete message at event.message.seq.
@@ -166,12 +176,12 @@ INSERT payload with no extra SELECT or RETURNING. State-only checkpoints emit
 nothing. A committed message replaces all temporary parts at its sequence; it
 is not a runner-completion event. Output DTOs carry no execution lease token.
 
-`stream_output(start_seq=0)` starts at an inclusive original history sequence,
+`live(after_seq=-1)` starts after the last applied complete history sequence (-1 replays all),
 confirms its subscription before reading history, filters overlaps and backfills
 missing predecessors when later events expose a gap. Every database read ends
 before yielding. Normal sequential events need no additional reads. Unfillable
 gaps and subscription errors end the generator. Reconnect from the last applied
-complete message's `seq + 1`, clearing provisional text first. Pub/Sub is best
+complete message's `seq`, clearing provisional text first. Pub/Sub is best
 effort: missing subscribers lose events, mid-response subscribers may see only a
 suffix, and an unpublished final checkpoint is recovered only on another replay.
 Old/new runner attempts may interleave temporary text before a committed message

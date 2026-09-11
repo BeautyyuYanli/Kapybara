@@ -377,47 +377,64 @@ class AgentRunner[OutputT]:
     async def _accept_inputs(
         self, *, batches: Sequence[InputBatch] = (), steer: Sequence[UserInput] = ()
     ) -> None:
-        inputs = list(steer)
-        for batch in batches:
-            inputs.extend(batch.inputs)
-        if not inputs:
-            return
-        parts = [UserPromptPart(deepcopy(content)) for content in inputs]
+        inputs = [*steer, *(content for batch in batches for content in batch.inputs)]
         created = self._native is None and self._next_step == "done"
-        if created:
-            combined: list[UserContent] = []
-            for content in inputs:
-                combined.extend([content] if isinstance(content, str) else content)
-            await self._open_native(combined)
-            assert isinstance(self._node, ModelRequestNode)
-            # The preparation node supplies initial system parts. Persist one
-            # UserPromptPart per input rather than the temporary flattened prompt.
-            request = deepcopy(self._node.request)
-            request.parts = [part for part in request.parts if not isinstance(part, UserPromptPart)]
-            request.parts.extend(parts)
-            self._node.request = deepcopy(request)
-        else:
-            if self._native is None:
+        while inputs:
+            if created:
+                combined: list[UserContent] = []
+                for content in inputs:
+                    combined.extend([content] if isinstance(content, str) else content)
+                # Dynamic prompts and SDK hooks must run outside row-lock transactions.
+                await self._open_native(combined)
+            elif self._native is None:
                 await self._open_native()
-            request = ModelRequest(parts=parts)
-        self._ensure_usable()
-        async with self._session_factory.begin() as db:
-            repo = AgentRepository(db)
-            await repo.lock_owned(self._session_id, self._lock_token)
-            for batch in batches:
-                await batch.consume(db)
-            entries = await repo.save_checkpoint(
-                self._session_id,
-                next_step="model_request",
-                start_seq=self._next_seq,
-                messages=[request],
-            )
-        self._ensure_usable()
-        self._accept_committed("model_request", [request])
-        if not created:
+            self._ensure_usable()
+            request: ModelRequest | None = None
+            entries: Sequence[HistoryMessage] = ()
+            async with self._session_factory.begin() as db:
+                repo = AgentRepository(db)
+                await repo.lock_owned(self._session_id, self._lock_token)
+                accepted = list(steer)
+                for batch in batches:
+                    accepted.extend(await batch.consume(db))
+                rebuild = created and len(accepted) < len(inputs)
+                if rebuild:
+                    # Undo consumption before rebuilding prompts from the smaller set.
+                    # The same immutable snapshot IDs can only shrink on the next try.
+                    await db.rollback()
+                elif accepted:
+                    parts = [UserPromptPart(deepcopy(content)) for content in accepted]
+                    if created:
+                        assert isinstance(self._node, ModelRequestNode)
+                        request = deepcopy(self._node.request)
+                        request.parts = [
+                            part for part in request.parts if not isinstance(part, UserPromptPart)
+                        ]
+                        request.parts.extend(parts)
+                    else:
+                        request = ModelRequest(parts=parts)
+                    entries = await repo.save_checkpoint(
+                        self._session_id,
+                        next_step="model_request",
+                        start_seq=self._next_seq,
+                        messages=[request],
+                    )
+            self._ensure_usable()
+            if rebuild:
+                await self._close_native()
+                inputs = accepted
+                continue
+            if not accepted:
+                return
+            assert request is not None
+            self._accept_committed("model_request", [request])
             assert isinstance(self._node, ModelRequestNode)
-            self._node.request.parts = [*self._node.request.parts, *deepcopy(request.parts)]
-        await self._publish_committed(entries)
+            if created:
+                self._node.request = deepcopy(request)
+            else:
+                self._node.request.parts = [*self._node.request.parts, *deepcopy(request.parts)]
+            await self._publish_committed(entries)
+            return
 
     def _accept_committed(self, next_step: NextStep, messages: Sequence[ModelMessage]) -> None:
         self._require_context().extend(deepcopy(messages))
@@ -630,7 +647,11 @@ async def start_runner[DepsT, OutputT](
     compaction_replay_turns: int = 10,
     on_output: OutputCallback | None = None,
 ) -> TurnResult[OutputT]:
-    """Run first, then start another run for each queued snapshot, including after cancel."""
+    """Drain queued snapshots after each run, preserving the last produced output.
+
+    An empty or fully withdrawn later snapshot still supplies the latest finished
+    state, but does not erase an output already produced during this call.
+    """
     async with open_runner(
         session_id,
         agent=agent,
@@ -640,6 +661,7 @@ async def start_runner[DepsT, OutputT](
         heartbeat_timeout=heartbeat_timeout,
     ) as runner:
         initial = None
+        output: OutputT | None = None
         while True:
             result = await runner.run(
                 initial=initial,
@@ -650,7 +672,9 @@ async def start_runner[DepsT, OutputT](
                 on_output=on_output,
             )
             runner._ensure_usable()
+            if result.output is not None:
+                output = result.output
             initial = await read_queued()
             runner._ensure_usable()
             if initial is None:
-                return result
+                return TurnResult(result.finished, output)
