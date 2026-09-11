@@ -127,9 +127,7 @@ async function save() {
   <section class="form-page">
     <RouterLink class="back-link" to="/providers"><span aria-hidden="true">← </span>返回列表</RouterLink>
     <div class="page-heading">
-      <span class="eyebrow">01 / CONNECTIONS</span>
       <h1>{{ id ? "编辑 Provider" : "创建 Provider" }}</h1>
-      <p class="muted">连接模型服务，从这里开始。</p>
     </div>
     <p v-if="resource.pending.value" role="status">加载中…</p>
     <div v-else-if="resource.error.value" role="alert">
@@ -159,7 +157,7 @@ async function save() {
         <FormField
           id="api_key"
           label="API key"
-          :help="id ? '留空保持原有密钥。' : '连接服务所需的 API key。'"
+          :help="id ? '留空保持原有密钥。' : undefined"
           :error="fields.api_key"
           v-slot="f"
           ><input
@@ -174,7 +172,7 @@ async function save() {
         <FormField
           id="base_url"
           label="Base URL（可选）"
-          help="清空恢复 SDK 默认地址。"
+          :help="id ? '清空恢复默认服务地址。' : '留空使用默认服务地址。'"
           :error="fields.base_url"
           v-slot="f"
           ><input

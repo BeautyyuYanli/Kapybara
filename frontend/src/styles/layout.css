@@ -34,10 +34,9 @@
 .primary-nav a {
   position: relative;
   display: flex;
-  flex-direction: column;
+  align-items: center;
   justify-content: center;
-  gap: 0.25rem;
-  min-height: 6.5rem;
+  min-height: 4.5rem;
   padding: 1.25rem 2.5rem;
   text-decoration: none;
   font-size: 1.125rem;
@@ -57,19 +56,11 @@
   height: 4px;
   background: var(--text-primary);
 }
-.nav-index,
-.eyebrow,
-.record-index,
-.collection-heading,
 .pagination {
   font-family: var(--font-mono);
   font-size: 0.6875rem;
   font-weight: 400;
   letter-spacing: 0.06em;
-}
-.nav-index {
-  color: var(--text-muted);
-  font-size: 0.625rem;
 }
 .shell {
   padding: 3.5rem clamp(1.5rem, 4vw, 4rem) 4rem;
@@ -78,19 +69,10 @@
 }
 .page-heading {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
   gap: var(--gap-large);
-  margin-bottom: 3.5rem;
-}
-.eyebrow {
-  display: block;
-  color: var(--text-muted);
-  margin: 0 0 1.5rem;
-}
-.page-heading p.muted {
-  font-size: var(--font-small);
-  margin: 1rem 0 0;
+  margin-bottom: 2.5rem;
 }
 .page-heading > .button {
   min-height: 3.25rem;
@@ -144,19 +126,11 @@ fieldset > button.primary {
   align-items: center;
   gap: var(--gap-small);
 }
-.collection-heading {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--gap);
-  color: var(--text-muted);
-  padding-bottom: 1rem;
-  border-bottom: var(--border-width) solid var(--border-strong);
-  margin-top: 2.5rem;
-}
 .records {
   list-style: none;
-  margin: 0;
+  margin: var(--gap-large) 0 0;
   padding: 0;
+  border-top: var(--border-width) solid var(--border-strong);
 }
 .record,
 .panel {
@@ -165,16 +139,11 @@ fieldset > button.primary {
 }
 .record {
   display: grid;
-  grid-template-columns: 2rem minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 1.5rem;
-  padding: 2rem 0;
+  padding: 1.5rem 0;
   border-bottom: var(--border-width) solid var(--border-default);
-}
-.record-index {
-  align-self: start;
-  padding-top: 0.75rem;
-  color: var(--text-muted);
 }
 .record h2 {
   font-size: 1.5rem;
@@ -204,13 +173,11 @@ fieldset > button.primary {
 .record .danger:hover {
   color: var(--status-danger);
 }
-.record-note {
-  text-align: right;
-}
 .panel {
-  margin: 0;
+  margin: var(--gap-large) 0 0;
   padding: 3rem 0;
   color: var(--text-muted);
+  border-top: var(--border-width) solid var(--border-strong);
   border-bottom: var(--border-width) solid var(--border-default);
 }
 .filters {
@@ -261,7 +228,7 @@ fieldset > button.primary {
 }
 @media (max-width: 47.99rem) {
   :root {
-    --mobile-nav-height: 4.5rem;
+    --mobile-nav-height: 3.5rem;
     --mobile-nav-safe-area: env(safe-area-max-inset-bottom, 36px);
     --mobile-nav-space: calc(var(--mobile-nav-height) + var(--mobile-nav-safe-area) + var(--border-width));
     /* Focused controls and the final form action must clear the fixed navigation. */
@@ -301,10 +268,6 @@ fieldset > button.primary {
     right: 0.625rem;
     height: 3px;
   }
-  .nav-index {
-    font-size: 0.625rem;
-    letter-spacing: 0;
-  }
   .shell {
     padding: 2.25rem 1.25rem calc(3rem + var(--mobile-nav-space));
   }
@@ -312,37 +275,24 @@ fieldset > button.primary {
     align-items: stretch;
     flex-direction: column;
     gap: 1.75rem;
-    margin-bottom: 2.5rem;
-  }
-  .eyebrow {
-    margin-bottom: 1rem;
-    font-size: 0.625rem;
-  }
-  .page-heading p.muted {
-    line-height: 1.8;
+    margin-bottom: 2rem;
   }
   .record {
-    grid-template-columns: 1.25rem minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: 0.75rem;
-    padding: 1.5rem 0;
+    padding: 1.25rem 0;
   }
-  .record > :last-child {
-    grid-column: 2;
+  .record > .actions,
+  .record > button {
     justify-self: start;
   }
   .record h2 {
     font-size: 1.25rem;
   }
-  .record-note {
-    text-align: left;
-  }
   .filters {
     grid-template-columns: minmax(0, 1fr);
     padding: 1rem;
     gap: 1rem;
-  }
-  .collection-heading {
-    font-size: 0.625rem;
   }
   .form-page .page-heading {
     margin-bottom: 1.75rem;

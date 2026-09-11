@@ -49,11 +49,7 @@ async function remove(item: ModelRecord) {
 </script>
 <template>
   <div class="page-heading">
-    <div>
-      <span class="eyebrow">02 / MODEL LIBRARY</span>
-      <h1>Model</h1>
-      <p class="muted">管理本地模型目录和请求预设</p>
-    </div>
+    <h1>Model</h1>
     <RouterLink
       class="button primary"
       :to="{ path: '/models/new', query: { provider_id: provider || undefined } }"
@@ -73,19 +69,13 @@ async function remove(item: ModelRecord) {
     <button @click="refresh">重试</button>
   </div>
   <template v-else-if="data">
-    <div class="collection-heading">
-      <span>模型目录</span><span>本页 {{ String(data.items.length).padStart(2, "0") }} 项</span>
-    </div>
     <p v-if="!data.items.length" class="panel">暂无匹配的 Model 配置。</p>
     <ul v-else class="records">
       <li
-        v-for="(item, index) in data.items"
+        v-for="item in data.items"
         :key="JSON.stringify([item.provider_id, item.model_name])"
         class="record"
       >
-        <span class="record-index" aria-hidden="true">
-          {{ String(offset + index + 1).padStart(2, "0") }}
-        </span>
         <div>
           <h2>
             <RouterLink
@@ -96,8 +86,12 @@ async function remove(item: ModelRecord) {
               >{{ item.name }}</RouterLink
             >
           </h2>
-          <p>{{ item.model_name }}</p>
-          <small>Provider {{ item.provider_id }} · 容量 {{ item.context_window ?? "未知" }}</small>
+          <p v-if="item.model_name !== item.name" class="muted">{{ item.model_name }}</p>
+          <small>{{
+            item.context_window === null
+              ? "上下文容量未知"
+              : `上下文 ${item.context_window.toLocaleString("en-US")} tokens`
+          }}</small>
         </div>
         <ConfirmDelete :name="item.name" :remove="() => remove(item)"
           ><p v-if="actionError" class="error" role="alert">{{ actionError }}</p></ConfirmDelete

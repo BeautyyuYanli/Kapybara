@@ -19,6 +19,13 @@ confirmations and errors retain semantic labels and a restrained red accent.
 All layout styles are handwritten;
 the generated API client is independent of the visual design.
 
+Supporting text must help distinguish records, explain the consequence of an
+input, or resolve an error. Navigation uses one label per destination. Lists omit
+decorative numbering, repeated headings, internal IDs and configuration details
+that belong in the editor. Identical model names appear once. Pagination appears
+only when another page can be reached; form hints retain meaningful defaults and
+the effects of clearing or saving values.
+
 Use Node 24 LTS (verified with 24.21.0) and npm 12 (verified with 12.0.2);
 package-lock.json locks dependencies. The generator pins an older js-yaml; a
 compatible 4.3.2 override includes its CPU-exhaustion fixes.

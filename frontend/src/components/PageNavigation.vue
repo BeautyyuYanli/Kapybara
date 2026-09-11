@@ -3,7 +3,7 @@ defineProps<{ offset: number; count: number; hasMore: boolean }>();
 defineEmits<{ change: [offset: number] }>();
 </script>
 <template>
-  <nav class="pagination" aria-label="分页">
+  <nav v-if="offset > 0 || hasMore" class="pagination" aria-label="分页">
     <button :disabled="offset === 0" @click="$emit('change', Math.max(0, offset - 25))">
       <span aria-hidden="true">←</span> 上一页
     </button>

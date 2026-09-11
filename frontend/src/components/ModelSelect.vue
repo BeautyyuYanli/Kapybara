@@ -37,7 +37,7 @@ const { items, pending, hasMore, error, more } = useOptions(
       {{ value }}（当前选择）
     </option>
     <option v-for="item in items" :key="item.model_name" :value="item.model_name">
-      {{ item.name }} · {{ item.model_name }}
+      {{ item.name === item.model_name ? item.name : `${item.name} · ${item.model_name}` }}
     </option>
   </select>
   <small v-if="error" role="alert" class="error">{{ error }}</small>

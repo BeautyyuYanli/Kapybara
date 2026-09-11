@@ -6,9 +6,9 @@ const route = useRoute();
 // List and form routes belong to the same navigation section.
 const currentSection = computed(() => `/${route.path.split("/")[1]}`);
 const navigation = [
-  { to: "/providers", label: "Provider", caption: "01 / 连接" },
-  { to: "/models", label: "Model", caption: "02 / 模型" },
-  { to: "/sessions", label: "Session", caption: "03 / 会话" },
+  { to: "/providers", label: "Provider" },
+  { to: "/models", label: "Model" },
+  { to: "/sessions", label: "Session" },
 ];
 </script>
 <template>
@@ -26,7 +26,7 @@ const navigation = [
           :class="{ 'is-current': currentSection === item.to }"
           :aria-current="currentSection === item.to ? 'location' : undefined"
         >
-          <span class="nav-index" aria-hidden="true">{{ item.caption }}</span>{{ item.label }}
+          {{ item.label }}
         </RouterLink>
       </nav>
     </header>
