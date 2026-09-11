@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic_ai.messages import ModelMessage, UserContent
+from pydantic_ai.messages import UserContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 type UserInput = str | Sequence[UserContent]
@@ -55,6 +55,15 @@ class TurnResult[OutputT]:
 
 
 @dataclass(frozen=True, slots=True)
+class Compaction:
+    """Saved summary covering the original history through last_message_seq."""
+
+    last_message_seq: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResumeState:
     next_step: NextStep
-    history: tuple[ModelMessage, ...]
+    next_seq: int
+    compaction: Compaction | None

@@ -67,6 +67,8 @@ class SessionService:
         deps: DepsT = None,
         heartbeat_interval: float = 10.0,
         heartbeat_timeout: float = 60.0,
+        compaction_threshold_tokens: int | None = None,
+        compaction_replay_turns: int = 10,
     ) -> TurnResult[OutputT]:
         """Await execution through steer/cancel turns and subsequent queued runs."""
 
@@ -94,4 +96,6 @@ class SessionService:
             consume_cancel=consume_cancel,
             heartbeat_interval=heartbeat_interval,
             heartbeat_timeout=heartbeat_timeout,
+            compaction_threshold_tokens=compaction_threshold_tokens,
+            compaction_replay_turns=compaction_replay_turns,
         )

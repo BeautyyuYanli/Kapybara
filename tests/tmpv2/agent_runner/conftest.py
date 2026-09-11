@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import (
 
 from kapy.tmpv2.agent_runner.models import agent_metadata
 from kapy.tmpv2.agent_runner.repository import AgentRepository
+from kapy.tmpv2.agent_runner.types import NextStep
 from kapy.tmpv2.control.database import ControlTable
 from kapy.tmpv2.control.sessions import models as session_models  # noqa: F401
 
@@ -60,6 +61,27 @@ async def database() -> AsyncIterator[Database]:
         await engine.dispose()
         async with await psycopg.AsyncConnection.connect(DATABASE_URL, autocommit=True) as db:
             await db.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.fixture
+def seed_history(database):
+    async def seed(messages, next_step: NextStep = "done", *, compaction_seq=None):
+        session_id, token = uuid4(), uuid4()
+        async with database.sessions.begin() as db:
+            repo = AgentRepository(db)
+            await repo.acquire(session_id, token, heartbeat_timeout=60)
+            await repo.lock_owned(session_id, token)
+            await repo.save_checkpoint(
+                session_id, next_step=next_step, start_seq=0, messages=messages
+            )
+            if compaction_seq is not None:
+                await repo.save_compaction(
+                    session_id, last_message_seq=compaction_seq, text="saved summary"
+                )
+            await repo.release(session_id, token)
+        return session_id
+
+    return seed
 
 
 @pytest.fixture

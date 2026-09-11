@@ -123,7 +123,12 @@ async def test_cancelled_unfinished_run_still_starts_queued_run(database):
     assert result.finished
     assert not await sessions.read_inputs(session_id, "queued")
     async with database.sessions.begin() as db:
-        messages = await AgentRepository(db).read_history(session_id)
+        messages = [
+            message
+            for _, message in await AgentRepository(db).read_history(
+                session_id, start_seq=0, through_seq=2**31 - 1
+            )
+        ]
     assert any(
         isinstance(part, UserPromptPart) and part.content == "queued after cancel"
         for message in messages
@@ -153,7 +158,12 @@ async def test_first_dynamic_system_prompt_prepared_outside_transaction(database
     result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished
     async with database.sessions.begin() as db:
-        messages = await AgentRepository(db).read_history(session_id)
+        messages = [
+            message
+            for _, message in await AgentRepository(db).read_history(
+                session_id, start_seq=0, through_seq=2**31 - 1
+            )
+        ]
     assert [
         part.content
         for part in messages[0].parts

@@ -5,15 +5,19 @@ when an SDK upgrade changes message mutation timing or recovery entry semantics.
 """
 
 from copy import deepcopy
+from uuid import uuid4
 
 import pytest
 from pydantic_ai import Agent, CallToolsNode, ModelRequestNode, UserPromptNode
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -21,6 +25,8 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_graph import End
+
+from kapy.tmpv2.agent_runner.compaction import summarize
 
 pytestmark = pytest.mark.asyncio
 
@@ -146,3 +152,72 @@ async def test_official_adapter_and_explicit_response_recovery_preserve_call_ids
         assert isinstance(part, ToolReturnPart)
         assert part.tool_call_id == "call-id"
     assert model_calls == []
+
+
+async def test_compaction_retries_raw_output_without_tools_validators_or_config_changes():
+    received = []
+
+    def model(messages, info):
+        received.append(deepcopy(messages))
+        assert info.model_settings == {"temperature": 0.25}
+        assert [tool.name for tool in info.function_tools] == ["work"]
+        assert [tool.name for tool in info.output_tools] == ["final_result"]
+        assert not info.allow_text_output
+        if len(received) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart("work", {}, "work-id"),
+                    ToolCallPart("final_result", {"response": ["not a summary"]}, "output-id"),
+                ]
+            )
+        return ModelResponse(
+            parts=[ThinkingPart("hidden"), TextPart(" summary"), TextPart(" text ")]
+        )
+
+    agent = Agent(FunctionModel(model), output_type=list[str], model_settings={"temperature": 0.25})
+
+    @agent.tool_plain
+    def work() -> str:
+        raise AssertionError("compaction must not execute client tools")
+
+    @agent.output_validator
+    def validate(output: list[str]) -> list[str]:
+        raise AssertionError("compaction must not execute business output validators")
+
+    history = [ModelRequest(parts=[UserPromptPart("original")])]
+    before = deepcopy(history)
+    session_id = uuid4()
+    assert (
+        await summarize(agent, history, session_id=session_id, deps=None, max_retries=1)
+        == "summary text"
+    )
+    assert history == before
+    retry = received[1][-1]
+    assert isinstance(retry, ModelRequest)
+    assert [
+        (part.tool_name, part.tool_call_id)
+        for part in retry.parts
+        if isinstance(part, RetryPromptPart)
+    ] == [("work", "work-id"), ("final_result", "output-id")]
+    assert isinstance(received[1][-2], ModelResponse)
+    assert received[1][-2].conversation_id == str(session_id)
+
+
+@pytest.mark.parametrize("incomplete", [False, True])
+async def test_compaction_empty_or_incomplete_response_has_bounded_failure(incomplete):
+    calls = []
+
+    def model(messages, info):
+        calls.append(deepcopy(messages))
+        return ModelResponse(
+            parts=[TextPart(" ")], state="incomplete" if incomplete else "complete"
+        )
+
+    with pytest.raises(UnexpectedModelBehavior):
+        await summarize(
+            Agent(FunctionModel(model)), [], session_id=uuid4(), deps=None, max_retries=2
+        )
+    assert len(calls) == (1 if incomplete else 3)
+    if not incomplete:
+        assert isinstance(calls[-1][-1].parts[0], RetryPromptPart)
+        assert len([m for m in calls[-1] if isinstance(m, ModelResponse)]) == 2

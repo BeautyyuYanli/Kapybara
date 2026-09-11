@@ -19,6 +19,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     UserContent,
     UserPromptPart,
 )
@@ -26,8 +27,10 @@ from pydantic_ai.run import AgentRun
 from pydantic_graph import End
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .repository import AgentRepository
+from .compaction import assemble_context, replay_start, require_nonnegative_int, summarize
+from .repository import AgentRepository, response_tokens
 from .types import (
+    Compaction,
     ConsumeCancel,
     InputBatch,
     NextStep,
@@ -41,7 +44,7 @@ from .types import (
 class AgentRunner[OutputT]:
     """One task's execution lease and native graph; obtain it using open_runner.
 
-    turn/run are sequential and non-reentrant. Any execution failure invalidates
+    Operations are sequential and non-reentrant. Any execution failure invalidates
     the handle; recovery requires opening a new one. A cancel signal is a normal
     run return and leaves the handle usable. External side effects may replay
     when they happened after the last committed checkpoint.
@@ -65,8 +68,11 @@ class AgentRunner[OutputT]:
         self._session_factory = session_factory
         self._heartbeat_interval = heartbeat_interval
         self._next_step = state.next_step
-        self._history = list(state.history)
-        self._next_seq = len(state.history)
+        self._context: list[ModelMessage] | None = None
+        self._next_seq = state.next_seq
+        self._compaction = state.compaction
+        self._latest_response_seq: int | None = None
+        self._observed_context_tokens: int | None = None
         self._owner = asyncio.current_task()
         self._occupied = False
         self._closed = False
@@ -109,9 +115,11 @@ class AgentRunner[OutputT]:
         handle. At done with no steer, return finished=True and output=None without
         rebuilding an earlier output or running the model. Otherwise finished
         reflects whether this turn committed done; output is its new final result.
+        Call rebuild_context first; this operation never loads history implicitly.
         """
         with self._operation():
             try:
+                self._require_context()
                 if steer and self._next_step == "handle_response":
                     raise ValueError("Cannot accept steer before handling the saved response")
                 await self._accept_inputs(steer=steer)
@@ -126,11 +134,27 @@ class AgentRunner[OutputT]:
         read_steer: ReadInputs,
         consume_cancel: ConsumeCancel,
         initial: InputBatch | None = None,
+        compaction_threshold_tokens: int | None = None,
+        compaction_replay_turns: int = 10,
     ) -> TurnResult[OutputT]:
-        """Check cancel and accept steer at turn boundaries until done with no input."""
+        """Prepare context and run until done with no steer, checking cancel first.
+
+        A positive threshold enables compaction using the latest complete business
+        response's input+output usage; None disables it. Replay is approximately N
+        responses, extending backwards to complete tool pairs. N must be a
+        nonnegative integer. A new summary never replaces the business output.
+        """
         with self._operation():
             try:
+                require_nonnegative_int(compaction_replay_turns, "compaction_replay_turns")
+                if compaction_threshold_tokens is not None:
+                    require_nonnegative_int(
+                        compaction_threshold_tokens, "compaction_threshold_tokens"
+                    )
+                    if compaction_threshold_tokens == 0:
+                        raise ValueError("compaction_threshold_tokens must be positive")
                 result: TurnResult[OutputT] = TurnResult(self._next_step == "done")
+                context_prepared = False
                 while True:
                     self._ensure_usable()
                     async with self._session_factory.begin() as db:
@@ -139,25 +163,182 @@ class AgentRunner[OutputT]:
                     self._ensure_usable()
                     if cancel:
                         return result
-                    if self._next_step != "handle_response":
-                        batch = await read_steer()
-                        self._ensure_usable()
-                        batches = [item for item in (initial, batch) if item is not None]
-                        await self._accept_inputs(batches=batches)
-                        initial = None
-                        if self._next_step == "done":
-                            return result
+                    if not context_prepared:
+                        await self._rebuild_context(replay_turns=compaction_replay_turns)
+                        context_prepared = True
+                    if self._next_step == "handle_response":
+                        result = await self._advance_turn()
+                        continue
+                    if await self._maybe_compact(compaction_threshold_tokens):
+                        await self._rebuild_context(replay_turns=compaction_replay_turns)
+                        continue
+                    batch = await read_steer()
+                    self._ensure_usable()
+                    batches = [item for item in (initial, batch) if item is not None]
+                    await self._accept_inputs(batches=batches)
+                    initial = None
+                    if self._next_step == "done":
+                        return result
                     result = await self._advance_turn()
             except BaseException as error:
                 await self._fail(error)
                 raise
+
+    def _require_context(self) -> list[ModelMessage]:
+        if self._context is None:
+            raise RuntimeError("Runner context has not been prepared; call rebuild_context first")
+        return self._context
+
+    async def rebuild_context(self, *, compaction_replay_turns: int = 10) -> None:
+        """Load required history and replace context without advancing any graph node.
+
+        Required once before manual turn/compact; run prepares it automatically.
+        N=0 omits replay. Later calls apply their N to the latest saved summary.
+        Reads are bounded by the committed cursor and do not hold the lease row lock.
+        """
+        with self._operation():
+            try:
+                require_nonnegative_int(compaction_replay_turns, "compaction_replay_turns")
+                await self._rebuild_context(replay_turns=compaction_replay_turns)
+            except BaseException as error:
+                await self._fail(error)
+                raise
+
+    async def _rebuild_context(self, *, replay_turns: int) -> None:
+        first = self._context is None
+        if self._compaction is None and not first:
+            return
+        through_seq = self._next_seq - 1
+        async with self._session_factory.begin() as db:
+            repo = AgentRepository(db)
+            compaction = self._compaction
+            if compaction is None:
+                tail = await repo.read_history(
+                    self._session_id, start_seq=0, through_seq=through_seq
+                )
+                context = [message for _, message in tail]
+            else:
+                replay_rows: list[tuple[int, ModelMessage]] = []
+                if replay_turns:
+                    before = compaction.last_message_seq
+                    while True:
+                        page = await repo.read_history_before(
+                            self._session_id, through_seq=before, limit=64
+                        )
+                        if not page:
+                            raise RuntimeError("Compaction history is missing")
+                        replay_rows[:0] = reversed(page)
+                        start = replay_start(replay_rows, replay_turns)
+                        if start is not None:
+                            replay_rows = [(seq, msg) for seq, msg in replay_rows if seq >= start]
+                            break
+                        before = replay_rows[0][0] - 1
+                first_rows = (
+                    replay_rows[:1]
+                    if replay_rows and replay_rows[0][0] == 0
+                    else await repo.read_history(self._session_id, start_seq=0, through_seq=0)
+                )
+                system_parts = [
+                    part
+                    for _, message in first_rows
+                    if isinstance(message, ModelRequest)
+                    for part in message.parts
+                    if isinstance(part, SystemPromptPart)
+                ]
+                tail = await repo.read_history(
+                    self._session_id,
+                    start_seq=compaction.last_message_seq + 1,
+                    through_seq=through_seq,
+                )
+                context = assemble_context(
+                    system_parts,
+                    compaction,
+                    [message for _, message in replay_rows],
+                    [message for _, message in tail],
+                )
+        self._ensure_usable()
+        if first:
+            for seq, message in tail:
+                if isinstance(message, ModelResponse):
+                    self._observe_response(seq, message)
+        self._context = deepcopy(context)
+        if self._native is not None:
+            if self._next_step == "model_request":
+                assert isinstance(self._node, ModelRequestNode)
+                assert isinstance(context[-1], ModelRequest)
+                # The pending request enters SDK history only when its node runs.
+                self._native.ctx.state.message_history[:] = deepcopy(context[:-1])
+                self._node.request = deepcopy(context[-1])
+            elif self._next_step == "handle_response":
+                self._native.ctx.state.message_history[:] = deepcopy(context)
+
+    async def compact(self, *, max_retries: int = 2) -> Compaction | None:
+        """Save a temporary text summary without changing context or checkpoint.
+
+        Requires prepared context and a model_request/done boundary. Empty history
+        returns None; an already summarized prefix returns its existing summary.
+        max_retries is a nonnegative extra-attempt budget. Invalid responses exhaust
+        it with UnexpectedModelBehavior; all execution failures invalidate the handle.
+        Apply the saved summary using rebuild_context when manually orchestrating.
+        """
+        with self._operation():
+            try:
+                return await self._compact(max_retries=max_retries)
+            except BaseException as error:
+                await self._fail(error)
+                raise
+
+    async def _compact(self, *, max_retries: int = 2) -> Compaction | None:
+        require_nonnegative_int(max_retries, "max_retries")
+        context = self._require_context()
+        if self._next_step == "handle_response":
+            raise ValueError("Cannot compact before handling the saved response")
+        last_seq = self._next_seq - 1
+        async with self._session_factory.begin() as db:
+            await AgentRepository(db).lock_owned(self._session_id, self._lock_token)
+        self._ensure_usable()
+        if last_seq < 0:
+            return None
+        if self._compaction is not None and self._compaction.last_message_seq == last_seq:
+            return self._compaction
+        text = await summarize(
+            self._agent,
+            context,
+            session_id=self._session_id,
+            deps=self._deps,
+            max_retries=max_retries,
+        )
+        self._ensure_usable()
+        async with self._session_factory.begin() as db:
+            repo = AgentRepository(db)
+            await repo.lock_owned(self._session_id, self._lock_token)
+            result = await repo.save_compaction(
+                self._session_id, last_message_seq=last_seq, text=text
+            )
+        self._ensure_usable()
+        self._compaction = result
+        return result
+
+    async def _maybe_compact(self, threshold: int | None) -> bool:
+        if (
+            threshold is None
+            or self._latest_response_seq is None
+            or self._observed_context_tokens is None
+            or self._observed_context_tokens <= threshold
+            or (
+                self._compaction is not None
+                and self._latest_response_seq <= self._compaction.last_message_seq
+            )
+        ):
+            return False
+        return await self._compact() is not None
 
     async def _open_native(self, user_prompt: UserInput | None = None) -> None:
         """Initialize only the SDK input node, never a model/tool node."""
         assert self._native is None
         context = self._agent.iter(
             user_prompt,
-            message_history=deepcopy(self._history),
+            message_history=deepcopy(self._require_context()),
             conversation_id=str(self._session_id),
             deps=self._deps,
         )
@@ -226,9 +407,17 @@ class AgentRunner[OutputT]:
             self._node.request.parts = [*self._node.request.parts, *deepcopy(request.parts)]
 
     def _accept_committed(self, next_step: NextStep, messages: Sequence[ModelMessage]) -> None:
-        self._history.extend(deepcopy(messages))
+        self._require_context().extend(deepcopy(messages))
+        for offset, message in enumerate(messages):
+            if isinstance(message, ModelResponse):
+                self._observe_response(self._next_seq + offset, message)
         self._next_seq += len(messages)
         self._next_step = next_step
+
+    def _observe_response(self, seq: int, response: ModelResponse) -> None:
+        self._latest_response_seq = seq
+        tokens = response_tokens(response)
+        self._observed_context_tokens = sum(tokens) if tokens is not None else None
 
     async def _checkpoint(self, next_step: NextStep, messages: Sequence[ModelMessage]) -> None:
         self._ensure_usable()
@@ -351,7 +540,12 @@ async def open_runner[DepsT, OutputT](
     heartbeat_interval: float = 10.0,
     heartbeat_timeout: float = 60.0,
 ) -> AsyncIterator[AgentRunner[OutputT]]:
-    """Acquire, load, heartbeat and release one execution lease in the calling task.
+    """Acquire metadata, heartbeat and release one execution lease in the calling task.
+
+    History is loaded by rebuild_context or run after this context yields.
+    Use the Agent's default max_concurrency=None: Agent-level limits do not support
+    the nested compaction graph. Configure ConcurrencyLimitedModel on the model or
+    limit workers outside start_runner instead; the runner never overrides limits.
 
     Heartbeat values are seconds and must be finite with
     0 < heartbeat_interval < heartbeat_timeout, otherwise ValueError is raised.
@@ -409,6 +603,8 @@ async def start_runner[DepsT, OutputT](
     deps: DepsT = None,
     heartbeat_interval: float = 10.0,
     heartbeat_timeout: float = 60.0,
+    compaction_threshold_tokens: int | None = None,
+    compaction_replay_turns: int = 10,
 ) -> TurnResult[OutputT]:
     """Run first, then start another run for each queued snapshot, including after cancel."""
     async with open_runner(
@@ -422,7 +618,11 @@ async def start_runner[DepsT, OutputT](
         initial = None
         while True:
             result = await runner.run(
-                initial=initial, read_steer=read_steer, consume_cancel=consume_cancel
+                initial=initial,
+                read_steer=read_steer,
+                consume_cancel=consume_cancel,
+                compaction_threshold_tokens=compaction_threshold_tokens,
+                compaction_replay_turns=compaction_replay_turns,
             )
             runner._ensure_usable()
             initial = await read_queued()

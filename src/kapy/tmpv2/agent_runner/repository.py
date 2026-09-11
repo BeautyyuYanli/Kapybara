@@ -3,8 +3,8 @@
 Checkpoint/history writes and input or cancel consumption must follow lock_owned
 in the same transaction. Heartbeat and release instead enforce ownership through
 their own token-qualified UPDATE statements. No method commits or manages session
-lifetime. Model usage is intentionally discarded; message parts retain the SDK's
-official JSON codec.
+lifetime. Only normalized input/output usage is stored, outside message JSON;
+message parts retain the SDK's official JSON codec.
 """
 
 from collections.abc import Sequence
@@ -12,14 +12,37 @@ from datetime import timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse
 from sqlalchemy import func, insert, or_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
-from .models import AgentHistoryRow, AgentStateRow
-from .types import NextStep, ResumeState, RunnerLost, SessionBusy
+from .models import AgentCompactionRow, AgentHistoryRow, AgentStateRow
+from .types import Compaction, NextStep, ResumeState, RunnerLost, SessionBusy
+
+
+def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
+    """Zero/unknown input usage is not a usable context-size observation."""
+    usage = response.usage
+    if usage.input_tokens > 0 and usage.output_tokens >= 0:
+        return usage.input_tokens, usage.output_tokens
+    return None
+
+
+def _decode_history(rows: Sequence[AgentHistoryRow]) -> list[tuple[int, ModelMessage]]:
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        payload = {**row.message_metadata, **row.message, "kind": row.kind}
+        if row.kind == "response":
+            payload["finish_reason"] = row.finish_reason
+            if row.input_tokens is not None and row.output_tokens is not None:
+                payload["usage"] = dict(
+                    input_tokens=row.input_tokens, output_tokens=row.output_tokens
+                )
+        payloads.append(payload)
+    messages = ModelMessagesTypeAdapter.validate_python(payloads)
+    return [(row.seq, message) for row, message in zip(rows, messages, strict=True)]
 
 
 class AgentRepository:
@@ -48,7 +71,19 @@ class AgentRepository:
         next_step = (await self._db.execute(statement)).scalar_one_or_none()
         if next_step is None:
             raise SessionBusy(str(session_id))
-        return ResumeState(cast(NextStep, next_step), tuple(await self.read_history(session_id)))
+        last_seq = (
+            await self._db.execute(
+                select(AgentHistoryRow.seq)
+                .where(col(AgentHistoryRow.session_id) == session_id)
+                .order_by(col(AgentHistoryRow.seq).desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return ResumeState(
+            cast(NextStep, next_step),
+            0 if last_seq is None else last_seq + 1,
+            await self.read_latest_compaction(session_id),
+        )
 
     async def lock_owned(self, session_id: UUID, lock_token: UUID) -> None:
         """Wait for the row lock, then fail with RunnerLost if token no longer matches."""
@@ -86,28 +121,57 @@ class AgentRepository:
             .values(lock_token=None)
         )
 
-    async def read_history(self, session_id: UUID) -> list[ModelMessage]:
-        """One snapshot; existing empty state returns [], absent state raises LookupError."""
+    async def read_history(
+        self, session_id: UUID, *, start_seq: int, through_seq: int
+    ) -> list[tuple[int, ModelMessage]]:
+        """Read the inclusive range in ascending absolute seq order; empty ranges return []."""
         statement = (
-            select(AgentStateRow.session_id, AgentHistoryRow)
-            .outerjoin(
-                AgentHistoryRow, col(AgentHistoryRow.session_id) == col(AgentStateRow.session_id)
+            select(AgentHistoryRow)
+            .where(
+                col(AgentHistoryRow.session_id) == session_id,
+                col(AgentHistoryRow.seq) >= start_seq,
+                col(AgentHistoryRow.seq) <= through_seq,
             )
-            .where(col(AgentStateRow.session_id) == session_id)
             .order_by(col(AgentHistoryRow.seq))
         )
-        rows = (await self._db.execute(statement)).all()
-        if not rows:
-            raise LookupError(str(session_id))
-        payloads: list[dict[str, Any]] = []
-        for _, row in rows:
-            if row is None:
-                continue
-            payload = {**row.message_metadata, **row.message, "kind": row.kind}
-            if row.kind == "response":
-                payload["finish_reason"] = row.finish_reason
-            payloads.append(payload)
-        return ModelMessagesTypeAdapter.validate_python(payloads)
+        return _decode_history((await self._db.execute(statement)).scalars().all())
+
+    async def read_history_before(
+        self, session_id: UUID, *, through_seq: int, limit: int
+    ) -> list[tuple[int, ModelMessage]]:
+        """Read at most limit rows at/before through_seq, in descending seq order."""
+        statement = (
+            select(AgentHistoryRow)
+            .where(
+                col(AgentHistoryRow.session_id) == session_id,
+                col(AgentHistoryRow.seq) <= through_seq,
+            )
+            .order_by(col(AgentHistoryRow.seq).desc())
+            .limit(limit)
+        )
+        return _decode_history((await self._db.execute(statement)).scalars().all())
+
+    async def read_latest_compaction(self, session_id: UUID) -> Compaction | None:
+        row = (
+            await self._db.execute(
+                select(AgentCompactionRow)
+                .where(col(AgentCompactionRow.session_id) == session_id)
+                .order_by(col(AgentCompactionRow.last_message_seq).desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return None if row is None else Compaction(row.last_message_seq, row.text)
+
+    async def save_compaction(
+        self, session_id: UUID, *, last_message_seq: int, text: str
+    ) -> Compaction:
+        """Insert one immutable summary after lock_owned in the caller's transaction."""
+        await self._db.execute(
+            insert(AgentCompactionRow).values(
+                session_id=session_id, last_message_seq=last_message_seq, text=text
+            )
+        )
+        return Compaction(last_message_seq, text)
 
     async def save_checkpoint(
         self,
@@ -125,6 +189,8 @@ class AgentRepository:
             parts = payload.pop("parts")
             payload.pop("usage", None)
             finish_reason = payload.pop("finish_reason", None)
+            message = messages[offset]
+            tokens = response_tokens(message) if isinstance(message, ModelResponse) else None
             rows.append(
                 dict(
                     session_id=session_id,
@@ -133,6 +199,8 @@ class AgentRepository:
                     message={"parts": parts},
                     message_metadata=payload,
                     finish_reason=finish_reason,
+                    input_tokens=tokens[0] if tokens is not None else None,
+                    output_tokens=tokens[1] if tokens is not None else None,
                 )
             )
         await self._db.execute(

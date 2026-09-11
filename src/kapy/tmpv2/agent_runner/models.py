@@ -1,4 +1,4 @@
-"""Latest execution position and append-only native messages, without physical FKs."""
+"""Execution position, append-only messages and anchored summaries, without physical FKs."""
 
 from datetime import datetime
 from typing import Any, ClassVar
@@ -36,6 +36,8 @@ class AgentHistoryRow(SQLModel, table=True):
     __table_args__ = (
         CheckConstraint("seq >= 0"),
         CheckConstraint("kind IN ('request', 'response')"),
+        CheckConstraint("input_tokens IS NULL OR input_tokens >= 0"),
+        CheckConstraint("output_tokens IS NULL OR output_tokens >= 0"),
     )
 
     session_id: UUID = Field(primary_key=True)
@@ -51,3 +53,20 @@ class AgentHistoryRow(SQLModel, table=True):
         default_factory=dict, sa_column=Column(JSON(none_as_null=True), nullable=False)
     )
     finish_reason: str | None = Field(default=None, sa_type=Text)
+    input_tokens: int | None = Field(default=None)
+    output_tokens: int | None = Field(default=None)
+
+
+class AgentCompactionRow(SQLModel, table=True):
+    metadata: ClassVar[MetaData] = agent_metadata
+    __tablename__ = "agent_compactions"  # pyrefly: ignore[bad-override]
+    __table_args__ = (CheckConstraint("last_message_seq >= 0"),)
+
+    session_id: UUID = Field(primary_key=True)
+    last_message_seq: int = Field(primary_key=True)
+    text: str = Field(sa_type=Text)
+    created_at: datetime = Field(
+        sa_column=Column(
+            DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+        )
+    )

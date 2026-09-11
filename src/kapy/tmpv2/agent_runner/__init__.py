@@ -2,6 +2,7 @@
 
 from .runner import AgentRunner, open_runner, start_runner
 from .types import (
+    Compaction,
     ConsumeCancel,
     ConsumeInputs,
     InputBatch,
@@ -16,6 +17,7 @@ from .types import (
 
 __all__ = [
     "AgentRunner",
+    "Compaction",
     "ConsumeCancel",
     "ConsumeInputs",
     "InputBatch",

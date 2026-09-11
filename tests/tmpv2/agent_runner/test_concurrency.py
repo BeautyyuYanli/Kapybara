@@ -114,7 +114,10 @@ async def test_lock_owned_protects_transaction_until_commit(database):
         )
     state = await asyncio.wait_for(task, 5)
     assert state.next_step == "model_request"
-    part = state.history[0].parts[0]
+    assert state.next_seq == 1
+    async with database.sessions.begin() as db:
+        rows = await AgentRepository(db).read_history(session_id, start_seq=0, through_seq=0)
+    part = rows[0][1].parts[0]
     assert isinstance(part, UserPromptPart)
     assert part.content == "protected"
 
@@ -157,6 +160,7 @@ async def test_heartbeat_while_model_waits_uses_independent_short_transactions(d
             heartbeat_interval=0.01,
             heartbeat_timeout=0.2,
         ) as runner:
+            await runner.rebuild_context()
             return await runner.turn(steer=["go"])
 
     task = asyncio.create_task(execute())
@@ -216,6 +220,7 @@ async def test_lost_runner_finishes_external_wait_but_cannot_write_or_release_ne
             heartbeat_interval=0.01,
             heartbeat_timeout=60,
         ) as runner:
+            await runner.rebuild_context()
             await runner.turn(steer=["go"])
 
     task = asyncio.create_task(execute())
@@ -239,7 +244,17 @@ async def test_lost_runner_finishes_external_wait_but_cannot_write_or_release_ne
     async with database.sessions.begin() as db:
         repo = AgentRepository(db)
         await repo.lock_owned(session_id, new)
-        assert len(await repo.read_history(session_id)) == 1
+        assert (
+            len(
+                [
+                    message
+                    for _, message in await repo.read_history(
+                        session_id, start_seq=0, through_seq=2**31 - 1
+                    )
+                ]
+            )
+            == 1
+        )
 
 
 async def test_process_exit_leaves_lease_then_allows_takeover(database):
@@ -298,6 +313,7 @@ async def test_caller_cancel_during_context_exit_propagates_and_releases(databas
             session_id, agent=agent, session_factory=database.sessions
         ) as runner:
             # Keep a native run open at the next request checkpoint during close.
+            await runner.rebuild_context()
             assert not (await runner.turn(steer=["go"])).finished
             owner = asyncio.current_task()
             assert owner is not None
@@ -316,6 +332,7 @@ async def test_caller_cancel_during_context_exit_propagates_and_releases(databas
         ).scalar_one()
         assert token is None
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         assert (await runner.turn()).finished
 
 
@@ -357,6 +374,7 @@ async def test_heartbeat_error_remains_visible_when_foreground_also_fails(
             heartbeat_interval=0.01,
             heartbeat_timeout=60,
         ) as runner:
+            await runner.rebuild_context()
             if failure_source != "context":
                 await runner.turn(steer=["go"])
             else:
@@ -369,7 +387,12 @@ async def test_heartbeat_error_remains_visible_when_foreground_also_fails(
         )
     else:
         async with database.sessions.begin() as db:
-            messages = await AgentRepository(db).read_history(session_id)
+            messages = [
+                message
+                for _, message in await AgentRepository(db).read_history(
+                    session_id, start_seq=0, through_seq=2**31 - 1
+                )
+            ]
             assert len(messages) == 1
             assert isinstance(messages[0], ModelRequest)
     async with database.sessions.begin() as db:
@@ -432,6 +455,7 @@ async def test_runner_rejects_consumption_after_takeover(database, takeover_at):
         async with open_runner(
             session_id, agent=agent, session_factory=database.sessions
         ) as runner:
+            await runner.rebuild_context()
             if takeover_at == "cancel_boundary":
                 assert not (await runner.turn(steer=["already accepted"])).finished
                 await take_over()
@@ -444,5 +468,10 @@ async def test_runner_rejects_consumption_after_takeover(database, takeover_at):
     async with database.sessions.begin() as db:
         repo = AgentRepository(db)
         await repo.lock_owned(session_id, new_token)
-        messages = await repo.read_history(session_id)
+        messages = [
+            message
+            for _, message in await repo.read_history(
+                session_id, start_seq=0, through_seq=2**31 - 1
+            )
+        ]
     assert len(messages) == (0 if takeover_at == "input_preparation" else 3)

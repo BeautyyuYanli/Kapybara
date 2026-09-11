@@ -31,7 +31,12 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 async def history(database, session_id):
     async with database.sessions.begin() as db:
-        return await AgentRepository(db).read_history(session_id)
+        return [
+            message
+            for _, message in await AgentRepository(db).read_history(
+                session_id, start_seq=0, through_seq=2**31 - 1
+            )
+        ]
 
 
 async def seed(database, session_id, next_step, messages):
@@ -48,6 +53,7 @@ async def test_text_done_continue_and_owned_resources(database):
     session_id = uuid4()
     agent = Agent(TestModel(custom_output_text="hello"), system_prompt="system")
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         assert (await runner.turn()).finished
         assert await history(database, session_id) == []
         first = await runner.turn(steer=["one", "two"])
@@ -64,6 +70,7 @@ async def test_text_done_continue_and_owned_resources(database):
         assert after[:2] == before
         assert len(after) == 4
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         assert runner.next_step == "done"
         assert (await runner.turn()).output is None
     async with database.sessions.begin() as db:
@@ -91,6 +98,7 @@ async def test_tools_checkpoint_resume_without_reexecuting_tools(
     async with open_runner(
         session_id, agent=agent, session_factory=database.sessions, heartbeat_interval=0.01
     ) as runner:
+        await runner.rebuild_context()
         assert not (await runner.turn(steer=["go"])).finished
         await asyncio.wait_for(heartbeat_called.wait(), 5)
         assert toolset_lifecycle.events == ["enter"]
@@ -101,6 +109,7 @@ async def test_tools_checkpoint_resume_without_reexecuting_tools(
     assert toolset_lifecycle.events == ["enter", "exit"]
     assert heartbeat_tasks and all(task.done() for task in heartbeat_tasks)
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         result = await runner.turn()
         assert result.finished
     assert called == ["tool"]
@@ -173,6 +182,7 @@ async def test_resume_handle_response_calls_no_model(database):
         assert row.finish_reason == "tool_call"
         assert row.message_metadata["provider_response_id"] == "response-123"
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         result = await runner.turn()
         assert not result.finished
         assert not model_calls
@@ -199,6 +209,7 @@ async def test_recovery_text_with_instructions_does_not_request_model(database):
         ],
     )
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         result = await runner.turn()
         assert result.finished and result.output == "saved"
     assert len(await history(database, session_id)) == 2
@@ -221,6 +232,7 @@ async def test_output_tool_and_retry_are_append_only(database):
 
     session_id = uuid4()
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         assert not (await runner.turn(steer=["go"])).finished
         saved = await history(database, session_id)
         assert saved[-1].parts[0].part_kind == "retry-prompt"
@@ -257,6 +269,7 @@ async def test_tool_failure_preserves_response_and_replays_batch(
         async with open_runner(
             session_id, agent=agent, session_factory=database.sessions, heartbeat_interval=0.01
         ) as runner:
+            await runner.rebuild_context()
             await runner.turn(steer=["go"])
     assert toolset_lifecycle.events == ["enter", "exit"]
     assert heartbeat_tasks and all(task.done() for task in heartbeat_tasks)
@@ -264,6 +277,7 @@ async def test_tool_failure_preserves_response_and_replays_batch(
     assert [m.kind for m in saved] == ["request", "response"]
     should_fail = False
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         assert runner.next_step == "handle_response"
         assert not (await runner.turn()).finished
     assert calls == ["first", "second", "first", "second"]
@@ -315,6 +329,7 @@ async def test_model_cancel_recovers_accepted_request_and_closes_native(
             session_factory=database.sessions,
             heartbeat_interval=0.01,
         ) as runner:
+            await runner.rebuild_context()
             await runner.turn(steer=["once"])
 
     task = asyncio.create_task(execute())
@@ -331,6 +346,7 @@ async def test_model_cancel_recovers_accepted_request_and_closes_native(
     async with open_runner(
         session_id, agent=Agent(TestModel()), session_factory=database.sessions
     ) as runner:
+        await runner.rebuild_context()
         assert runner.next_step == "model_request"
         assert (await runner.turn()).finished
     assert (await history(database, session_id))[0] == saved[0]
@@ -340,6 +356,7 @@ async def test_cross_task_and_reentrant_calls_rejected(database):
     session_id = uuid4()
     agent = Agent(TestModel())
     async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+        await runner.rebuild_context()
         with pytest.raises(RuntimeError, match="task that opened"):
             await asyncio.create_task(runner.turn())
 
@@ -427,6 +444,7 @@ async def test_input_acceptance_fault_preserves_atomic_recoverable_state(databas
             agent=agent,
             session_factory=FailingSessions(database.engine, expire_on_commit=False),
         ) as runner:
+            await runner.rebuild_context()
             with pytest.raises(InjectedFailure, match=failure_at):
                 await runner.run(read_steer=read_steer, consume_cancel=consume_cancel)
             # Even when the caller catches the error, the old handle must not retry
