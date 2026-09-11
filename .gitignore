@@ -18,3 +18,7 @@ build/
 *.sqlite3-*
 *.log
 .context/
+node_modules/
+*.tsbuildinfo
+frontend/playwright-report/
+frontend/test-results/

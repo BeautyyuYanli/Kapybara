@@ -67,11 +67,14 @@ class UpdateModel(UpdateDTO):
 
 
 class ProviderRecord(DTO):
+    """Readable constructor configuration; only api_key remains write-only."""
+
     id: UUID
     name: str
     provider_class: str
     model_class: str
     base_url: str | None
+    provider_kwargs: JsonObject
     created_at: datetime
     updated_at: datetime
 

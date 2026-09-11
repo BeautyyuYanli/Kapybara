@@ -66,8 +66,8 @@ references. The supported model protocols are OpenAIChatModel,
 OpenAIResponsesModel and GoogleModel, including compatible subclasses. Provider
 construction passes the stored api_key, optional base_url and JSON provider_kwargs
 directly to its SDK constructor. Class references select installed code: they do
-not translate incompatible SDK protocols. Credentials and kwargs are excluded from
-ordinary ProviderRecord results, but actual credentials are stored in the database;
+not translate incompatible SDK protocols. ProviderRecord returns provider_kwargs unchanged as ordinary constructor configuration.
+Only api_key is excluded from ordinary results; actual credentials are stored in the database;
 SecretStr only controls their Python representation. Client injection parameters
 are not accepted as stored configuration.
 

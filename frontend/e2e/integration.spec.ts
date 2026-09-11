@@ -1,0 +1,50 @@
+import { test, expect } from "@playwright/test";
+
+test("actual FastAPI supports config CRUD and slash model identity", async ({ page }) => {
+  // Local PostgreSQL integration is opt-in; fixture-only browser tests remain standalone.
+  // eslint-disable-next-line playwright/no-skipped-test
+  test.skip(!process.env.KAPY_SPA_INTEGRATION, "Start scripts/test_api.py for local integration");
+  const base = "http://127.0.0.1:8001/app/";
+  const name = `Browser ${test.info().project.name} ${Date.now()}`;
+  await page.goto(`${base}providers/new`);
+  await page.getByLabel("名称", { exact: true }).fill(name);
+  await page.getByLabel("API key", { exact: true }).fill("local-test-not-a-real-key");
+  await page.getByRole("button", { name: "保存 Provider" }).click();
+  await expect(page.getByRole("heading", { name: "编辑 Provider" })).toBeVisible();
+  await expect(page.getByLabel("API key", { exact: true })).toHaveValue("");
+  const providerId = new URL(page.url()).pathname.split("/").at(-1)!;
+  await page.goto(`${base}models/new?provider_id=${providerId}`);
+  await page.getByLabel("模型名称", { exact: true }).fill("vendor/model");
+  await page.getByLabel("Context window（可选）", { exact: true }).fill("4096");
+  await page.getByRole("button", { name: "保存 Model" }).click();
+  await expect(page.getByRole("heading", { name: "编辑 Model" })).toBeVisible();
+  await page.getByLabel("Context window（可选）", { exact: true }).fill("");
+  await page.getByRole("button", { name: "保存 Model" }).click();
+  await expect(page.getByText("已保存。", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByLabel("模型名称", { exact: true })).toHaveValue("vendor/model");
+  await expect(page.getByLabel("Context window（可选）", { exact: true })).toHaveValue("");
+  await page.goto(`${base}sessions/new`);
+  await page.getByLabel("Provider", { exact: true }).selectOption(providerId);
+  await page.getByLabel("Model", { exact: true }).selectOption("vendor/model");
+  await page.getByLabel("标题", { exact: true }).fill("Configuration only");
+  await page.getByLabel("回放轮数", { exact: true }).fill("0");
+  await page.getByRole("button", { name: "保存 Session" }).click();
+  await expect(page.getByRole("heading", { name: "编辑 Session" })).toBeVisible();
+  await expect(page.getByLabel("回放轮数", { exact: true })).toHaveValue("0");
+  await page.goto(`${base}models?provider_id=${providerId}`);
+  await page.getByRole("button", { name: "删除", exact: true }).click();
+  await page.getByRole("button", { name: "确认删除" }).click();
+  await expect(page.getByRole("alertdialog")).toContainText("仍被 Session 引用");
+  await page.keyboard.press("Escape");
+  await page.goto(`${base}providers/new`);
+  await page.getByLabel("名称", { exact: true }).fill(`${name} unused`);
+  await page.getByLabel("API key", { exact: true }).fill("local-test-not-a-real-key");
+  await page.getByRole("button", { name: "保存 Provider" }).click();
+  await expect(page.getByRole("heading", { name: "编辑 Provider" })).toBeVisible();
+  await page.goto(`${base}providers`);
+  const row = page.getByRole("listitem").filter({ hasText: `${name} unused` });
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  await page.getByRole("button", { name: "确认删除" }).click();
+  await expect(row).toHaveCount(0);
+});

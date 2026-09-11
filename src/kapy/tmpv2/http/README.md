@@ -26,7 +26,7 @@ Provider/model CRUD and discover-models endpoints call their identically named
 ModelService operations. Models use `/models/{provider_id}/{model_name:path}`;
 use the canonical model_name from the returned record, including vendor slashes.
 PATCH preserves omitted fields and replaces supplied JSON objects as a whole.
-Provider responses exclude stored credentials and constructor kwargs.
+Provider responses return constructor kwargs unchanged and exclude api_key.
 
 Session routes are:
 
@@ -82,3 +82,7 @@ Router-local error handling returns FastAPI detail objects: 422 validation,
 request data and credentials are not returned. HTTP operation IDs match endpoint
 names. The controller owns protocol adaptation and background scheduling; services
 own DTOs, parameter constraints, queue consumption, replay and execution handoff.
+
+Mount the SPA beside the API with `app.include_router(create_frontend_router(dist_dir))`.
+The host supplies the explicit Vite build directory and shares its existing resource
+lifespan. Missing index.html fails setup. See the root frontend/README.md.
