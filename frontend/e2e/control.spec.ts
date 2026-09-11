@@ -142,12 +142,14 @@ test("model slash identity uses router encoding once and nullable context PATCH"
   expect(saved.postDataJSON()).toEqual({ name: model.name, settings: {}, context_window: null });
 });
 
-test("session configuration create omits input and permits zero replay", async ({ page }) => {
+test("session create leaves threshold default to the service and permits zero replay", async ({
+  page,
+}) => {
   await page.goto("sessions/new");
   await page.getByLabel("Provider", { exact: true }).selectOption(id);
   await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
   await expect(
-    page.getByText("模型容量未知，运行前需要设置摘要阈值。仍可保存配置。"),
+    page.getByText("模型容量未知，创建时将保存默认摘要阈值 183500。"),
   ).toBeVisible();
   await page.getByLabel("回放轮数", { exact: true }).fill("0");
   const request = page.waitForRequest((request) => request.method() === "POST");
@@ -244,6 +246,9 @@ test("paged options keep current selection and model switch preserves JSON draft
   });
   await page.goto(`sessions/${id}`);
   await expect(page.getByLabel("Provider", { exact: true })).toHaveValue(id);
+  await expect(
+    page.getByText("模型容量未知，运行前需要设置摘要阈值。仍可保存配置。"),
+  ).toBeVisible();
   await page.getByRole("button", { name: "加载更多 Provider" }).click();
   await expect(page.getByRole("option", { name: "Demo Provider", exact: true })).toHaveCount(1);
   await page.getByLabel("模型设置 JSON").fill('{"temperature":0.7}');
@@ -257,6 +262,7 @@ test("paged options keep current selection and model switch preserves JSON draft
     provider_id: secondId,
     model_name: model.model_name,
     model_settings: { temperature: 0.7 },
+    compaction_threshold_tokens: null,
   });
   await expect(page.getByText("已保存，下次启动生效。", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Provider", { exact: true })).toHaveValue(secondId);

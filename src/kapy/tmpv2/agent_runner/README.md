@@ -113,8 +113,11 @@ on that original model does not apply. Worker limits can wrap the complete
 `run()` and the runner module's `start_runner()` accept
 `compaction_threshold_tokens=None` and `compaction_replay_turns=10`.
 SessionService instead reads these values from the session: a stored None threshold
-resolves to 70% of model capacity, or rejects startup if capacity is unknown. A positive
-threshold enables automatic summaries at safe boundaries, including done. The
+resolves to 70% of model capacity, or rejects startup if capacity is unknown.
+When creating a session with unknown model capacity and no explicit threshold,
+SessionService stores 183500 (70% of 256 Ki tokens, rounded down); updates and
+existing sessions receive no default. See [control services](../control/README.md).
+A positive threshold enables automatic summaries at safe boundaries, including done. The
 latest business response's input+output count must exceed it and lie after the
 latest summary anchor. Unknown usage suppresses triggering, cache counts are not
 added again, and summary usage does not affect this observation. This is an observed

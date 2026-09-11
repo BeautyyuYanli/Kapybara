@@ -83,7 +83,11 @@ class SessionService:
         self._heartbeat_timeout = heartbeat_timeout
 
     async def create_session(self, data: CreateSession) -> SessionRecord:
-        """Save validated configuration without starting execution or allocating SDK clients."""
+        """Save configuration without execution or SDK clients.
+
+        An omitted/None threshold stays None for a known model capacity; otherwise
+        creation stores 70% of 256 Ki tokens, rounded down. Updates do not default it.
+        """
         async with self._session_factory.begin() as db:
             models = ModelRepository(db)
             model = await models.get_model(data.provider_id, data.model_name)
@@ -91,8 +95,16 @@ class SessionService:
             _, model_cls = resolve_classes(provider)
             settings = validate_settings(model_cls, data.model_settings)
             validate_settings(model_cls, model.settings | settings)
+            threshold = data.compaction_threshold_tokens
+            if threshold is None and model.context_window is None:
+                threshold = 256 * 1024 * 7 // 10
             return await SessionRepository(db).create_session(
-                data.model_copy(update={"model_settings": settings})
+                data.model_copy(
+                    update={
+                        "model_settings": settings,
+                        "compaction_threshold_tokens": threshold,
+                    }
+                )
             )
 
     async def get_session(self, session_id: UUID) -> SessionRecord:
@@ -404,7 +416,7 @@ class SessionService:
 
 
 def resolve_compaction_threshold(configured: int | None, context_window: int | None) -> int:
-    """Resolve business defaults; None selects model capacity rather than disabling compaction."""
+    """Resolve a stored threshold at startup; None requires a known model capacity."""
     if configured is not None:
         if type(configured) is not int or configured <= 0:
             raise ValueError("compaction_threshold_tokens must be a positive integer")

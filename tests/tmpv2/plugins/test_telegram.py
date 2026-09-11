@@ -465,6 +465,48 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
     ]
 
 
+@pytest.mark.asyncio
+async def test_buffer_overflow_resumes_after_last_delivered_commit(repository, monkeypatch):
+    row = await delivery_row(repository)
+    key = delivery_key(row)
+    client = AsyncMock(spec=TelegramClient)
+    cursors, closed = [], []
+    recovered = asyncio.Event()
+
+    async def live(session_id, *, after_seq):
+        cursors.append(after_seq)
+        try:
+            if len(cursors) == 1:
+                yield [
+                    MessageCommitted(
+                        HistoryMessage(session_id, 0, ModelResponse([TextPart("first")]))
+                    )
+                ]
+                assert (await repository.get_delivery(key)).after_seq == 0
+                raise BufferError("Output subscription buffer is full")
+            yield [
+                MessageCommitted(HistoryMessage(session_id, 1, ModelResponse([TextPart("second")])))
+            ]
+            recovered.set()
+            await asyncio.Future()
+        finally:
+            closed.append(after_seq)
+
+    monkeypatch.setattr("kapy.tmpv2.plugins.telegram.delivery.retry_delay", lambda *args: 0)
+    sessions = AsyncMock(spec=SessionService)
+    sessions.live = live
+    task = asyncio.create_task(TelegramDelivery(client, sessions, repository, 42).follow(key))
+    try:
+        await asyncio.wait_for(recovered.wait(), 2)
+    finally:
+        task.cancel()
+        (result,) = await asyncio.gather(task, return_exceptions=True)
+    assert isinstance(result, asyncio.CancelledError)
+    assert cursors == [-1, 0] and closed == [-1, 0]
+    assert [call.args[2] for call in client.send.await_args_list] == ["first", "second"]
+    assert (await repository.get_delivery(key)).after_seq == 1
+
+
 def test_plain_chunks_preserve_unicode():
     body = "x" * 3999 + "😀" + "tail"
     left, right = text_chunk(body)

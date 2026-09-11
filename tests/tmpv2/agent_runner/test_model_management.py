@@ -436,6 +436,35 @@ async def test_session_configuration_applies_through_queued_runs_and_compaction(
     assert (await sessions.get_session(session.id)).model_settings == {"temperature": 0.9}
 
 
+@pytest.mark.parametrize(
+    "context_window,threshold_fields,expected",
+    [
+        (None, {}, 183500),
+        (None, {"compaction_threshold_tokens": None}, 183500),
+        (None, {"compaction_threshold_tokens": 50}, 50),
+        (1000, {}, None),
+        (1000, {"compaction_threshold_tokens": None}, None),
+        (1000, {"compaction_threshold_tokens": 50}, 50),
+    ],
+)
+async def test_session_creation_persists_threshold_default(
+    database, sdk_http, context_window, threshold_fields, expected
+):
+    sdk_http(lambda request: pytest.fail("No model request expected"))
+    catalog, sessions = ModelService(database.sessions), SessionService(database.sessions)
+    provider = await create_provider(catalog)
+    model = await catalog.create_model(
+        CreateModel(provider_id=provider.id, model_name="custom", context_window=context_window)
+    )
+    session = await sessions.create_session(
+        CreateSession.model_validate(
+            {"provider_id": provider.id, "model_name": model.model_name} | threshold_fields
+        )
+    )
+    assert session.compaction_threshold_tokens == expected
+    assert (await sessions.get_session(session.id)).compaction_threshold_tokens == expected
+
+
 async def test_threshold_required_before_any_input_is_consumed(database, sdk_http):
     clients = sdk_http(lambda request: pytest.fail("No model request expected"))
     catalog, sessions = ModelService(database.sessions), SessionService(database.sessions)
@@ -445,6 +474,8 @@ async def test_threshold_required_before_any_input_is_consumed(database, sdk_htt
     session = await sessions.create_session(
         CreateSession(provider_id=provider.id, model_name="custom")
     )
+    await sessions.update_session(session.id, UpdateSession(compaction_threshold_tokens=None))
+    assert (await sessions.get_session(session.id)).compaction_threshold_tokens is None
     queued = await sessions.enqueue_input(session.id, "queued", "go")
     with pytest.raises(ValueError, match="compaction_threshold_tokens"):
         await sessions.start_runner(session.id, agent=Agent())

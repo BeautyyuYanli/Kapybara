@@ -67,6 +67,7 @@ async def test_http_create_input_background_and_withdrawal(database, seed_sessio
             },
         )
         assert response.status_code == 201
+        assert response.json()["compaction_threshold_tokens"] is None
         created_id = response.json()["id"]
         assert str(starts[0][0]) == created_id and starts[0][1][0].content == "first"
         assert starts[0][2]["realtime_output"] is True
@@ -89,14 +90,23 @@ async def test_http_create_input_background_and_withdrawal(database, seed_sessio
         cancelled = await client.post(f"/api/sessions/{created_id}/cancel")
         assert cancelled.status_code == 202 and cancelled.content == b""
         assert (await client.get(f"/api/sessions/{created_id}/cancel")).json() is True
+        updated_model = await client.patch(
+            f"/api/models/{existing.provider_id}/{existing.model_name}",
+            json={"context_window": None},
+        )
+        assert updated_model.status_code == 200
         empty = await client.post(
             "/api/sessions",
             json={
                 "provider_id": str(existing.provider_id),
                 "model_name": existing.model_name,
+                "compaction_threshold_tokens": None,
             },
         )
         assert empty.status_code == 201 and len(starts) == 2
+        assert empty.json()["compaction_threshold_tokens"] == 183500
+        saved = await client.get(f"/api/sessions/{empty.json()['id']}")
+        assert saved.json()["compaction_threshold_tokens"] == 183500
 
 
 async def test_http_history_pages_and_canonical_model_paths(database, seed_history, seed_session):

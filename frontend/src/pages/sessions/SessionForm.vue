@@ -191,7 +191,11 @@ async function save() {
           "
           role="status"
         >
-          模型容量未知，运行前需要设置摘要阈值。仍可保存配置。
+          {{
+            id
+              ? "模型容量未知，运行前需要设置摘要阈值。仍可保存配置。"
+              : "模型容量未知，创建时将保存默认摘要阈值 183500。"
+          }}
         </p>
         <JsonObjectField
           id="model_settings"
@@ -202,7 +206,11 @@ async function save() {
         <FormField
           id="compaction_threshold_tokens"
           label="摘要阈值（可选）"
-          help="留空自动采用模型容量的 70%。"
+          :help="
+            id
+              ? '留空在下次启动时采用模型容量的 70%；容量未知时需设置阈值。'
+              : '留空采用模型容量的 70%；创建时容量未知则保存默认阈值 183500。'
+          "
           :error="fields.compaction_threshold_tokens"
           v-slot="f"
           ><input

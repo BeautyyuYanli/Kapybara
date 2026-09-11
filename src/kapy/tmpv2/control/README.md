@@ -107,9 +107,14 @@ configuration updates affect the next start. Explicit SDK options retain their
 SDK semantics; no extra runner-specific settings blacklist is applied.
 
 The stored compaction_threshold_tokens must be positive, or None to use 70% of
-model capacity (rounded down, at least one). Unknown capacity plus None prevents
-startup before acquiring execution or consuming inputs. compaction_replay_turns is
-a nonnegative integer, defaults to 10, and zero omits replay before the summary
+model capacity at startup (rounded down, at least one). On session creation,
+an omitted/None threshold stays None when model capacity is known; if capacity is
+unknown, SessionService stores `256 * 1024 * 7 // 10 = 183500`. Explicit thresholds
+are preserved. Updates can clear the threshold to None without applying this
+creation default, and existing sessions are not backfilled. Unknown capacity plus
+a stored None prevents startup before acquiring execution or consuming inputs.
+compaction_replay_turns is a nonnegative integer, defaults to 10, and zero omits
+replay before the summary
 anchor. These are session fields, not arguments to SessionService.start_runner.
 The lower runner still accepts ordinary explicit compaction arguments.
 
