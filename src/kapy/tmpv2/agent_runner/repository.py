@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
 from .models import AgentCompactionRow, AgentHistoryRow, AgentStateRow
-from .types import Compaction, NextStep, ResumeState, RunnerLost, SessionBusy
+from .types import Compaction, HistoryMessage, NextStep, ResumeState, RunnerLost, SessionBusy
 
 
 def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
@@ -30,7 +30,7 @@ def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
     return None
 
 
-def _decode_history(rows: Sequence[AgentHistoryRow]) -> list[tuple[int, ModelMessage]]:
+def _decode_history(rows: Sequence[AgentHistoryRow]) -> tuple[HistoryMessage, ...]:
     payloads: list[dict[str, Any]] = []
     for row in rows:
         payload = {**row.message_metadata, **row.message, "kind": row.kind}
@@ -42,7 +42,10 @@ def _decode_history(rows: Sequence[AgentHistoryRow]) -> list[tuple[int, ModelMes
                 )
         payloads.append(payload)
     messages = ModelMessagesTypeAdapter.validate_python(payloads)
-    return [(row.seq, message) for row, message in zip(rows, messages, strict=True)]
+    return tuple(
+        HistoryMessage(row.session_id, row.seq, message)
+        for row, message in zip(rows, messages, strict=True)
+    )
 
 
 class AgentRepository:
@@ -134,6 +137,25 @@ class AgentRepository:
             )
             .order_by(col(AgentHistoryRow.seq))
         )
+        return [
+            (entry.seq, entry.message)
+            for entry in _decode_history((await self._db.execute(statement)).scalars().all())
+        ]
+
+    async def read_history_entries(
+        self, session_id: UUID, *, after_seq: int = -1
+    ) -> tuple[HistoryMessage, ...]:
+        """Read original history after an absolute cursor, including for unstarted sessions."""
+        if isinstance(after_seq, bool) or not isinstance(after_seq, int) or after_seq < -1:
+            raise ValueError("after_seq must be an integer >= -1")
+        statement = (
+            select(AgentHistoryRow)
+            .where(
+                col(AgentHistoryRow.session_id) == session_id,
+                col(AgentHistoryRow.seq) > after_seq,
+            )
+            .order_by(col(AgentHistoryRow.seq))
+        )
         return _decode_history((await self._db.execute(statement)).scalars().all())
 
     async def read_history_before(
@@ -149,7 +171,10 @@ class AgentRepository:
             .order_by(col(AgentHistoryRow.seq).desc())
             .limit(limit)
         )
-        return _decode_history((await self._db.execute(statement)).scalars().all())
+        return [
+            (entry.seq, entry.message)
+            for entry in _decode_history((await self._db.execute(statement)).scalars().all())
+        ]
 
     async def read_latest_compaction(self, session_id: UUID) -> Compaction | None:
         row = (
@@ -180,10 +205,14 @@ class AgentRepository:
         next_step: NextStep,
         start_seq: int,
         messages: Sequence[ModelMessage] = (),
-    ) -> None:
-        """Append an explicit delta after lock_owned; the caller supplies its next seq."""
+    ) -> tuple[HistoryMessage, ...]:
+        """Append after lock_owned and return normalized DTOs, without committing.
+
+        DTOs derive from the INSERT payload, without another database read. They
+        must only be published after the caller's transaction has committed.
+        """
         payloads = ModelMessagesTypeAdapter.dump_python(list(messages), mode="json")
-        rows = []
+        rows: list[dict[str, Any]] = []
         for offset, payload in enumerate(payloads):
             kind = payload.pop("kind")
             parts = payload.pop("parts")
@@ -210,3 +239,4 @@ class AgentRepository:
         )
         if rows:
             await self._db.execute(insert(AgentHistoryRow), rows)
+        return _decode_history([AgentHistoryRow(**row) for row in rows])

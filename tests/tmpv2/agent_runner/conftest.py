@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from valkey.asyncio import Valkey
 
 from kapy.tmpv2.agent_runner.models import agent_metadata
 from kapy.tmpv2.agent_runner.repository import AgentRepository
@@ -27,6 +28,19 @@ from kapy.tmpv2.control.sessions import models as session_models  # noqa: F401
 DATABASE_URL = os.environ.get(
     "KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
 )
+
+
+@pytest_asyncio.fixture
+async def valkey_client():
+    client = Valkey.from_url(
+        os.environ.get("KAPY_VALKEY_URL", "valkey://127.0.0.1:56379/0"),
+        socket_connect_timeout=1,
+    )
+    try:
+        await client.ping()
+        yield client
+    finally:
+        await client.aclose()
 
 
 @dataclass

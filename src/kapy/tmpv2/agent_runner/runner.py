@@ -28,12 +28,16 @@ from pydantic_graph import End
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .compaction import assemble_context, replay_start, require_nonnegative_int, summarize
+from .output import OutputCapability
 from .repository import AgentRepository, response_tokens
 from .types import (
     Compaction,
     ConsumeCancel,
+    HistoryMessage,
     InputBatch,
+    MessageCommitted,
     NextStep,
+    OutputCallback,
     ReadInputs,
     ResumeState,
     TurnResult,
@@ -70,6 +74,7 @@ class AgentRunner[OutputT]:
         self._next_step = state.next_step
         self._context: list[ModelMessage] | None = None
         self._next_seq = state.next_seq
+        self._output = OutputCapability(session_id)
         self._compaction = state.compaction
         self._latest_response_seq: int | None = None
         self._observed_context_tokens: int | None = None
@@ -136,6 +141,7 @@ class AgentRunner[OutputT]:
         initial: InputBatch | None = None,
         compaction_threshold_tokens: int | None = None,
         compaction_replay_turns: int = 10,
+        on_output: OutputCallback | None = None,
     ) -> TurnResult[OutputT]:
         """Prepare context and run until done with no steer, checking cancel first.
 
@@ -143,8 +149,11 @@ class AgentRunner[OutputT]:
         response's input+output usage; None disables it. Replay is approximately N
         responses, extending backwards to complete tool pairs. N must be a
         nonnegative integer. A new summary never replaces the business output.
+        on_output enables business text and committed-message events for this call
+        only. Callback errors invalidate the handle; cancellation still propagates.
         """
         with self._operation():
+            self._output.callback = on_output
             try:
                 require_nonnegative_int(compaction_replay_turns, "compaction_replay_turns")
                 if compaction_threshold_tokens is not None:
@@ -183,6 +192,8 @@ class AgentRunner[OutputT]:
             except BaseException as error:
                 await self._fail(error)
                 raise
+            finally:
+                self._output.callback = None
 
     def _require_context(self) -> list[ModelMessage]:
         if self._context is None:
@@ -341,6 +352,7 @@ class AgentRunner[OutputT]:
             message_history=deepcopy(self._require_context()),
             conversation_id=str(self._session_id),
             deps=self._deps,
+            capabilities=[self._output],
         )
         native = await context.__aenter__()
         self._native_context = context
@@ -394,7 +406,7 @@ class AgentRunner[OutputT]:
             await repo.lock_owned(self._session_id, self._lock_token)
             for batch in batches:
                 await batch.consume(db)
-            await repo.save_checkpoint(
+            entries = await repo.save_checkpoint(
                 self._session_id,
                 next_step="model_request",
                 start_seq=self._next_seq,
@@ -405,6 +417,7 @@ class AgentRunner[OutputT]:
         if not created:
             assert isinstance(self._node, ModelRequestNode)
             self._node.request.parts = [*self._node.request.parts, *deepcopy(request.parts)]
+        await self._publish_committed(entries)
 
     def _accept_committed(self, next_step: NextStep, messages: Sequence[ModelMessage]) -> None:
         self._require_context().extend(deepcopy(messages))
@@ -424,7 +437,7 @@ class AgentRunner[OutputT]:
         async with self._session_factory.begin() as db:
             repo = AgentRepository(db)
             await repo.lock_owned(self._session_id, self._lock_token)
-            await repo.save_checkpoint(
+            entries = await repo.save_checkpoint(
                 self._session_id,
                 next_step=next_step,
                 start_seq=self._next_seq,
@@ -432,6 +445,12 @@ class AgentRunner[OutputT]:
             )
         self._ensure_usable()
         self._accept_committed(next_step, messages)
+        await self._publish_committed(entries)
+
+    async def _publish_committed(self, entries: Sequence[HistoryMessage]) -> None:
+        if self._output.callback is not None:
+            for entry in entries:
+                await self._output.callback(MessageCommitted(entry))
 
     async def _advance_turn(self) -> TurnResult[OutputT]:
         self._ensure_usable()
@@ -442,7 +461,11 @@ class AgentRunner[OutputT]:
         assert self._native is not None
         if self._next_step == "model_request":
             assert isinstance(self._node, ModelRequestNode)
-            following = await self._native.next(self._node)
+            self._output.response_seq = self._next_seq
+            try:
+                following = await self._native.next(self._node)
+            finally:
+                self._output.response_seq = None
             self._ensure_usable()
             if not isinstance(following, CallToolsNode):
                 raise RuntimeError("Expected a complete model response")
@@ -605,6 +628,7 @@ async def start_runner[DepsT, OutputT](
     heartbeat_timeout: float = 60.0,
     compaction_threshold_tokens: int | None = None,
     compaction_replay_turns: int = 10,
+    on_output: OutputCallback | None = None,
 ) -> TurnResult[OutputT]:
     """Run first, then start another run for each queued snapshot, including after cancel."""
     async with open_runner(
@@ -623,6 +647,7 @@ async def start_runner[DepsT, OutputT](
                 consume_cancel=consume_cancel,
                 compaction_threshold_tokens=compaction_threshold_tokens,
                 compaction_replay_turns=compaction_replay_turns,
+                on_output=on_output,
             )
             runner._ensure_usable()
             initial = await read_queued()

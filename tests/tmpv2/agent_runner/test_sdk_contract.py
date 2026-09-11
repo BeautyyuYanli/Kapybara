@@ -221,3 +221,51 @@ async def test_compaction_empty_or_incomplete_response_has_bounded_failure(incom
     if not incomplete:
         assert isinstance(calls[-1][-1].parts[0], RetryPromptPart)
         assert len([m for m in calls[-1] if isinstance(m, ModelResponse)]) == 2
+
+
+async def test_output_observer_preserves_part_resets_and_ignores_nontext_events():
+    from pydantic_ai import RunContext
+    from pydantic_ai.messages import (
+        PartDeltaEvent,
+        PartStartEvent,
+        TextPartDelta,
+        ThinkingPartDelta,
+    )
+    from pydantic_ai.usage import RunUsage
+
+    from kapy.tmpv2.agent_runner import TextDelta
+    from kapy.tmpv2.agent_runner.output import OutputCapability
+
+    session_id = uuid4()
+    observer = OutputCapability(session_id)
+    observer.response_seq = 9
+    received = []
+
+    async def callback(event):
+        received.append(event)
+
+    observer.callback = callback
+    original = [
+        PartStartEvent(index=0, part=TextPart("old")),
+        PartStartEvent(index=0, part=TextPart("")),
+        PartDeltaEvent(index=0, delta=TextPartDelta(" \n")),
+        PartDeltaEvent(index=0, delta=TextPartDelta("")),
+        PartStartEvent(index=1, part=ThinkingPart("")),
+        PartDeltaEvent(index=1, delta=ThinkingPartDelta(signature_delta="opaque")),
+        PartStartEvent(index=2, part=ToolCallPart("work", {}, "call")),
+    ]
+
+    async def events():
+        for event in original:
+            yield event
+
+    ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
+    assert [
+        event async for event in observer.wrap_run_event_stream(ctx, stream=events())
+    ] == original
+    assert received == [
+        TextDelta(session_id, 9, 0, "text", "replace", "old"),
+        TextDelta(session_id, 9, 0, "text", "replace", ""),
+        TextDelta(session_id, 9, 0, "text", "append", " \n"),
+        TextDelta(session_id, 9, 1, "thinking", "replace", ""),
+    ]

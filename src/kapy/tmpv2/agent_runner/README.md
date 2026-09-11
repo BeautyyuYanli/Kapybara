@@ -112,7 +112,83 @@ prompt, then all subsequent history. These virtual messages are never persisted 
 executed as inputs; done with no real input stays done. Each run applies its own N
 once and again after a new summary; ordinary turns never re-read full history.
 
+Optional live output is composed by `SessionService`, using an application-owned
+`valkey.asyncio.Valkey` client:
+
+```python
+from contextlib import aclosing
+
+from kapy.tmpv2.agent_output import AgentOutputService
+from kapy.tmpv2.control.sessions import MessageCommitted, SessionService
+
+sessions = SessionService(
+    session_factory,
+    output_service=AgentOutputService(valkey_client, channel_prefix="my-environment:agent-output"),
+)
+
+# Producer: the service owns the publisher across all queued runs.
+await sessions.start_runner(session_id, agent=agent, realtime_output=True)
+
+# Observer: run independently; this stream continues across runner lifetimes.
+async with aclosing(sessions.stream_output(session_id, start_seq=0)) as events:
+    async for event in events:
+        if isinstance(event, MessageCommitted):
+            ...  # Save/replace the complete message at event.message.seq.
+        else:
+            ...  # Apply the provisional text part's replace/append operation.
+```
+
+`realtime_output=False` (default) needs no output service, starts no publisher and
+does not request SDK streaming. Direct users can pass `on_output` to `run()` or
+the runner module's `start_runner()`. The callback applies only to that run call;
+`turn()` does not inherit it. It is awaited in the runner's task, outside database
+transactions. Callback errors invalidate the handle. Only business model text and
+readable thinking stream; compaction summaries and tool argument deltas do not.
+The SDK capability dynamically enables streaming on each model node, preserving
+ordinary node hooks and a native graph retained across successive run calls.
+
+`TextDelta` identifies `(session_id, response_seq, part_index)` with `part_kind`
+`text` or `thinking`. `replace` initializes/clears a part, `append` adds text without
+trimming. `response_seq` is the next absolute history sequence captured before the
+model request. `MessageCommitted.message` is a `HistoryMessage(session_id, seq,
+message)`, using the same normalized usage and official SDK codec as history reads.
+Both input and response/tool-result checkpoints publish after commit, reusing the
+INSERT payload with no extra SELECT or RETURNING. State-only checkpoints emit
+nothing. A committed message replaces all temporary parts at its sequence; it
+is not a runner-completion event. Output DTOs carry no execution lease token.
+
+`stream_output(start_seq=0)` starts at an inclusive original history sequence,
+confirms its subscription before reading history, filters overlaps and backfills
+missing predecessors when later events expose a gap. Every database read ends
+before yielding. Normal sequential events need no additional reads. Unfillable
+gaps and subscription errors end the generator. Reconnect from the last applied
+complete message's `seq + 1`, clearing provisional text first. Pub/Sub is best
+effort: missing subscribers lose events, mid-response subscribers may see only a
+suffix, and an unpublished final checkpoint is recovered only on another replay.
+Old/new runner attempts may interleave temporary text before a committed message
+corrects it. There is no outbox, periodic history poll or delta recovery cursor.
+
+`AgentOutputService.publisher(flush_interval=0.5)` batches deltas for 0.5 seconds
+by default, flushing early at 64 KiB encoded size or at a committed message.
+When output is enabled, `SessionService.start_runner(output_flush_interval=...)`
+forwards that value to the publisher's `flush_interval`.
+A commit follows preceding buffered deltas in the same JSON array. Zero interval
+publishes immediately. Normal exit flushes; failure/cancellation drops the buffer
+and joins its sole flush task. PUBLISH waits at most one second, does not retry,
+and drops recognized transport errors. `subscribe()` yields individual typed
+events only after a SUBSCRIBE acknowledgement and owns its connection until exit;
+idle reads have no timeout and disconnects propagate. Shared clients stay open.
+
+The channel is `{channel_prefix}:{session_id}` and carries nonempty JSON arrays of
+these two events. Prefixes must isolate environments because Pub/Sub ignores the
+Valkey database number. This uses ordinary PUBLISH/SUBSCRIBE, including with a
+direct-node async client in Cluster, not sharded Pub/Sub. No database schema changes,
+Valkey keys, TTLs or output heartbeat are required; the execution lease heartbeat
+retains its existing purpose.
+
 The relevant tests are `tests/tmpv2/agent_runner`. The SDK contract tests require no
 services. Integration tests use real PostgreSQL at `KAPY_DATABASE_URL` (defaulting
 to the repository's local port 55432), own random schemas, and exercise actual
-connections/processes. Run all of them with `uv run pytest tests/tmpv2/agent_runner`.
+connections/processes. Output integration tests also require Valkey at
+`KAPY_VALKEY_URL` (default local port 56379), use unique session channels and
+close their clients. Run all of them with `uv run pytest tests/tmpv2/agent_runner`.

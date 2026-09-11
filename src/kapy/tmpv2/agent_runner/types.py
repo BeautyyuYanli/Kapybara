@@ -1,16 +1,56 @@
-"""Runner values and same-database input callbacks; no transport or session CRUD."""
+"""Runner values, normalized history and transient events; no transport or session CRUD."""
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Annotated, Literal
+from uuid import UUID
 
-from pydantic_ai.messages import UserContent
+from pydantic import Field
+from pydantic_ai.messages import ModelMessage, UserContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 type UserInput = str | Sequence[UserContent]
 type NextStep = Literal["model_request", "handle_response", "done"]
 type ConsumeInputs = Callable[[AsyncSession], Awaitable[None]]
 type ConsumeCancel = Callable[[AsyncSession], Awaitable[bool]]
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryMessage:
+    """One original history row, using the same normalized message codec as storage."""
+
+    session_id: UUID
+    seq: int
+    message: ModelMessage
+
+
+@dataclass(frozen=True, slots=True)
+class TextDelta:
+    """Provisional text for one response part; its committed message replaces it.
+
+    replace initializes or clears a part, append adds text without trimming.
+    Different execution attempts can share response_seq; deltas are not resumable.
+    """
+
+    session_id: UUID
+    response_seq: int
+    part_index: int
+    part_kind: Literal["text", "thinking"]
+    op: Literal["replace", "append"]
+    text: str
+    type: Literal["delta"] = "delta"
+
+
+@dataclass(frozen=True, slots=True)
+class MessageCommitted:
+    """A complete durable message, not a notification that execution has finished."""
+
+    message: HistoryMessage
+    type: Literal["message"] = "message"
+
+
+type OutputEvent = Annotated[TextDelta | MessageCommitted, Field(discriminator="type")]
+type OutputCallback = Callable[[OutputEvent], Awaitable[None]]
 
 
 class SessionBusy(RuntimeError):
