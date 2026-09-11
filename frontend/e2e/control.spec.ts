@@ -49,6 +49,50 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test("mobile navigation covers the bottom edge as browser safe areas change", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 740 });
+  const cdp = await page.context().newCDPSession(page);
+  await page.goto("sessions/new");
+  await expect(page.getByRole("button", { name: "保存 Session" })).toBeVisible();
+  const navigation = page.getByRole("navigation", { name: "主导航" });
+
+  // Emulate the actual CSS environment variables, including toolbar expansion
+  // after the gesture area was exposed. Plain viewport resizing leaves these zero.
+  for (const maximum of [24, 36]) {
+    const heights: number[] = [];
+    for (const bottom of [maximum, 0, maximum]) {
+      await page.setViewportSize({ width: 390, height: 716 + bottom });
+      await cdp.send("Emulation.setSafeAreaInsetsOverride", {
+        insets: { bottom, bottomMax: maximum },
+      });
+      await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+      const viewportHeight = await page.evaluate(() => window.innerHeight);
+      const bar = await page.locator(".site-header").boundingBox();
+      const tab = await navigation.getByRole("link", { name: "Model", exact: true }).boundingBox();
+      const save = await page.getByRole("button", { name: "保存 Session" }).boundingBox();
+      expect(bar).not.toBeNull();
+      expect(tab).not.toBeNull();
+      expect(save).not.toBeNull();
+      heights.push(bar!.height);
+      // Each tab's background and divider reach the viewport edge without an
+      // empty strip; the last form action remains above the navigation.
+      expect(tab!.y + tab!.height).toBeGreaterThanOrEqual(viewportHeight);
+      expect(save!.y + save!.height).toBeLessThanOrEqual(bar!.y);
+      const labelBottom = await navigation
+        .getByRole("link", { name: "Model", exact: true })
+        .evaluate((link) => {
+          const text = document.createRange();
+          text.selectNodeContents(link);
+          return text.getBoundingClientRect().bottom;
+        });
+      expect(labelBottom).toBeLessThanOrEqual(viewportHeight - bottom);
+    }
+    expect(new Set(heights).size).toBe(1);
+  }
+  await navigation.getByRole("link", { name: "Model", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Model", exact: true })).toBeVisible();
+});
+
 test("provider PATCH preserves blank key, replaces JSON, and clears URL", async ({ page }) => {
   await page.goto(`providers/${id}`);
   await expect(page.getByLabel("其他连接参数 JSON")).toHaveValue(
