@@ -1,42 +1,44 @@
 :root {
   /* Primitive values. */
   --gray-0: #fff;
-  --gray-50: #f6f7f9;
-  --gray-200: #d4d9e0;
-  --gray-600: #526071;
-  --gray-900: #192432;
-  --blue-700: #2359b1;
-  --blue-800: #19478f;
-  --red-700: #b42332;
-  --veil: #19243280;
+  --gray-50: #f5f5f2;
+  --gray-200: #d7d7d0;
+  --gray-600: #656560;
+  --gray-800: #343431;
+  --gray-900: #20201e;
+  --red-700: #a52b2b;
+  --veil: #20201e70;
   --space-2: 0.5rem;
   --space-4: 1rem;
   --space-6: 1.5rem;
   --space-8: 2rem;
   --size-touch: 2.75rem;
-  --size-content: 72rem;
-  --size-form: 42rem;
-  --size-radius: 0.5rem;
+  --size-content: 88rem;
+  --size-form: 40rem;
+  --size-radius: 0;
   --text-sm: 0.875rem;
   --text-base: 1rem;
   --text-lg: 1.25rem;
-  --text-xl: 2rem;
-  --line-normal: 1.5;
+  --text-xl: clamp(2.5rem, 5.5vw, 4.5rem);
+  --line-normal: 1.6;
   --size-focus: 2px;
   --size-border: 1px;
+  --layer-navigation: 5;
   --layer-overlay: 10;
   --layer-dialog: 11;
   /* Semantic mappings. */
-  --surface-page: var(--gray-50);
+  --surface-page: var(--gray-0);
   --surface-panel: var(--gray-0);
+  --surface-subtle: var(--gray-50);
   --text-primary: var(--gray-900);
   --text-muted: var(--gray-600);
   --border-default: var(--gray-200);
-  --action-primary: var(--blue-700);
-  --action-hover: var(--blue-800);
+  --border-strong: var(--gray-900);
+  --action-primary: var(--gray-900);
+  --action-hover: var(--gray-800);
   --text-on-action: var(--gray-0);
   --status-danger: var(--red-700);
-  --focus-ring: var(--blue-700);
+  --focus-ring: var(--gray-900);
   --overlay-bg: var(--veil);
   --control-height: var(--size-touch);
   --control-radius: var(--size-radius);
@@ -53,6 +55,7 @@
   --line-height: var(--line-normal);
   --focus-width: var(--size-focus);
   --border-width: var(--size-border);
+  --navigation-layer: var(--layer-navigation);
   --overlay-layer: var(--layer-overlay);
   --dialog-layer: var(--layer-dialog);
   /* Component mappings only where a component needs one. */
@@ -60,4 +63,5 @@
   --button-radius: var(--control-radius);
   --field-border: var(--border-default);
   --dialog-bg: var(--surface-panel);
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }

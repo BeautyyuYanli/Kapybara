@@ -129,9 +129,11 @@ async function save() {
 </script>
 <template>
   <section class="form-page">
+    <RouterLink class="back-link" to="/models"><span aria-hidden="true">← </span>返回列表</RouterLink>
     <div class="page-heading">
+      <span class="eyebrow">02 / MODEL LIBRARY</span>
       <h1>{{ editing ? "编辑 Model" : "创建 Model" }}</h1>
-      <RouterLink to="/models">返回列表</RouterLink>
+      <p class="muted">设定模型容量与默认请求参数。</p>
     </div>
     <p v-if="resource.pending.value" role="status">加载中…</p>
     <div v-else-if="resource.error.value" role="alert">

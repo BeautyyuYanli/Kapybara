@@ -137,9 +137,11 @@ async function save() {
 </script>
 <template>
   <section class="form-page">
+    <RouterLink class="back-link" to="/sessions"><span aria-hidden="true">← </span>返回列表</RouterLink>
     <div class="page-heading">
+      <span class="eyebrow">03 / SESSIONS</span>
       <h1>{{ id ? "编辑 Session" : "创建 Session" }}</h1>
-      <RouterLink to="/sessions">返回列表</RouterLink>
+      <p class="muted">选择模型，设定会话的上下文策略。</p>
     </div>
     <p class="muted">配置更新对下次启动生效。</p>
     <p v-if="resource.pending.value" role="status">加载中…</p>

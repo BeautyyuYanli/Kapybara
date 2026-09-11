@@ -4,10 +4,15 @@
 body {
   margin: 0;
   font:
-    var(--font-body)/var(--line-height) system-ui,
+    var(--font-body)/var(--line-height) "Helvetica Neue", Arial, "Noto Sans CJK SC", system-ui,
     sans-serif;
   color: var(--text-primary);
   background: var(--surface-page);
+  -webkit-font-smoothing: antialiased;
+}
+::selection {
+  background: var(--text-primary);
+  color: var(--surface-panel);
 }
 a {
   display: inline-block;
@@ -37,14 +42,16 @@ button {
   cursor: pointer;
   background: var(--button-bg);
   border-radius: var(--button-radius);
+  font-size: var(--font-small);
 }
 button:hover:not(:disabled),
 .button:hover {
   border-color: var(--action-primary);
+  background: var(--surface-subtle);
 }
 button:disabled,
 fieldset:disabled {
-  opacity: 0.6;
+  opacity: 0.45;
   cursor: default;
 }
 button.primary,
@@ -52,6 +59,7 @@ button.primary,
   background: var(--action-primary);
   color: var(--text-on-action);
   border-color: var(--action-primary);
+  font-weight: 600;
 }
 button.primary:hover:not(:disabled),
 .button.primary:hover {
@@ -72,13 +80,25 @@ textarea {
   padding: var(--gap);
   width: 100%;
   resize: vertical;
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
+  font-size: var(--font-small);
+  line-height: 1.8;
   overflow: auto;
 }
 input,
 select {
   width: 100%;
   min-width: 0;
+  min-height: 3.25rem;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+}
+input[readonly],
+select:disabled {
+  background: var(--surface-subtle);
+  color: var(--text-muted);
 }
 fieldset {
   border: 0;
@@ -88,10 +108,15 @@ fieldset {
 }
 h1 {
   font-size: var(--font-title);
+  font-weight: 500;
+  letter-spacing: -0.065em;
+  line-height: 1.08;
   margin: 0;
 }
 h2 {
   font-size: var(--font-section);
+  font-weight: 500;
+  letter-spacing: -0.025em;
   margin: 0;
 }
 p {
@@ -108,12 +133,17 @@ small:empty {
   display: none;
 }
 label {
-  font-weight: 600;
+  font-weight: 500;
+  font-size: var(--font-small);
 }
 summary {
   cursor: pointer;
   min-height: var(--control-height);
-  padding-block: var(--gap-small);
+  padding-block: var(--gap);
+  border-block: var(--border-width) solid var(--border-default);
+}
+details[open] > summary {
+  margin-bottom: var(--gap-large);
 }
 .button {
   display: inline-flex;
@@ -125,6 +155,8 @@ summary {
   border-radius: var(--control-radius);
   background: var(--surface-panel);
   text-decoration: none;
+  font-size: var(--font-small);
+  gap: var(--gap);
 }
 .skip {
   position: absolute;
