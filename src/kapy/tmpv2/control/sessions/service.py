@@ -2,11 +2,12 @@
 
 Ordinary methods own short transactions. Consumption borrows the runner's already
 fenced transaction, preserving atomic queue-to-history transfer. This service
-owns no long-lived ORM session, Agent, task, or engine. Optional output transport
-is borrowed from agent_output; live owns each subscription and joins
+owns no long-lived ORM session, Agent, or engine. Optional output transport
+is borrowed from agent_output; each live call owns its subscription/read task and joins
 original history to live events without holding a transaction during iteration.
 """
 
+import asyncio
 import math
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import nullcontext
@@ -55,7 +56,7 @@ class SessionService:
     """User-side entry point; configure the same finite heartbeat policy on every worker.
 
     The instance stores only borrowed factories/output transport and heartbeat
-    values. Per-start model resources and overrides are scoped to that async call.
+    and live polling values. Per-start model resources and overrides are scoped to that async call.
     """
 
     def __init__(
@@ -65,6 +66,7 @@ class SessionService:
         output_service: AgentOutputService | None = None,
         heartbeat_interval: float = 10.0,
         heartbeat_timeout: float = 60.0,
+        live_poll_interval: float = 5.0,
     ) -> None:
         if not (
             math.isfinite(heartbeat_interval)
@@ -72,6 +74,9 @@ class SessionService:
             and 0 < heartbeat_interval < heartbeat_timeout
         ):
             raise ValueError("Require finite 0 < heartbeat_interval < heartbeat_timeout")
+        if not math.isfinite(live_poll_interval) or live_poll_interval <= 0:
+            raise ValueError("live_poll_interval must be finite and positive")
+        self._live_poll_interval = live_poll_interval
         self._session_factory = session_factory
         self._output_service = output_service
         self._heartbeat_interval = heartbeat_interval
@@ -207,7 +212,8 @@ class SessionService:
 
         Disabled output needs no transport. Enabled output requires output_service
         before acquiring a lease and owns one publisher across all queued runs.
-        The flush interval is finite and nonnegative; zero publishes immediately.
+        The flush interval is finite and nonnegative; zero schedules background
+        publication immediately.
         Session/model/provider configuration is read once and remains fixed across
         queued runs and compaction. The Agent keeps its prompts/tools/output type;
         a task-local override supplies the stored model and merged request settings.
@@ -305,14 +311,14 @@ class SessionService:
         after_seq must be an integer >= -1, otherwise ValueError is raised.
         An output_service is required even for history replay, otherwise RuntimeError
         is raised. Validation, subscription and history reads begin on iteration.
-        Live continuation requires the producer to enable realtime_output.
+        Realtime output supplies provisional deltas; complete messages are also polled.
 
-        Subscribe before reading so overlapping commits can be deduplicated. Only
-        committed messages advance the cursor; gaps trigger one short database read.
-        No transaction survives a yield. Missing predecessors raise RuntimeError.
-        This stream continues across runner lifetimes, with no polling or guaranteed
-        delivery of a lost final notification. Reconnect from the last committed
-        seq and discard provisional text. Use aclosing when stopping early.
+        Subscribe before reading to deduplicate overlapping commits. Only complete
+        messages advance the cursor. Gaps trigger a short read; unresolved gaps wait
+        for later events or the next poll without skipping predecessors. Polling uses
+        live_poll_interval, independent of incoming traffic. No transaction spans a
+        yield, and consumer backpressure pauses polling. Database/subscription errors
+        end the stream; runner completion does not. Use aclosing when stopping early.
         """
         if type(after_seq) is not int or after_seq < -1:
             raise ValueError("after_seq must be an integer >= -1")
@@ -326,29 +332,58 @@ class SessionService:
                     session_id, after_seq=last_seq
                 )
 
+        loop = asyncio.get_running_loop()
+        next_poll_at = loop.time()
+        pending = None
         async with self._output_service.subscribe(session_id) as events:
-            for entry in await read_history():
-                if entry.seq != last_seq + 1:
-                    raise RuntimeError("Session history has a sequence gap")
-                last_seq = entry.seq
-                yield MessageCommitted(entry)
-            async for event in events:
-                seq = (
-                    event.message.seq if isinstance(event, MessageCommitted) else event.response_seq
-                )
-                if seq > last_seq + 1:
-                    for entry in await read_history():
-                        if entry.seq != last_seq + 1:
-                            raise RuntimeError("Session history has a sequence gap")
-                        last_seq = entry.seq
-                        yield MessageCommitted(entry)
-                if seq <= last_seq:
-                    continue
-                if seq != last_seq + 1:
-                    raise RuntimeError("Session history is missing an event predecessor")
-                if isinstance(event, MessageCommitted):
-                    last_seq = seq
-                yield event
+            try:
+                while True:
+                    if loop.time() >= next_poll_at:
+                        entries = await read_history()
+                        next_poll_at = loop.time() + self._live_poll_interval
+                        for entry in entries:
+                            if entry.seq != last_seq + 1:
+                                break
+                            last_seq = entry.seq
+                            yield MessageCommitted(entry)
+
+                    if pending is None:
+                        pending = asyncio.ensure_future(anext(events))
+                    done, _ = await asyncio.wait(
+                        {pending}, timeout=max(0, next_poll_at - loop.time())
+                    )
+                    # Preserve the same read across polling timeouts, including its
+                    # result when both the event and the deadline become ready.
+                    if not done or loop.time() >= next_poll_at:
+                        continue
+                    try:
+                        event = pending.result()
+                    except StopAsyncIteration:
+                        return
+                    pending = None
+                    seq = (
+                        event.message.seq
+                        if isinstance(event, MessageCommitted)
+                        else event.response_seq
+                    )
+                    if seq > last_seq + 1:
+                        entries = await read_history()
+                        next_poll_at = loop.time() + self._live_poll_interval
+                        for entry in entries:
+                            if entry.seq != last_seq + 1:
+                                break
+                            last_seq = entry.seq
+                            yield MessageCommitted(entry)
+                    if seq != last_seq + 1:
+                        continue
+                    if isinstance(event, MessageCommitted):
+                        last_seq = seq
+                    yield event
+            finally:
+                # Finish anext before subscribe closes its underlying iterator.
+                if pending is not None:
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
 
 
 def resolve_compaction_threshold(configured: int | None, context_window: int | None) -> int:

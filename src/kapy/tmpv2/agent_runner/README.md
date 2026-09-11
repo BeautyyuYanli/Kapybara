@@ -178,25 +178,34 @@ is not a runner-completion event. Output DTOs carry no execution lease token.
 
 `live(after_seq=-1)` starts after the last applied complete history sequence (-1 replays all),
 confirms its subscription before reading history, filters overlaps and backfills
-missing predecessors when later events expose a gap. Every database read ends
-before yielding. Normal sequential events need no additional reads. Unfillable
-gaps and subscription errors end the generator. Reconnect from the last applied
-complete message's `seq`, clearing provisional text first. Pub/Sub is best
-effort: missing subscribers lose events, mid-response subscribers may see only a
-suffix, and an unpublished final checkpoint is recovered only on another replay.
-Old/new runner attempts may interleave temporary text before a committed message
-corrects it. There is no outbox, periodic history poll or delta recovery cursor.
+missing predecessors when later events expose a gap. It also polls history every
+5 seconds, configurable through `SessionService(live_poll_interval=...)`, so lost
+final notifications are recovered without another event or reconnect. Only the
+contiguous prefix advances the cursor; unresolved gaps wait for another read.
+Each short transaction ends before yielding. Consumer backpressure pauses polling;
+incoming traffic does not postpone it. Each live call owns at most one pending
+subscription read and joins it before closing its subscription. Database and
+subscription errors end the generator; runner completion does not. Reconnect from
+the last complete seq, clearing provisional text first. Missing subscribers lose
+deltas, and temporary append events may occasionally repeat or interleave between
+runner attempts; committed messages replace all provisional content. There is no
+outbox or delta recovery cursor.
 
-`AgentOutputService.publisher(flush_interval=0.5)` batches deltas for 0.5 seconds
-by default, flushing early at 64 KiB encoded size or at a committed message.
-When output is enabled, `SessionService.start_runner(output_flush_interval=...)`
-forwards that value to the publisher's `flush_interval`.
-A commit follows preceding buffered deltas in the same JSON array. Zero interval
-publishes immediately. Normal exit flushes; failure/cancellation drops the buffer
-and joins its sole flush task. PUBLISH waits at most one second, does not retry,
-and drops recognized transport errors. `subscribe()` yields individual typed
-events only after a SUBSCRIBE acknowledgement and owns its connection until exit;
-idle reads have no timeout and disconnects propagate. Shared clients stay open.
+`AgentOutputService.publisher(flush_interval=0.5)` buffers at most 64 KiB of encoded
+JSON plus one in-flight batch of the same maximum size. The awaited callback only
+encodes and buffers locally: it never waits on network I/O and drops ordinary errors,
+overflow, oversized events, and events during recovery or after close. First arrival
+starts the batching deadline; commits, capacity and zero interval wake the background
+task immediately. `SessionService.start_runner(output_flush_interval=...)` forwards
+this interval. One task sends and recovers connections, including with zero interval.
+Each network attempt has a one-second deadline. Failed batches are discarded;
+recoverable failures trigger a one-second delay and a bounded PING probe until
+recovery, independently of new events. Unrecoverable errors disable that publisher.
+Every context exit drops pending output and cancels/joins the task without a final
+flush, so the final commit notification may be recovered through database polling.
+`subscribe()` yields individual events after acknowledgement, allows backpressure,
+and propagates connection/decode errors without automatic resubscription. Idle reads
+have no timeout. Shared clients stay open.
 
 The channel is `{channel_prefix}:{session_id}` and carries nonempty JSON arrays of
 these two events. Prefixes must isolate environments because Pub/Sub ignores the

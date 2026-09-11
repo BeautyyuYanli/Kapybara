@@ -248,7 +248,8 @@ async def test_websocket_replay_live_frames_and_idle_subscription_cleanup(
             delta = TextDelta(session_id, 1, 0, "text", "replace", "live")
             async with outputs.publisher(session_id, flush_interval=0) as publish:
                 await publish(delta)
-            assert adapter.validate_json(await ws.recv()) == delta
+                async with asyncio.timeout(2):
+                    assert adapter.validate_json(await ws.recv()) == delta
         async with asyncio.timeout(2):
             # Valkey has no notification API for another connection unsubscribing.
             while (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1]:  # noqa: ASYNC110
