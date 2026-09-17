@@ -75,7 +75,7 @@ are directly accessible without login or an access token. The SPA uses
 same-origin requests.
 
 ```python
-from kapy.tmpv2.plugins.http import create_frontend_router, create_router
+from kapy.plugins.http import create_frontend_router, create_router
 
 app.include_router(create_router(models, sessions, agent=agent))
 app.include_router(create_frontend_router(frontend_dist_dir))
@@ -111,4 +111,4 @@ KAPY_SPA_INTEGRATION=1 npm run test:e2e
 `spa_test_*` schema and drops it on graceful shutdown. It never reads `.env`.
 Tests create only configuration with fake keys and explicit model capacities;
 they make no model requests or discovery calls. Reports are in playwright-report/
-and test-results/. Backend tests are `tests/tmpv2/agent_runner/test_frontend.py`.
+and test-results/. Backend tests are `tests/agent_runner/test_frontend.py`.

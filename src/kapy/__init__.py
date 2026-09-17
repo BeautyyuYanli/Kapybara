@@ -1,1 +1,1 @@
-"""Kapy agent control and execution planes."""
+"""Kapy session services and independent HTTP/Telegram interface plugins."""

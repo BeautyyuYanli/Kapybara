@@ -1,7 +1,7 @@
 [project]
 name = "kapy"
 version = "0.1.0"
-description = "An agent control plane with remote execution and Telegram sessions"
+description = "Agent session services with independent HTTP and Telegram interfaces"
 requires-python = ">=3.14"
 dependencies = [
     "aiosqlite>=0.22.1",
@@ -35,6 +35,10 @@ build-backend = "uv_build"
 [tool.ruff]
 target-version = "py314"
 line-length = 100
+extend-exclude = ["prototype"]
+
+[tool.uv.build-backend]
+source-exclude = ["prototype/**"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]

@@ -2,7 +2,7 @@
 
 Run from the repository: .venv/bin/uvicorn test_api:app --app-dir frontend/scripts
 --host 127.0.0.1 --port 8001. Build frontend first. Uses the same local test database
-as tests/tmpv2/agent_runner; never reads .env and never schedules model requests.
+as tests/agent_runner; never reads .env and never schedules model requests.
 No schema or rows in the normal application namespace are changed.
 """
 
@@ -16,10 +16,10 @@ from psycopg import sql
 from pydantic_ai import Agent
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from kapy.tmpv2.control.database import ControlTable
-from kapy.tmpv2.control.models import ModelService
-from kapy.tmpv2.control.sessions import SessionService
-from kapy.tmpv2.plugins.http import create_frontend_router, create_router
+from kapy.control.database import ControlTable
+from kapy.control.models import ModelService
+from kapy.control.sessions import SessionService
+from kapy.plugins.http import create_frontend_router, create_router
 
 schema = "spa_test_" + uuid4().hex
 url = "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"

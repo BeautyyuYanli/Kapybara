@@ -17,7 +17,7 @@ services:
       retries: 30
   valkey:
     image: valkey/valkey:8-alpine
-    # tmpv2 only uses Pub/Sub: there are no messages to persist or expire.
+    # Output uses Pub/Sub: there are no messages to persist or expire.
     command: ["valkey-server", "--save", "", "--appendonly", "no"]
     ports:
       - "127.0.0.1:${KAPY_VALKEY_PORT:-56379}:6379"

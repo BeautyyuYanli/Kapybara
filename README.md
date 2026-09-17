@@ -1,8 +1,12 @@
 # Kapy v2
 
-当前开发栈围绕 `src/kapy/tmpv2` 的 Python 模块：本地进程与 PTY、文件传输、
+当前开发栈围绕 `src/kapy` 的 Python 模块：本地进程与 PTY、文件传输、
 Agent Runner、上下文压缩，以及基于 Valkey Pub/Sub 的实时输出和历史回放。
 HTTP 和 Telegram 作为独立进程插件，直接调用这些服务。HTTP 同时挂载配置前端。
+
+主实现位于 `src/kapy/`，测试位于 `tests/`，模块直接通过 `kapy.*` 导入。
+早期实现及其测试、脚本原样归档在 `prototype/`，不参与当前安装、构建和默认检查。
+`kapy` 命令提供 `plugin` 与 `db` 两个入口；旧控制面 CLI 随原型一起归档。
 
 ## 本地启动
 
@@ -49,18 +53,18 @@ HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
 
 ## 验证
 
-全部 tmpv2 测试使用真实 PostgreSQL、Valkey、子进程、PTY 和本地 HTTP 服务；
+主实现测试使用真实 PostgreSQL、Valkey、子进程、PTY 和本地 HTTP 服务；
 模型行为使用 SDK 的确定性测试模型，不调用外部模型 API。
 进程和文件测试要求在容器中运行，避免在宿主机跳过。
 
 ```sh
-docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests/tmpv2
+docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests
 ```
 
 使用 `.env` 的模型端点和凭据运行真实模型验收：
 
 ```sh
-docker compose exec -T runtime python scripts/check_tmpv2.py
+docker compose exec -T runtime python scripts/check_runtime.py
 ```
 
 该脚本使用 OpenAI Responses 协议，会产生数次模型请求。运行前需按上方步骤
@@ -84,14 +88,14 @@ session 供检查，每次运行使用新的 session ID。
 
 ## 模块入口
 
-- [进程管理 API](src/kapy/tmpv2/processes/README.md)
-- [文件传输](src/kapy/tmpv2/file_transfer.py)
-- [Runner、压缩和实时输出契约](src/kapy/tmpv2/agent_runner/README.md)
-- [Valkey 输出服务](src/kapy/tmpv2/agent_output/service.py)
-- [SessionService：生产侧与历史回放](src/kapy/tmpv2/control/sessions/service.py)
-- [独立进程接口插件](src/kapy/tmpv2/plugins/README.md)
-- [核心与插件数据库迁移](src/kapy/tmpv2/database/README.md)
-- [控制面 FastAPI HTTP / WebSocket API](src/kapy/tmpv2/plugins/http/README.md)
+- [进程管理 API](src/kapy/processes/README.md)
+- [文件传输](src/kapy/file_transfer.py)
+- [Runner、压缩和实时输出契约](src/kapy/agent_runner/README.md)
+- [Valkey 输出服务](src/kapy/agent_output/service.py)
+- [SessionService：生产侧与历史回放](src/kapy/control/sessions/service.py)
+- [独立进程接口插件](src/kapy/plugins/README.md)
+- [核心与插件数据库迁移](src/kapy/database/README.md)
+- [控制面 FastAPI HTTP / WebSocket API](src/kapy/plugins/http/README.md)
 
 调用方负责 engine、数据库 schema、模型 Agent 和 Valkey client 的生命周期。
 `SessionService.start_runner(..., realtime_output=True)` 需要注入

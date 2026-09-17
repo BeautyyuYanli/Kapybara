@@ -3,6 +3,7 @@
 .env.*
 .venv
 .context
+prototype
 .local
 __pycache__
 .pytest_cache
