@@ -233,7 +233,7 @@ class TelegramController:
                 queued = await self.sessions.read_inputs(session_id, "queued")
                 steer = await self.sessions.read_inputs(session_id, "steer")
                 action["reply"] = (
-                    f"Session: {session_id}\nLease: {'running' if running else 'idle'}\n"
+                    f"Session: {session_id}\nLease: {'busy' if running else 'idle'}\n"
                     f"Cancellation requested: {cancelled}\n"
                     f"Queued: {len(queued)}; steer: {len(steer)}"
                 )

@@ -19,6 +19,8 @@ from sqlalchemy import text
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
 from kapy.control.sessions import service as session_service
+from kapy.session_lease import open_session_lease
+from kapy.session_lease import service as lease_service
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -105,7 +107,7 @@ async def test_delete_races_with_atomic_queue_to_history_commit(
     database, rollback, monkeypatch, wait_for_lock
 ):
     sessions = SessionService(database.sessions)
-    session_id, token = uuid4(), uuid4()
+    session_id = uuid4()
     from kapy.control.sessions.repository import SessionRepository
 
     pid_ready = asyncio.get_running_loop().create_future()
@@ -118,12 +120,15 @@ async def test_delete_races_with_atomic_queue_to_history_commit(
     monkeypatch.setattr(SessionRepository, "delete_input", observe_delete)
     async with database.sessions.begin() as db:
         row = await SessionRepository(db).enqueue_input(session_id, "queued", "candidate")
-        await AgentRepository(db).acquire(session_id, token, heartbeat_timeout=60)
     deletion = None
     try:
-        async with database.sessions.begin() as db:
+        async with (
+            open_session_lease(session_id, session_factory=database.sessions) as lease,
+            database.sessions.begin() as db,
+        ):
+            await lease.lock_owned(db)
             repo = AgentRepository(db)
-            await repo.lock_owned(session_id, token)
+            await repo.resume(session_id)
             accepted = await sessions.consume_inputs(session_id, "queued", db=db, ids=[row.id])
             assert accepted == (row,)
             deletion = asyncio.create_task(sessions.delete_input(session_id, row.id))
@@ -156,18 +161,19 @@ async def test_input_arriving_in_final_lease_release_window_is_drained(
     sessions = SessionService(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
-    release = AgentRepository.release
+    update_owned = lease_service._update_owned
     injected = False
 
-    async def release_with_input(repo, session_id, token):
+    async def release_with_input(db, lease, *, release):
+        session_id = lease.session_id
         nonlocal injected
-        if not injected:
+        if release and not injected:
             injected = True
             await sessions.enqueue_input(session_id, channel, "during release")
             assert await sessions.is_runner_running(session_id)
-        await release(repo, session_id, token)
+        await update_owned(db, lease, release=release)
 
-    monkeypatch.setattr(AgentRepository, "release", release_with_input)
+    monkeypatch.setattr(lease_service, "_update_owned", release_with_input)
     agent = Agent("test")
     session_model(agent.model)
     result = await sessions.start_runner(session_id, agent=agent)
@@ -259,7 +265,13 @@ async def test_service_reacquisition_preserves_output_and_latest_finished_state(
             await sessions.enqueue_input(session_id, "queued", "after release")
             if handoff == "busy":
                 async with database.sessions.begin() as db:
-                    await AgentRepository(db).acquire(session_id, uuid4(), heartbeat_timeout=60)
+                    await db.execute(
+                        text(
+                            "UPDATE session_leases SET lock_token=:token, "
+                            "heartbeat_at=clock_timestamp() WHERE session_id=:id"
+                        ),
+                        {"id": session_id, "token": uuid4()},
+                    )
         return result
 
     monkeypatch.setattr(session_service, "run_agent_session", run_with_handoff)

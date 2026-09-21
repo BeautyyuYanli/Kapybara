@@ -114,6 +114,7 @@ def create_session_router[DepsT, OutputT](
 
     @router.get("/sessions/{session_id}/runner", operation_id="is_runner_running")
     async def is_runner_running(session_id: UUID) -> bool:
+        # Compatibility route: lease occupancy does not mean the Agent is generating.
         return await sessions.is_runner_running(session_id)
 
     @router.post("/sessions/{session_id}/cancel", status_code=202, operation_id="request_cancel")

@@ -41,6 +41,7 @@ from kapy.plugins.telegram.repository import TelegramRepository, delivery_key
 from kapy.plugins.telegram.schema import migrate as migrate_telegram
 from kapy.plugins.telegram.settings import TelegramSettings
 from kapy.plugins.telegram.storage import open_storage
+from kapy.session_lease.models import lease_metadata
 
 pytestmark = pytest.mark.integration
 
@@ -68,7 +69,7 @@ async def test_core_migrations_own_only_core_tables(database):
                     config = migration_config(
                         connection,
                         directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
-                        metadata=[ControlTable.metadata, agent_metadata],
+                        metadata=[ControlTable.metadata, agent_metadata, lease_metadata],
                         version_table="core_schema_version",
                         owns_table=OWNED_TABLES.__contains__,
                     )

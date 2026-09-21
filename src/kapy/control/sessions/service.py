@@ -39,6 +39,7 @@ from kapy.control.models.runtime import (
     validate_settings,
 )
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
+from kapy.session_lease import is_session_busy
 
 from .repository import SessionRepository
 from .types import (
@@ -141,11 +142,13 @@ class SessionService:
             return await repo.update_session(session_id, values | {"model_settings": settings})
 
     async def is_runner_running(self, session_id: UUID) -> bool:
-        """Observe a live lease using this service's timeout, including a still-owned done state."""
+        """Observe lease occupancy with this service's timeout, not Agent generation.
+
+        The owner can be any cooperating session operation, even at a done checkpoint.
+        This compatibility name neither acquires ownership nor proves process liveness.
+        """
         async with self._session_factory.begin() as db:
-            return await AgentRepository(db).is_runner_running(
-                session_id, heartbeat_timeout=self._heartbeat_timeout
-            )
+            return await is_session_busy(db, session_id, heartbeat_timeout=self._heartbeat_timeout)
 
     async def enqueue_input(
         self, session_id: UUID, channel: InputChannel, content: UserInput

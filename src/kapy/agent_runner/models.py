@@ -17,12 +17,6 @@ class AgentStateRow(SQLModel, table=True):
 
     session_id: UUID = Field(primary_key=True)
     next_step: str = Field(default="done", sa_type=Text)
-    lock_token: UUID | None = None
-    heartbeat_at: datetime = Field(
-        sa_column=Column(
-            DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
-        )
-    )
     updated_at: datetime = Field(
         sa_column=Column(
             DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()

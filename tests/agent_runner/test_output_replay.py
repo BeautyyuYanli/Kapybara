@@ -19,6 +19,7 @@ from kapy.agent_output import AgentOutputService
 from kapy.agent_runner import HistoryMessage, MessageCommitted, OutputEvent, TextDelta
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
+from kapy.session_lease import open_session_lease
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -59,18 +60,19 @@ def response(text="answer"):
 
 
 async def append(database, session_id, messages, start_seq):
-    token = uuid4()
-    async with database.sessions.begin() as db:
+    async with (
+        open_session_lease(session_id, session_factory=database.sessions) as lease,
+        database.sessions.begin() as db,
+    ):
+        await lease.lock_owned(db)
         repo = AgentRepository(db)
-        await repo.acquire(session_id, token, heartbeat_timeout=60)
-        await repo.lock_owned(session_id, token)
+        await repo.resume(session_id)
         entries = await repo.save_checkpoint(
             session_id,
             next_step="done",
             start_seq=start_seq,
             messages=messages,
         )
-        await repo.release(session_id, token)
     return entries
 
 

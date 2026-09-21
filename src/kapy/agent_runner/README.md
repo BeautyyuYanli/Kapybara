@@ -1,17 +1,25 @@
 # Agent runner
 
-`open_runner` acquires one session's logical execution lease and yields a handle.
+`open_runner` borrows ownership from the independent `kapy.session_lease` component
+and yields a runner handle. `session_leases` contains ownership only; acquiring a
+lease creates neither business sessions nor runner checkpoints.
 It loads only the checkpoint, next absolute message sequence and latest summary.
 Use and close it in the task that opened it: `Agent.iter()` owns task-local AnyIO
 cancel scopes. All handle operations reject concurrent, reentrant or cross-task calls.
-The separate heartbeat task only uses its own short database transactions.
+The lease maintains one heartbeat task using short transactions, through native
+graph cleanup. Checkpoint/history and queue consumption first call
+`lease.lock_owned(db)` in the same transaction; all cooperating writers take the
+lease row before business rows. Bypassing that protocol is not automatically fenced.
 
 The application owns the configured Agent, deps, PostgreSQL engine and async
-session factory. `kapy db upgrade` migrates `agent_metadata` and the control tables;
+session factory. `kapy db upgrade` migrates `agent_metadata`, `lease_metadata` and the control tables;
 the services never create tables or close shared clients. Isolated tests can
 initialize disposable schemas directly from their metadata.
-The repository currently relies on PostgreSQL READ COMMITTED row locks, conditional
-upsert and `clock_timestamp()`. Table declarations use the connection's default
+The lease relies on PostgreSQL READ COMMITTED row locks, conditional upsert and
+`clock_timestamp()`. It can also be used by non-runner operations through
+`open_session_lease`; `SessionBusy` and `RunnerLost` remain compatible exports
+(the latter aliases `LeaseLost`). A timeout permits takeover; it does not revoke
+an unchanged token or undo external requests. Table declarations use the connection's default
 schema and deliberately contain no physical foreign keys.
 
 The runner can execute independently of business session configuration. For a
@@ -26,6 +34,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from kapy.agent_runner import open_runner
 from kapy.agent_runner.models import agent_metadata
+from kapy.session_lease.models import lease_metadata
 
 
 async def example(database_url: str):
@@ -33,6 +42,7 @@ async def example(database_url: str):
     try:
         async with engine.begin() as connection:
             await connection.run_sync(agent_metadata.create_all)
+            await connection.run_sync(lease_metadata.create_all)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with open_runner(
             uuid4(), agent=Agent("test"), session_factory=session_factory

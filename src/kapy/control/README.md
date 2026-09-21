@@ -119,10 +119,11 @@ anchor. These are session fields, not arguments to SessionService.start_runner.
 The lower runner still accepts ordinary explicit compaction arguments.
 
 Heartbeat interval and timeout are finite constructor settings satisfying
-`0 < interval < timeout`. Every worker using the same execution table must use the
+`0 < interval < timeout`. Every worker using the same session lease table must use the
 same policy, including callers that bypass SessionService. is_runner_running uses
 this timeout and the database clock to observe a non-expired owned lease, even if
-the checkpoint is done. It does not acquire execution or prove process liveness;
+the checkpoint is done. The owner may be a non-runner operation; this observation
+does not mean the Agent is generating. It does not acquire execution or prove process liveness;
 start_runner still atomically acquires the lease and raises SessionBusy if occupied.
 
 Input is enqueued with `enqueue_input(id, "queued", content)` for the next run, or

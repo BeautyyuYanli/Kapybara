@@ -25,6 +25,7 @@ from kapy.agent_runner import InputBatch, open_runner
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
 from kapy.control.sessions.repository import SessionRepository
+from kapy.session_lease import open_session_lease
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -40,13 +41,14 @@ async def history(database, session_id):
 
 
 async def seed(database, session_id, next_step, messages):
-    token = uuid4()
-    async with database.sessions.begin() as db:
+    async with (
+        open_session_lease(session_id, session_factory=database.sessions) as lease,
+        database.sessions.begin() as db,
+    ):
+        await lease.lock_owned(db)
         repo = AgentRepository(db)
-        await repo.acquire(session_id, token, heartbeat_timeout=60)
-        await repo.lock_owned(session_id, token)
+        await repo.resume(session_id)
         await repo.save_checkpoint(session_id, next_step=next_step, start_seq=0, messages=messages)
-        await repo.release(session_id, token)
 
 
 async def test_text_done_continue_and_owned_resources(database):
@@ -74,7 +76,9 @@ async def test_text_done_continue_and_owned_resources(database):
         assert runner.next_step == "done"
         assert (await runner.turn()).output is None
     async with database.sessions.begin() as db:
-        assert (await db.execute(text("select lock_token from agent_states"))).scalar_one() is None
+        assert (
+            await db.execute(text("select lock_token from session_leases"))
+        ).scalar_one() is None
         rows = (
             await db.execute(text("select seq, message_metadata from agent_history order by seq"))
         ).all()

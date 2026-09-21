@@ -9,6 +9,9 @@ from pydantic import Field
 from pydantic_ai.messages import ModelMessage, UserContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kapy.session_lease import LeaseLost
+from kapy.session_lease import SessionBusy as SessionBusy
+
 type UserInput = str | Sequence[UserContent]
 type NextStep = Literal["model_request", "handle_response", "done"]
 type ConsumeInputs = Callable[[AsyncSession], Awaitable[tuple[UserInput, ...]]]
@@ -53,12 +56,8 @@ type OutputEvent = Annotated[TextDelta | MessageCommitted, Field(discriminator="
 type OutputCallback = Callable[[OutputEvent], Awaitable[None]]
 
 
-class SessionBusy(RuntimeError):
-    """Another runner still owns a live execution lease."""
-
-
-class RunnerLost(RuntimeError):
-    """This runner's execution token has been replaced or removed."""
+# Compatibility name: ownership belongs to the shared lease, not only runners.
+RunnerLost = LeaseLost
 
 
 @dataclass(frozen=True, slots=True)

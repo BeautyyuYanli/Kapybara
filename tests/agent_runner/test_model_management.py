@@ -22,7 +22,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from kapy.agent_runner import SessionBusy, open_runner
 from kapy.agent_runner.compaction import COMPACTION_PROMPT
-from kapy.agent_runner.repository import AgentRepository
 from kapy.control.models import (
     CreateModel,
     CreateProvider,
@@ -35,6 +34,8 @@ from kapy.control.models import (
 )
 from kapy.control.models.repository import ModelRepository
 from kapy.control.sessions import CreateSession, SessionService, UpdateSession
+from kapy.session_lease import is_session_busy
+from kapy.session_lease.models import SessionLeaseRow
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -500,7 +501,7 @@ async def test_running_status_observes_fresh_done_and_expired_leases(database):
         async with database.sessions.begin() as db:
             await db.execute(
                 text(
-                    "UPDATE agent_states "
+                    "UPDATE session_leases "
                     "SET heartbeat_at=clock_timestamp() - interval '45 seconds' "
                     "WHERE session_id=:id"
                 ),
@@ -622,17 +623,17 @@ async def test_service_uses_configured_timeout_and_renews_while_model_waits(
         CreateSession(provider_id=provider.id, model_name="custom")
     )
     async with database.sessions.begin() as db:
-        repo = AgentRepository(db)
-        await repo.acquire(session.id, uuid4(), heartbeat_timeout=60)
+        db.add(SessionLeaseRow(session_id=session.id, lock_token=uuid4()))
+        await db.flush()
         await db.execute(
             text(
-                "UPDATE agent_states "
+                "UPDATE session_leases "
                 "SET heartbeat_at=clock_timestamp() - interval '45 seconds' "
                 "WHERE session_id=:id"
             ),
             {"id": session.id},
         )
-        assert await repo.is_runner_running(session.id, heartbeat_timeout=60)
+        assert await is_session_busy(db, session.id, heartbeat_timeout=60)
     assert not await sessions.is_runner_running(session.id)
     await sessions.enqueue_input(session.id, "queued", "go")
     task = asyncio.create_task(sessions.start_runner(session.id, agent=Agent()))

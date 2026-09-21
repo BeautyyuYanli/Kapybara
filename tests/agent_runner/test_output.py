@@ -29,6 +29,7 @@ from kapy.agent_runner import (
 )
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
+from kapy.session_lease import open_session_lease
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 ADAPTER = TypeAdapter(list[OutputEvent])
@@ -176,7 +177,7 @@ async def test_callback_switches_on_retained_native_graph(database, first_enable
 
 
 async def test_normalized_checkpoint_dto_matches_read_without_extra_select(database):
-    session_id, token = uuid4(), uuid4()
+    session_id = uuid4()
     messages = [
         ModelRequest(
             parts=[
@@ -198,10 +199,13 @@ async def test_normalized_checkpoint_dto_matches_read_without_extra_select(datab
     def record(connection, cursor, statement, parameters, context, many):
         statements.append(statement)
 
-    async with database.sessions.begin() as db:
+    async with (
+        open_session_lease(session_id, session_factory=database.sessions) as lease,
+        database.sessions.begin() as db,
+    ):
+        await lease.lock_owned(db)
         repo = AgentRepository(db)
-        await repo.acquire(session_id, token, heartbeat_timeout=60)
-        await repo.lock_owned(session_id, token)
+        await repo.resume(session_id)
         sql_event.listen(database.engine.sync_engine, "before_cursor_execute", record)
         try:
             written = await repo.save_checkpoint(

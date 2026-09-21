@@ -23,13 +23,13 @@ from kapy.agent_runner import (
     SessionBusy,
     TextDelta,
 )
-from kapy.agent_runner.repository import AgentRepository
 from kapy.application.settings import CommonSettings
 from kapy.control.models import ModelService
 from kapy.control.sessions import SessionService
 from kapy.plugins.http import create_router
 from kapy.plugins.http.app import create_app
 from kapy.plugins.http.settings import HttpSettings
+from kapy.session_lease.models import SessionLeaseRow
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -83,7 +83,7 @@ async def test_http_create_input_background_and_withdrawal(database, seed_sessio
         ).json() is False
         token = uuid4()
         async with database.sessions.begin() as db:
-            await AgentRepository(db).acquire(starts[0][0], token, heartbeat_timeout=60)
+            db.add(SessionLeaseRow(session_id=starts[0][0], lock_token=token))
         response = await client.post(f"/api/sessions/{created_id}/inputs", json={"content": "busy"})
         assert response.status_code == 202 and len(starts) == 2
         assert (await client.get(f"/api/sessions/{created_id}/runner")).json() is True

@@ -2,17 +2,16 @@
 
 The application owns Agent, deps and the session factory. A handle belongs to the
 asyncio task that opens it: the native graph owns task-local AnyIO cancel scopes.
-Only the heartbeat runs separately, always with its own AsyncSession. Committed
+The borrowed SessionLease renews ownership through graph cleanup. Committed
 history is independent of SDK working messages and is never rewritten.
 """
 
 import asyncio
-import math
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from copy import deepcopy
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from pydantic_ai import Agent, CallToolsNode, DeferredToolRequests, ModelRequestNode, UserPromptNode
 from pydantic_ai.messages import (
@@ -26,6 +25,8 @@ from pydantic_ai.messages import (
 from pydantic_ai.run import AgentRun
 from pydantic_graph import End
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from kapy.session_lease import SessionLease, open_session_lease
 
 from .compaction import assemble_context, replay_start, require_nonnegative_int, summarize
 from .output import OutputCapability
@@ -57,20 +58,18 @@ class AgentRunner[OutputT]:
     def __init__(
         self,
         session_id: UUID,
-        lock_token: UUID,
+        lease: SessionLease,
         state: ResumeState,
         *,
         agent: Agent[Any, OutputT],
         deps: Any,
         session_factory: async_sessionmaker[AsyncSession],
-        heartbeat_interval: float,
     ) -> None:
         self._session_id = session_id
-        self._lock_token = lock_token
+        self._lease = lease
         self._agent = agent
         self._deps = deps
         self._session_factory = session_factory
-        self._heartbeat_interval = heartbeat_interval
         self._next_step = state.next_step
         self._context: list[ModelMessage] | None = None
         self._next_seq = state.next_seq
@@ -85,15 +84,13 @@ class AgentRunner[OutputT]:
         self._native_context: AbstractAsyncContextManager[AgentRun[Any, OutputT]] | None = None
         self._native: AgentRun[Any, OutputT] | None = None
         self._node: ModelRequestNode[Any, OutputT] | CallToolsNode[Any, OutputT] | None = None
-        self._heartbeat_task = asyncio.create_task(
-            self._heartbeat(), name=f"agent-heartbeat:{session_id}"
-        )
 
     @property
     def next_step(self) -> NextStep:
         return self._next_step
 
     def _ensure_usable(self) -> None:
+        self._lease.check()
         if self._error is not None:
             raise self._error
         if self._closed:
@@ -167,7 +164,7 @@ class AgentRunner[OutputT]:
                 while True:
                     self._ensure_usable()
                     async with self._session_factory.begin() as db:
-                        await AgentRepository(db).lock_owned(self._session_id, self._lock_token)
+                        await self._lease.lock_owned(db)
                         cancel = await consume_cancel(db)
                     self._ensure_usable()
                     if cancel:
@@ -306,7 +303,7 @@ class AgentRunner[OutputT]:
             raise ValueError("Cannot compact before handling the saved response")
         last_seq = self._next_seq - 1
         async with self._session_factory.begin() as db:
-            await AgentRepository(db).lock_owned(self._session_id, self._lock_token)
+            await self._lease.lock_owned(db)
         self._ensure_usable()
         if last_seq < 0:
             return None
@@ -322,7 +319,7 @@ class AgentRunner[OutputT]:
         self._ensure_usable()
         async with self._session_factory.begin() as db:
             repo = AgentRepository(db)
-            await repo.lock_owned(self._session_id, self._lock_token)
+            await self._lease.lock_owned(db)
             result = await repo.save_compaction(
                 self._session_id, last_message_seq=last_seq, text=text
             )
@@ -393,7 +390,7 @@ class AgentRunner[OutputT]:
             entries: Sequence[HistoryMessage] = ()
             async with self._session_factory.begin() as db:
                 repo = AgentRepository(db)
-                await repo.lock_owned(self._session_id, self._lock_token)
+                await self._lease.lock_owned(db)
                 accepted = list(steer)
                 for batch in batches:
                     accepted.extend(await batch.consume(db))
@@ -453,7 +450,7 @@ class AgentRunner[OutputT]:
         self._ensure_usable()
         async with self._session_factory.begin() as db:
             repo = AgentRepository(db)
-            await repo.lock_owned(self._session_id, self._lock_token)
+            await self._lease.lock_owned(db)
             entries = await repo.save_checkpoint(
                 self._session_id,
                 next_step=next_step,
@@ -511,19 +508,6 @@ class AgentRunner[OutputT]:
             return TurnResult(True, output)
         raise RuntimeError("Unexpected response handler node")
 
-    async def _heartbeat(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self._heartbeat_interval)
-                async with self._session_factory.begin() as db:
-                    await AgentRepository(db).heartbeat(self._session_id, self._lock_token)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            # Do not cancel external tool/model work. Every subsequent boundary
-            # observes this failure, and no later checkpoint can be accepted.
-            self._remember_error(error)
-
     def _remember_error(self, error: BaseException) -> None:
         previous = self._error
         if previous is not None and previous is not error:
@@ -532,27 +516,27 @@ class AgentRunner[OutputT]:
                 error.add_note(note)
         self._error = error
 
-    async def _stop_heartbeat(self) -> None:
-        self._heartbeat_task.cancel()
-        # gather turns only the child's cancellation into a result. Cancellation
-        # of the calling task still raises and must survive resource cleanup.
-        await asyncio.gather(self._heartbeat_task, return_exceptions=True)
-
     async def _close_native(self, error: BaseException | None = None) -> None:
         context = self._native_context
         self._native_context = None
         self._native = None
         self._node = None
         if context is not None:
+            owner = asyncio.current_task()
+            assert owner is not None
+            cancelling = owner.cancelling()
             await context.__aexit__(
                 type(error) if error is not None else None,
                 error,
                 error.__traceback__ if error is not None else None,
             )
+            # SDK cancel-scope cleanup can consume an asyncio cancellation sent
+            # during exit. Preserve that caller signal after its scopes unwind.
+            if owner.cancelling() > cancelling:
+                raise asyncio.CancelledError
 
     async def _fail(self, error: BaseException) -> None:
         self._remember_error(error)
-        await self._stop_heartbeat()
         try:
             await self._close_native(error)
         except BaseException as cleanup_error:
@@ -560,14 +544,9 @@ class AgentRunner[OutputT]:
 
     async def _close(self) -> None:
         self._closed = True
-        try:
-            await self._stop_heartbeat()
-        finally:
-            try:
-                await self._close_native()
-            finally:
-                async with self._session_factory.begin() as db:
-                    await AgentRepository(db).release(self._session_id, self._lock_token)
+        # Native AnyIO scopes must close in the owner task, while the outer
+        # SessionLease still maintains its heartbeat.
+        await self._close_native()
 
 
 @asynccontextmanager
@@ -590,7 +569,8 @@ async def open_runner[DepsT, OutputT](
     Heartbeat values are seconds and must be finite with
     0 < heartbeat_interval < heartbeat_timeout, otherwise ValueError is raised.
     Timeout only permits takeover: it neither limits a turn nor revokes a token
-    until another runner acquires it. A live owner prevents acquisition with
+    until another operation following the lease protocol acquires ownership.
+    A live owner prevents acquisition with
     SessionBusy; replaced ownership raises RunnerLost at a subsequent check.
 
     Database exceptions propagate unchanged. Background heartbeat failures surface
@@ -598,38 +578,35 @@ async def open_runner[DepsT, OutputT](
     external work or retrying. The handle is unusable after execution failure;
     recovery requires a new open_runner context.
     """
-    if not (
-        math.isfinite(heartbeat_interval)
-        and math.isfinite(heartbeat_timeout)
-        and 0 < heartbeat_interval < heartbeat_timeout
-    ):
-        raise ValueError("Require finite 0 < heartbeat_interval < heartbeat_timeout")
-    token = uuid4()
-    async with session_factory.begin() as db:
-        state = await AgentRepository(db).acquire(
-            session_id, token, heartbeat_timeout=heartbeat_timeout
-        )
-    runner = AgentRunner(
+    async with open_session_lease(
         session_id,
-        token,
-        state,
-        agent=agent,
-        deps=deps,
         session_factory=session_factory,
         heartbeat_interval=heartbeat_interval,
-    )
-    try:
-        yield runner
-        runner._ensure_usable()
-    except BaseException as error:
-        runner._remember_error(error)
-        raise
-    finally:
+        heartbeat_timeout=heartbeat_timeout,
+    ) as lease:
+        async with session_factory.begin() as db:
+            await lease.lock_owned(db)
+            state = await AgentRepository(db).resume(session_id)
+        runner = AgentRunner(
+            session_id,
+            lease,
+            state,
+            agent=agent,
+            deps=deps,
+            session_factory=session_factory,
+        )
         try:
-            await runner._close()
+            yield runner
+            runner._ensure_usable()
         except BaseException as error:
             runner._remember_error(error)
             raise
+        finally:
+            try:
+                await runner._close()
+            except BaseException as error:
+                runner._remember_error(error)
+                raise
 
 
 async def start_runner[DepsT, OutputT](

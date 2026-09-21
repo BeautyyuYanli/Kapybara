@@ -48,7 +48,7 @@ Session routes are:
 | POST /sessions/{id}/inputs | submit_input_and_schedule | 202 SessionInput |
 | GET /sessions/{id}/inputs | read_inputs | FIFO SessionInput[]; channel defaults queued |
 | DELETE /sessions/{id}/inputs/{input_id} | delete_input | bool; positive input_id |
-| GET /sessions/{id}/runner | is_runner_running | bool for a valid lease |
+| GET /sessions/{id}/runner | is_runner_running | bool for an occupied lease, not Agent generation |
 | POST /sessions/{id}/cancel | request_cancel | 202 empty body |
 | GET /sessions/{id}/cancel | read_cancel | bool |
 | GET /sessions/{id}/history | read_history | Page[HistoryMessage] |

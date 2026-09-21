@@ -1,19 +1,17 @@
-"""PostgreSQL lease and history operations, borrowing one caller-owned transaction.
+"""Runner history and checkpoints, borrowing one caller-owned transaction.
 
-Checkpoint/history writes and input or cancel consumption must follow lock_owned
-in the same transaction. Heartbeat and release instead enforce ownership through
-their own token-qualified UPDATE statements. No method commits or manages session
-lifetime. Only normalized input/output usage is stored, outside message JSON;
-message parts retain the SDK's official JSON codec.
+Mutations and input/cancel consumption must follow SessionLease.lock_owned in the
+same transaction, taking the lease row before business rows. No method acquires a
+lease, commits, or manages session lifetime. Usage is normalized outside message
+JSON; message parts retain the SDK's official codec.
 """
 
 from collections.abc import Sequence
-from datetime import timedelta
 from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse
-from sqlalchemy import func, insert, or_, update
+from sqlalchemy import func, insert, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
@@ -21,7 +19,7 @@ from sqlmodel import col, select
 from kapy.pagination import Page, paginate
 
 from .models import AgentCompactionRow, AgentHistoryRow, AgentStateRow
-from .types import Compaction, HistoryMessage, NextStep, ResumeState, RunnerLost, SessionBusy
+from .types import Compaction, HistoryMessage, NextStep, ResumeState
 
 
 def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
@@ -56,44 +54,18 @@ class AgentRepository:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
-    async def is_runner_running(self, session_id: UUID, *, heartbeat_timeout: float) -> bool:
-        """Observe the current live lease without locking or renewing it.
-
-        This uses the same database clock/timeout as acquire. It neither proves
-        process liveness nor reserves execution; callers still need acquire.
-        """
-        statement = select(
-            select(AgentStateRow.session_id)
-            .where(
-                col(AgentStateRow.session_id) == session_id,
-                col(AgentStateRow.lock_token).is_not(None),
-                col(AgentStateRow.heartbeat_at)
-                > func.clock_timestamp() - timedelta(seconds=heartbeat_timeout),
-            )
-            .exists()
-        )
-        return (await self._db.execute(statement)).scalar_one()
-
-    async def acquire(
-        self, session_id: UUID, lock_token: UUID, *, heartbeat_timeout: float
-    ) -> ResumeState:
-        statement = (
+    async def resume(self, session_id: UUID) -> ResumeState:
+        """Initialize/read checkpoint metadata after lease.lock_owned in this transaction."""
+        await self._db.execute(
             pg_insert(AgentStateRow)
-            .values(session_id=session_id, lock_token=lock_token, next_step="done")
-            .on_conflict_do_update(
-                index_elements=["session_id"],
-                set_={"lock_token": lock_token, "heartbeat_at": func.clock_timestamp()},
-                where=or_(
-                    col(AgentStateRow.lock_token).is_(None),
-                    col(AgentStateRow.heartbeat_at)
-                    <= func.clock_timestamp() - timedelta(seconds=heartbeat_timeout),
-                ),
-            )
-            .returning(col(AgentStateRow.next_step))
+            .values(session_id=session_id, next_step="done")
+            .on_conflict_do_nothing(index_elements=["session_id"])
         )
-        next_step = (await self._db.execute(statement)).scalar_one_or_none()
-        if next_step is None:
-            raise SessionBusy(str(session_id))
+        next_step = (
+            await self._db.execute(
+                select(AgentStateRow.next_step).where(col(AgentStateRow.session_id) == session_id)
+            )
+        ).scalar_one()
         last_seq = (
             await self._db.execute(
                 select(AgentHistoryRow.seq)
@@ -106,42 +78,6 @@ class AgentRepository:
             cast(NextStep, next_step),
             0 if last_seq is None else last_seq + 1,
             await self.read_latest_compaction(session_id),
-        )
-
-    async def lock_owned(self, session_id: UUID, lock_token: UUID) -> None:
-        """Wait for the row lock, then fail with RunnerLost if token no longer matches."""
-        statement = (
-            select(col(AgentStateRow.session_id))
-            .where(
-                col(AgentStateRow.session_id) == session_id,
-                col(AgentStateRow.lock_token) == lock_token,
-            )
-            .with_for_update()
-        )
-        if (await self._db.execute(statement)).scalar_one_or_none() is None:
-            raise RunnerLost(str(session_id))
-
-    async def heartbeat(self, session_id: UUID, lock_token: UUID) -> None:
-        statement = (
-            update(AgentStateRow)
-            .where(
-                col(AgentStateRow.session_id) == session_id,
-                col(AgentStateRow.lock_token) == lock_token,
-            )
-            .values(heartbeat_at=func.clock_timestamp())
-            .returning(col(AgentStateRow.session_id))
-        )
-        if (await self._db.execute(statement)).scalar_one_or_none() is None:
-            raise RunnerLost(str(session_id))
-
-    async def release(self, session_id: UUID, lock_token: UUID) -> None:
-        await self._db.execute(
-            update(AgentStateRow)
-            .where(
-                col(AgentStateRow.session_id) == session_id,
-                col(AgentStateRow.lock_token) == lock_token,
-            )
-            .values(lock_token=None)
         )
 
     async def read_history(

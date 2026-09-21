@@ -25,6 +25,9 @@ from kapy.agent_runner.repository import AgentRepository
 from kapy.agent_runner.types import NextStep
 from kapy.control.database import ControlTable
 from kapy.control.sessions import models as session_models  # noqa: F401
+from kapy.session_lease import open_session_lease
+from kapy.session_lease import service as lease_service
+from kapy.session_lease.models import lease_metadata
 
 DATABASE_URL = os.environ.get(
     "KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
@@ -68,6 +71,7 @@ async def database() -> AsyncIterator[Database]:
     try:
         async with engine.begin() as db:
             await db.run_sync(agent_metadata.create_all)
+            await db.run_sync(lease_metadata.create_all)
             await db.run_sync(ControlTable.metadata.create_all)
         yield Database(
             schema, DATABASE_URL, engine, async_sessionmaker(engine, expire_on_commit=False)
@@ -81,11 +85,14 @@ async def database() -> AsyncIterator[Database]:
 @pytest.fixture
 def seed_history(database):
     async def seed(messages, next_step: NextStep = "done", *, compaction_seq=None):
-        session_id, token = uuid4(), uuid4()
-        async with database.sessions.begin() as db:
+        session_id = uuid4()
+        async with (
+            open_session_lease(session_id, session_factory=database.sessions) as lease,
+            database.sessions.begin() as db,
+        ):
+            await lease.lock_owned(db)
             repo = AgentRepository(db)
-            await repo.acquire(session_id, token, heartbeat_timeout=60)
-            await repo.lock_owned(session_id, token)
+            await repo.resume(session_id)
             await repo.save_checkpoint(
                 session_id, next_step=next_step, start_seq=0, messages=messages
             )
@@ -93,7 +100,6 @@ def seed_history(database):
                 await repo.save_compaction(
                     session_id, last_message_seq=compaction_seq, text="saved summary"
                 )
-            await repo.release(session_id, token)
         return session_id
 
     return seed
@@ -124,16 +130,17 @@ def toolset_lifecycle():
 def heartbeat_observation(monkeypatch):
     tasks = set()
     called = asyncio.Event()
-    original = AgentRepository.heartbeat
+    original = lease_service._update_owned
 
-    async def observe(self, session_id, lock_token):
+    async def observe(db, lease, *, release):
         task = asyncio.current_task()
         assert task is not None
-        tasks.add(task)
-        await original(self, session_id, lock_token)
-        called.set()
+        await original(db, lease, release=release)
+        if not release:
+            tasks.add(task)
+            called.set()
 
-    monkeypatch.setattr(AgentRepository, "heartbeat", observe)
+    monkeypatch.setattr(lease_service, "_update_owned", observe)
     return tasks, called
 
 

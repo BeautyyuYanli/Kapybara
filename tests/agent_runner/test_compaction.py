@@ -460,12 +460,15 @@ async def test_summary_wait_releases_db_and_takeover_fences_insert(database, see
             await db.execute(text("SET LOCAL lock_timeout = '200ms'"))
             await db.execute(
                 text(
-                    "UPDATE agent_states SET heartbeat_at=clock_timestamp() - interval '1 hour' "
+                    "UPDATE session_leases SET heartbeat_at=clock_timestamp() - interval '1 hour' "
                     "WHERE session_id=:id"
                 ),
                 {"id": session_id},
             )
-            await AgentRepository(db).acquire(session_id, replacement, heartbeat_timeout=60)
+            await db.execute(
+                text("UPDATE session_leases SET lock_token=:token WHERE session_id=:id"),
+                {"id": session_id, "token": replacement},
+            )
         finish.set()
         with pytest.raises(RunnerLost):
             await asyncio.wait_for(task, 5)
@@ -473,7 +476,12 @@ async def test_summary_wait_releases_db_and_takeover_fences_insert(database, see
         finish.set()
         await asyncio.gather(task, return_exceptions=True)
     async with database.sessions.begin() as db:
-        await AgentRepository(db).lock_owned(session_id, replacement)
+        assert (
+            await db.execute(
+                text("SELECT lock_token FROM session_leases WHERE session_id=:id"),
+                {"id": session_id},
+            )
+        ).scalar_one() == replacement
     rows, summary = await snapshot(database, session_id)
     assert len(rows) == 2 and summary is None
 

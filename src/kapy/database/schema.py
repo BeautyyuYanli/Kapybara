@@ -18,6 +18,7 @@ from kapy.application.settings import CommonSettings
 from kapy.control.database import ControlTable
 from kapy.control.models import models as model_tables  # noqa: F401
 from kapy.control.sessions import models as session_tables  # noqa: F401
+from kapy.session_lease.models import lease_metadata
 
 from .migration import execute, migration_config
 
@@ -29,6 +30,7 @@ OWNED_TABLES = frozenset(
         "session_inputs",
         "session_cancels",
         "agent_states",
+        "session_leases",
         "agent_history",
         "agent_compactions",
     }
@@ -47,7 +49,7 @@ async def migrate(settings: CommonSettings, operation: str, message: str | None 
                 config = migration_config(
                     db,
                     directory=Path(__file__).parent / "migrations",
-                    metadata=[ControlTable.metadata, agent_metadata],
+                    metadata=[ControlTable.metadata, agent_metadata, lease_metadata],
                     version_table="core_schema_version",
                     owns_table=OWNED_TABLES.__contains__,
                 )
