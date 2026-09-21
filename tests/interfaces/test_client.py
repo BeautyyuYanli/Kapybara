@@ -5,7 +5,7 @@ import json
 import httpx2
 import pytest
 
-from kapy.plugins.telegram.client import TelegramClient, TelegramFailure
+from kapy.interfaces.telegram.client import TelegramClient, TelegramFailure
 
 
 @pytest.mark.asyncio

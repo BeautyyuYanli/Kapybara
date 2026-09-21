@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, JsonValue
 from pydantic_ai.messages import ModelMessage, UserContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -97,15 +97,16 @@ class TurnResult[OutputT]:
 
 
 @dataclass(frozen=True, slots=True)
-class Compaction:
-    """Saved summary covering the original history through last_message_seq."""
+class ContextPage:
+    """Durable strategy state at an original-history anchor; not a checkpoint."""
 
-    last_message_seq: int
-    text: str
+    anchor_seq: int
+    policy_key: str
+    payload: dict[str, JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
 class ResumeState:
     next_step: NextStep
     next_seq: int
-    compaction: Compaction | None
+    page: ContextPage | None

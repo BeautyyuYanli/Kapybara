@@ -1,19 +1,20 @@
 # Independent interface processes
 
-Each plugin owns its configuration, event loop/server, background work and resource
-cleanup. `kapy plugin <name> ...` lazily calls one entry in the current process;
+Each interface owns its configuration, event loop/server, background work and resource
+cleanup. `kapy interface <name> ...` lazily calls one entry in the current process;
 it does not launch or supervise child processes. Run HTTP and Telegram as separate
 commands under the deployment's process manager. The entry contract is
-`main(argv: list[str]) -> int`; built-in names and import paths live in registry.py.
+`main(argv: list[str]) -> int`; built-in names and import paths live in
+[cli/registry.py](../cli/registry.py).
 
 ```sh
 kapy db upgrade
-kapy plugin http serve
-kapy plugin telegram db upgrade
-kapy plugin telegram serve
+kapy interface http serve
+kapy interface telegram db upgrade
+kapy interface telegram serve
 ```
 
-The equivalent direct entry is `python -m kapy.plugins.<name>.main ...`.
+The equivalent direct entry is `python -m kapy.interfaces.<name>.main ...`.
 Each process creates its own core PostgreSQL pool, Valkey client, SessionService
 and text Agent using ordinary application/ factories. They communicate through
 core tables and a common Valkey output namespace, never shared Python objects.
@@ -36,7 +37,7 @@ Common environment values (read only during command execution):
 
 All workers sharing core tables must use compatible heartbeat and Agent settings.
 No command implicitly reads `.env`; export configuration or use `uv run --env-file`.
-Private plugin databases do not inherit the core URL or schema. The process manager's
+Private interface databases do not inherit the core URL or schema. The process manager's
 own local database retains its existing independent lifecycle.
 
 See [Telegram](telegram/README.md), [HTTP](http/README.md), and

@@ -1,6 +1,6 @@
 """Create resources for the calling process; callers finish tasks before context exit.
 
-No services, plugin discovery, global objects or schema changes occur here.
+No services, interface discovery, global objects or schema changes occur here.
 """
 
 from collections.abc import AsyncIterator

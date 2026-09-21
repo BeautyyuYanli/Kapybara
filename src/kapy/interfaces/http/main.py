@@ -13,7 +13,7 @@ from .settings import HttpSettings
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="kapy plugin http")
+    parser = argparse.ArgumentParser(prog="kapy interface http")
     parser.add_argument("command", choices=["serve"])
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)

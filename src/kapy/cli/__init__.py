@@ -1,4 +1,4 @@
-"""Public command-line entry point for Kapy's independent plugins and databases."""
+"""Public command-line entry point for Kapy's independent interfaces and databases."""
 
 from .commands import main
 

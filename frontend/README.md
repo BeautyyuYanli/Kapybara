@@ -43,7 +43,7 @@ npm run preview
 
 `API_PROXY_TARGET` overrides the development proxy. Browser requests always use
 same-origin credentials and the generated `/api` paths. API keys stay in form
-memory and clear after success. The standalone HTTP plugin requires no access token.
+memory and clear after success. The standalone HTTP interface requires no access token.
 
 ## API generation
 
@@ -64,10 +64,10 @@ Normal build uses these committed files without contacting the API.
 
 ## Hosting
 
-The independent HTTP plugin can mount the existing build alongside `/api`:
+The independent HTTP interface can mount the existing build alongside `/api`:
 
 ```sh
-kapy plugin http serve --frontend-dist /absolute/path/to/frontend/dist
+kapy interface http serve --frontend-dist /absolute/path/to/frontend/dist
 ```
 
 `KAPY_HTTP_FRONTEND_DIST` provides the same setting. The frontend and HTTP/WS API
@@ -75,7 +75,7 @@ are directly accessible without login or an access token. The SPA uses
 same-origin requests.
 
 ```python
-from kapy.plugins.http import create_frontend_router, create_router
+from kapy.interfaces.http import create_frontend_router, create_router
 
 app.include_router(create_router(models, sessions, agent=agent))
 app.include_router(create_frontend_router(frontend_dist_dir))

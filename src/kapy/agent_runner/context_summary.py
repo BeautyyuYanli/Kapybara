@@ -22,11 +22,17 @@ from pydantic_ai.messages import (
     TextPart,
     ThinkingPart,
     ToolCallPart,
-    ToolReturnPart,
     UserPromptPart,
 )
 
-from .types import Compaction
+from .context import (
+    ContextAssemblyContext,
+    ContextPolicy,
+    JsonObject,
+    PageBoundary,
+    PageTurnContext,
+    close_tool_pairs,
+)
 
 # Original Codex prompt, with only the opening pause instruction added:
 # https://github.com/openai/codex/blob/main/codex-rs/prompts/templates/compact/prompt.md
@@ -139,59 +145,97 @@ def replay_start(rows: Sequence[tuple[int, ModelMessage]], turns: int) -> int | 
             start -= 1
         if start == 0 and rows[0][0] != 0:
             return None
-        calls = {
-            (part.tool_name, part.tool_call_id)
-            for _, message in rows[start:]
-            if isinstance(message, ModelResponse)
-            for part in message.parts
-            if isinstance(part, ToolCallPart)
-        }
-        replies = {
-            (part.tool_name, part.tool_call_id)
-            for _, message in rows[start:]
+        closed = close_tool_pairs(rows, start)
+        if closed is None:
+            return None
+        if closed == start:
+            return rows[start][0]
+        start = closed
+
+
+def summary_context_policy(
+    agent: Agent[Any, Any],
+    *,
+    deps: Any = None,
+    threshold_tokens: int | None = None,
+    replay_turns: int = 10,
+    max_retries: int = 2,
+) -> ContextPolicy:
+    """Construct the default summary/v1 strategy, borrowing Agent and deps.
+
+    Automatic paging observes completed business usage; None disables its trigger.
+    Manual paging still summarizes. Configuration is fixed for a runner lifetime.
+    Auxiliary calls do not receive its per-run execution/output capabilities.
+    """
+    require_nonnegative_int(replay_turns, "replay_turns")
+    require_nonnegative_int(max_retries, "max_retries")
+    if threshold_tokens is not None:
+        require_nonnegative_int(threshold_tokens, "threshold_tokens")
+        if threshold_tokens == 0:
+            raise ValueError("threshold_tokens must be positive")
+
+    def should_turn(boundary: PageBoundary) -> bool:
+        return (
+            threshold_tokens is not None
+            and boundary.latest_response_seq is not None
+            and boundary.response_tokens is not None
+            and sum(boundary.response_tokens) > threshold_tokens
+            and (
+                boundary.previous_anchor_seq is None
+                or boundary.latest_response_seq > boundary.previous_anchor_seq
+            )
+        )
+
+    async def on_turn(context: PageTurnContext) -> JsonObject:
+        text = await summarize(
+            agent,
+            context.messages,
+            session_id=context.session_id,
+            deps=deps,
+            max_retries=max_retries,
+        )
+        return {"summary": text}
+
+    async def assemble(context: ContextAssemblyContext) -> list[ModelMessage]:
+        if context.page is None:
+            return [message for _, message in await context.read_history()]
+        summary = context.page.payload.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("summary/v1 page requires a nonempty summary")
+        rows: list[tuple[int, ModelMessage]] = []
+        if replay_turns and context.prefix_through_seq >= 0:
+            cursor = context.prefix_through_seq
+            while True:
+                chunk = await context.read_history_before(through_seq=cursor)
+                if not chunk:
+                    raise RuntimeError("Context page history is missing")
+                rows[:0] = reversed(chunk)
+                start = replay_start(rows, replay_turns)
+                if start is not None:
+                    rows = [(seq, msg) for seq, msg in rows if seq >= start]
+                    break
+                cursor = rows[0][0] - 1
+        first = rows[:1] if rows and rows[0][0] == 0 else await context.read_history(through_seq=0)
+        system = [
+            part
+            for _, message in first
             if isinstance(message, ModelRequest)
             for part in message.parts
-            if isinstance(part, (ToolReturnPart, RetryPromptPart)) and part.tool_name is not None
-        }
-        missing = replies - calls
-        if not missing:
-            return rows[start][0]
-        for index in range(start - 1, -1, -1):
-            message = rows[index][1]
-            if isinstance(message, ModelResponse):
-                missing.difference_update(
-                    (part.tool_name, part.tool_call_id)
-                    for part in message.parts
-                    if isinstance(part, ToolCallPart)
-                )
-            if not missing:
-                start = index
-                break
-        else:
-            if rows[0][0] == 0:
-                raise RuntimeError("History contains a tool reply without its call")
-            return None
+            if isinstance(part, SystemPromptPart)
+        ]
+        replay = deepcopy([message for _, message in rows])
+        for message in replay:
+            if isinstance(message, ModelRequest):
+                message.parts = [p for p in message.parts if not isinstance(p, SystemPromptPart)]
+        return [
+            ModelRequest(
+                parts=[
+                    *deepcopy(system),
+                    UserPromptPart(COMPACTION_CONTEXT_PROMPT.format(summary_text=summary)),
+                ]
+            ),
+            *replay,
+            ModelRequest(parts=[UserPromptPart(COMPACTION_RESUME_PROMPT)]),
+        ]
 
-
-def assemble_context(
-    system_parts: Sequence[SystemPromptPart],
-    compaction: Compaction,
-    replay: Sequence[ModelMessage],
-    tail: Sequence[ModelMessage],
-) -> list[ModelMessage]:
-    """Create virtual summary/replay/resume messages without mutating source history."""
-    replay_copy = deepcopy(list(replay))
-    for message in replay_copy:
-        if isinstance(message, ModelRequest):
-            message.parts = [p for p in message.parts if not isinstance(p, SystemPromptPart)]
-    return [
-        ModelRequest(
-            parts=[
-                *deepcopy(system_parts),
-                UserPromptPart(COMPACTION_CONTEXT_PROMPT.format(summary_text=compaction.text)),
-            ]
-        ),
-        *replay_copy,
-        ModelRequest(parts=[UserPromptPart(COMPACTION_RESUME_PROMPT)]),
-        *deepcopy(tail),
-    ]
+    return ContextPolicy("summary/v1", should_turn, on_turn, assemble)

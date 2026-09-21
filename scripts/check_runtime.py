@@ -26,6 +26,7 @@ from valkey.asyncio import Valkey
 
 from kapy.agent_output import AgentOutputService
 from kapy.agent_runner import HistoryMessage, MessageCommitted, TextDelta, open_runner
+from kapy.agent_runner.context_summary import summary_context_policy
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.models import CreateModel, CreateProvider, ModelService
 from kapy.control.sessions import CreateSession, SessionService, UpdateSession
@@ -173,11 +174,16 @@ async def check(
             assert await anext(batches) == [MessageCommitted(row) for row in history[1:]]
 
         print("Checking manual compaction, restart and automatic compaction...", flush=True)
-        async with open_runner(session_id, agent=agent, session_factory=factory) as runner:
+        async with open_runner(
+            session_id,
+            agent=agent,
+            session_factory=factory,
+            context_policy=summary_context_policy(agent),
+        ) as runner:
             await runner.rebuild_context()
-            summary = await runner.compact()
-            assert summary is not None and summary.text.strip()
-            assert summary.last_message_seq == history[-1].seq
+            summary = await runner.turn_context_page()
+            assert summary is not None and isinstance(summary.payload.get("summary"), str)
+            assert summary.anchor_seq == history[-1].seq
         assert await read_history(factory, session_id) == history
 
         await sessions.enqueue_input(
@@ -196,8 +202,8 @@ async def check(
         assert final_history[: len(history)] == history
         assert len(final_history) == len(history) + 2
         async with factory.begin() as db:
-            automatic = await AgentRepository(db).read_latest_compaction(session_id)
-        assert automatic is not None and automatic.last_message_seq == final_history[-1].seq
+            automatic = await AgentRepository(db).read_latest_page(session_id)
+        assert automatic is not None and automatic.anchor_seq == final_history[-1].seq
         assert not await sessions.read_inputs(session_id, "queued")
         # Disabled broadcasting still checkpoints; reconnect recovers that durable tail.
         async with aclosing(sessions.live(session_id, after_seq=len(history) - 1)) as batches:
@@ -217,8 +223,8 @@ async def check(
                 "text_deltas": sum(event.part_kind == "text" for event in deltas),
                 "thinking_deltas": sum(event.part_kind == "thinking" for event in deltas),
                 "tool_calls": tool_calls,
-                "manual_compaction_seq": summary.last_message_seq,
-                "automatic_compaction_seq": automatic.last_message_seq,
+                "manual_compaction_seq": summary.anchor_seq,
+                "automatic_compaction_seq": automatic.anchor_seq,
             },
             indent=2,
         )

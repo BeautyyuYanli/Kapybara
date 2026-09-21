@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from kapy.control.database import ControlTable
 from kapy.control.models import ModelService
 from kapy.control.sessions import SessionService
-from kapy.plugins.http import create_frontend_router, create_router
+from kapy.interfaces.http import create_frontend_router, create_router
 
 schema = "spa_test_" + uuid4().hex
 url = "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"

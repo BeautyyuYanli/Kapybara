@@ -26,9 +26,9 @@ from kapy.agent_runner import (
 from kapy.application.settings import CommonSettings
 from kapy.control.models import ModelService
 from kapy.control.sessions import SessionService
-from kapy.plugins.http import create_router
-from kapy.plugins.http.app import create_app
-from kapy.plugins.http.settings import HttpSettings
+from kapy.interfaces.http import create_router
+from kapy.interfaces.http.app import create_app
+from kapy.interfaces.http.settings import HttpSettings
 from kapy.session_lease.models import SessionLeaseRow
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -283,7 +283,7 @@ async def test_websocket_replay_live_frames_and_idle_subscription_cleanup(
                 pass
 
 
-async def test_http_plugin_websocket_without_credentials(
+async def test_http_interface_websocket_without_credentials(
     database, seed_history, seed_session, monkeypatch
 ):
     monkeypatch.delenv("KAPY_CONTROL_TOKEN", raising=False)

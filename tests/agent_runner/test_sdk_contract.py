@@ -26,7 +26,7 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_graph import End
 
-from kapy.agent_runner.compaction import summarize
+from kapy.agent_runner.context_summary import summarize
 
 pytestmark = pytest.mark.asyncio
 

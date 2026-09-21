@@ -1,8 +1,11 @@
 """Separate session leases from runner checkpoints
 
-Revision ID: 99ea34c7be0d
-Revises: 12fd53fd60d5
+Revision ID: d8fbb0f09711
+Revises: eae2fdb48969
 """
+
+# Alembic renders SQL statements as indivisible string literals.
+# ruff: noqa: E501
 
 from collections.abc import Sequence
 
@@ -10,8 +13,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "99ea34c7be0d"
-down_revision: str | Sequence[str] | None = "12fd53fd60d5"
+revision: str = "d8fbb0f09711"
+down_revision: str | Sequence[str] | None = "eae2fdb48969"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

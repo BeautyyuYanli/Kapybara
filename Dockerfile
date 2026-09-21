@@ -21,5 +21,5 @@ RUN groupadd --gid 10001 kapy \
     && useradd --uid 10001 --gid kapy --create-home --shell /usr/sbin/nologin kapy \
     && install -d -m 0700 -o kapy -g kapy /var/lib/kapy /var/lib/kapy/state
 USER 10001:10001
-# Compose selects the independent HTTP or Telegram plugin command.
+# Compose selects the independent HTTP or Telegram interface command.
 CMD ["sleep", "infinity"]

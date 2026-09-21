@@ -1,4 +1,4 @@
-# Telegram session plugin
+# Telegram session interface
 
 Run one instance per bot and state file. The standalone process directly calls
 SessionService for session business; it never loads the old gateway, ControlAPI,
@@ -7,8 +7,8 @@ principal/machine RPC or State output protocol.
 ```sh
 # Initialize both independent schemas before serving.
 kapy db upgrade
-kapy plugin telegram db upgrade
-kapy plugin telegram serve
+kapy interface telegram db upgrade
+kapy interface telegram serve
 ```
 
 `TELEGRAM_BOT_TOKEN` is required for serving. Set
@@ -19,7 +19,7 @@ After configuring the provider/model through HTTP, send
 `/model <provider UUID> <model name>` to select it for this bot. With a bound session,
 the command also updates that session's provider/model pair. `/model` without
 arguments shows the default and usage. The selection is saved in private SQLite
-and takes effect immediately without restarting the plugin.
+and takes effect immediately without restarting the interface process.
 
 The optional `KAPY_TELEGRAM_SESSION_TEMPLATE` supplies the initial fallback, for example
 `{"provider_id":"00000000-0000-0000-0000-000000000001","model_name":"your-model"}`.
@@ -43,12 +43,14 @@ or empty. Resolve the path at invocation, not import. Override with an absolute
 value takes precedence. Mount this directory persistently, including WAL/SHM files.
 Database commands need only this path, not core/Valkey/model/bot configuration.
 
-The plugin owns `plugin_telegram_poll`, `plugin_telegram_inbox`,
+The interface owns `plugin_telegram_poll`, `plugin_telegram_inbox`,
 `plugin_telegram_routes`, `plugin_telegram_delivery`, `plugin_telegram_defaults`,
 and the independent migration
 version table `plugin_telegram_schema_version`. SQLite uses one queued connection,
 WAL, FULL synchronization, a 5-second busy timeout and explicit transactions.
 No runtime create_all, cross-database foreign keys, joins or transactions are used.
+The `plugin_telegram_*` table names and `plugins/telegram` state path are stable
+storage identifiers; moving the Python package to `interfaces` does not change them.
 
 | Input | Behavior |
 | --- | --- |
@@ -73,7 +75,7 @@ those overrides against the selected model; failure leaves the default unchanged
 A running runner retains its model snapshot until its next start. The command
 does not start or cancel execution, and an unbound chat does not create a session.
 
-Session updates commit first, then the plugin records that progress and saves the
+Session updates commit first, then the interface records that progress and saves the
 default. These are separate database transactions. A transient SQLite failure
 after the session update is retried before replying; there is no cross-database
 rollback. Retries reuse the resolved session and model pair, and skip a session
@@ -99,7 +101,7 @@ only confirmed complete messages advance the persisted cursor.
 Private chats (including topics) receive replace/append draft previews rendered once
 per consumed batch. Delivery awaits that send, including retries and chat pacing,
 before reading the next batch. SessionService/AgentOutput retain incoming output
-and merge pending deltas during this wait; the plugin has no read-ahead task,
+and merge pending deltas during this wait; the interface has no read-ahead task,
 coalescing timer or output queue. Preview state only retains the text and draft ID
 needed for rendering. The Bot API client paces draft requests using
 `KAPY_OUTPUT_FLUSH_INTERVAL` (default 0.5 seconds; zero uses 0.5 seconds for pacing);

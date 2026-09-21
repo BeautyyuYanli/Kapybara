@@ -2,11 +2,11 @@
 
 当前开发栈围绕 `src/kapy` 的 Python 模块：本地进程与 PTY、文件传输、
 Agent Runner、上下文压缩，以及基于 Valkey Pub/Sub 的实时输出和历史回放。
-HTTP 和 Telegram 作为独立进程插件，直接调用这些服务。HTTP 同时挂载配置前端。
+HTTP 和 Telegram 作为独立接口进程，直接调用这些服务。HTTP 同时挂载配置前端。
 
 主实现位于 `src/kapy/`，测试位于 `tests/`，模块直接通过 `kapy.*` 导入。
 早期实现及其测试、脚本原样归档在 `prototype/`，不参与当前安装、构建和默认检查。
-`kapy` 命令提供 `plugin` 与 `db` 两个入口；旧控制面 CLI 随原型一起归档。
+`kapy` 命令提供 `interface` 与 `db` 两个入口；旧控制面 CLI 随原型一起归档。
 
 ## 本地启动
 
@@ -20,7 +20,7 @@ docker compose build runtime
 docker compose up -d --wait postgres valkey
 # 首次启动：核心和 Telegram 数据库分别升级，serve 不自动迁移。
 docker compose run --rm runtime kapy db upgrade
-docker compose run --rm telegram kapy plugin telegram db upgrade
+docker compose run --rm telegram kapy interface telegram db upgrade
 docker compose up -d runtime telegram
 docker compose ps
 ```
@@ -29,8 +29,8 @@ docker compose ps
 | --- | --- | --- |
 | `postgres` | Runner checkpoint、原始 history、compaction、输入队列及取消状态 | `127.0.0.1:55432` |
 | `valkey` | 按 session 广播临时输出；无离线消息、TTL 或持久化 | `127.0.0.1:56379` |
-| `runtime` | 非 root 的 HTTP 插件和配置前端 | `0.0.0.0:8000`，前端 `/app/` |
-| `telegram` | 独立 Telegram session 插件，通过 Bot API 长轮询 | 无入站端口 |
+| `runtime` | 非 root 的 HTTP 接口和配置前端 | `0.0.0.0:8000`，前端 `/app/` |
+| `telegram` | 独立 Telegram session 接口，通过 Bot API 长轮询 | 无入站端口 |
 
 源码、测试和脚本挂载为只读；更新依赖或前端后需要重新构建。
 PostgreSQL、runtime 和 Telegram 状态目录分别保存在 `postgres-data`、
@@ -93,9 +93,9 @@ session 供检查，每次运行使用新的 session ID。
 - [Runner、压缩和实时输出契约](src/kapy/agent_runner/README.md)
 - [Valkey 输出服务](src/kapy/agent_output/service.py)
 - [SessionService：生产侧与历史回放](src/kapy/control/sessions/service.py)
-- [独立进程接口插件](src/kapy/plugins/README.md)
-- [核心与插件数据库迁移](src/kapy/database/README.md)
-- [控制面 FastAPI HTTP / WebSocket API](src/kapy/plugins/http/README.md)
+- [独立进程接口](src/kapy/interfaces/README.md)
+- [核心与接口数据库迁移](src/kapy/database/README.md)
+- [控制面 FastAPI HTTP / WebSocket API](src/kapy/interfaces/http/README.md)
 
 调用方负责 engine、数据库 schema、模型 Agent 和 Valkey client 的生命周期。
 `SessionService.start_runner(..., realtime_output=True)` 需要注入

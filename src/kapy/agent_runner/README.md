@@ -3,7 +3,7 @@
 `open_runner` borrows ownership from the independent `kapy.session_lease` component
 and yields a runner handle. `session_leases` contains ownership only; acquiring a
 lease creates neither business sessions nor runner checkpoints.
-It loads only the checkpoint, next absolute message sequence and latest summary.
+It loads only the checkpoint, next absolute message sequence and latest context page.
 Use and close it in the task that opened it: `Agent.iter()` owns task-local AnyIO
 cancel scopes. All handle operations reject concurrent, reentrant or cross-task calls.
 The lease maintains one heartbeat task using short transactions, through native
@@ -87,63 +87,105 @@ responses, and hooks that rewrite existing history are outside this module's
 execution model. A stale runner may finish external work but cannot commit it.
 
 For manual execution, call `await runner.rebuild_context()` before `turn()` or
-`compact()`. `run()` prepares context automatically. Preparation loads only the
-latest summary's replay window and subsequent history; without a summary it loads
-all history once. The handle retains a committed working context and a separate
-mutable SDK graph, not another permanent copy of full history. Normal turns append
-only their newly committed messages. Absolute database sequences never derive from
-context length or SDK message indices.
+`turn_context_page()`. `run()` prepares context automatically. `turn()` advances
+one complete model/tool batch without automatic paging; `run()` checks the injected
+policy at its existing safe boundaries, including done. Cancel precedes preparation,
+paging and input acceptance. A page action never replaces the business turn result.
 
-`await runner.compact(max_retries=2)` temporarily asks the same configured Agent
-for a text summary and saves it in `agent_compactions`, anchored to the latest
-committed message. It leaves the current context, graph and checkpoint unchanged;
-call `rebuild_context()` to apply the summary. Empty history returns `None`, and a
-repeated call at the same anchor returns the saved summary. `handle_response` must
-finish its pending tool/output batch before compaction is allowed.
+`SessionExecutionCapability` owns SDK initialization recovery, input acceptance and
+node checkpoints through Pydantic AI 2.40.0's public hooks. It is injected into each
+business `Agent.iter()` alongside `OutputCapability`, without changing shared Agent
+configuration or caller deps. Its outermost node ordering checkpoints after ordinary
+business after-node hooks. Protocol/transaction failures are latched independently
+of SDK error recovery. The thin runner owns the lease scope, task constraint,
+graph lifetime and queued/cancel scheduling; SessionLease maintains the heartbeat.
+The runner never writes SDK private history.
 
-Only input and model nodes execute during this temporary call. Non-text responses
-receive bounded format retries with paired tool replies; client tools and business
-output validators never execute. Original tool definitions, native server tools,
-output schema, settings, initialization and request hooks remain active. A config
-that forces non-text output may exhaust retries and fail. Temporary messages and
-usage never enter business history or checkpoints. Failed execution invalidates the
-handle; reopening recovers its committed checkpoint and any saved summary.
+The handle keeps a committed working context and a separate SDK graph. Absolute
+history sequences never derive from SDK message indices or virtual context length.
+A new graph receives the assembled view as `message_history`; an existing graph
+applies rebuilt context through `before_model_request`, preserving the SDK's freshly
+resolved pending content, instructions and metadata. Ordinary turns append their
+committed messages without rereading all history.
 
-Keep Agent-level `max_concurrency=None` (the SDK default). Its built-in limiter
-holds a token for the entire `Agent.iter()` lifetime and rejects the same task's
-nested compaction run, even with a limit greater than one. This lifecycle therefore
-does not support Agent-level concurrency limits. When calling the lower-level
-runner directly, request limits can use `Agent(ConcurrencyLimitedModel(model, limiter=N))`
-from `pydantic_ai.models.concurrency`; its token covers each model request, so the
-paused main graph does not hold it. `SessionService.start_runner` overrides the
-Agent's original model with the session-configured model, so a concurrency wrapper
-on that original model does not apply. Worker limits can wrap the complete
-`start_runner()` call for either entry point.
+`open_runner(..., context_policy=...)` and the lower-level `start_runner` accept one
+`ContextPolicy` for their entire lifetime. Omission selects `full_history_policy()`:
+no automatic trigger/action, with all original history retained. `run` and
+`rebuild_context` have no summary-specific parameters. A policy combines independent
+callbacks rather than requiring a subclass:
 
-`run()` and the runner module's `start_runner()` accept
-`compaction_threshold_tokens=None` and `compaction_replay_turns=10`.
-SessionService instead reads these values from the session: a stored None threshold
-resolves to 70% of model capacity, or rejects startup if capacity is unknown.
-When creating a session with unknown model capacity and no explicit threshold,
-SessionService stores 183500 (70% of 256 Ki tokens, rounded down); updates and
-existing sessions receive no default. See [control services](../control/README.md).
-A positive threshold enables automatic summaries at safe boundaries, including done. The
-latest business response's input+output count must exceed it and lie after the
-latest summary anchor. Unknown usage suppresses triggering, cache counts are not
-added again, and summary usage does not affect this observation. This is an observed
-size, not a pre-request context limit: pending inputs and tool results are not counted.
-Cancel is checked before preparation/compaction, and summary output never replaces
-the business turn result.
+```python
+from kapy.agent_runner import open_runner, summary_context_policy
 
-Replay N is nonnegative; zero omits replay. Otherwise choose the Nth response
-backwards from the summary anchor, include its preceding consecutive requests,
-then extend backwards to include every crossing tool call/reply pair (including
-tool retries and parallel batches). Fewer than N responses includes the whole
-prefix. Paging cannot change the selected window. Context contains the original
-system parts once, a virtual summary prompt, this fixed replay, a virtual resume
-prompt, then all subsequent history. These virtual messages are never persisted or
-executed as inputs; done with no real input stays done. Each run applies its own N
-once and again after a new summary; ordinary turns never re-read full history.
+policy = summary_context_policy(
+    agent, deps=deps, threshold_tokens=100_000, replay_turns=10, max_retries=2
+)
+async with open_runner(
+    session_id, agent=agent, deps=deps, session_factory=factory, context_policy=policy
+) as runner:
+    await runner.rebuild_context()
+    page = await runner.turn_context_page()
+```
+
+`ContextPolicy(key, should_turn, on_turn, assemble)` separates trigger, action and
+assembly. The pure trigger receives `PageBoundary` with checkpoint, current/previous
+anchors and normalized latest-response usage. The optional async action receives
+`PageTurnContext`: session, fixed anchor, prior page, a copied committed view, bounded
+history readers and stable `operation_id` (`session:policy:anchor`). It returns a JSON
+object; absent action stores `{}`. Actions run outside transactions while the lease
+heartbeat continues. External effects may repeat before page commit: use that
+operation ID for idempotency or reconciliation when needed.
+
+The async assembler receives `ContextAssemblyContext` with page payload (or None),
+`prefix_through_seq`, and readers bound to that prefix. `read_history` returns ascending
+inclusive ranges; `read_history_before` returns descending bounded pages. Each call
+uses its own short transaction. The assembler returns only a replacement prefix.
+The core appends original post-anchor history and the pending checkpoint suffix,
+extending backwards to close tool call/result pairs. Even replay zero cannot remove
+a pending request or its required tool results. Strategies must keep their returned
+prefix internally paired and must not rerun actions, consume inputs or mutate history.
+
+`turn_context_page()` requires prepared context and a model_request/done boundary;
+handle_response must finish its saved tool/output batch first. Empty history returns
+None. It fences the lease, runs the action, validates JSON, fences and commits an
+immutable `agent_context_pages` row, then assembles/applies the new view. Repeated
+calls at one anchor reuse its saved payload. Page state never advances checkpoint
+or absolute history seq. Assembly failure after commit invalidates the handle;
+reopening reassembles the saved page without repeating its action. Stored policy_key
+must match the injected policy; unknown protocols fail instead of losing context.
+
+`summary_context_policy` implements `summary/v1`: optional token trigger, a temporary
+text summary action, and summary/replay/resume assembly. Positive threshold enables
+automatic summaries when the latest business response's input+output tokens exceed
+it and its seq is later than the previous page anchor. Unknown usage does not trigger;
+cache usage is not counted again and summary usage never changes this observation.
+This is an observed size, not a pre-request limit. `threshold_tokens=None` disables
+automatic paging but still permits manual summaries.
+
+The summary action runs only input/model nodes of the same configured Agent. Non-text
+responses receive bounded paired format retries; client tools and business output
+validators never execute. Tool definitions, native server tools, settings and request
+hooks remain active. Auxiliary graphs do not receive SessionExecutionCapability or
+business OutputCapability. Keep Agent-level `max_concurrency=None`: its run-wide
+limiter rejects nested page-action graphs. Request limits may use
+`ConcurrencyLimitedModel`; SessionService overrides the original Agent model, so
+limits on that original model do not apply to service-created models.
+
+The default assembler retains original system parts once, summary, N replay responses
+with backwards tool-pair closure, and a resume prompt; the core appends the protected
+raw suffix. Replay reads are restricted to the replaceable prefix. N is nonnegative;
+zero omits replay, never required continuation. Virtual messages are not persisted
+or accepted as user inputs. Done without new real input remains done.
+
+SessionService constructs one policy outside its configuration transaction and freezes
+it across queued/reacquired runners. Default summary settings still come from the
+session's compaction_threshold_tokens and compaction_replay_turns. A stored None
+threshold resolves to 70% of model capacity or rejects startup if capacity is unknown.
+Creation with unknown capacity and no threshold stores 183500; updates do not default
+it. An injected `context_policy_factory(session, model_record, agent)` may use another
+strategy without interpreting those summary fields. HTTP and Telegram share the
+application's service factory and never choose a context strategy in controllers.
+
 
 Optional live output is composed by `SessionService`, using an application-owned
 `valkey.asyncio.Valkey` client:
@@ -178,7 +220,7 @@ does not request SDK streaming. Direct users can pass `on_output` to `run()` or
 the runner module's `start_runner()`. The callback applies only to that run call;
 `turn()` does not inherit it. It is awaited in the runner's task, outside database
 transactions. Callback errors invalidate the handle. Only business model text and
-readable thinking stream; compaction summaries and tool argument deltas do not.
+readable thinking stream; summary page actions and tool argument deltas do not.
 The SDK capability dynamically enables streaming on each model node, preserving
 ordinary node hooks and a native graph retained across successive run calls.
 

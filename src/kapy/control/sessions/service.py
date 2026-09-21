@@ -9,10 +9,10 @@ original history to live events without holding a transaction during iteration.
 
 import asyncio
 import math
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import nullcontext
 from functools import partial
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai import Agent
@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kapy.agent_output import AgentOutputService
 from kapy.agent_runner import (
+    ContextPolicy,
     HistoryMessage,
     InputBatch,
     MessageCommitted,
@@ -28,6 +29,7 @@ from kapy.agent_runner import (
     SessionBusy,
     TurnResult,
     UserInput,
+    summary_context_policy,
 )
 from kapy.agent_runner import start_runner as run_agent_session
 from kapy.agent_runner.repository import AgentRepository
@@ -38,6 +40,7 @@ from kapy.control.models.runtime import (
     resolve_classes,
     validate_settings,
 )
+from kapy.control.models.types import ModelRecord
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.session_lease import is_session_busy
 
@@ -52,12 +55,15 @@ from .types import (
     UpdateSession,
 )
 
+type ContextPolicyFactory = Callable[[SessionRecord, ModelRecord, Agent[Any, Any]], ContextPolicy]
+
 
 class SessionService:
     """User-side entry point; configure the same finite heartbeat policy on every worker.
 
     The instance stores only borrowed factories/output transport and heartbeat
-    and live polling values. Per-start model resources and overrides are scoped to that async call.
+    and live polling values, plus an optional pure context-policy factory. Per-start
+    model resources, frozen policy and overrides are scoped to that async call.
     """
 
     def __init__(
@@ -68,6 +74,7 @@ class SessionService:
         heartbeat_interval: float = 10.0,
         heartbeat_timeout: float = 60.0,
         live_poll_interval: float = 5.0,
+        context_policy_factory: ContextPolicyFactory | None = None,
     ) -> None:
         if not (
             math.isfinite(heartbeat_interval)
@@ -82,6 +89,7 @@ class SessionService:
         self._output_service = output_service
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
+        self._context_policy_factory = context_policy_factory
 
     async def create_session(self, data: CreateSession) -> SessionRecord:
         """Save configuration without execution or SDK clients.
@@ -230,7 +238,7 @@ class SessionService:
         The flush interval is finite and nonnegative; zero schedules background
         publication immediately.
         Session/model/provider configuration is read once and remains fixed across
-        queued runs and compaction. The Agent keeps its prompts/tools/output type;
+        queued runs and page actions. The Agent keeps its prompts/tools/output type;
         a task-local override supplies the stored model and merged request settings.
         Configuration errors precede output publication, lease acquisition and input
         consumption. Provider and Model contexts outlive the complete runner loop.
@@ -249,8 +257,17 @@ class SessionService:
             repo = ModelRepository(db)
             model = await repo.get_model(session.provider_id, session.model_name)
             config = await repo.get_provider_config(session.provider_id)
-        threshold = resolve_compaction_threshold(
-            session.compaction_threshold_tokens, model.context_window
+        policy = (
+            self._context_policy_factory(session, model, agent)
+            if self._context_policy_factory is not None
+            else summary_context_policy(
+                agent,
+                deps=deps,
+                threshold_tokens=resolve_compaction_threshold(
+                    session.compaction_threshold_tokens, model.context_window
+                ),
+                replay_turns=session.compaction_replay_turns,
+            )
         )
         provider_cls, model_cls = resolve_classes(config)
         settings = validate_settings(model_cls, model.settings | session.model_settings)
@@ -299,8 +316,7 @@ class SessionService:
                                 consume_cancel=consume_cancel,
                                 heartbeat_interval=self._heartbeat_interval,
                                 heartbeat_timeout=self._heartbeat_timeout,
-                                compaction_threshold_tokens=threshold,
-                                compaction_replay_turns=session.compaction_replay_turns,
+                                context_policy=policy,
                                 on_output=on_output,
                             )
                         except SessionBusy:
