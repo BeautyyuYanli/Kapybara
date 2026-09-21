@@ -1,4 +1,4 @@
-"""Plugin wiring against real PostgreSQL/Valkey; Telegram network sends are captured."""
+"""Interface wiring against real PostgreSQL/Valkey; Telegram network sends are captured."""
 
 import asyncio
 import os
@@ -31,16 +31,16 @@ from kapy.control.models import CreateModel, CreateProvider, ModelService
 from kapy.control.sessions import CreateSession, SessionService
 from kapy.database.migration import migration_config
 from kapy.database.schema import OWNED_TABLES, migrate
-from kapy.plugins.http.app import create_app
-from kapy.plugins.http.settings import HttpSettings
-from kapy.plugins.telegram.client import TelegramClient
-from kapy.plugins.telegram.controller import TelegramController
-from kapy.plugins.telegram.delivery import TelegramDelivery
-from kapy.plugins.telegram.models import DeliveryRow
-from kapy.plugins.telegram.repository import TelegramRepository, delivery_key
-from kapy.plugins.telegram.schema import migrate as migrate_telegram
-from kapy.plugins.telegram.settings import TelegramSettings
-from kapy.plugins.telegram.storage import open_storage
+from kapy.interfaces.http.app import create_app
+from kapy.interfaces.http.settings import HttpSettings
+from kapy.interfaces.telegram.client import TelegramClient
+from kapy.interfaces.telegram.controller import TelegramController
+from kapy.interfaces.telegram.delivery import TelegramDelivery
+from kapy.interfaces.telegram.models import DeliveryRow
+from kapy.interfaces.telegram.repository import TelegramRepository, delivery_key
+from kapy.interfaces.telegram.schema import migrate as migrate_telegram
+from kapy.interfaces.telegram.settings import TelegramSettings
+from kapy.interfaces.telegram.storage import open_storage
 
 pytestmark = pytest.mark.integration
 
@@ -139,7 +139,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
     models = ModelService(database.sessions)
     provider = await models.create_provider(
         CreateProvider(
-            name="plugin-check",
+            name="interface-check",
             provider_class="pydantic_ai.providers.openai:OpenAIProvider",
             model_class="pydantic_ai.models.openai:OpenAIResponsesModel",
             api_key=SecretStr(settings_values.get("OPENAI_API_KEY") or "local-test"),
@@ -154,7 +154,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
             context_window=10000,
         )
     )
-    prefix = "plugin-test:" + uuid4().hex
+    prefix = "interface-test:" + uuid4().hex
     sessions = SessionService(
         database.sessions,
         output_service=AgentOutputService(
@@ -196,7 +196,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
                     "message": {
                         "chat": {"id": 123, "type": "private"},
                         "from": {"id": 1, "is_bot": False},
-                        "text": "Reply with exactly KAPY_PLUGIN_OK and nothing else.",
+                        "text": "Reply with exactly KAPY_INTERFACE_OK and nothing else.",
                     },
                 }
             ],
@@ -218,7 +218,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
                 output_flush_interval=0,
             )
             assert result.finished and result.output is not None
-            assert result.output.strip() == "KAPY_PLUGIN_OK"
+            assert result.output.strip() == "KAPY_INTERFACE_OK"
             async with asyncio.timeout(5):
                 while (await repository.get_delivery(delivery_key(row))).after_seq < 1:  # noqa: ASYNC110
                     await asyncio.sleep(0.01)
@@ -229,7 +229,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
                 call.args[2]
                 for call in client.send.call_args_list
                 if call.kwargs.get("draft_id") is None
-            ] == ["KAPY_PLUGIN_OK"]
+            ] == ["KAPY_INTERFACE_OK"]
         finally:
             follower.cancel()
             await asyncio.gather(follower, return_exceptions=True)
@@ -240,7 +240,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
 async def test_telegram_core_runner_live_round_trip(
     database, valkey_client, tmp_path, session_model
 ):
-    session_model(TestModel(custom_output_text="KAPY_PLUGIN_OK"))
+    session_model(TestModel(custom_output_text="KAPY_INTERFACE_OK"))
     await session_round_trip(database, valkey_client, tmp_path)
 
 
@@ -335,7 +335,7 @@ async def test_telegram_model_command_updates_only_bound_session_and_new_default
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    os.environ.get("KAPY_PLUGIN_LIVE_CHECK") != "1", reason="Explicit paid-model opt-in"
+    os.environ.get("KAPY_INTERFACE_LIVE_CHECK") != "1", reason="Explicit paid-model opt-in"
 )
 @pytest.mark.asyncio
 async def test_real_model_telegram_round_trip(database, valkey_client, tmp_path):
@@ -347,7 +347,7 @@ async def test_real_model_telegram_round_trip(database, valkey_client, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_http_plugin_serves_http_without_credentials(database, monkeypatch):
+async def test_http_interface_serves_http_without_credentials(database, monkeypatch):
     monkeypatch.delenv("KAPY_CONTROL_TOKEN", raising=False)
     settings = HttpSettings(
         common=CommonSettings(
@@ -372,7 +372,7 @@ async def test_http_shutdown_joins_background_runner_before_resources_close(
 ):
     from contextlib import asynccontextmanager
 
-    from kapy.plugins.http import app as http_app
+    from kapy.interfaces.http import app as http_app
 
     session_id = uuid4()
     await seed_session(session_id)
@@ -425,7 +425,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
 ):
     from contextlib import asynccontextmanager
 
-    from kapy.plugins.telegram import main as telegram_main
+    from kapy.interfaces.telegram import main as telegram_main
 
     models = ModelService(database.sessions)
     provider = await models.create_provider(
@@ -516,7 +516,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
 async def test_telegram_serve_draft_pacing_uses_publisher_setting(
     database, seed_session, tmp_path, monkeypatch, configured_interval, interval
 ):
-    from kapy.plugins.telegram import main as telegram_main
+    from kapy.interfaces.telegram import main as telegram_main
 
     session_id = uuid4()
     await seed_session(session_id)
@@ -588,7 +588,7 @@ async def test_telegram_serve_draft_pacing_uses_publisher_setting(
 
 
 @pytest.mark.asyncio
-async def test_http_plugin_mounts_existing_frontend_with_api(database, tmp_path):
+async def test_http_interface_mounts_existing_frontend_with_api(database, tmp_path):
     (tmp_path / "index.html").write_text("<main>existing frontend</main>")
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets/app.js").write_text("export {}")
@@ -616,7 +616,7 @@ async def test_http_plugin_mounts_existing_frontend_with_api(database, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_http_plugin_rejects_missing_frontend_entry(tmp_path):
+async def test_http_interface_rejects_missing_frontend_entry(tmp_path):
     app = create_app(HttpSettings(frontend_dist=tmp_path))
     with pytest.raises(RuntimeError, match="Frontend entry point"):
         async with app.router.lifespan_context(app):
@@ -633,8 +633,8 @@ async def test_telegram_reconnects_after_real_subscription_setup_timeout(
 ):
     from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
-    from kapy.plugins.telegram import delivery as delivery_module
-    from kapy.plugins.telegram.models import DeliveryRow
+    from kapy.interfaces.telegram import delivery as delivery_module
+    from kapy.interfaces.telegram.models import DeliveryRow
 
     session_id = await seed_history(
         [

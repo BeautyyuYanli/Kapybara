@@ -168,5 +168,5 @@ queue. Cancel ends the current run at a boundary and leaves queued inputs intact
 history and following complete messages/deltas in nonempty event lists. Consumers
 apply each batch in order; only complete messages advance the cursor. History
 pagination uses before_seq independently. Use aclosing when
-stopping early. See [HTTP adapters](../plugins/http/README.md) for application wiring,
+stopping early. See [HTTP adapters](../interfaces/http/README.md) for application wiring,
 background scheduling and WebSocket lifetime.

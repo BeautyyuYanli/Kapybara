@@ -9,25 +9,25 @@ from typer.testing import CliRunner
 from kapy.cli.commands import app
 
 
-def test_plugin_help_is_forwarded_and_unknown_names_are_rejected():
+def test_interface_help_is_forwarded_and_unknown_names_are_rejected():
     runner = CliRunner()
-    result = runner.invoke(app, ["plugin", "telegram", "serve", "--help"])
+    result = runner.invoke(app, ["interface", "telegram", "serve", "--help"])
     assert result.exit_code == 0 and "--database-path" in result.output
-    result = runner.invoke(app, ["plugin", "unknown", "serve"])
+    result = runner.invoke(app, ["interface", "unknown", "serve"])
     assert result.exit_code == 2 and "http, telegram" in result.output
 
 
-def test_registry_and_cli_help_do_not_import_plugins():
+def test_registry_and_cli_help_do_not_import_interfaces():
     code = """
 import sys
 from typer.testing import CliRunner
 from kapy.cli.commands import app
-from kapy.plugins.registry import PLUGIN_ENTRIES
+from kapy.cli.registry import INTERFACE_ENTRIES
 assert CliRunner().invoke(app, ['--help']).exit_code == 0
-assert set(PLUGIN_ENTRIES) == {'http', 'telegram'}
+assert set(INTERFACE_ENTRIES) == {'http', 'telegram'}
 assert not any(
     name.startswith((
-        'kapy.plugins.http', 'kapy.plugins.telegram', 'kapy.database',
+        'kapy.interfaces.http', 'kapy.interfaces.telegram', 'kapy.database',
         'kapy.gateway', 'kapy.execution', 'kapy.state', 'kapy.rpc', 'kapy.settings',
     ))
     for name in sys.modules
@@ -43,7 +43,7 @@ def test_database_cli_uses_xdg_without_other_configuration(tmp_path):
         if not key.startswith(("KAPY_", "TELEGRAM_"))
     }
     env.update(XDG_STATE_HOME=str(tmp_path), KAPY_DATABASE_URL="deliberately-invalid")
-    command = [sys.executable, "-m", "kapy.plugins.telegram.main", "db"]
+    command = [sys.executable, "-m", "kapy.interfaces.telegram.main", "db"]
     subprocess.run([*command, "upgrade"], env=env, check=True, capture_output=True)
     result = subprocess.run(
         [*command, "current"], env=env, check=True, capture_output=True, text=True

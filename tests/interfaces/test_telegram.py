@@ -26,14 +26,14 @@ from kapy.control.sessions import (
     SubmitInput,
     UpdateSession,
 )
-from kapy.plugins.telegram.client import TelegramClient, TelegramFailure, text_chunk
-from kapy.plugins.telegram.controller import TelegramController
-from kapy.plugins.telegram.delivery import TelegramDelivery
-from kapy.plugins.telegram.models import DeliveryRow
-from kapy.plugins.telegram.repository import TelegramRepository, delivery_key
-from kapy.plugins.telegram.schema import migrate
-from kapy.plugins.telegram.settings import StorageSettings, TelegramSettings
-from kapy.plugins.telegram.storage import open_storage
+from kapy.interfaces.telegram.client import TelegramClient, TelegramFailure, text_chunk
+from kapy.interfaces.telegram.controller import TelegramController
+from kapy.interfaces.telegram.delivery import TelegramDelivery
+from kapy.interfaces.telegram.models import DeliveryRow
+from kapy.interfaces.telegram.repository import TelegramRepository, delivery_key
+from kapy.interfaces.telegram.schema import migrate
+from kapy.interfaces.telegram.settings import StorageSettings, TelegramSettings
+from kapy.interfaces.telegram.storage import open_storage
 
 
 @pytest_asyncio.fixture
@@ -492,7 +492,7 @@ async def test_buffer_overflow_resumes_after_last_delivered_commit(repository, m
         finally:
             closed.append(after_seq)
 
-    monkeypatch.setattr("kapy.plugins.telegram.delivery.retry_delay", lambda *args: 0)
+    monkeypatch.setattr("kapy.interfaces.telegram.delivery.retry_delay", lambda *args: 0)
     sessions = AsyncMock(spec=SessionService)
     sessions.live = live
     task = asyncio.create_task(TelegramDelivery(client, sessions, repository, 42).follow(key))
@@ -593,7 +593,7 @@ async def test_draft_retry_and_plain_fallback_finish_before_next_read(repository
         TelegramFailure(400, rich_content_rejected=True),
         None,
     ]
-    monkeypatch.setattr("kapy.plugins.telegram.delivery.retry_delay", lambda error: 0)
+    monkeypatch.setattr("kapy.interfaces.telegram.delivery.retry_delay", lambda error: 0)
 
     async def live(session_id, *, after_seq):
         yield [TextDelta(session_id, 0, 0, "text", "replace", "preview")]
@@ -638,7 +638,7 @@ async def test_discovery_retry_preserves_existing_followers(repository, monkeypa
             closed.add(session_id)
 
     monkeypatch.setattr(repository, "deliveries", deliveries)
-    from kapy.plugins.telegram import delivery as module
+    from kapy.interfaces.telegram import delivery as module
 
     monkeypatch.setattr(module, "retry_delay", lambda *args: 0)
     sessions = AsyncMock(spec=SessionService)

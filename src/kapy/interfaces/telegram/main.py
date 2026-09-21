@@ -130,7 +130,7 @@ async def _serve_with_signals(settings: TelegramSettings) -> None:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="kapy plugin telegram")
+    parser = argparse.ArgumentParser(prog="kapy interface telegram")
     commands = parser.add_subparsers(dest="command", required=True)
     serve_parser = commands.add_parser("serve")
     serve_parser.add_argument("--database-path", type=Path)
@@ -152,7 +152,7 @@ def main(argv: list[str]) -> int:
                 logging.getLogger(name).setLevel(logging.WARNING)
             asyncio.run(_serve_with_signals(settings))
     except ValidationError:
-        parser.error("Invalid Telegram configuration; see plugins/telegram/README.md")
+        parser.error("Invalid Telegram configuration; see interfaces/telegram/README.md")
     except KeyboardInterrupt, asyncio.CancelledError:
         return 0
     except Exception as error:

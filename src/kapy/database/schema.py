@@ -1,4 +1,4 @@
-"""Core PostgreSQL migrations; this catalog never imports interface plugins.
+"""Core PostgreSQL migrations; this catalog never imports interfaces.
 
 Keep removed/renamed table names in OWNED_TABLES so autogeneration can see their
 removal. Pre-baseline development databases are discarded and initialized afresh;

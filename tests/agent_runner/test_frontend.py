@@ -7,7 +7,7 @@ from pydantic_ai import Agent
 
 from kapy.control.models import ModelService
 from kapy.control.sessions import SessionService
-from kapy.plugins.http import create_frontend_router, create_router
+from kapy.interfaces.http import create_frontend_router, create_router
 
 
 def test_missing_frontend_build_fails_setup(tmp_path):

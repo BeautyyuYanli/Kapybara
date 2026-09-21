@@ -1,1 +1,1 @@
-"""Kapy session services and independent HTTP/Telegram interface plugins."""
+"""Kapy session services and independent HTTP/Telegram interfaces."""
