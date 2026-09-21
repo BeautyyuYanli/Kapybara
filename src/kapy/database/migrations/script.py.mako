@@ -4,6 +4,9 @@ Revision ID: ${up_revision}
 Revises: ${down_revision | comma,n}
 """
 
+# Alembic renders SQL statements as indivisible string literals.
+# ruff: noqa: E501
+
 from collections.abc import Sequence
 
 from alembic import op

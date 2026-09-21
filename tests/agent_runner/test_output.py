@@ -26,6 +26,7 @@ from kapy.agent_runner import (
     OutputEvent,
     TextDelta,
     open_runner,
+    summary_context_policy,
 )
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
@@ -283,16 +284,17 @@ async def test_compaction_summary_is_excluded_from_business_output(database):
     async def callback(event):
         events.append(event)
 
+    agent = Agent(FunctionModel(summarize, stream_function=business))
     async with open_runner(
         session_id,
-        agent=Agent(FunctionModel(summarize, stream_function=business)),
+        agent=agent,
+        context_policy=summary_context_policy(agent, threshold_tokens=1),
         session_factory=database.sessions,
     ) as runner:
         await runner.run(
             initial=InputBatch(("go",), consume),
             read_steer=no_inputs,
             consume_cancel=no_cancel,
-            compaction_threshold_tokens=1,
             on_output=callback,
         )
     assert len(summaries) == 1

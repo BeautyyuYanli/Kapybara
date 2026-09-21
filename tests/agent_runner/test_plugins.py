@@ -57,7 +57,7 @@ async def test_core_migrations_own_only_core_tables(database):
                 await db.execute(text("CREATE TABLE unrelated (id INTEGER)"))
                 await db.execute(text("CREATE TABLE plugin_other_state (id INTEGER)"))
                 tables = await db.run_sync(lambda conn: inspect(conn).get_table_names())
-                assert set(tables) == OWNED_TABLES | {
+                assert set(tables) == (OWNED_TABLES - {"agent_compactions"}) | {
                     "core_schema_version",
                     "unrelated",
                     "plugin_other_state",
@@ -75,6 +75,57 @@ async def test_core_migrations_own_only_core_tables(database):
                     command.check(config)
 
                 await db.run_sync(check)
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_context_page_migration_preserves_summary_anchor_and_timestamp(database):
+    schema = "tmpv2_page_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    session_id = uuid4()
+    try:
+        await migrate(settings, "upgrade")
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+
+                def migrate_to(connection, target, *, downgrade=False):
+                    connection.dialect.default_schema_name = schema
+                    config = migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, agent_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+                    (command.downgrade if downgrade else command.upgrade)(config, target)
+
+                await db.run_sync(
+                    lambda connection: migrate_to(connection, "12fd53fd60d5", downgrade=True)
+                )
+                await db.execute(
+                    text(
+                        "INSERT INTO agent_compactions "
+                        "(session_id, last_message_seq, text, created_at) "
+                        "VALUES (:session, 9, :summary, '2026-09-01T00:00:00Z')"
+                    ),
+                    {"session": session_id, "summary": "summary with Unicode 摘要"},
+                )
+                await db.run_sync(lambda connection: migrate_to(connection, "head"))
+                row = (await db.execute(text("SELECT * FROM agent_context_pages"))).one()
+                assert row.session_id == session_id and row.anchor_seq == 9
+                assert row.policy_key == "summary/v1"
+                assert row.payload == {"summary": "summary with Unicode 摘要"}
+                assert row.created_at.isoformat() == "2026-09-01T00:00:00+00:00"
+                await db.run_sync(
+                    lambda connection: migrate_to(connection, "12fd53fd60d5", downgrade=True)
+                )
+                old = (await db.execute(text("SELECT * FROM agent_compactions"))).one()
+                assert old.last_message_seq == 9 and old.text == row.payload["summary"]
+                assert old.created_at == row.created_at
     finally:
         async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
             await db.execute(

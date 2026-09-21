@@ -6,11 +6,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from kapy.agent_output import AgentOutputService
 from kapy.application.agent import create_agent
 from kapy.application.resources import open_resources
+from kapy.application.sessions import create_session_service
 from kapy.control.models import ModelService
-from kapy.control.sessions import SessionService
 
 from . import create_frontend_router, create_router
 from .settings import HttpSettings
@@ -41,15 +40,7 @@ def create_app(settings: HttpSettings) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async with open_resources(settings.common) as resources:
-            sessions = SessionService(
-                resources.core_session_factory,
-                output_service=AgentOutputService(
-                    resources.valkey,
-                    channel_prefix=settings.common.valkey_namespace + ":agent-output",
-                ),
-                heartbeat_interval=settings.common.heartbeat_interval,
-                heartbeat_timeout=settings.common.heartbeat_timeout,
-            )
+            sessions = create_session_service(resources, settings.common)
             router = create_router(
                 ModelService(resources.core_session_factory),
                 sessions,

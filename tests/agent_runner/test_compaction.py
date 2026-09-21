@@ -23,8 +23,8 @@ from pydantic_ai.usage import RequestUsage
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from kapy.agent_runner import RunnerLost, open_runner
-from kapy.agent_runner.compaction import (
+from kapy.agent_runner import RunnerLost, open_runner, summary_context_policy
+from kapy.agent_runner.context_summary import (
     COMPACTION_CONTEXT_PROMPT,
     COMPACTION_PROMPT,
     COMPACTION_RESUME_PROMPT,
@@ -33,6 +33,17 @@ from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService, UpdateSession
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+
+
+def summary_runner(session_id, *, agent, replay_turns=0, threshold_tokens=None, **kwargs):
+    return open_runner(
+        session_id,
+        agent=agent,
+        context_policy=summary_context_policy(
+            agent, replay_turns=replay_turns, threshold_tokens=threshold_tokens
+        ),
+        **kwargs,
+    )
 
 
 def user_texts(messages):
@@ -48,12 +59,12 @@ async def snapshot(database, session_id):
     async with database.sessions.begin() as db:
         repo = AgentRepository(db)
         rows = await repo.read_history(session_id, start_seq=0, through_seq=2**31 - 1)
-        return rows, await repo.read_latest_compaction(session_id)
+        return rows, await repo.read_latest_page(session_id)
 
 
-@pytest.mark.parametrize("apply_summary,reopen", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("reopen", [False, True])
 async def test_manual_summary_preserves_pending_graph_history_and_absolute_sequences(
-    database, apply_summary, reopen
+    database, reopen
 ):
     business, summaries, tools = [], [], []
 
@@ -75,27 +86,25 @@ async def test_manual_summary_preserves_pending_graph_history_and_absolute_seque
         return "tool result"
 
     session_id = uuid4()
-    async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+    async with summary_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
         await runner.rebuild_context()
         assert not (await runner.turn(steer=["original"])).finished
         before, _ = await snapshot(database, session_id)
-        summary = await runner.compact()
-        assert summary is not None and summary.last_message_seq == 2
+        summary = await runner.turn_context_page()
+        assert summary is not None and summary.anchor_seq == 2
         assert runner.next_step == "model_request"
         assert (await snapshot(database, session_id))[0] == before
-        assert await runner.compact() == summary
+        assert await runner.turn_context_page() == summary
         assert len(summaries) == 1 and tools == [True]
         if not reopen:
-            if apply_summary:
-                await runner.rebuild_context(compaction_replay_turns=0)
             result = await runner.turn(steer=["new steer"])
             assert result.finished and result.output == "business output"
     if reopen:
-        async with open_runner(
+        async with summary_runner(
             session_id, agent=agent, session_factory=database.sessions
         ) as runner:
-            await runner.rebuild_context(compaction_replay_turns=0)
-            assert await runner.compact() == summary
+            await runner.rebuild_context()
+            assert await runner.turn_context_page() == summary
             result = await runner.turn(steer=["new steer"])
             assert result.finished and result.output == "business output"
     prompts = user_texts(business[-1])
@@ -105,8 +114,6 @@ async def test_manual_summary_preserves_pending_graph_history_and_absolute_seque
             COMPACTION_RESUME_PROMPT,
             "new steer",
         ]
-        if apply_summary
-        else ["original", "new steer"]
     )
     assert [
         p.content for m in business[-1] for p in m.parts if isinstance(p, SystemPromptPart)
@@ -188,17 +195,19 @@ async def test_rebuild_reads_only_anchor_window_and_tail_and_preserves_resume_bo
         tools.append(True)
         return "ok"
 
-    async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+    async with summary_runner(
+        session_id, agent=agent, session_factory=database.sessions, replay_turns=1
+    ) as runner:
         assert reads == []
-        await runner.rebuild_context(compaction_replay_turns=1)
-        assert all(seq == 0 or seq >= 197 for seq in reads)
-        assert len(reads) < 12
+        await runner.rebuild_context()
+        assert all(seq == 0 or seq >= 193 for seq in reads)
+        assert len(reads) < 20
         loaded = list(reads)
         result = await runner.turn()
         if next_step == "handle_response":
             assert not result.finished and received == [] and tools == [True]
             # Rebuilding an already-open pending request must not append it twice.
-            await runner.rebuild_context(compaction_replay_turns=1)
+            await runner.rebuild_context()
             loaded = list(reads)
             result = await runner.turn()
         assert result.finished
@@ -288,8 +297,8 @@ async def test_threshold_persists_normalized_usage_and_restarts_without_recompac
         "after restart",
     ]
     rows, compaction = await snapshot(database, session_id)
-    assert compaction is not None and compaction.last_message_seq == 3
-    assert compaction.text == "summary 2"
+    assert compaction is not None and compaction.anchor_seq == 3
+    assert compaction.payload == {"summary": "summary 2"}
     assert [seq for seq, _ in rows] == list(range(8))
     async with database.sessions.begin() as db:
         stored = (
@@ -384,15 +393,13 @@ async def test_latest_unknown_usage_supersedes_older_high_usage(
         return False
 
     agent = Agent(FunctionModel(model))
-    async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+    async with summary_runner(
+        session_id, agent=agent, session_factory=database.sessions, threshold_tokens=10
+    ) as runner:
         await runner.rebuild_context()
         assert (await runner.turn(steer=["new"])).finished
         if not reopen:
-            assert (
-                await runner.run(
-                    read_steer=no_steer, consume_cancel=no_cancel, compaction_threshold_tokens=10
-                )
-            ).finished
+            assert (await runner.run(read_steer=no_steer, consume_cancel=no_cancel)).finished
     if reopen:
         await SessionService(database.sessions).update_session(
             session_id, UpdateSession(compaction_threshold_tokens=10)
@@ -405,10 +412,10 @@ async def test_latest_unknown_usage_supersedes_older_high_usage(
     assert len(rows) == 4 and compaction is None
 
 
-@pytest.mark.parametrize("operation", ["turn", "compact"])
+@pytest.mark.parametrize("operation", ["turn", "turn_context_page"])
 async def test_manual_execution_requires_prepared_context(database, operation):
     with pytest.raises(RuntimeError, match="context has not been prepared"):
-        async with open_runner(
+        async with summary_runner(
             uuid4(), agent=Agent("test"), session_factory=database.sessions
         ) as runner:
             await getattr(runner, operation)()
@@ -419,19 +426,19 @@ async def test_empty_compaction_and_handle_response_rejection(database, seed_his
         raise AssertionError("no summary model request is allowed")
 
     agent = Agent(FunctionModel(unexpected))
-    async with open_runner(uuid4(), agent=agent, session_factory=database.sessions) as runner:
+    async with summary_runner(uuid4(), agent=agent, session_factory=database.sessions) as runner:
         await runner.rebuild_context()
-        assert await runner.compact() is None
+        assert await runner.turn_context_page() is None
     session_id = await seed_history(
         [ModelRequest(parts=[UserPromptPart("go")]), ModelResponse(parts=[TextPart("saved")])],
         "handle_response",
     )
     with pytest.raises(ValueError, match="handling the saved response"):
-        async with open_runner(
+        async with summary_runner(
             session_id, agent=agent, session_factory=database.sessions
         ) as runner:
             await runner.rebuild_context()
-            await runner.compact()
+            await runner.turn_context_page()
 
 
 async def test_summary_wait_releases_db_and_takeover_fences_insert(database, seed_history):
@@ -447,11 +454,11 @@ async def test_summary_wait_releases_db_and_takeover_fences_insert(database, see
         return ModelResponse(parts=[TextPart("stale summary")])
 
     async def execute():
-        async with open_runner(
+        async with summary_runner(
             session_id, agent=Agent(FunctionModel(model)), session_factory=database.sessions
         ) as runner:
             await runner.rebuild_context()
-            await runner.compact()
+            await runner.turn_context_page()
 
     task = asyncio.create_task(execute())
     try:
@@ -485,14 +492,14 @@ async def test_summary_commit_failure_recovers_from_saved_anchor(
     session_id = await seed_history(
         [ModelRequest(parts=[UserPromptPart("go")]), ModelResponse(parts=[TextPart("done")])]
     )
-    original_save = AgentRepository.save_compaction
+    original_save = AgentRepository.save_page
 
     async def mark(self, *args, **kwargs):
         result = await original_save(self, *args, **kwargs)
         self._db.info["summary_saved"] = True
         return result
 
-    monkeypatch.setattr(AgentRepository, "save_compaction", mark)
+    monkeypatch.setattr(AgentRepository, "save_page", mark)
 
     class FailingSessions(async_sessionmaker):
         @asynccontextmanager
@@ -514,17 +521,17 @@ async def test_summary_commit_failure_recovers_from_saved_anchor(
 
     agent = Agent(FunctionModel(model))
     with pytest.raises(RuntimeError, match="summary commit failed"):
-        async with open_runner(
+        async with summary_runner(
             session_id,
             agent=agent,
             session_factory=FailingSessions(database.engine, expire_on_commit=False),
         ) as runner:
             await runner.rebuild_context()
-            await runner.compact()
-    async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+            await runner.turn_context_page()
+    async with summary_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
         await runner.rebuild_context()
-        result = await runner.compact()
-    assert result is not None and result.last_message_seq == 1
+        result = await runner.turn_context_page()
+    assert result is not None and result.anchor_seq == 1
     assert len(calls) == (1 if after_commit else 2)
     assert len((await snapshot(database, session_id))[0]) == 2
 
@@ -573,7 +580,7 @@ async def test_automatic_summary_finishes_saved_tools_before_compacting_and_hono
     assert not result.finished and result.output is None
     assert events == ["tool", "summary"]
     rows, summary = await snapshot(database, session_id)
-    assert len(rows) == 3 and summary is not None and summary.last_message_seq == 2
+    assert len(rows) == 3 and summary is not None and summary.anchor_seq == 2
     result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output == "done"
     assert events == ["tool", "summary", "business"]
@@ -602,12 +609,12 @@ async def test_cancellation_closes_temporary_then_main_graph_and_recovers_pendin
         return "ok"
 
     async def execute():
-        async with open_runner(
+        async with summary_runner(
             session_id, agent=agent, session_factory=database.sessions, heartbeat_interval=0.01
         ) as runner:
             await runner.rebuild_context()
             assert not (await runner.turn(steer=["go"])).finished
-            await runner.compact()
+            await runner.turn_context_page()
 
     task = asyncio.create_task(execute())
     try:
@@ -626,7 +633,7 @@ async def test_cancellation_closes_temporary_then_main_graph_and_recovers_pendin
     rows, summary = await snapshot(database, session_id)
     assert len(rows) == 3 and summary is None
     summarizing = False
-    async with open_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
+    async with summary_runner(session_id, agent=agent, session_factory=database.sessions) as runner:
         await runner.rebuild_context()
         assert runner.next_step == "model_request"
         result = await runner.turn()

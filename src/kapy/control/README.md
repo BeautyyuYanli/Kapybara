@@ -3,7 +3,7 @@
 `ModelService` manages local provider/model configuration. `SessionService` is the
 user-side entry point for session configuration, inputs, cancellation, output and
 execution. The agent runner remains independent: it accepts an Agent, values and
-callbacks, and owns only the lease, history, checkpoint and compaction flow.
+callbacks, and owns only the lease, history, checkpoint and context paging flow.
 
 Import both services before creating `ControlTable.metadata` tables; application
 code owns database creation/migrations, engines and session factories. All control
@@ -106,17 +106,30 @@ The same values remain active through every queued run and temporary compaction;
 configuration updates affect the next start. Explicit SDK options retain their
 SDK semantics; no extra runner-specific settings blacklist is applied.
 
-The stored compaction_threshold_tokens must be positive, or None to use 70% of
-model capacity at startup (rounded down, at least one). On session creation,
+`SessionService(..., context_policy_factory=...)` optionally supplies a pure factory
+`(session_record, model_record, agent) -> ContextPolicy`. It runs outside the
+configuration transaction once per start call, before clients/leases are opened, and
+its policy is shared across queued and reacquired runners. Model metadata includes
+context_window. The default constructs summary/v1 using the resolved threshold,
+replay count and borrowed Agent/deps; custom factories need not interpret summary
+fields. HTTP and Telegram both use `application.sessions.create_session_service`.
+The runner core deals only with generic page state and does not import the summary
+strategy. See the [paging contracts](../agent_runner/README.md).
+
+The stored compaction_threshold_tokens must be positive or None. The default
+summary factory resolves None to 70% of model capacity at startup (rounded down,
+at least one). On session creation,
 an omitted/None threshold stays None when model capacity is known; if capacity is
 unknown, SessionService stores `256 * 1024 * 7 // 10 = 183500`. Explicit thresholds
 are preserved. Updates can clear the threshold to None without applying this
-creation default, and existing sessions are not backfilled. Unknown capacity plus
-a stored None prevents startup before acquiring execution or consuming inputs.
+creation default, and existing sessions are not backfilled. With the default summary
+factory, unknown capacity plus a stored None prevents startup before acquiring
+execution or consuming inputs. A custom factory may ignore these summary fields.
 compaction_replay_turns is a nonnegative integer, defaults to 10, and zero omits
-replay before the summary
-anchor. These are session fields, not arguments to SessionService.start_runner.
-The lower runner still accepts ordinary explicit compaction arguments.
+replay in the replaceable prefix. These are session fields, not arguments to
+SessionService.start_runner. Lower-level callers pass
+`context_policy=summary_context_policy(agent, threshold_tokens=..., replay_turns=..., max_retries=...)`
+to open_runner or start_runner; run and rebuild_context have no compaction arguments.
 
 Heartbeat interval and timeout are finite constructor settings satisfying
 `0 < interval < timeout`. Every worker using the same execution table must use the

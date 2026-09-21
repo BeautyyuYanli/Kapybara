@@ -20,8 +20,8 @@ from sqlmodel import col, select
 
 from kapy.pagination import Page, paginate
 
-from .models import AgentCompactionRow, AgentHistoryRow, AgentStateRow
-from .types import Compaction, HistoryMessage, NextStep, ResumeState, RunnerLost, SessionBusy
+from .models import AgentContextPageRow, AgentHistoryRow, AgentStateRow
+from .types import ContextPage, HistoryMessage, NextStep, ResumeState, RunnerLost, SessionBusy
 
 
 def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
@@ -105,7 +105,7 @@ class AgentRepository:
         return ResumeState(
             cast(NextStep, next_step),
             0 if last_seq is None else last_seq + 1,
-            await self.read_latest_compaction(session_id),
+            await self.read_latest_page(session_id),
         )
 
     async def lock_owned(self, session_id: UUID, lock_token: UUID) -> None:
@@ -210,27 +210,50 @@ class AgentRepository:
             for entry in _decode_history((await self._db.execute(statement)).scalars().all())
         ]
 
-    async def read_latest_compaction(self, session_id: UUID) -> Compaction | None:
+    async def read_latest_page(self, session_id: UUID) -> ContextPage | None:
         row = (
             await self._db.execute(
-                select(AgentCompactionRow)
-                .where(col(AgentCompactionRow.session_id) == session_id)
-                .order_by(col(AgentCompactionRow.last_message_seq).desc())
+                select(AgentContextPageRow)
+                .where(col(AgentContextPageRow.session_id) == session_id)
+                .order_by(col(AgentContextPageRow.anchor_seq).desc())
                 .limit(1)
             )
         ).scalar_one_or_none()
-        return None if row is None else Compaction(row.last_message_seq, row.text)
+        return None if row is None else ContextPage(row.anchor_seq, row.policy_key, row.payload)
 
-    async def save_compaction(
-        self, session_id: UUID, *, last_message_seq: int, text: str
-    ) -> Compaction:
-        """Insert one immutable summary after lock_owned in the caller's transaction."""
+    async def save_page(self, session_id: UUID, page: ContextPage) -> ContextPage:
+        """Insert one immutable page after lock_owned in the caller's transaction."""
         await self._db.execute(
-            insert(AgentCompactionRow).values(
-                session_id=session_id, last_message_seq=last_message_seq, text=text
+            insert(AgentContextPageRow).values(
+                session_id=session_id,
+                anchor_seq=page.anchor_seq,
+                policy_key=page.policy_key,
+                payload=page.payload,
             )
         )
-        return Compaction(last_message_seq, text)
+        return page
+
+    async def read_latest_response(
+        self, session_id: UUID, *, through_seq: int
+    ) -> HistoryMessage | None:
+        """Restore usage without requiring the assembler to retain an old response."""
+        rows = (
+            (
+                await self._db.execute(
+                    select(AgentHistoryRow)
+                    .where(
+                        col(AgentHistoryRow.session_id) == session_id,
+                        col(AgentHistoryRow.seq) <= through_seq,
+                        col(AgentHistoryRow.kind) == "response",
+                    )
+                    .order_by(col(AgentHistoryRow.seq).desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return _decode_history(rows)[0] if rows else None
 
     async def save_checkpoint(
         self,

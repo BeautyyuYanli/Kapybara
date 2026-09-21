@@ -62,6 +62,7 @@ def run_environment() -> None:
         include_schemas=True,
         render_as_batch=connection.dialect.name == "sqlite",
         compare_type=True,
+        process_revision_directives=attributes.get("process_revision_directives"),
     )
     with context.begin_transaction():
         context.run_migrations()

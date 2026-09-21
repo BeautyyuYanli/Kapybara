@@ -16,12 +16,11 @@ import httpx2
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from kapy.agent_output import AgentOutputService
 from kapy.agent_runner import SessionBusy
 from kapy.application.agent import create_agent
 from kapy.application.resources import open_resources
+from kapy.application.sessions import create_session_service
 from kapy.control.models import ModelService
-from kapy.control.sessions import SessionService
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .controller import COMMANDS, TelegramController
@@ -49,15 +48,7 @@ async def serve(settings: TelegramSettings) -> None:
             draft_interval=draft_interval,
         )
         repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
-        sessions = SessionService(
-            resources.core_session_factory,
-            output_service=AgentOutputService(
-                resources.valkey,
-                channel_prefix=settings.common.valkey_namespace + ":agent-output",
-            ),
-            heartbeat_interval=settings.common.heartbeat_interval,
-            heartbeat_timeout=settings.common.heartbeat_timeout,
-        )
+        sessions = create_session_service(resources, settings.common)
         agent = create_agent()
         failures = 0
         while True:

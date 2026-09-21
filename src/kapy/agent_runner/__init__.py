@@ -1,10 +1,18 @@
 """Agent worker APIs; all shared application resources remain caller-owned."""
 
+from .context import (
+    ContextAssemblyContext,
+    ContextPolicy,
+    PageBoundary,
+    PageTurnContext,
+    full_history_policy,
+)
+from .context_summary import summary_context_policy
 from .runner import AgentRunner, open_runner, start_runner
 from .types import (
-    Compaction,
     ConsumeCancel,
     ConsumeInputs,
+    ContextPage,
     HistoryMessage,
     InputBatch,
     MessageCommitted,
@@ -22,7 +30,13 @@ from .types import (
 
 __all__ = [
     "AgentRunner",
-    "Compaction",
+    "ContextPage",
+    "ContextPolicy",
+    "ContextAssemblyContext",
+    "PageBoundary",
+    "PageTurnContext",
+    "full_history_policy",
+    "summary_context_policy",
     "ConsumeCancel",
     "ConsumeInputs",
     "HistoryMessage",

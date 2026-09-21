@@ -1,4 +1,4 @@
-"""Execution position, append-only messages and anchored summaries, without physical FKs."""
+"""Execution position, append-only messages and context pages, without physical FKs."""
 
 from datetime import datetime
 from typing import Any, ClassVar
@@ -57,14 +57,15 @@ class AgentHistoryRow(SQLModel, table=True):
     output_tokens: int | None = Field(default=None)
 
 
-class AgentCompactionRow(SQLModel, table=True):
+class AgentContextPageRow(SQLModel, table=True):
     metadata: ClassVar[MetaData] = agent_metadata
-    __tablename__ = "agent_compactions"  # pyrefly: ignore[bad-override]
-    __table_args__ = (CheckConstraint("last_message_seq >= 0"),)
+    __tablename__ = "agent_context_pages"  # pyrefly: ignore[bad-override]
+    __table_args__ = (CheckConstraint("anchor_seq >= 0"),)
 
     session_id: UUID = Field(primary_key=True)
-    last_message_seq: int = Field(primary_key=True)
-    text: str = Field(sa_type=Text)
+    anchor_seq: int = Field(primary_key=True)
+    policy_key: str = Field(sa_type=Text)
+    payload: dict[str, Any] = Field(sa_column=Column(JSON(none_as_null=True), nullable=False))
     created_at: datetime = Field(
         sa_column=Column(
             DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()

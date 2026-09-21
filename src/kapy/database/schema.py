@@ -31,11 +31,20 @@ OWNED_TABLES = frozenset(
         "agent_states",
         "agent_history",
         "agent_compactions",
+        "agent_context_pages",
     }
 )
 
 
-async def migrate(settings: CommonSettings, operation: str, message: str | None = None) -> None:
+async def migrate(
+    settings: CommonSettings,
+    operation: str,
+    message: str | None = None,
+    *,
+    plan: str | None = None,
+) -> None:
+    if plan is not None and (operation != "revision" or plan != "context-pages"):
+        raise ValueError("context-pages is a revision generation plan")
     async with open_core_database(settings) as engine:
         async with engine.begin() as connection:
             if operation in {"upgrade", "revision"}:
@@ -51,6 +60,10 @@ async def migrate(settings: CommonSettings, operation: str, message: str | None 
                     version_table="core_schema_version",
                     owns_table=OWNED_TABLES.__contains__,
                 )
+                if plan == "context-pages":
+                    from .revision_plans import context_pages
+
+                    config.attributes["process_revision_directives"] = context_pages
                 execute(config, operation, message=message)
 
             await connection.run_sync(run)
@@ -60,8 +73,14 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="kapy db")
     parser.add_argument("operation", choices=["upgrade", "current", "revision"])
     parser.add_argument("--message")
+    parser.add_argument("--plan", choices=["context-pages"])
     args = parser.parse_args(argv)
     asyncio.run(
-        migrate(CommonSettings.model_validate(dict(os.environ)), args.operation, args.message)
+        migrate(
+            CommonSettings.model_validate(dict(os.environ)),
+            args.operation,
+            args.message,
+            plan=args.plan,
+        )
     )
     return 0
