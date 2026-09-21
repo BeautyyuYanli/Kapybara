@@ -8,7 +8,6 @@ from .types import (
     ModelDiscoveryError,
     ModelRecord,
     ProviderRecord,
-    ResourceInUse,
     UpdateModel,
     UpdateProvider,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "ModelRecord",
     "ModelService",
     "ProviderRecord",
-    "ResourceInUse",
     "UpdateModel",
     "UpdateProvider",
 ]

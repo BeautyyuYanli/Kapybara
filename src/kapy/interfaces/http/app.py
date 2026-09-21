@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from kapy.application.agent import create_agent
 from kapy.application.resources import open_resources
 from kapy.application.sessions import create_session_service
 from kapy.control.models import ModelService
@@ -44,7 +43,6 @@ def create_app(settings: HttpSettings) -> FastAPI:
             router = create_router(
                 ModelService(resources.core_session_factory),
                 sessions,
-                agent=create_agent(),
                 realtime_output=settings.common.realtime_output,
                 output_flush_interval=settings.common.output_flush_interval,
             )

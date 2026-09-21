@@ -17,10 +17,10 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kapy.agent_runner import SessionBusy
-from kapy.application.agent import create_agent
 from kapy.application.resources import open_resources
 from kapy.application.sessions import create_session_service
 from kapy.control.models import ModelService
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .controller import COMMANDS, TelegramController
@@ -49,7 +49,6 @@ async def serve(settings: TelegramSettings) -> None:
         )
         repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
         sessions = create_session_service(resources, settings.common)
-        agent = create_agent()
         failures = 0
         while True:
             try:
@@ -74,13 +73,14 @@ async def serve(settings: TelegramSettings) -> None:
 
         async def run_runner(session_id: UUID) -> None:
             try:
+                if (await sessions.get_session(session_id)).status != LifecycleStatus.READY:
+                    return
                 await sessions.start_runner(
                     session_id,
-                    agent=agent,
                     realtime_output=settings.common.realtime_output,
                     output_flush_interval=settings.common.output_flush_interval,
                 )
-            except SessionBusy:
+            except SessionBusy, LifecycleError:
                 pass
             except Exception as error:
                 logger.error("Runner failed for session %s: %s", session_id, type(error).__name__)

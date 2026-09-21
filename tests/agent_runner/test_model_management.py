@@ -28,7 +28,6 @@ from kapy.control.models import (
     ModelAlreadyExists,
     ModelDiscoveryError,
     ModelService,
-    ResourceInUse,
     UpdateModel,
     UpdateProvider,
 )
@@ -150,10 +149,9 @@ async def test_catalog_crud_references_and_session_settings(database, sdk_http):
         await sessions.list_sessions(provider_id=uuid4(), model_name=first.model_name)
     ).items == []
     assert (await catalog.list_models(provider_id=provider.id, offset=1)).items == [unknown]
-    with pytest.raises(ResourceInUse):
-        await catalog.delete_model(provider.id, first.model_name)
-    with pytest.raises(ResourceInUse):
-        await catalog.delete_provider(provider.id)
+    await catalog.delete_model(provider.id, first.model_name)
+    await catalog.delete_provider(provider.id)
+    assert (await sessions.get_session(session.id)).provider_id == provider.id
     other = await create_provider(catalog, google=True)
     google = await catalog.create_model(
         CreateModel(provider_id=other.id, model_name="models/custom", context_window=1000)
@@ -199,10 +197,13 @@ async def test_sdk_settings_validation_and_update_semantics(database):
     ):
         with pytest.raises(ValidationError):
             UpdateSession.model_validate(data)
-    with pytest.raises(ValueError):
-        await sessions.update_session(session.id, UpdateSession(model_settings={"google_top_k": 1}))
+    await sessions.update_session(session.id, UpdateSession(model_settings={"google_top_k": 1}))
     saved = await sessions.get_session(session.id)
-    assert saved == session
+    assert saved.model_settings == {"google_top_k": 1}
+    queued = await sessions.enqueue_input(session.id, "queued", "go")
+    with pytest.raises(ValueError):
+        await sessions.start_runner(session.id, agent=Agent())
+    assert await sessions.read_inputs(session.id, "queued") == (queued,)
     changed = await catalog.update_provider(
         provider.id, UpdateProvider(api_key=SecretStr("new-secret"), base_url=None)
     )

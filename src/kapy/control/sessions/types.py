@@ -1,4 +1,4 @@
-"""Session configuration and user inputs; prompts/tools stay on the caller-owned Agent."""
+"""Session configuration, fixed plugin specs, lifecycle results and user inputs."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,8 +7,10 @@ from uuid import UUID
 
 from pydantic import Field, model_validator
 
+from kapy.agent_plugins.contracts import PluginSpec
 from kapy.agent_runner.types import UserInput
 from kapy.control.types import DTO, JsonObject, Name, UpdateDTO
+from kapy.lifecycle import LifecycleStatus
 
 type InputChannel = Literal["steer", "queued"]
 
@@ -32,6 +34,7 @@ class InputSubmission(DTO):
 
 
 class CreateSession(DTO):
+    plugins: list[PluginSpec] = Field(default_factory=list)
     provider_id: UUID
     model_name: Name
     title: str = Field(default="", max_length=256)
@@ -57,6 +60,7 @@ class UpdateSession(UpdateDTO):
 
 
 class SessionRecord(DTO):
+    status: LifecycleStatus
     id: UUID
     title: str
     provider_id: UUID

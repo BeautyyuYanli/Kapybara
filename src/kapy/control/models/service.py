@@ -9,7 +9,6 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from kapy.control.sessions.repository import SessionRepository
 from kapy.pagination import Page, validate_pagination
 
 from .models import ModelRow
@@ -32,7 +31,6 @@ from .types import (
     ModelRecord,
     ProviderConfig,
     ProviderRecord,
-    ResourceInUse,
     UpdateModel,
     UpdateProvider,
 )
@@ -68,8 +66,6 @@ class ModelService:
 
     async def delete_provider(self, provider_id: UUID) -> None:
         async with self._session_factory.begin() as db:
-            if await SessionRepository(db).uses_provider(provider_id):
-                raise ResourceInUse(f"Provider {provider_id} is used by a session")
             await ModelRepository(db).delete_provider(provider_id)
 
     async def create_model(self, data: CreateModel) -> ModelRecord:
@@ -116,8 +112,6 @@ class ModelService:
 
     async def delete_model(self, provider_id: UUID, model_name: str) -> None:
         async with self._session_factory.begin() as db:
-            if await SessionRepository(db).uses_model(provider_id, model_name):
-                raise ResourceInUse(f"Model {(provider_id, model_name)} is used by a session")
             await ModelRepository(db).delete_model(provider_id, model_name)
 
     async def discover_models(self, provider_id: UUID) -> tuple[ModelRecord, ...]:

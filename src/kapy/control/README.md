@@ -82,13 +82,17 @@ remote models. Google discovery includes only generateContent models. Unsupporte
 listing and remote failures raise ModelDiscoveryError; manual creation is still
 available. Provider/model get and update operations raise LookupError for missing
 records; delete succeeds idempotently if the resource is already absent.
-ModelAlreadyExists reports duplicate model identity, and ResourceInUse rejects
-deletion of configuration referenced by sessions. Deleting an unused provider
-deletes its local models in the same transaction, without deleting remote resources.
+ModelAlreadyExists reports duplicate model identity. Session model references are
+weak: create/update may retain unresolved identifiers, and deleting a provider
+deletes its local models without blocking on or rewriting session references.
+No remote resources are deleted.
 
 Sessions have UUID identities, title, model identity, JSON model_settings and two
-compaction columns. They have create/get/list/update APIs and no deletion API.
-Prompt, tools, dependencies and output type stay on the caller-owned Agent. DTOs
+compaction columns and a ready/closing/closed lifecycle status. create/get/list/update
+and close APIs retain records; there is no physical deletion. Fixed plugin bindings
+are supplied in CreateSession.plugins. The shared application factory creates
+Agent instructions/tools per execution; direct Agent calls remain available for
+sessions without plugins. DTOs
 reject unknown fields. Updates preserve omitted fields and replace supplied JSON
 objects as a whole; `{}` clears a preset/override. Explicit None is accepted only
 for provider base_url, model context_window and session compaction_threshold_tokens.
@@ -97,6 +101,21 @@ creation-time/identity order with offset >= 0 and limit between 1 and 200, retur
 `Page(items, has_more)`. `read_history(id, before_seq=None, limit=100)` returns the
 latest matching page in ascending seq order; before_seq is exclusive and has_more
 means older history exists. History and ordinary lists share kapy.pagination.
+
+
+Session creation validates plugin config before saving ready session/binding records
+in one transaction; it does not allocate external resources. `close_session(id)`
+records closing, requests cooperative runner cancellation, then closes bindings
+sequentially. Failure preserves progress; retry skips closed bindings. It uses no
+runner lease and does not wait for in-flight external work. Only registered cleanup
+blocks closed; late orphan resources require plugin reconciliation. See
+[Agent plugins](../agent_plugins/README.md) for StateStore and resource contracts.
+
+Input intake, runner acquisition/resumption, subsequent input consumption and new
+tools require ready. Queries/history/live, cancellation, input withdrawal and
+ordinary configuration updates remain usable in closing/closed. SDK-dependent
+model settings are validated at execution startup, leaving inputs untouched on
+failure. Plugin choices and lifecycle fields cannot be patched through UpdateSession.
 
 At startup, SessionService reads session/model/provider configuration once in a
 short transaction, then releases it before constructing SDK resources. It merges
@@ -108,8 +127,8 @@ SDK semantics; no extra runner-specific settings blacklist is applied.
 
 `SessionService(..., context_policy_factory=...)` optionally supplies a pure factory
 `(session_record, model_record, agent) -> ContextPolicy`. It runs outside the
-configuration transaction once per start call, before clients/leases are opened, and
-its policy is shared across queued and reacquired runners. Model metadata includes
+configuration transaction for each newly acquired runner lease, using its actual
+Agent. Its policy covers that execution and paging. Model metadata includes
 context_window. The default constructs summary/v1 using the resolved threshold,
 replay count and borrowed Agent/deps; custom factories need not interpret summary
 fields. HTTP and Telegram both use `application.sessions.create_session_service`.
@@ -120,7 +139,7 @@ The stored compaction_threshold_tokens must be positive or None. The default
 summary factory resolves None to 70% of model capacity at startup (rounded down,
 at least one). On session creation,
 an omitted/None threshold stays None when model capacity is known; if capacity is
-unknown, SessionService stores `256 * 1024 * 7 // 10 = 183500`. Explicit thresholds
+unknown or the model reference is unresolved, SessionService stores `256 * 1024 * 7 // 10 = 183500`. Explicit thresholds
 are preserved. Updates can clear the threshold to None without applying this
 creation default, and existing sessions are not backfilled. With the default summary
 factory, unknown capacity plus a stored None prevents startup before acquiring
@@ -140,7 +159,8 @@ does not mean the Agent is generating. It does not acquire execution or prove pr
 start_runner still atomically acquires the lease and raises SessionBusy if occupied.
 
 Input is enqueued with `enqueue_input(id, "queued", content)` for the next run, or
-`"steer"` to supplement the current run at its next input boundary. Enqueue does
+`"steer"` to supplement the current run at its next input boundary. Intake and
+consumption lock/check ready in the same transaction as their queue changes. Enqueue does
 not launch a runner. `read_inputs` returns a FIFO snapshot without consuming it and
 without requiring a business session row. `submit_input(id, SubmitInput(...))`
 commits input first, then returns InputSubmission(input, should_start_runner); this

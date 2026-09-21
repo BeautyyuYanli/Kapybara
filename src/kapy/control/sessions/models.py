@@ -1,18 +1,29 @@
 """Session configuration, FIFO inputs and a coalescing cancellation bit.
 
-Configuration does not own runner state. References are checked by services rather
-than physical FKs; input and agent rows use the same session identifier.
+Configuration does not own runner state. Model references may dangle; services use
+no physical FKs; input and agent rows use the same session identifier.
 """
 
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, BigInteger, CheckConstraint, Column, DateTime, Identity, Index, Text
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Enum,
+    Identity,
+    Index,
+    Text,
+)
 from sqlmodel import Field
 
 from kapy.control.database import ControlTable
 from kapy.control.types import utc_now
+from kapy.lifecycle import LifecycleStatus
 
 
 class SessionRow(ControlTable, table=True):
@@ -24,6 +35,16 @@ class SessionRow(ControlTable, table=True):
     )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
+    status: LifecycleStatus = Field(
+        default=LifecycleStatus.READY,
+        sa_column=Column(
+            Enum(
+                LifecycleStatus, native_enum=False, values_callable=lambda e: [v.value for v in e]
+            ),
+            nullable=False,
+            server_default="ready",
+        ),
+    )
     title: str = Field(default="", sa_type=Text)
     provider_id: UUID
     model_name: str = Field(sa_type=Text)

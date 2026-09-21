@@ -1,12 +1,38 @@
-"""One text Agent configuration for every interface process.
+"""One application Agent factory for HTTP and Telegram, fresh for each runner lease.
 
-Model/provider values are resolved by SessionService per start. Add shared tools
-and their dependencies here when introducing them; interface code must not give
-one session different execution environments merely because its input route differs.
+Only this composition layer registers builtin definitions. Interfaces never
+select different plugins for the same session. Plugin contexts enclose all SDK
+runs and compaction, and are released before the runner relinquishes ownership.
 """
 
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from typing import Any
+from uuid import UUID
+
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import AbstractCapability
+
+from kapy.agent_plugins import AgentPluginService, PluginRegistry
+from kapy.agent_plugins.capability import PluginCapabilityAdapter
+from kapy.agent_runner import RunnerExecution
 
 
-def create_agent() -> Agent[None, str]:
-    return Agent(instructions="Be concise and precise.", output_type=str)
+def create_registry() -> PluginRegistry:
+    """Register installed builtin implementations here; no examples loaded by default."""
+    return PluginRegistry()
+
+
+def create_agent(*, capabilities: Sequence[AbstractCapability[Any]] = ()) -> Agent[None, str]:
+    return Agent(instructions="Be concise and precise.", output_type=str, capabilities=capabilities)
+
+
+def create_execution_factory(plugins: AgentPluginService):
+    @asynccontextmanager
+    async def factory(session_id: UUID) -> AsyncIterator[RunnerExecution[str]]:
+        async with plugins.open_execution(session_id) as bindings:
+            names: set[str] = set()
+            capabilities = [PluginCapabilityAdapter.build(*binding, names) for binding in bindings]
+            yield RunnerExecution(create_agent(capabilities=capabilities))
+
+    return factory

@@ -18,8 +18,10 @@ from uuid import UUID
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from kapy.agent_plugins import PluginOperationError
 from kapy.control.models import ModelService
 from kapy.control.sessions import CreateSession, SessionService, SubmitInput, UpdateSession
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .models import InboxRow
@@ -33,6 +35,7 @@ COMMANDS = {
     "steer": "Steer the current run",
     "status": "Show session status",
     "cancel": "Request cancellation",
+    "close": "Close this session and release its registered resources",
     "model": "Set the session model and bot default, or show the default",
     "help": "Show commands",
 }
@@ -161,7 +164,7 @@ class TelegramController:
                 session_id = None
         if command == "model":
             return await self.resolve_model(text, session_id)
-        if command in {"status", "cancel"} and session_id is None:
+        if command in {"status", "cancel", "close"} and session_id is None:
             return {"command": "reply", "reply": "No current session. Use /new or send text."}
         create = command == "new" or session_id is None
         template = await self.session_template() if create else None
@@ -224,16 +227,21 @@ class TelegramController:
                         self.schedule_runner(session_id)
                 if command == "new":
                     action["reply"] = "New session created."
+            elif command == "close":
+                await self.sessions.close_session(session_id)
+                action["reply"] = "Session closed."
             elif command == "cancel":
                 await self.sessions.request_cancel(session_id)
                 action["reply"] = "Cancellation requested."
             elif command == "status":
+                session = await self.sessions.get_session(session_id)
                 running = await self.sessions.is_runner_running(session_id)
                 cancelled = await self.sessions.read_cancel(session_id)
                 queued = await self.sessions.read_inputs(session_id, "queued")
                 steer = await self.sessions.read_inputs(session_id, "steer")
                 action["reply"] = (
-                    f"Session: {session_id}\nLease: {'busy' if running else 'idle'}\n"
+                    f"Session: {session_id}\nStatus: {session.status}\n"
+                    f"Lease: {'busy' if running else 'idle'}\n"
                     f"Cancellation requested: {cancelled}\n"
                     f"Queued: {len(queued)}; steer: {len(steer)}"
                 )
@@ -258,6 +266,18 @@ class TelegramController:
                 handled=error.code in {400, 403},
                 next_attempt_at=time.time() + retry_delay(error),
             )
+        except PluginOperationError:
+            await self.repository.save_action(
+                item, {"command": "reply", "reply": "Plugin cleanup failed. Use /close to retry."}
+            )
+        except LifecycleError:
+            await self.repository.save_action(
+                item,
+                {
+                    "command": "reply",
+                    "reply": "Session is closing or closed. Use /new to continue.",
+                },
+            )
         except (LookupError, ValueError) as error:
             # Definite business validation failures are safe to report by category only.
             await self.repository.save_action(
@@ -272,6 +292,12 @@ class TelegramController:
     async def recover(self) -> None:
         """Schedule only known Telegram sessions with pending input and no valid lease."""
         for session_id in {row.session_id for row in await self.repository.deliveries(self.bot_id)}:
+            try:
+                session = await self.sessions.get_session(session_id)
+            except LookupError:
+                continue
+            if session.status != LifecycleStatus.READY:
+                continue
             if not await self.sessions.is_runner_running(session_id) and (
                 await self.sessions.read_inputs(session_id, "queued")
                 or await self.sessions.read_inputs(session_id, "steer")

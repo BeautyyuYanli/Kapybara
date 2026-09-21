@@ -12,6 +12,7 @@ from pathlib import Path
 
 from sqlalchemy.schema import CreateSchema
 
+from kapy.agent_plugins import models as plugin_tables  # noqa: F401
 from kapy.agent_runner.models import agent_metadata
 from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
@@ -27,6 +28,7 @@ OWNED_TABLES = frozenset(
         "providers",
         "models",
         "sessions",
+        "plugin_agent_bindings",
         "session_inputs",
         "session_cancels",
         "agent_states",

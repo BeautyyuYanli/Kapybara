@@ -104,10 +104,11 @@ async def test_withdrawn_new_input_does_not_replace_a_pending_checkpoint(
 
 @pytest.mark.parametrize("rollback", [False, True])
 async def test_delete_races_with_atomic_queue_to_history_commit(
-    database, rollback, monkeypatch, wait_for_lock
+    database, rollback, monkeypatch, wait_for_lock, seed_session
 ):
     sessions = SessionService(database.sessions)
     session_id = uuid4()
+    await seed_session(session_id)
     from kapy.control.sessions.repository import SessionRepository
 
     pid_ready = asyncio.get_running_loop().create_future()

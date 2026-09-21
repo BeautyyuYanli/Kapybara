@@ -58,20 +58,21 @@ storage identifiers; moving the Python package to `interfaces` does not change t
 | Text or /queue text | Submit queued input; create a session if unbound |
 | /steer text | Submit steer input; create a session if unbound |
 | /status | Current UUID, active lease, cancel flag and channel queue sizes |
+| /close | Close the session and registered plugin resources; repeat to retry failures |
 | /cancel | Request cancellation, without claiming the runner already stopped |
 | /model [provider UUID model name] | Show the bot default; with arguments, update the bound session and save the default |
 | /help | List these session commands |
 
 Routes are keyed by bot/chat/topic (topic 0 when absent). Only allowed chats and
 non-bot senders are handled. Media receives an unsupported notice; unknown commands
-are never forwarded to the model. Status/cancel on an unbound route do not create
+are never forwarded to the model. Status/cancel/close on an unbound route do not create
 a session. A missing session clears its route; infrastructure errors do not.
 
 The default is shared by all allowed chats for that bot. A model command changes
 only the current chat/topic's bound session and the bot default; other existing
 sessions retain their configuration. Session updates preserve history, inputs,
-model-setting overrides, title and compaction configuration. The service validates
-those overrides against the selected model; failure leaves the default unchanged.
+model-setting overrides, title and compaction configuration. SDK-dependent
+overrides are validated when execution starts; ordinary session updates keep them.
 A running runner retains its model snapshot until its next start. The command
 does not start or cancel execution, and an unbound chat does not create a session.
 
@@ -91,7 +92,7 @@ idempotent request-ID protocol. Completed submission is saved before confirmatio
 messages, so a Telegram confirmation retry does not re-submit that input.
 
 main.py owns runner tasks and absorbs SessionBusy; the controller merely requests
-scheduling after submit_input. The input loop checks known Telegram sessions at
+scheduling after submit_input. The input loop checks ready Telegram sessions at
 startup and periodically for queued/steer input without a valid lease, covering
 crashes before scheduling. No global session scan or output polling is introduced.
 
@@ -126,3 +127,9 @@ separate sessions in one topic can interleave. Reconnection drops provisional
 preview state. Cancellation unwinds the current read or send and closes the live generator. SIGINT/SIGTERM stop all input, delivery and runner tasks before closing
 Bot API, SQLite, Valkey and core PostgreSQL resources; exit does not set a user
 cancel flag. Existing legacy Telegram state is not imported.
+
+`/close` awaits sequential plugin cleanup and keeps the route/history for inspection.
+Failure preserves closing progress and replies with a retry notice. Input to a
+closing/closed session is rejected without enqueueing; `/new` creates another one.
+`/status` includes the lifecycle status. HTTP and Telegram share the application
+registry/execution factory; neither controller allocates plugin resources.

@@ -9,23 +9,27 @@ original history to live events without holding a transaction during iteration.
 
 import asyncio
 import math
-from collections.abc import AsyncGenerator, Callable, Sequence
-from contextlib import nullcontext
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from functools import partial
 from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.settings import ModelSettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kapy.agent_output import AgentOutputService
+from kapy.agent_plugins import AgentPluginService, PluginRegistry
+from kapy.agent_plugins.repository import BindingRepository, lock_session
 from kapy.agent_runner import (
     ContextPolicy,
     HistoryMessage,
     InputBatch,
     MessageCommitted,
     OutputEvent,
+    RunnerExecution,
     SessionBusy,
     TurnResult,
     UserInput,
@@ -41,6 +45,8 @@ from kapy.control.models.runtime import (
     validate_settings,
 )
 from kapy.control.models.types import ModelRecord
+from kapy.control.types import utc_now
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.session_lease import is_session_busy
 
@@ -55,6 +61,20 @@ from .types import (
     UpdateSession,
 )
 
+type SessionExecutionFactory = Callable[[UUID], AbstractAsyncContextManager[RunnerExecution[Any]]]
+
+
+class SessionReadyCapability(AbstractCapability[Any]):
+    """Check the business lifecycle before every new tool, including non-plugin tools."""
+
+    def __init__(self, service: SessionService, session_id: UUID) -> None:
+        self.service, self.session_id = service, session_id
+
+    async def before_tool_execute(self, ctx, *, call, tool_def, args):
+        await self.service.require_ready(self.session_id)
+        return args
+
+
 type ContextPolicyFactory = Callable[[SessionRecord, ModelRecord, Agent[Any, Any]], ContextPolicy]
 
 
@@ -62,8 +82,10 @@ class SessionService:
     """User-side entry point; configure the same finite heartbeat policy on every worker.
 
     The instance stores only borrowed factories/output transport and heartbeat
-    and live polling values, plus an optional pure context-policy factory. Per-start
-    model resources, frozen policy and overrides are scoped to that async call.
+    and live polling values, plus plugin/execution/context-policy factories. Model
+    configuration is fixed for each start call, which owns its model resources.
+    Each lease acquisition constructs its execution policy and scopes agent overrides
+    to that execution.
     """
 
     def __init__(
@@ -75,6 +97,8 @@ class SessionService:
         heartbeat_timeout: float = 60.0,
         live_poll_interval: float = 5.0,
         context_policy_factory: ContextPolicyFactory | None = None,
+        plugin_service: AgentPluginService | None = None,
+        execution_factory: SessionExecutionFactory | None = None,
     ) -> None:
         if not (
             math.isfinite(heartbeat_interval)
@@ -90,6 +114,8 @@ class SessionService:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
         self._context_policy_factory = context_policy_factory
+        self.plugins = plugin_service or AgentPluginService(session_factory, PluginRegistry())
+        self._execution_factory = execution_factory
 
     async def create_session(self, data: CreateSession) -> SessionRecord:
         """Save configuration without execution or SDK clients.
@@ -97,24 +123,64 @@ class SessionService:
         An omitted/None threshold stays None for a known model capacity; otherwise
         creation stores 70% of 256 Ki tokens, rounded down. Updates do not default it.
         """
+        prepared = self.plugins.prepare_bindings(data.plugins)
         async with self._session_factory.begin() as db:
-            models = ModelRepository(db)
-            model = await models.get_model(data.provider_id, data.model_name)
-            provider = await models.get_provider_config(data.provider_id)
-            _, model_cls = resolve_classes(provider)
-            settings = validate_settings(model_cls, data.model_settings)
-            validate_settings(model_cls, model.settings | settings)
+            try:
+                model = await ModelRepository(db).get_model(data.provider_id, data.model_name)
+            except LookupError:
+                model = None
             threshold = data.compaction_threshold_tokens
-            if threshold is None and model.context_window is None:
+            if threshold is None and (model is None or model.context_window is None):
                 threshold = 256 * 1024 * 7 // 10
-            return await SessionRepository(db).create_session(
-                data.model_copy(
-                    update={
-                        "model_settings": settings,
-                        "compaction_threshold_tokens": threshold,
-                    }
-                )
+            record = await SessionRepository(db).create_session(
+                data.model_copy(update={"compaction_threshold_tokens": threshold})
             )
+            self.plugins.create_bindings(db, record.id, prepared)
+        return record
+
+    async def require_ready(self, session_id: UUID, *, db: AsyncSession | None = None) -> None:
+        """Lock the session for intake/consumption; keep this check in their transaction."""
+        if db is None:
+            async with self._session_factory.begin() as owned:
+                await self.require_ready(session_id, db=owned)
+            return
+        row = await lock_session(db, session_id)
+        if row.status != LifecycleStatus.READY:
+            raise LifecycleError(f"Session {session_id} is {row.status}")
+
+    async def close_session(self, session_id: UUID) -> SessionRecord:
+        """Decide closing atomically, then sequentially clean bindings without a lease.
+
+        Stop at the first error and preserve completed progress. Concurrent calls
+        may repeat external deletes. Closed only confirms registered resources;
+        in-flight runners/late allocation are not awaited. Never physically delete.
+        """
+        async with self._session_factory.begin() as db:
+            row = await lock_session(db, session_id)
+            if row.status == LifecycleStatus.CLOSED:
+                return SessionRecord.model_validate(row)
+            repo = BindingRepository(db)
+            row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
+            for binding in await repo.list(session_id):
+                if binding.status != LifecycleStatus.CLOSED:
+                    target = await repo.get(
+                        session_id, binding.plugin_provider, binding.plugin_name
+                    )
+                    target.status, target.updated_at = LifecycleStatus.CLOSING, utc_now()
+            await SessionRepository(db).set_cancel(session_id)
+        for binding in await self.plugins.list_bindings(session_id):
+            if binding.status != LifecycleStatus.CLOSED:
+                await self.plugins.close_binding(binding)
+        async with self._session_factory.begin() as db:
+            row = await lock_session(db, session_id)
+            if row.status != LifecycleStatus.CLOSED:
+                if any(
+                    b.status != LifecycleStatus.CLOSED
+                    for b in await BindingRepository(db).list(session_id)
+                ):
+                    raise LifecycleError("Session still has unclosed plugin bindings")
+                row.status, row.updated_at = LifecycleStatus.CLOSED, utc_now()
+            return SessionRecord.model_validate(row)
 
     async def get_session(self, session_id: UUID) -> SessionRecord:
         async with self._session_factory.begin() as db:
@@ -137,17 +203,9 @@ class SessionService:
     async def update_session(self, session_id: UUID, data: UpdateSession) -> SessionRecord:
         """Replace supplied fields; model switches supply both parts of the model identity."""
         async with self._session_factory.begin() as db:
-            repo = SessionRepository(db)
-            current = await repo.get_session(session_id)
-            values = data.model_dump(exclude_unset=True)
-            updated = current.model_copy(update=values)
-            models = ModelRepository(db)
-            model = await models.get_model(updated.provider_id, updated.model_name)
-            provider = await models.get_provider_config(updated.provider_id)
-            _, model_cls = resolve_classes(provider)
-            settings = validate_settings(model_cls, updated.model_settings)
-            validate_settings(model_cls, model.settings | settings)
-            return await repo.update_session(session_id, values | {"model_settings": settings})
+            return await SessionRepository(db).update_session(
+                session_id, data.model_dump(exclude_unset=True)
+            )
 
     async def is_runner_running(self, session_id: UUID) -> bool:
         """Observe lease occupancy with this service's timeout, not Agent generation.
@@ -163,7 +221,7 @@ class SessionService:
     ) -> SessionInput:
         async with self._session_factory.begin() as db:
             repo = SessionRepository(db)
-            await repo.get_session(session_id)
+            await self.require_ready(session_id, db=db)
             item = await repo.enqueue_input(session_id, channel, content)
         return item
 
@@ -216,6 +274,7 @@ class SessionService:
         ids: Sequence[int],
     ) -> tuple[SessionInput, ...]:
         """Return actual consumption in the borrowed checkpoint transaction; never commit."""
+        await self.require_ready(session_id, db=db)
         return await SessionRepository(db).consume_inputs(session_id, channel, ids=ids)
 
     async def consume_cancel(self, session_id: UUID, *, db: AsyncSession) -> bool:
@@ -226,7 +285,7 @@ class SessionService:
         self,
         session_id: UUID,
         *,
-        agent: Agent[DepsT, OutputT],
+        agent: Agent[DepsT, OutputT] | None = None,
         deps: DepsT = None,
         realtime_output: bool = False,
         output_flush_interval: float = 0.5,
@@ -238,10 +297,13 @@ class SessionService:
         The flush interval is finite and nonnegative; zero schedules background
         publication immediately.
         Session/model/provider configuration is read once and remains fixed across
-        queued runs and page actions. The Agent keeps its prompts/tools/output type;
+        queued runs and page actions. Each lease enters the configured execution factory;
+        direct Agents are supported for sessions without plugins. The Agent keeps its
+        prompts/tools/output type;
         a task-local override supplies the stored model and merged request settings.
-        Configuration errors precede output publication, lease acquisition and input
-        consumption. Provider and Model contexts outlive the complete runner loop.
+        Model/settings and default threshold errors precede output publication and
+        lease acquisition; plugin/policy assembly failures still precede input consumption.
+        Provider and Model contexts outlive the complete runner loop.
         After lease release, pending inputs trigger reacquisition with the same
         configuration. Across the entire call, output retains the last non-None
         output, while finished comes from the last normally returned result. Later
@@ -257,22 +319,20 @@ class SessionService:
             repo = ModelRepository(db)
             model = await repo.get_model(session.provider_id, session.model_name)
             config = await repo.get_provider_config(session.provider_id)
-        policy = (
-            self._context_policy_factory(session, model, agent)
-            if self._context_policy_factory is not None
-            else summary_context_policy(
-                agent,
-                deps=deps,
-                threshold_tokens=resolve_compaction_threshold(
-                    session.compaction_threshold_tokens, model.context_window
-                ),
-                replay_turns=session.compaction_replay_turns,
-            )
+        if agent is None and self._execution_factory is None:
+            raise ValueError("Provide an Agent or configure an execution factory")
+        if agent is not None and await self.plugins.list_bindings(session_id):
+            raise ValueError("Plugin sessions require the application execution factory")
+        threshold = (
+            resolve_compaction_threshold(session.compaction_threshold_tokens, model.context_window)
+            if self._context_policy_factory is None
+            else None
         )
         provider_cls, model_cls = resolve_classes(config)
         settings = validate_settings(model_cls, model.settings | session.model_settings)
 
         async def read_batch(channel: InputChannel) -> InputBatch | None:
+            await self.require_ready(session_id)
             rows = await self.read_inputs(session_id, channel)
             if not rows:
                 return None
@@ -285,6 +345,7 @@ class SessionService:
             return InputBatch(tuple(row.content for row in rows), consume)
 
         async def consume_cancel(db: AsyncSession) -> bool:
+            await self.require_ready(session_id, db=db)
             return await self.consume_cancel(session_id, db=db)
 
         publisher = (
@@ -301,40 +362,70 @@ class SessionService:
                 profile={"context_window": model.context_window},
             ) as sdk_model,
         ):
-            with agent.override(model=sdk_model, model_settings=cast(ModelSettings, settings)):
-                async with publisher as on_output:
-                    result: TurnResult[OutputT] | None = None
-                    while True:
-                        try:
-                            current = await run_agent_session(
-                                session_id,
-                                agent=agent,
-                                session_factory=self._session_factory,
-                                deps=deps,
-                                read_steer=partial(read_batch, "steer"),
-                                read_queued=partial(read_batch, "queued"),
-                                consume_cancel=consume_cancel,
-                                heartbeat_interval=self._heartbeat_interval,
-                                heartbeat_timeout=self._heartbeat_timeout,
-                                context_policy=policy,
-                                on_output=on_output,
-                            )
-                        except SessionBusy:
-                            if result is None:
-                                raise
-                            return result
-                        result = TurnResult(
-                            current.finished,
-                            current.output
-                            if current.output is not None
-                            else (result.output if result is not None else None),
+
+            @asynccontextmanager
+            async def execution_factory() -> AsyncIterator[RunnerExecution[Any]]:
+                await self.require_ready(session_id)
+                if agent is None:
+                    assert self._execution_factory is not None
+                    source = self._execution_factory(session_id)
+                else:
+                    source = nullcontext(RunnerExecution(agent, deps))
+                async with source as execution:
+                    actual = execution.agent
+                    policy = (
+                        self._context_policy_factory(session, model, actual)
+                        if self._context_policy_factory is not None
+                        else summary_context_policy(
+                            actual,
+                            deps=execution.deps,
+                            threshold_tokens=cast(int, threshold),
+                            replay_turns=session.compaction_replay_turns,
                         )
-                        # run_agent_session returns only after its lease release commits.
-                        if not (
-                            await self.read_inputs(session_id, "queued")
-                            or await self.read_inputs(session_id, "steer")
-                        ):
-                            return result
+                    )
+                    with actual.override(
+                        model=sdk_model, model_settings=cast(ModelSettings, settings)
+                    ):
+                        await self.require_ready(session_id)
+                        yield RunnerExecution(
+                            actual,
+                            execution.deps,
+                            policy,
+                            [*execution.capabilities, SessionReadyCapability(self, session_id)],
+                        )
+
+            async with publisher as on_output:
+                result: TurnResult[OutputT] | None = None
+                while True:
+                    try:
+                        current = await run_agent_session(
+                            session_id,
+                            execution_factory=execution_factory,
+                            session_factory=self._session_factory,
+                            read_steer=partial(read_batch, "steer"),
+                            read_queued=partial(read_batch, "queued"),
+                            consume_cancel=consume_cancel,
+                            heartbeat_interval=self._heartbeat_interval,
+                            heartbeat_timeout=self._heartbeat_timeout,
+                            on_output=on_output,
+                        )
+                    except SessionBusy:
+                        if result is None:
+                            raise
+                        return result
+                    result = TurnResult(
+                        current.finished,
+                        current.output
+                        if current.output is not None
+                        else (result.output if result is not None else None),
+                    )
+                    # Reacquisition creates a fresh execution after lease release.
+                    await self.require_ready(session_id)
+                    if not (
+                        await self.read_inputs(session_id, "queued")
+                        or await self.read_inputs(session_id, "steer")
+                    ):
+                        return result
 
     async def live(
         self, session_id: UUID, *, after_seq: int = -1

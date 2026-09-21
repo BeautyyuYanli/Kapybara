@@ -149,7 +149,8 @@ async def test_http_history_pages_and_canonical_model_paths(database, seed_histo
         assert "test-key" not in str(providers)
         assert (await client.delete(model_path)).status_code == 204
         assert (await client.get(model_path)).status_code == 404
-        assert (await client.delete(f"/api/providers/{existing.provider_id}")).status_code == 409
+        assert (await client.delete(f"/api/providers/{existing.provider_id}")).status_code == 204
+        assert (await client.get(f"/api/sessions/{session_id}")).status_code == 200
         page = (await client.get("/api/sessions?limit=1")).json()
         assert page["items"][0]["id"] == str(session_id) and not page["has_more"]
         missing = uuid4()

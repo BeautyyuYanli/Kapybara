@@ -1,9 +1,10 @@
 # HTTP interface
 
-`create_router(models, sessions, *, agent, deps=None, realtime_output=True,
+`create_router(models, sessions, *, agent=None, deps=None, realtime_output=True,
 output_flush_interval=0.5)` returns an APIRouter under `/api`. The separate
 `create_model_router` and `create_session_router` omit the prefix, for custom mounts.
-All constructors borrow their services, configured Agent and dependencies.
+Constructors borrow services and optional direct Agent/deps. The standalone app
+uses the common application execution factory; plugin sessions use that factory.
 
 `kapy interface http serve` runs the standalone application. HTTP and WebSocket
 routes are directly accessible without login or an access token.
@@ -45,6 +46,7 @@ Session routes are:
 | GET /sessions | list_sessions | Page[SessionRecord] |
 | GET /sessions/{id} | get_session | SessionRecord |
 | PATCH /sessions/{id} | update_session | SessionRecord |
+| POST /sessions/{id}/close | close_session | SessionRecord |
 | POST /sessions/{id}/inputs | submit_input_and_schedule | 202 SessionInput |
 | GET /sessions/{id}/inputs | read_inputs | FIFO SessionInput[]; channel defaults queued |
 | DELETE /sessions/{id}/inputs/{input_id} | delete_input | bool; positive input_id |
@@ -61,8 +63,9 @@ submit_input observed an idle lease. These are separate committed transactions;
 a later failure does not undo the session or input. The inputs endpoint performs
 the same submission/scheduling step. HTTP responds without awaiting runner work;
 BackgroundTasks are in-process and non-durable, not a job queue. Concurrent startup
-intents are resolved by the existing lease. SessionBusy is absorbed in the background;
-other failures are logged by session ID and exception class, and cancellation propagates.
+intents are resolved by the existing lease. SessionBusy and LifecycleError are absorbed
+in the background; other failures are logged by session ID and exception class,
+and cancellation propagates.
 No independent run endpoint is exposed. Submission is not HTTP-retry-idempotent.
 
 List providers/models/sessions with offset=0 and limit=100. Page contains only
@@ -89,7 +92,8 @@ input/history association or execution outcome state is exposed; a valid lease
 neither proves model health nor identifies the preceding run's success.
 
 Router-local error handling returns FastAPI detail objects: 422 validation,
-404 LookupError, 409 identity/reference conflict, 502 model discovery, otherwise
+404 LookupError, 409 identity/lifecycle conflict, 503 plugin close failure (retry
+the same close call), 502 model discovery, otherwise
 500. Validation details keep only loc/msg/type; upstream exception text, raw
 request data and credentials are not returned. HTTP operation IDs match endpoint
 names. The controller owns protocol adaptation and background scheduling; services
@@ -98,3 +102,9 @@ own DTOs, parameter constraints, queue consumption, replay and execution handoff
 Mount the SPA beside the API with `app.include_router(create_frontend_router(dist_dir))`.
 The host supplies the explicit Vite build directory and shares its existing resource
 lifespan. Missing index.html fails setup. See the root frontend/README.md.
+
+CreateSession accepts fixed `plugins` (provider/name/config); SessionRecord returns
+`status`. Close transitions ready -> closing -> closed and retains records. Intake
+and background runner scheduling require ready; read/history/live and ordinary
+configuration changes remain available after close. Model references may dangle;
+SDK settings/model availability are checked before execution consumes input.

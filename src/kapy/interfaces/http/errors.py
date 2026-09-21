@@ -9,11 +9,12 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
+from kapy.agent_plugins import PluginOperationError
 from kapy.control.models.types import (
     ModelAlreadyExists,
     ModelDiscoveryError,
-    ResourceInUse,
 )
+from kapy.lifecycle import LifecycleError
 
 
 class ControlRoute(APIRoute):
@@ -32,7 +33,16 @@ class ControlRoute(APIRoute):
                     {key: item[key] for key in ("loc", "msg", "type")} for item in error.errors()
                 ]
                 return JSONResponse(status_code=422, content={"detail": detail})
-            except ModelAlreadyExists, ResourceInUse:
+            except LifecycleError:
+                return JSONResponse(
+                    status_code=409, content={"detail": "Session lifecycle conflict"}
+                )
+            except PluginOperationError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Plugin operation failed; session close can be retried"},
+                )
+            except ModelAlreadyExists:
                 return JSONResponse(status_code=409, content={"detail": "Resource conflict"})
             except LookupError:
                 return JSONResponse(status_code=404, content={"detail": "Resource not found"})

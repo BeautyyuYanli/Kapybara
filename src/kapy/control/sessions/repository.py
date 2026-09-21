@@ -31,7 +31,7 @@ class SessionRepository:
         return row
 
     async def create_session(self, data: CreateSession) -> SessionRecord:
-        row = SessionRow(**data.model_dump())
+        row = SessionRow(**data.model_dump(exclude={"plugins"}))
         self._db.add(row)
         await self._db.flush()
         return SessionRecord.model_validate(row)
@@ -62,23 +62,6 @@ class SessionRepository:
         row.sqlmodel_update(values | {"updated_at": utc_now()})
         await self._db.flush()
         return SessionRecord.model_validate(row)
-
-    async def uses_model(self, provider_id: UUID, model_name: str) -> bool:
-        statement = select(
-            select(SessionRow.id)
-            .where(
-                col(SessionRow.provider_id) == provider_id,
-                col(SessionRow.model_name) == model_name,
-            )
-            .exists()
-        )
-        return (await self._db.execute(statement)).scalar_one()
-
-    async def uses_provider(self, provider_id: UUID) -> bool:
-        statement = select(
-            select(SessionRow.id).where(col(SessionRow.provider_id) == provider_id).exists()
-        )
-        return (await self._db.execute(statement)).scalar_one()
 
     async def enqueue_input(
         self, session_id: UUID, channel: InputChannel, content: UserInput

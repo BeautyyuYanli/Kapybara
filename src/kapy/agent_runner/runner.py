@@ -8,13 +8,15 @@ SessionLease owns renewal through native graph cleanup.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, nullcontext
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import UserContent
 from pydantic_ai.run import AgentRun
 from pydantic_graph import End
@@ -39,6 +41,23 @@ from .types import (
 )
 
 
+@dataclass(frozen=True)
+class RunnerExecution[OutputT]:
+    """Application-produced execution, entered inside the runner's lease.
+
+    Factories own their local resources. Graph cleanup precedes factory exit and
+    lease release. The lower runner knows neither business sessions nor plugins.
+    """
+
+    agent: Agent[Any, OutputT]
+    deps: Any = None
+    context_policy: ContextPolicy | None = None
+    capabilities: Sequence[AbstractCapability[Any]] = ()
+
+
+type ExecutionFactory[OutputT] = Callable[[], AbstractAsyncContextManager[RunnerExecution[OutputT]]]
+
+
 class AgentRunner[OutputT]:
     """One task's lease and native graph; obtain it using open_runner.
 
@@ -57,9 +76,11 @@ class AgentRunner[OutputT]:
         deps: Any,
         session_factory: async_sessionmaker[AsyncSession],
         context_policy: ContextPolicy | None,
+        capabilities: Sequence[AbstractCapability[Any]] = (),
     ) -> None:
         self._session_id = session_id
         self._agent, self._deps = agent, deps
+        self._capabilities = capabilities
         self._output = OutputCapability(session_id)
         self._execution = ExecutionState(
             session_id,
@@ -197,7 +218,7 @@ class AgentRunner[OutputT]:
             message_history=deepcopy(self._execution.require_context()),
             conversation_id=str(self._session_id),
             deps=self._deps,
-            capabilities=[capability, self._output],
+            capabilities=[capability, self._output, *self._capabilities],
         )
         native = await context.__aenter__()
         self._native_context, self._native, self._capability = context, native, capability
@@ -297,7 +318,8 @@ class AgentRunner[OutputT]:
 async def open_runner[DepsT, OutputT](
     session_id: UUID,
     *,
-    agent: Agent[DepsT, OutputT],
+    agent: Agent[DepsT, OutputT] | None = None,
+    execution_factory: ExecutionFactory[OutputT] | None = None,
     session_factory: async_sessionmaker[AsyncSession],
     deps: DepsT = None,
     context_policy: ContextPolicy | None = None,
@@ -323,42 +345,55 @@ async def open_runner[DepsT, OutputT](
     external work or retrying. The handle is unusable after execution failure;
     recovery requires a new open_runner context.
     """
+    if (agent is None) == (execution_factory is None):
+        raise ValueError("Provide exactly one of agent or execution_factory")
+    if execution_factory is not None and (deps is not None or context_policy is not None):
+        raise ValueError("Execution factory owns deps and context policy")
     async with open_session_lease(
         session_id,
         session_factory=session_factory,
         heartbeat_interval=heartbeat_interval,
         heartbeat_timeout=heartbeat_timeout,
     ) as lease:
-        async with session_factory.begin() as db:
-            await lease.lock_owned(db)
-            state = await AgentRepository(db).resume(session_id)
-        runner = AgentRunner(
-            session_id,
-            lease,
-            state,
-            agent=agent,
-            deps=deps,
-            session_factory=session_factory,
-            context_policy=context_policy,
-        )
-        try:
-            yield runner
-            runner._ensure_usable()
-        except BaseException as error:
-            runner._remember_error(error)
-            raise
-        finally:
+        if execution_factory is not None:
+            context = execution_factory()
+        else:
+            assert agent is not None
+            context = nullcontext(RunnerExecution(agent, deps, context_policy))
+        async with context as execution:
+            lease.check()
+            async with session_factory.begin() as db:
+                await lease.lock_owned(db)
+                state = await AgentRepository(db).resume(session_id)
+            runner = AgentRunner(
+                session_id,
+                lease,
+                state,
+                agent=execution.agent,
+                deps=execution.deps,
+                session_factory=session_factory,
+                context_policy=execution.context_policy,
+                capabilities=execution.capabilities,
+            )
             try:
-                await runner._close()
+                yield runner
+                runner._ensure_usable()
             except BaseException as error:
                 runner._remember_error(error)
                 raise
+            finally:
+                try:
+                    await runner._close()
+                except BaseException as error:
+                    runner._remember_error(error)
+                    raise
 
 
 async def start_runner[DepsT, OutputT](
     session_id: UUID,
     *,
-    agent: Agent[DepsT, OutputT],
+    agent: Agent[DepsT, OutputT] | None = None,
+    execution_factory: ExecutionFactory[OutputT] | None = None,
     session_factory: async_sessionmaker[AsyncSession],
     read_steer: ReadInputs,
     read_queued: ReadInputs,
@@ -377,6 +412,7 @@ async def start_runner[DepsT, OutputT](
     async with open_runner(
         session_id,
         agent=agent,
+        execution_factory=execution_factory,
         session_factory=session_factory,
         deps=deps,
         context_policy=context_policy,

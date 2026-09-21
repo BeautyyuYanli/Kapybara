@@ -11,6 +11,14 @@ graph cleanup. Checkpoint/history and queue consumption first call
 `lease.lock_owned(db)` in the same transaction; all cooperating writers take the
 lease row before business rows. Bypassing that protocol is not automatically fenced.
 
+`open_runner` and `start_runner` accept either direct `agent`/`deps` or an
+`execution_factory`, exclusively. The factory is an async context manager yielding
+`RunnerExecution(agent, deps, context_policy, capabilities)` inside the acquired
+lease. It receives no lease handle. SDK graph cleanup precedes factory exit, which
+precedes lease release. It is recreated on reacquisition; the core still needs no
+business session record and does not import plugin implementations. Application
+factories compose [Agent plugins](../agent_plugins/README.md) with a fresh Agent.
+
 The application owns the configured Agent, deps, PostgreSQL engine and async
 session factory. `kapy db upgrade` migrates `agent_metadata`, `lease_metadata` and the control tables;
 the services never create tables or close shared clients. Isolated tests can
@@ -177,8 +185,9 @@ raw suffix. Replay reads are restricted to the replaceable prefix. N is nonnegat
 zero omits replay, never required continuation. Virtual messages are not persisted
 or accepted as user inputs. Done without new real input remains done.
 
-SessionService constructs one policy outside its configuration transaction and freezes
-it across queued/reacquired runners. Default summary settings still come from the
+SessionService constructs a policy for each acquired execution outside its configuration
+transaction, using the actual Agent. Configuration stays fixed across queued/reacquired
+runners; each factory owns its policy and plugin contexts. Default summary settings come from the
 session's compaction_threshold_tokens and compaction_replay_turns. A stored None
 threshold resolves to 70% of model capacity or rejects startup if capacity is unknown.
 Creation with unknown capacity and no threshold stores 183500; updates do not default

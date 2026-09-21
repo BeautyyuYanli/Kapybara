@@ -16,6 +16,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from kapy.agent_plugins import PluginOperationError
 from kapy.agent_runner import HistoryMessage, MessageCommitted, TextDelta
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
@@ -34,6 +35,7 @@ from kapy.interfaces.telegram.repository import TelegramRepository, delivery_key
 from kapy.interfaces.telegram.schema import migrate
 from kapy.interfaces.telegram.settings import StorageSettings, TelegramSettings
 from kapy.interfaces.telegram.storage import open_storage
+from kapy.lifecycle import LifecycleStatus
 
 
 @pytest_asyncio.fixture
@@ -69,6 +71,7 @@ def update(update_id, text="hello", *, chat=123, thread=0, **message):
 def controller(repository, tmp_path):
     sessions = AsyncMock(spec=SessionService)
     sessions.create_session.return_value = SimpleNamespace(id=uuid4())
+    sessions.get_session.return_value = SimpleNamespace(status=LifecycleStatus.READY)
     sessions.submit_input.return_value = InputSubmission(
         input=SessionInput(1, "hello"),
         should_start_runner=True,
@@ -333,19 +336,26 @@ async def test_stale_binding_is_cleared_without_recreating_session(repository, t
 @pytest.mark.asyncio
 async def test_recovery_schedules_only_idle_sessions_with_pending_input(repository, tmp_path):
     app, sessions, _, scheduled = controller(repository, tmp_path)
-    queued, steer, active, empty = (uuid4() for _ in range(4))
+    queued, steer, active, empty, closing, closed = (uuid4() for _ in range(6))
     sessions.create_session.side_effect = [
-        SimpleNamespace(id=session_id) for session_id in (queued, steer, active, empty)
+        SimpleNamespace(id=session_id)
+        for session_id in (queued, steer, active, empty, closing, closed)
     ]
-    await repository.ingest(42, [update(index, "/new") for index in range(1, 5)])
-    for _ in range(4):
+    await repository.ingest(42, [update(index, "/new") for index in range(1, 7)])
+    for _ in range(6):
         await app.process_once()
     channels = {
         queued: {"queued": (SessionInput(1, "queued input"),), "steer": ()},
         steer: {"queued": (), "steer": (SessionInput(2, "steer input"),)},
         active: {"queued": (SessionInput(3, "busy input"),), "steer": ()},
         empty: {"queued": (), "steer": ()},
+        closing: {"queued": (SessionInput(4, "closing input"),), "steer": ()},
+        closed: {"queued": (), "steer": (SessionInput(5, "closed steer"),)},
     }
+    statuses = {closing: LifecycleStatus.CLOSING, closed: LifecycleStatus.CLOSED}
+    sessions.get_session.side_effect = lambda session_id: SimpleNamespace(
+        status=statuses.get(session_id, LifecycleStatus.READY)
+    )
     sessions.is_runner_running.side_effect = lambda session_id: session_id == active
     sessions.read_inputs.side_effect = lambda session_id, channel: channels[session_id][channel]
     await app.recover()
@@ -782,3 +792,33 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
     assert sorted(
         (call.args[0], call.args[2]) for call in calls if call.kwargs.get("draft_id") is None
     ) == [(-123, "group final"), (123, "private final")]
+
+
+@pytest.mark.asyncio
+async def test_close_reports_cleanup_failure_then_user_retry_succeeds(repository, tmp_path):
+    app, sessions, client, scheduled = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/new")])
+    assert await app.process_once()
+    session_id = await repository.route(42, 123, 0)
+    assert session_id is not None
+    attempts = []
+
+    async def close(target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise PluginOperationError("p", "resource", "close session")
+
+    sessions.close_session.side_effect = close
+    client.send.reset_mock()
+    await repository.ingest(42, [update(2, "/close")])
+    assert await app.process_once()
+    assert await app.process_once()
+    assert client.send.await_args.args[-1] == "Plugin cleanup failed. Use /close to retry."
+    assert await repository.next_inbox(42) is None
+    await repository.ingest(42, [update(3, "/close")])
+    assert await app.process_once()
+    assert client.send.await_args.args[-1] == "Session closed."
+    assert attempts == [session_id, session_id]
+    assert await repository.route(42, 123, 0) == session_id
+    sessions.create_session.assert_awaited_once()
+    assert not scheduled

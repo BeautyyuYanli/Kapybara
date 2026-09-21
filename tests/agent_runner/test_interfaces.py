@@ -506,6 +506,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
                 "steer",
                 "status",
                 "cancel",
+                "close",
                 "model",
                 "help",
             }

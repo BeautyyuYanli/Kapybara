@@ -8,7 +8,7 @@ from .context import (
     full_history_policy,
 )
 from .context_summary import summary_context_policy
-from .runner import AgentRunner, open_runner, start_runner
+from .runner import AgentRunner, ExecutionFactory, RunnerExecution, open_runner, start_runner
 from .types import (
     ConsumeCancel,
     ConsumeInputs,
@@ -30,6 +30,8 @@ from .types import (
 
 __all__ = [
     "AgentRunner",
+    "ExecutionFactory",
+    "RunnerExecution",
     "ContextPage",
     "ContextPolicy",
     "ContextAssemblyContext",

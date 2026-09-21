@@ -103,9 +103,5 @@ class ModelAlreadyExists(ValueError):
     pass
 
 
-class ResourceInUse(ValueError):
-    pass
-
-
 class ModelDiscoveryError(RuntimeError):
     pass

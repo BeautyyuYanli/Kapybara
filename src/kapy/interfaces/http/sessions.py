@@ -25,6 +25,7 @@ from kapy.control.sessions import (
     SubmitInput,
     UpdateSession,
 )
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import Page
 
 from .dependencies import HistoryPage, LiveCursor, OffsetPage
@@ -38,7 +39,7 @@ _output_adapter = TypeAdapter(list[OutputEvent])
 def create_session_router[DepsT, OutputT](
     sessions: SessionService,
     *,
-    agent: Agent[DepsT, OutputT],
+    agent: Agent[DepsT, OutputT] | None = None,
     deps: DepsT = None,
     realtime_output: bool = True,
     output_flush_interval: float = 0.5,
@@ -47,6 +48,8 @@ def create_session_router[DepsT, OutputT](
 
     async def _run_runner(session_id: UUID) -> None:
         try:
+            if (await sessions.get_session(session_id)).status != LifecycleStatus.READY:
+                return
             await sessions.start_runner(
                 session_id,
                 agent=agent,
@@ -54,7 +57,7 @@ def create_session_router[DepsT, OutputT](
                 realtime_output=realtime_output,
                 output_flush_interval=output_flush_interval,
             )
-        except SessionBusy:
+        except SessionBusy, LifecycleError:
             return
         except Exception as error:
             _logger.error("Runner failed for session %s: %s", session_id, type(error).__name__)
@@ -90,6 +93,10 @@ def create_session_router[DepsT, OutputT](
     @router.patch("/sessions/{session_id}", operation_id="update_session")
     async def update_session(session_id: UUID, data: UpdateSession) -> SessionRecord:
         return await sessions.update_session(session_id, data)
+
+    @router.post("/sessions/{session_id}/close", operation_id="close_session")
+    async def close_session(session_id: UUID) -> SessionRecord:
+        return await sessions.close_session(session_id)
 
     @router.post(
         "/sessions/{session_id}/inputs", status_code=202, operation_id="submit_input_and_schedule"

@@ -23,7 +23,7 @@ def create_router[DepsT, OutputT](
     models: ModelService,
     sessions: SessionService,
     *,
-    agent: Agent[DepsT, OutputT],
+    agent: Agent[DepsT, OutputT] | None = None,
     deps: DepsT = None,
     realtime_output: bool = True,
     output_flush_interval: float = 0.5,
