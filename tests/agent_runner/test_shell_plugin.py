@@ -30,6 +30,7 @@ from kapy.agent_plugins.contracts import SessionContext, VersionedState
 from kapy.application.agent import create_execution_factory, create_registry
 from kapy.control.sessions import CreateSession, SessionService
 from kapy.lifecycle import LifecycleError, LifecycleStatus
+from kapy.session_lease import open_session_lease
 
 
 class MemoryStore:
@@ -554,7 +555,10 @@ async def test_real_shellctl_postgres_and_application_capability(
     record = (await plugins.list_bindings(session.id))[0]
     assert job_id in ShellPluginState.model_validate(record.state).jobs
     # A fresh plugin/context reuses the persisted cursor and the real PTY.
-    async with plugins.open_execution(session.id) as bindings:
+    async with (
+        open_session_lease(session.id, session_factory=database.sessions) as lease,
+        plugins.open_execution(session.id, lease=lease) as bindings,
+    ):
         binding = bindings[0][2]
         tools = {tool.name: tool.function for tool in binding.tools}
         assert "echo:resume" in await tools["input"](job_id, "resume\n", timeout=2)

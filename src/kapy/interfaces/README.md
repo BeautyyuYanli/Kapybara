@@ -32,6 +32,7 @@ Common environment values (read only during command execution):
 | KAPY_VALKEY_NAMESPACE | kapy_tmpv2 (channel prefix adds :agent-output) |
 | KAPY_LOG_LEVEL | INFO |
 | KAPY_HEARTBEAT_INTERVAL / KAPY_HEARTBEAT_TIMEOUT | 10 / 60 seconds |
+| KAPY_TAKEOVER_GRACE_PERIOD | 30 seconds, after expired-token takeover |
 | KAPY_REALTIME_OUTPUT | true |
 | KAPY_OUTPUT_FLUSH_INTERVAL | 0.5 seconds |
 

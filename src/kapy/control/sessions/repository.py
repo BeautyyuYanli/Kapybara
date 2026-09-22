@@ -20,6 +20,17 @@ from .types import CreateSession, InputChannel, SessionInput, SessionRecord
 _input_adapter = TypeAdapter(UserInput)
 
 
+async def lock_session(db: AsyncSession, session_id: UUID) -> SessionRow:
+    row = (
+        await db.execute(
+            select(SessionRow).where(col(SessionRow.id) == session_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise LookupError(f"Session {session_id} does not exist")
+    return row
+
+
 class SessionRepository:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db

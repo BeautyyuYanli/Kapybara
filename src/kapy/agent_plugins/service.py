@@ -1,8 +1,8 @@
-"""Generic builtin plugin service; no resource-specific semantics or runner leases.
+"""Plugin host borrowing the admitted operation's lease for all runtime transactions.
 
-Every operation owns its short DB transactions. Contexts are revoked on exit;
-closing immediately prevents execution-scope state access. External resource I/O
-is never atomic with registration, so plugins must support orphan reconciliation.
+Callers own lifecycle admission, the lease, and plugin child-task lifetimes. Stores
+are revoked on exit. Fencing protects state, not external I/O or resource creation;
+plugins still own registration compensation and orphan reconciliation.
 """
 
 from collections.abc import AsyncIterator, Sequence
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kapy.control.types import utc_now
 from kapy.lifecycle import LifecycleError, LifecycleStatus
+from kapy.session_lease import SessionLease
 
 from .contracts import (
     BindingRecord,
@@ -24,21 +25,20 @@ from .contracts import (
     PluginOperationError,
     PluginSpec,
     SessionContext,
-    StateConflict,
     VersionedState,
 )
 from .models import PluginBindingRow
 from .registry import PluginDefinition, PluginRegistry, encode_model, json_copy, validate_model
-from .repository import BindingRepository, Operation
+from .repository import BindingRepository
 
 _read_only = ContextVar("plugin_state_read_only", default=False)
 
 
 class ScopedStateStore:
-    """Host-fixed identity/schema/purpose; each read or replace owns one transaction.
+    """Host-fixed identity/schema and borrowed lease, revoked after plugin cleanup.
 
-    State validators run outside transactions. No automatic writeback, nested
-    transaction, lease borrowing or retry of user state mutations occurs here.
+    Each read/write fences its own short transaction. Validation runs outside it;
+    state mutations are never automatically retried or implicitly saved.
     """
 
     def __init__(
@@ -46,43 +46,30 @@ class ScopedStateStore:
         service: AgentPluginService,
         session_id: UUID,
         definition: PluginDefinition,
-        operation: Operation,
+        lease: SessionLease,
     ) -> None:
-        self.service, self.session_id, self.definition, self.operation = (
+        self.service, self.session_id, self.definition, self.lease = (
             service,
             session_id,
             definition,
-            operation,
+            lease,
         )
         self.active = True
 
     def check_active(self) -> None:
         if not self.active:
             raise LifecycleError("Plugin context has expired")
-
-    async def _row(self, db: AsyncSession) -> PluginBindingRow:
-        self.check_active()
-        row = await BindingRepository(db).allowed(
-            self.session_id,
-            self.definition.plugin_provider,
-            self.definition.plugin_name,
-            self.operation,
-        )
-        self.check_active()
-        if row.data_version != self.definition.data_version:
-            raise LifecycleError("Plugin data format changed; reopen the context")
-        return row
-
-    async def check(self) -> None:
-        async with self.service.session_factory.begin() as db:
-            await self._row(db)
+        self.lease.check()
 
     async def read(self) -> VersionedState[BaseModel]:
+        self.check_active()
         async with self.service.session_factory.begin() as db:
-            row = await self._row(db)
+            await self.lease.lock_owned(db)
+            row = await BindingRepository(db).get(
+                self.session_id, self.definition.plugin_provider, self.definition.plugin_name
+            )
             revision, value = row.revision, json_copy(row.state)
         parsed = None if value is None else validate_model(self.definition.state_type, value)[0]
-        self.check_active()
         return VersionedState(revision, parsed)
 
     async def replace(
@@ -97,7 +84,10 @@ class ScopedStateStore:
             raise ValueError("State must use the registered state type")
         parsed, raw = validate_model(self.definition.state_type, encode_model(value))
         async with self.service.session_factory.begin() as db:
-            row = await self._row(db)
+            await self.lease.lock_owned(db)
+            row = await BindingRepository(db).get(
+                self.session_id, self.definition.plugin_provider, self.definition.plugin_name
+            )
             saved = await BindingRepository(db).replace(
                 row,
                 version=self.definition.data_version,
@@ -156,55 +146,52 @@ class AgentPluginService:
             return await BindingRepository(db).list(session_id)
 
     async def _context(
-        self, session_id: UUID, definition: PluginDefinition, operation: Operation
+        self, original: BindingRecord, definition: PluginDefinition, lease: SessionLease
     ) -> tuple[SessionContext[Any, Any], ScopedStateStore]:
-        while True:
+        config, data = definition.load(
+            original.data_version, PluginData(original.config, original.state)
+        )
+        if original.data_version != definition.data_version:
             async with self.session_factory.begin() as db:
-                row = await BindingRepository(db).allowed(
-                    session_id, definition.plugin_provider, definition.plugin_name, operation
+                await lease.lock_owned(db)
+                repo = BindingRepository(db)
+                row = await repo.get(
+                    original.session_id, definition.plugin_provider, definition.plugin_name
                 )
-                original = BindingRecord.model_validate(row)
-            config, data = definition.load(
-                original.data_version, PluginData(original.config, original.state)
-            )
-            if original.data_version == definition.data_version:
-                break
-            try:
-                async with self.session_factory.begin() as db:
-                    repo = BindingRepository(db)
-                    row = await repo.allowed(
-                        session_id, definition.plugin_provider, definition.plugin_name, operation
-                    )
-                    await repo.replace(
-                        row,
-                        version=original.data_version,
-                        revision=original.revision,
-                        data=data,
-                        target=definition.data_version,
-                    )
-                break
-            except StateConflict:
-                continue
-        store = ScopedStateStore(self, session_id, definition, operation)
-        # Validation/migration runs outside locks; closing can win during it.
-        await store.check()
+                await repo.replace(
+                    row,
+                    version=original.data_version,
+                    revision=original.revision,
+                    data=data,
+                    target=definition.data_version,
+                )
+        store = ScopedStateStore(self, original.session_id, definition, lease)
         return SessionContext(
-            session_id, definition.plugin_provider, definition.plugin_name, config, store
+            original.session_id, definition.plugin_provider, definition.plugin_name, config, store
         ), store
+
+    @staticmethod
+    def _check_lease(session_id: UUID, lease: SessionLease) -> None:
+        if lease.session_id != session_id:
+            raise ValueError("Plugin operation requires the target session's lease")
+        lease.check()
 
     @asynccontextmanager
     async def open_execution(
-        self, session_id: UUID
+        self, session_id: UUID, *, lease: SessionLease
     ) -> AsyncIterator[list[tuple[str, str, PluginBinding, ScopedStateStore]]]:
         """Enter in stable order, exit in reverse in this same task; no detached work."""
-        bindings = await self.list_bindings(session_id)
+        self._check_lease(session_id, lease)
+        async with self.session_factory.begin() as db:
+            await lease.lock_owned(db)
+            bindings = await BindingRepository(db).list(session_id)
         async with AsyncExitStack() as stack:
             opened = []
             for binding in bindings:
                 provider, name = binding.plugin_provider, binding.plugin_name
                 try:
                     definition = self.registry.get(provider, name)
-                    ctx, store = await self._context(session_id, definition, "execution")
+                    ctx, store = await self._context(binding, definition, lease)
                     # Registered before the plugin context so cleanup can still use state.
                     stack.callback(setattr, store, "active", False)
                     result = await stack.enter_async_context(
@@ -217,37 +204,21 @@ class AgentPluginService:
                     raise PluginOperationError(provider, name, "open execution") from error
             yield opened
 
-    async def close_binding(self, binding: BindingRecord) -> None:
-        """Close one binding; recognize only completed-lifecycle competition as success."""
+    async def close_binding(self, binding: BindingRecord, *, lease: SessionLease) -> None:
+        """Close one binding under the admitted closer's lease; retain partial progress."""
+        self._check_lease(binding.session_id, lease)
         provider, name = binding.plugin_provider, binding.plugin_name
-        store = None
         try:
             definition = self.registry.get(provider, name)
-            ctx, store = await self._context(binding.session_id, definition, "close")
+            ctx, store = await self._context(binding, definition, lease)
             try:
                 await definition.plugin_type().close_session(ctx)
             finally:
                 store.active = False
             async with self.session_factory.begin() as db:
-                row = await BindingRepository(db).allowed(
-                    binding.session_id, provider, name, "close"
-                )
+                await lease.lock_owned(db)
+                row = await BindingRepository(db).get(binding.session_id, provider, name)
                 row.status = LifecycleStatus.CLOSED
                 row.updated_at = utc_now()
         except Exception as error:
-            # A cleanup failure can be replaced by a lifecycle error in a plugin's
-            # finally block. Even a suppressed exception context must propagate;
-            # only an unchained lifecycle rejection is a completion competition.
-            if (
-                isinstance(error, LifecycleError)
-                and error.__context__ is None
-                and error.__cause__ is None
-            ):
-                async with self.session_factory.begin() as db:
-                    row = await BindingRepository(db).get(binding.session_id, provider, name)
-                    if row.status == LifecycleStatus.CLOSED:
-                        return
             raise PluginOperationError(provider, name, "close session") from error
-        finally:
-            if store is not None:
-                store.active = False

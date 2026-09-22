@@ -43,21 +43,21 @@ class StateStore[StateT: BaseModel](Protocol):
     separately; neither makes an external effect atomic with its tool result.
     Only business state is writable, not binding identity, config or lifecycle.
 
-    Execution stores require a ready session, including during exit cleanup.
-    Close stores require both session and binding to be closing. The host fixes
-    this purpose and revokes the store after the operation; plugins cannot switch
-    purpose or retain access for later work. LifecycleError reports expired access,
-    a disallowed lifecycle or a changed data format. It must not be treated as a
-    StateConflict and blindly retried to bypass closing. Cleanup must therefore
-    work with locally held references when state access has been revoked.
+    The host admits execution only while ready and close only after deciding
+    closing, under the same session lease. Each state transaction first fences
+    ownership, then accesses the binding; a lost owner cannot read or write state.
+    The host revokes the store after plugin cleanup. LifecycleError reports expired
+    access or instruction writes; LeaseLost reports lost ownership. Neither is a
+    StateConflict to retry. Cleanup must support locally held resource references
+    when state access is unavailable.
     """
 
     async def read(self) -> VersionedState[StateT]:
         """Read and validate the current state, returning an independent value.
 
         This is not a resource reservation or a lock across subsequent plugin
-        work: another writer or close may win before replace. Reading and changing
-        the returned object do not write back or advance the revision.
+        work: another tool may write before replace, or ownership may be lost.
+        Reading and changing the returned object do not advance the revision.
         """
         ...
 
@@ -90,7 +90,7 @@ class SessionContext[ConfigT: BaseModel, StateT: BaseModel]:
     the store rather than assuming the object contains a fixed state snapshot.
 
     Both plugin methods receive this type, but each operation gets its own store
-    purpose and lifetime. Identity fields identify resource ownership, not access
+    lifetime. Identity fields identify resource ownership, not access
     credentials. No DB connection, SDK RunContext, logger or resource backend is
     injected; the plugin owns the clients it creates within the operation.
     """
@@ -175,7 +175,8 @@ class AgentPlugin[ConfigT: BaseModel, StateT: BaseModel](ABC):
     needed for cleanup. Parallel first use and retry/replay are plugin concerns:
     UUID CAS prevents lost state updates, not duplicate external creation.
 
-    Closing can overlap execution/allocation and does not wait for the runner.
+    Execution and closing share one exclusive session lease. A lost owner may
+    still have in-flight external work; a takeover grace period does not prove exit.
     On denied registration or cancellation, stop further allocation and use local
     references for bounded best-effort cleanup of known unregistered resources.
     Do not blindly delete resources whose registration may have committed. Tag
@@ -211,23 +212,22 @@ class AgentPlugin[ConfigT: BaseModel, StateT: BaseModel](ABC):
         """Confirm all registered resources deleted/absent before returning.
 
         Override this no-op whenever the plugin owns resources needing session
-        cleanup. Accept absent/partial state, repeated calls and concurrent closes
-        from different instances/processes. A missing resource counts as deleted;
+        cleanup. Accept absent/partial state, repeated calls and in-flight external
+        deletes from a lost owner. A missing resource counts as deleted;
         an accepted asynchronous deletion request alone does not count as done.
         Never allocate replacement session resources or start detached deletes.
         Destroy only session-owned resources; release borrowed shared resources.
 
-        Save useful partial progress through the close-scoped StateStore and merge
-        CAS conflicts without regressing cleanup or losing resource references.
-        Another closer may finish first and revoke access: still finish local
-        cleanup and let the host resolve the lifecycle rejection. Do not hide a
-        real cleanup failure behind that rejection. Errors/cancellation must
-        propagate after bounded local cleanup; the host retains progress for retry.
+        Save useful partial progress through StateStore. Close callbacks run
+        sequentially under the lease; ownership loss rejects further persistence.
+        Errors/cancellation propagate after bounded local cleanup; the host retains
+        committed progress for an explicit retry. Never hide cleanup failures.
 
         Return only after registered cleanup and local client/task cleanup finish.
         The host then conditionally records closed; plugins cannot advance that
-        status themselves. This does not wait for in-flight execution or promise
-        every late/unregistered orphan is gone. The store expires on method exit.
+        status themselves. The lease covers execution cleanup, but cannot promise
+        every lost-owner request or late/unregistered orphan is gone. The store
+        expires on method exit.
         """
         return None
 

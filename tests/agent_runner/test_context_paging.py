@@ -541,7 +541,7 @@ async def test_page_auxiliary_borrows_execution_capabilities_and_does_not_persis
             return [ModelRequest(parts=[UserPromptPart("upper")])]
 
     @asynccontextmanager
-    async def factory():
+    async def factory(lease):
         yield RunnerExecution(
             agent, context_plugin=BorrowPlugin(), capabilities=[StableCapability()]
         )

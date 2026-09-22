@@ -22,6 +22,7 @@ from kapy.agent_plugins import PluginOperationError
 from kapy.control.models import ModelService
 from kapy.control.sessions import CreateSession, SessionService, SubmitInput, UpdateSession
 from kapy.lifecycle import LifecycleError, LifecycleStatus
+from kapy.session_lease import SessionBusy
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .models import InboxRow
@@ -228,8 +229,12 @@ class TelegramController:
                 if command == "new":
                     action["reply"] = "New session created."
             elif command == "close":
-                await self.sessions.close_session(session_id)
-                action["reply"] = "Session closed."
+                try:
+                    await self.sessions.close_session(session_id)
+                except SessionBusy:
+                    action["reply"] = "Session is busy; close has not started. Retry explicitly."
+                else:
+                    action["reply"] = "Session closed."
             elif command == "cancel":
                 await self.sessions.request_cancel(session_id)
                 action["reply"] = "Cancellation requested."

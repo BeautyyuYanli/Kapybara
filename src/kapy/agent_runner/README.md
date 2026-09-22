@@ -6,31 +6,41 @@ lease creates neither business sessions nor runner checkpoints.
 It loads only the checkpoint, next absolute message sequence and latest context page.
 Use and close it in the task that opened it: `Agent.iter()` owns task-local AnyIO
 cancel scopes. All handle operations reject concurrent, reentrant or cross-task calls.
-The lease maintains one heartbeat task using short transactions, through native
-graph cleanup. Checkpoint/history and queue consumption first call
+The lease binds its heartbeat and business scope in one AnyIO task group.
+Heartbeat failure cancels business; business exit joins heartbeat after native
+graph/resource cleanup and before token release. Single task-group failures retain
+their exception type; concurrent real failures remain exception groups. Only errors
+propagated out of the SDK can be aggregated: during cancellation, its graph may
+discard a model child's error after closing the result stream. The heartbeat error
+still propagates; the host does not inspect SDK internals.
+Checkpoint/history and queue consumption first call
 `lease.lock_owned(db)` in the same transaction; all cooperating writers take the
 lease row before business rows. Bypassing that protocol is not automatically fenced.
 
 `open_runner` and `start_runner` accept either direct `agent`/`deps` or an
 `execution_factory`, exclusively. The factory is an async context manager yielding
 `RunnerExecution(agent, deps, context_plugin, capabilities)` inside the acquired
-lease. It receives no lease handle. SDK graph cleanup precedes factory exit, which
-precedes lease release. It is recreated on reacquisition; the core still needs no
+lease. It receives the current SessionLease explicitly. SDK graph cleanup precedes
+factory exit, which precedes lease release. It is recreated on reacquisition; the core still needs no
 business session record and does not import plugin implementations. Application
 factories collect [Agent plugins](../agent_plugins/README.md) into
-RunnerExecution.capabilities alongside SessionReadyCapability. Their fresh base
-Agent directly receives the model, model settings, static instructions and output
+RunnerExecution.capabilities. Their fresh base Agent directly receives the model, model settings, static instructions and output
 type; it carries no business capabilities and needs no model override.
 
 The application owns the configured Agent, deps, PostgreSQL engine and async
 session factory. `kapy db upgrade` migrates `agent_metadata`, `lease_metadata` and the control tables;
 the services never create tables or close shared clients. Isolated tests can
 initialize disposable schemas directly from their metadata.
-The lease relies on PostgreSQL READ COMMITTED row locks, conditional upsert and
+The lease relies on PostgreSQL READ COMMITTED row locks, conditional acquisition and
 `clock_timestamp()`. It can also be used by non-runner operations through
 `open_session_lease`; `SessionBusy` and `RunnerLost` remain compatible exports
 (the latter aliases `LeaseLost`). A timeout permits takeover; it does not revoke
-an unchanged token or undo external requests. Table declarations use the connection's default
+an unchanged token or undo external requests. A takeover of an expired nonempty
+token waits `takeover_grace_period` (finite, positive, default 30 seconds), renewing
+during the wait and fencing ownership before admission. Released/new leases enter
+immediately. Grace does not guarantee old-owner exit, and cancellation during it
+conditionally releases the new token. Runner and plugin transactions retain their
+own fencing independently of the wait. Table declarations use the connection's default
 schema and deliberately contain no physical foreign keys.
 
 The runner can execute independently of business session configuration. For a

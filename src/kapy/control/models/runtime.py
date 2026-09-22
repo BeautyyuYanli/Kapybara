@@ -1,13 +1,19 @@
 """SDK construction and discovery outside database transactions.
 
-Callers own native Provider and Model async contexts. Enter the provider before
-constructing its model so constructor failure still closes SDK-owned clients.
+Callers own Provider and Model contexts. Their exits have bounded cancellation
+protection in the calling task, after nested graph/plugin scopes have unwound.
+Enter the provider before constructing its model so constructor failure still
+closes SDK-owned clients.
 Class references select installed code, not a universal protocol adapter.
 """
 
 import inspect
+from collections.abc import AsyncGenerator
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from types import TracebackType
 from typing import Any, cast
 
+import anyio
 from google.genai import Client
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, ImportString, TypeAdapter
@@ -76,8 +82,30 @@ def validate_provider(config: ProviderConfig) -> None:
     validate_settings(model_cls, {})
 
 
-def build_provider(provider_cls: type[Provider], config: ProviderConfig) -> Provider:
-    return provider_cls(**provider_arguments(config))
+@asynccontextmanager
+async def _sdk_context[ResourceT](
+    resource: AbstractAsyncContextManager[ResourceT],
+) -> AsyncGenerator[ResourceT]:
+    """Protect only Provider/Model exit; never wrap graph or plugin cancel scopes."""
+
+    async def close(
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        with anyio.fail_after(5, shield=True):
+            return await resource.__aexit__(exc_type, exc_value, traceback)
+
+    async with AsyncExitStack() as stack:
+        entered = await resource.__aenter__()
+        stack.push_async_exit(close)
+        yield entered
+
+
+def build_provider(
+    provider_cls: type[Provider], config: ProviderConfig
+) -> AbstractAsyncContextManager[Provider]:
+    return _sdk_context(provider_cls(**provider_arguments(config)))
 
 
 def build_model(
@@ -86,10 +114,10 @@ def build_model(
     provider: Provider,
     *,
     profile: ModelProfileSpec | None = None,
-) -> Model:
+) -> AbstractAsyncContextManager[Model]:
     # Model's abstract base signature does not include the concrete protocol's
     # model_name/provider arguments. Configuration selects that constructor.
-    return cast(Any, model_cls)(model_name, provider=provider, profile=profile)
+    return _sdk_context(cast(Any, model_cls)(model_name, provider=provider, profile=profile))
 
 
 def validate_settings(model_cls: type[Model], data: JsonObject) -> JsonObject:

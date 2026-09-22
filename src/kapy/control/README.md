@@ -105,24 +105,27 @@ means older history exists. History and ordinary lists share kapy.pagination.
 
 Session creation validates plugin config before saving ready session/binding records
 in one transaction; it does not allocate external resources. `close_session(id)`
-records closing, requests cooperative runner cancellation, then closes bindings
-sequentially. Failure preserves progress; retry skips closed bindings. It uses no
-runner lease and does not wait for in-flight external work. Only registered cleanup
-blocks closed; late orphan resources require plugin reconciliation. See
+first acquires the shared session lease. SessionBusy leaves all business state,
+inputs and cancel flags unchanged. After admission it records closing, cleans fixed
+bindings sequentially, and records each completed binding and then the session as
+closed. Failure preserves progress; explicit retry skips completed bindings. Close
+never changes cancellation flags. Registered cleanup is confirmed; lost-owner
+external requests and orphan resources still require plugin reconciliation. See
 [Agent plugins](../agent_plugins/README.md) for StateStore and resource contracts.
 
-Input intake, runner acquisition/resumption, subsequent input consumption and new
-tools require ready. Queries/history/live, cancellation, input withdrawal and
-ordinary configuration updates remain usable in closing/closed. SDK-dependent
-model settings are validated at execution startup, leaving inputs untouched on
-failure. Plugin choices and lifecycle fields cannot be patched through UpdateSession.
+Input intake and execution admission require ready. Admission is fenced by the
+acquired lease; no normal closer can change lifecycle until execution cleanup ends.
+Queries/history/live, cancellation, input withdrawal and ordinary configuration
+updates remain usable in closing/closed. SDK-dependent model settings are validated
+at execution startup, leaving inputs untouched on failure. Plugin choices and
+lifecycle fields cannot be patched through UpdateSession.
 
 At startup, SessionService reads session/model/provider configuration once in a
 short transaction, then releases it before constructing SDK resources. It merges
 model.settings with session.model_settings at the top level, validates against the
 SDK's protocol Settings type, and delegates that snapshot to the application
 execution factory. The factory opens Provider/Model and plugin resources inside
-the lease, creates the Agent with its model/settings, and collects SessionReady,
+the lease, creates the Agent with its model/settings, and collects
 plugin capabilities and paging configuration into RunnerExecution. The runner
 installs capabilities when opening the SDK graph. The service does not wrap the
 factory's Agent or append business capabilities. Direct caller-owned Agents use
@@ -133,10 +136,15 @@ configuration updates affect the next start. Explicit SDK options retain their
 SDK semantics; no extra runner-specific settings blacklist is applied.
 
 A configured SessionExecutionFactory receives the service, a validated
-SessionExecutionConfig snapshot and the service's ContextPluginRegistry, and yields
-RunnerExecution within its resource context. The default implementation is
+SessionExecutionConfig snapshot, the service's ContextPluginRegistry and the
+current SessionLease, and yields RunnerExecution within its resource context.
+Every factory, including custom factories, owns admission on each entry and lease
+reacquisition: in the same short transaction, first `await lease.lock_owned(db)`,
+then `await service.require_ready(config.session.id, db=db)`, before creating any
+model or plugin resources. An acquired lease does not imply READY, and the status
+in the configuration snapshot may be stale. The default implementation is
 application.agent.create_execution_factory; application.sessions injects it into
-both interfaces. No model or plugin resource exists before lease acquisition.
+both interfaces.
 
 `SessionService(..., context_plugin_registry=...)` selects an implementation from the
 session's `context_plugin: {"name": "kapy/summary", "config": {}}`. The name is fixed
@@ -159,15 +167,22 @@ context_plugin plus separate host threshold/reference options; see the
 
 Heartbeat interval and timeout are finite constructor settings satisfying
 `0 < interval < timeout`. Every worker using the same session lease table must use the
-same policy, including callers that bypass SessionService. is_runner_running uses
+same policy, including callers that bypass SessionService. A finite positive
+`takeover_grace_period` defaults to 30 seconds. Only an expired-token takeover waits
+before business admission, while maintaining heartbeat. Grace does not prove that
+an old process exited; runner and plugin transactions retain ownership fencing.
+Heartbeat failure cancels business through an AnyIO task group; normal exit joins
+heartbeat before conditional release. Single failures retain their original type,
+while simultaneous real failures remain exception groups. is_runner_running uses
 this timeout and the database clock to observe a non-expired owned lease, even if
 the checkpoint is done. The owner may be a non-runner operation; this observation
 does not mean the Agent is generating. It does not acquire execution or prove process liveness;
 start_runner still atomically acquires the lease and raises SessionBusy if occupied.
 
 Input is enqueued with `enqueue_input(id, "queued", content)` for the next run, or
-`"steer"` to supplement the current run at its next input boundary. Intake and
-consumption lock/check ready in the same transaction as their queue changes. Enqueue does
+`"steer"` to supplement the current run at its next input boundary. Intake
+locks/checks ready in the same transaction as its queue changes; consumption
+borrows the runner's fenced checkpoint transaction. Enqueue does
 not launch a runner. `read_inputs` returns a FIFO snapshot without consuming it and
 without requiring a business session row. `submit_input(id, SubmitInput(...))`
 commits input first, then returns InputSubmission(input, should_start_runner); this

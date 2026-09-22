@@ -63,7 +63,9 @@ class RunnerExecution[OutputT]:
     compaction_replay_turns: int = 10
 
 
-type ExecutionFactory[OutputT] = Callable[[], AbstractAsyncContextManager[RunnerExecution[OutputT]]]
+type ExecutionFactory[OutputT] = Callable[
+    [SessionLease], AbstractAsyncContextManager[RunnerExecution[OutputT]]
+]
 
 
 class AgentRunner[OutputT]:
@@ -375,6 +377,7 @@ async def open_runner[DepsT, OutputT](
     compaction_replay_turns: int = 10,
     heartbeat_interval: float = 10.0,
     heartbeat_timeout: float = 60.0,
+    takeover_grace_period: float = 30.0,
 ) -> AsyncIterator[AgentRunner[OutputT]]:
     """Acquire metadata, heartbeat and release one execution lease in the calling task.
 
@@ -384,15 +387,18 @@ async def open_runner[DepsT, OutputT](
     limit workers outside start_runner instead; the runner never overrides limits.
 
     Heartbeat values are seconds and must be finite with
-    0 < heartbeat_interval < heartbeat_timeout, otherwise ValueError is raised.
+    0 < heartbeat_interval < heartbeat_timeout and a finite positive takeover grace
+    period, otherwise ValueError is raised. Expired-token takeovers renew while
+    waiting before factory entry; the default grace is 30 seconds, not an exit proof.
     Timeout only permits takeover: it neither limits a turn nor revokes a token
     until another operation following the lease protocol acquires ownership.
     A live owner prevents acquisition with
     SessionBusy; replaced ownership raises RunnerLost at a subsequent check.
 
-    Database exceptions propagate unchanged. Background heartbeat failures surface
-    at the next execution boundary or context exit, without automatically stopping
-    external work or retrying. The handle is unusable after execution failure;
+    Heartbeat failures cancel business through the lease task group. Single failures
+    retain their type; simultaneous real failures remain exception groups. Already
+    issued external effects cannot be undone and no work is automatically retried.
+    The handle is unusable after execution failure;
     recovery requires a new open_runner context.
     """
     if (agent is None) == (execution_factory is None):
@@ -409,9 +415,10 @@ async def open_runner[DepsT, OutputT](
         session_factory=session_factory,
         heartbeat_interval=heartbeat_interval,
         heartbeat_timeout=heartbeat_timeout,
+        takeover_grace_period=takeover_grace_period,
     ) as lease:
         if execution_factory is not None:
-            context = execution_factory()
+            context = execution_factory(lease)
         else:
             assert agent is not None
             context = nullcontext(
@@ -469,6 +476,7 @@ async def start_runner[DepsT, OutputT](
     compaction_replay_turns: int = 10,
     heartbeat_interval: float = 10.0,
     heartbeat_timeout: float = 60.0,
+    takeover_grace_period: float = 30.0,
     on_output: OutputCallback | None = None,
 ) -> TurnResult[OutputT]:
     """Drain queued snapshots after each run, preserving the last produced output.
@@ -487,6 +495,7 @@ async def start_runner[DepsT, OutputT](
         compaction_replay_turns=compaction_replay_turns,
         heartbeat_interval=heartbeat_interval,
         heartbeat_timeout=heartbeat_timeout,
+        takeover_grace_period=takeover_grace_period,
     ) as runner:
         initial = None
         output: OutputT | None = None

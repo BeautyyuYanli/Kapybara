@@ -14,7 +14,7 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 import anyio
-from sqlalchemy import func, or_, update
+from sqlalchemy import func, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import col, select
@@ -43,7 +43,6 @@ class SessionLease:
         self._token = token
         self._active = True
         self._error: BaseException | None = None
-        self._lost = asyncio.Event()
 
     def check(self) -> None:
         """Reject an expired handle or known failure without accessing the database."""
@@ -79,49 +78,55 @@ class SessionLease:
             self._remember(error)
             raise
 
-    async def wait_lost(self) -> None:
-        """Wait and raise a known failure; callers own and must join their monitors."""
-        self.check()
-        await self._lost.wait()
-        self.check()
-
     def _remember(self, error: BaseException) -> None:
         if self._error is None:
             self._error = error
-        elif self._error is not error:
-            self._error.add_note(f"Additional lease failure: {error!r}")
-        self._lost.set()
 
 
 async def _acquire(
     factory: async_sessionmaker[AsyncSession], lease: SessionLease, heartbeat_timeout: float
-) -> None:
-    statement = (
-        insert(SessionLeaseRow)
-        .values(session_id=lease.session_id, lock_token=lease._token)
-        .on_conflict_do_update(
-            index_elements=["session_id"],
-            set_={"lock_token": lease._token, "heartbeat_at": func.clock_timestamp()},
-            where=or_(
-                col(SessionLeaseRow.lock_token).is_(None),
-                col(SessionLeaseRow.heartbeat_at)
-                <= func.clock_timestamp() - timedelta(seconds=heartbeat_timeout),
-            ),
-        )
-        .returning(col(SessionLeaseRow.session_id))
-    )
+) -> bool:
+    """Commit ownership and return whether an expired, nonempty token was replaced."""
     # Explicit transaction calls keep commit/rollback in this task. The maker's
     # begin context shields a separate commit task which could outlive cancellation.
     db = factory()
     try:
-        if (await db.execute(statement)).scalar_one_or_none() is None:
-            raise SessionBusy(str(lease.session_id))
+        inserted = (
+            await db.execute(
+                insert(SessionLeaseRow)
+                .values(session_id=lease.session_id, lock_token=lease._token)
+                .on_conflict_do_nothing()
+                .returning(col(SessionLeaseRow.session_id))
+            )
+        ).scalar_one_or_none()
+        takeover = False
+        if inserted is None:
+            token, expired = (
+                await db.execute(
+                    select(
+                        SessionLeaseRow.lock_token,
+                        col(SessionLeaseRow.heartbeat_at)
+                        <= func.clock_timestamp() - timedelta(seconds=heartbeat_timeout),
+                    )
+                    .where(col(SessionLeaseRow.session_id) == lease.session_id)
+                    .with_for_update()
+                )
+            ).one()
+            if token is not None and not expired:
+                raise SessionBusy(str(lease.session_id))
+            takeover = token is not None
+            await db.execute(
+                update(SessionLeaseRow)
+                .where(col(SessionLeaseRow.session_id) == lease.session_id)
+                .values(lock_token=lease._token, heartbeat_at=func.clock_timestamp())
+            )
         await db.commit()
+        return takeover
     finally:
         await db.close()
 
 
-async def _abort_acquisition(task: asyncio.Task[None]) -> None:
+async def _abort_acquisition(task: asyncio.Task[bool]) -> None:
     """Cancel and join the actual transaction, interrupting stalled driver cleanup."""
     task.cancel()
     try:
@@ -177,17 +182,22 @@ async def _heartbeat(
 ) -> None:
     try:
         while True:
-            await asyncio.sleep(interval)
-            async with factory.begin() as db:
+            await anyio.sleep(interval)
+            db = factory()
+            try:
                 await _update_owned(db, lease, release=False)
+                await db.commit()
+            finally:
+                # Keep rollback/close in this child before the task group joins it.
+                with anyio.fail_after(5, shield=True):
+                    await db.close()
     except Exception as error:
-        # Report failure without implicitly cancelling external model/tool work.
         lease._remember(error)
+        raise
 
 
 async def _cleanup(
     lease: SessionLease,
-    heartbeat: asyncio.Task[None] | None,
     factory: async_sessionmaker[AsyncSession],
     *,
     release_required: bool,
@@ -195,9 +205,6 @@ async def _cleanup(
     # Cleanup alone is bounded; callers finish their work and resources before
     # exiting the context. It is safe to run this DB-only cleanup in another task.
     async with asyncio.timeout(5):
-        if heartbeat is not None:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
         async with factory.begin() as db:
             try:
                 await _update_owned(db, lease, release=True)
@@ -213,26 +220,28 @@ async def open_session_lease(
     session_factory: async_sessionmaker[AsyncSession],
     heartbeat_interval: float = 10.0,
     heartbeat_timeout: float = 60.0,
+    takeover_grace_period: float = 30.0,
 ) -> AsyncIterator[SessionLease]:
-    """Acquire ownership, renew it through cleanup, then conditionally release.
+    """Acquire ownership, bind heartbeat to business, and release after all cleanup.
 
-    Enter/exit in the same task. Do not nest acquisition of the same session:
-    internal operations borrow this handle. Join all children and loss monitors,
-    and finish resource cleanup before exiting; children use separate DB sessions.
-    The engine/pool belongs to the application. All participants must use the same
-    finite policy, with 0 < heartbeat_interval < heartbeat_timeout (seconds).
+    Enter/exit in the same task: the task group's cancel scope encloses business
+    and SDK scopes. Join business children and finish resource cleanup before exit.
+    Heartbeat failure cancels business; business exit stops and joins heartbeat.
+    This boundary unwraps only the task group's single-error wrapper; concurrent
+    real failures remain an exception group. DB release failures retain the original
+    error with a diagnostic note. Direct asyncio cancellation is also propagated.
 
-    A live owner causes SessionBusy; acquisition does not poll or automatically
-    retry. Database failures retain their original exception types.
+    All competitors use the same finite 0 < heartbeat_interval < heartbeat_timeout
+    policy and positive takeover_grace_period. A live owner raises SessionBusy
+    without polling. An expired-token takeover renews during its grace period and
+    checks ownership before yielding. Grace offers no guarantee that an old process
+    exited; each protected transaction still requires lock_owned. Ordinary free
+    acquisition does not wait. Cancellation during grace conditionally releases.
 
-    Failure is reported at check/lock_owned/wait_lost and normal context exit.
-    A foreground exception, including cancellation, stays primary; simultaneous
-    lease/cleanup failures are attached as exception notes. Cancellation during
-    acquisition cancels and joins its transaction, with a five-second driver
-    cleanup deadline, before conditionally releasing any committed token. No handle
-    is yielded to the cancelled caller. Cleanup is protected
-    from caller cancellation for at most five seconds; cancellation still escapes.
-    Neither this context nor timeout can undo external effects or ensure exactly-once.
+    Acquisition cancellation joins the actual transaction before conditionally
+    releasing a possibly committed token. DB-only abort/release cleanup is protected
+    from caller cancellation with a five-second driver deadline. The engine/pool
+    belongs to the application; external effects are not undone or exactly-once.
     """
     if not (
         math.isfinite(heartbeat_interval)
@@ -240,17 +249,18 @@ async def open_session_lease(
         and 0 < heartbeat_interval < heartbeat_timeout
     ):
         raise ValueError("Require finite 0 < heartbeat_interval < heartbeat_timeout")
+    if not math.isfinite(takeover_grace_period) or takeover_grace_period <= 0:
+        raise ValueError("takeover_grace_period must be finite and positive")
     lease = SessionLease(session_id, uuid4())
     acquired = False
     acquisition = None
-    heartbeat = None
     error: BaseException | None = None
     try:
         # Cancellation must stop lock waits while still joining the transaction
         # before release. _acquire uses no context that detaches commit or close.
         acquisition = asyncio.create_task(_acquire(session_factory, lease, heartbeat_timeout))
         try:
-            await asyncio.shield(acquisition)
+            takeover = await asyncio.shield(acquisition)
         except asyncio.CancelledError as cancelled:
             abort = asyncio.create_task(_abort_acquisition(acquisition))
             await _join_protected(abort)
@@ -260,25 +270,39 @@ async def open_session_lease(
                 cancelled.add_note(f"Lease acquisition abort failed: {abort_error!r}")
             raise
         acquired = True
-        coroutine = _heartbeat(lease, session_factory, heartbeat_interval)
         try:
-            heartbeat = asyncio.create_task(coroutine, name=f"session-heartbeat:{session_id}")
-        except BaseException:
-            coroutine.close()
+            async with anyio.create_task_group() as group:
+                group.start_soon(
+                    _heartbeat,
+                    lease,
+                    session_factory,
+                    heartbeat_interval,
+                    name=f"session-heartbeat:{session_id}",
+                )
+                try:
+                    if takeover:
+                        await anyio.sleep(takeover_grace_period)
+                        async with session_factory.begin() as db:
+                            await lease.lock_owned(db)
+                    yield lease
+                    lease.check()
+                finally:
+                    group.cancel_scope.cancel()
+        except BaseExceptionGroup as grouped:
+            if len(grouped.exceptions) == 1:
+                # Preserve the original exception's own cause/context.
+                raise grouped.exceptions[0]  # noqa: B904
             raise
-        yield lease
-        lease.check()
     except BaseException as caught:
         error = caught
     finally:
         lease._active = False
-        lease._lost.set()
         if acquisition is not None:
             # A cancelled/failed COMMIT can have an uncertain server outcome.
             # Only after its task has ended may we release this token; a missing
             # token is expected when acquisition rolled back or never succeeded.
             cleanup = asyncio.create_task(
-                _cleanup(lease, heartbeat, session_factory, release_required=acquired)
+                _cleanup(lease, session_factory, release_required=acquired)
             )
             cancellation = await _join_protected(cleanup)
             if error is None:
@@ -286,14 +310,10 @@ async def open_session_lease(
             try:
                 cleanup.result()
             except BaseException as cleanup_error:
-                lease._remember(cleanup_error)
-        if lease._error is not None and error is not lease._error:
-            if error is None:
-                error = lease._error
-            else:
-                error.add_note(f"Lease failure: {lease._error!r}")
-                for note in getattr(lease._error, "__notes__", ()):
-                    error.add_note(note)
+                if error is None:
+                    error = cleanup_error
+                else:
+                    error.add_note(f"Lease release failed: {cleanup_error!r}")
         if error is not None:
             raise error
 

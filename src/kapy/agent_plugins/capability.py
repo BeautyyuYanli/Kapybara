@@ -34,10 +34,10 @@ class PluginCapabilityAdapter:
     ) -> tuple[AbstractCapability[Any], ...]:
         """Normalize declarative contributions, then retain native capabilities as-is."""
 
-        async def check_call(_ctx: RunContext[Any], /, **kwargs: Any) -> None:
+        def check_call(_ctx: RunContext[Any], /, **kwargs: Any) -> None:
             # The SDK validates typed arguments before this hook and owns sync,
             # async and sync-returning-awaitable dispatch. Keep its semantics.
-            await store.check()
+            store.check_active()
 
         tools = []
         for declaration in binding.tools:
@@ -57,7 +57,7 @@ class PluginCapabilityAdapter:
             )
 
         async def instructions() -> str:
-            await store.check()
+            store.check_active()
             token = _read_only.set(True)
             try:
                 return await binding.instructions() if binding.instructions is not None else ""

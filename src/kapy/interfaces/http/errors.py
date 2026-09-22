@@ -15,6 +15,7 @@ from kapy.control.models.types import (
     ModelDiscoveryError,
 )
 from kapy.lifecycle import LifecycleError
+from kapy.session_lease import SessionBusy
 
 
 class ControlRoute(APIRoute):
@@ -33,6 +34,10 @@ class ControlRoute(APIRoute):
                     {key: item[key] for key in ("loc", "msg", "type")} for item in error.errors()
                 ]
                 return JSONResponse(status_code=422, content={"detail": detail})
+            except SessionBusy:
+                return JSONResponse(
+                    status_code=409, content={"detail": "Session busy; close has not started"}
+                )
             except LifecycleError:
                 return JSONResponse(
                     status_code=409, content={"detail": "Session lifecycle conflict"}

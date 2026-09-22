@@ -172,8 +172,6 @@ class _ShellTools:
             "KAPY_PLUGIN_PROVIDER": self.ctx.plugin_provider,
             "KAPY_PLUGIN_NAME": self.ctx.plugin_name,
         }
-        # Check scope before allocating; a concurrent close may still win later.
-        await self.ctx.state.read()
         try:
             result = await self.client.run(
                 script, cwd=self.ctx.config.cwd, env=env, mode=JobMode.PTY, timeout=timeout
@@ -260,12 +258,12 @@ class ShellPlugin(AgentPlugin[ShellPluginConfig, ShellPluginState]):
     async def close_session(self, ctx: ShellContext) -> None:
         """Sequential bounded deletion, preserving partial progress for a retry."""
         with anyio.fail_after(60):
-            state = (await ctx.state.read()).value
+            previous = await ctx.state.read()
+            state = previous.value
             if state is None or not state.jobs:
                 return
             async with _client(ctx.config) as (client, _):
-                while state is not None and state.jobs:
-                    job_id = min(state.jobs)
+                for job_id in sorted(state.jobs):
                     await _delete(client, job_id)
-                    await _change_job(ctx.state, job_id, None)
-                    state = (await ctx.state.read()).value
+                    del state.jobs[job_id]
+                    previous = await ctx.state.replace(state, expected_revision=previous.revision)

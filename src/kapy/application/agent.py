@@ -22,9 +22,9 @@ from kapy.control.models.runtime import build_model, build_provider
 from kapy.control.sessions.service import (
     SessionExecutionConfig,
     SessionExecutionFactory,
-    SessionReadyCapability,
     SessionService,
 )
+from kapy.session_lease import SessionLease
 
 
 def create_registry() -> PluginRegistry:
@@ -49,9 +49,11 @@ def create_agent(
 def create_execution_factory(plugins: AgentPluginService) -> SessionExecutionFactory:
     """Compose each leased execution from the service's snapshot and context registry.
 
-    The service supplies business lifecycle checks; this factory owns model/plugin
-    contexts, the base Agent, capabilities and paging configuration. It neither
-    installs capabilities nor rereads mutable session/model configuration.
+    This factory owns admission on every entry, including lease reacquisition:
+    lock_owned and require_ready share a short transaction before resources open.
+    Ownership alone does not imply READY; the snapshot's status may be stale.
+    It then owns model/plugin contexts, the base Agent, capabilities and paging
+    configuration, without rereading model settings or installing capabilities.
     """
 
     @asynccontextmanager
@@ -59,9 +61,12 @@ def create_execution_factory(plugins: AgentPluginService) -> SessionExecutionFac
         service: SessionService,
         config: SessionExecutionConfig,
         context_plugin_registry: ContextPluginRegistry,
+        lease: SessionLease,
     ) -> AsyncIterator[RunnerExecution[str]]:
         session = config.session
-        await service.require_ready(session.id)
+        async with plugins.session_factory.begin() as db:
+            await lease.lock_owned(db)
+            await service.require_ready(session.id, db=db)
         async with (
             build_provider(config.provider_class, config.provider) as provider,
             build_model(
@@ -70,20 +75,16 @@ def create_execution_factory(plugins: AgentPluginService) -> SessionExecutionFac
                 provider,
                 profile={"context_window": config.model.context_window},
             ) as model,
-            plugins.open_execution(session.id) as bindings,
+            plugins.open_execution(session.id, lease=lease) as bindings,
         ):
             names: set[str] = set()
-            capabilities = (
-                SessionReadyCapability(service, session.id),
-                *(
-                    capability
-                    for binding in bindings
-                    for capability in PluginCapabilityAdapter.build(*binding, names)
-                ),
+            capabilities = tuple(
+                capability
+                for binding in bindings
+                for capability in PluginCapabilityAdapter.build(*binding, names)
             )
             context_plugin = context_plugin_registry.create(session.context_plugin)
             agent = create_agent(model=model, model_settings=config.model_settings)
-            await service.require_ready(session.id)
             yield RunnerExecution(
                 agent=agent,
                 capabilities=capabilities,

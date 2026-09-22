@@ -31,6 +31,7 @@ def create_session_service(
         ),
         heartbeat_interval=settings.heartbeat_interval,
         heartbeat_timeout=settings.heartbeat_timeout,
+        takeover_grace_period=settings.takeover_grace_period,
         context_plugin_registry=context_plugin_registry or create_default_registry(),
         plugin_service=plugins,
         execution_factory=create_execution_factory(plugins),

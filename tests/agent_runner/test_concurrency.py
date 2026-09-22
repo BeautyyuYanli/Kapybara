@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import pytest
@@ -11,7 +12,7 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import text
 
-from kapy.agent_runner import InputBatch, RunnerLost, SessionBusy, open_runner
+from kapy.agent_runner import InputBatch, RunnerExecution, RunnerLost, SessionBusy, open_runner
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
 from kapy.session_lease import open_session_lease
@@ -38,7 +39,6 @@ async def test_heartbeat_while_model_waits_uses_independent_short_transactions(d
     async def model(messages, info):
         entered.set()
         await finish.wait()
-        from pydantic_ai.messages import ModelResponse, TextPart
 
         return ModelResponse(parts=[TextPart("ok")])
 
@@ -88,7 +88,7 @@ async def test_heartbeat_while_model_waits_uses_independent_short_transactions(d
         assert (await asyncio.wait_for(task, 5)).finished
 
 
-async def test_lost_runner_finishes_external_wait_but_cannot_write_or_release_new_token(
+async def test_lost_runner_cancels_external_wait_and_cannot_write_or_release_new_token(
     database, toolset_lifecycle, heartbeat_observation
 ):
     entered, finish = asyncio.Event(), asyncio.Event()
@@ -98,7 +98,6 @@ async def test_lost_runner_finishes_external_wait_but_cannot_write_or_release_ne
     async def model(messages, info):
         entered.set()
         await finish.wait()
-        from pydantic_ai.messages import ModelResponse, TextPart
 
         return ModelResponse(parts=[TextPart("stale")])
 
@@ -129,7 +128,6 @@ async def test_lost_runner_finishes_external_wait_but_cannot_write_or_release_ne
             text("UPDATE session_leases SET lock_token=:token WHERE session_id=:id"),
             {"id": session_id, "token": new},
         )
-    finish.set()
     with pytest.raises(RunnerLost):
         await asyncio.wait_for(task, 5)
     assert toolset_lifecycle.events == ["enter", "exit"]
@@ -192,7 +190,9 @@ asyncio.run(main())
             async with open_session_lease(session_id, session_factory=database.sessions):
                 pytest.fail("live lease was acquired")
         await expire(database, session_id)
-        async with open_session_lease(session_id, session_factory=database.sessions):
+        async with open_session_lease(
+            session_id, session_factory=database.sessions, takeover_grace_period=0.01
+        ):
             pass
     finally:
         if child.returncode is None:
@@ -236,70 +236,66 @@ async def test_caller_cancel_during_context_exit_propagates_and_releases(databas
         assert (await runner.turn()).finished
 
 
-@pytest.mark.parametrize("failure_source", ["model", "context", "heartbeat"])
-async def test_heartbeat_error_remains_visible_when_foreground_also_fails(
-    database, monkeypatch, failure_source
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_heartbeat_cancels_model_and_groups_factory_cleanup_failure(
+    database, monkeypatch, cleanup_fails
 ):
     session_id = uuid4()
-    heartbeat_failed = asyncio.Event()
     model_entered = asyncio.Event()
-
     update_owned = lease_service._update_owned
 
     async def failing_heartbeat(db, lease, *, release):
         if release:
             return await update_owned(db, lease, release=True)
         await model_entered.wait()
-        # Signal completion only after the runner has recorded the background
-        # error and the heartbeat's transaction has finished rolling back.
-        task = asyncio.current_task()
-        assert task is not None
-        task.add_done_callback(lambda _: heartbeat_failed.set())
         raise OSError("heartbeat connection failed")
 
     monkeypatch.setattr(lease_service, "_update_owned", failing_heartbeat)
 
     async def model(messages, info):
         model_entered.set()
-        await heartbeat_failed.wait()
-        if failure_source == "heartbeat":
-            return ModelResponse(parts=[TextPart("must not be committed")])
-        raise ValueError("foreground failed")
+        await asyncio.Event().wait()
+        return ModelResponse(parts=[TextPart("unreachable")])
 
-    error_type = OSError if failure_source == "heartbeat" else ValueError
-    error_text = (
-        "heartbeat connection failed" if failure_source == "heartbeat" else "foreground failed"
-    )
-    with pytest.raises(error_type, match=error_text) as caught:
+    @asynccontextmanager
+    async def factory(lease):
+        try:
+            yield RunnerExecution(Agent(FunctionModel(model)))
+        finally:
+            if cleanup_fails:
+                raise ValueError("foreground cleanup failed")
+
+    error_type = ExceptionGroup if cleanup_fails else OSError
+    with pytest.raises(error_type) as caught:
         async with open_runner(
             session_id,
-            agent=Agent(FunctionModel(model)),
+            execution_factory=factory,
             session_factory=database.sessions,
             heartbeat_interval=0.01,
-            heartbeat_timeout=60,
         ) as runner:
             await runner.rebuild_context()
-            if failure_source != "context":
-                await runner.turn(steer=["go"])
-            else:
-                model_entered.set()
-                await heartbeat_failed.wait()
-                raise ValueError("foreground failed")
-    if failure_source != "heartbeat":
-        assert any(
-            "heartbeat connection failed" in note for note in getattr(caught.value, "__notes__", ())
-        )
+            await runner.turn(steer=["go"])
+    if cleanup_fails:
+
+        def leaves(error):
+            if isinstance(error, BaseExceptionGroup):
+                return [leaf for child in error.exceptions for leaf in leaves(child)]
+            return [error]
+
+        assert {(type(e), str(e)) for e in leaves(caught.value)} == {
+            (OSError, "heartbeat connection failed"),
+            (ValueError, "foreground cleanup failed"),
+        }
     else:
-        async with database.sessions.begin() as db:
-            messages = [
-                message
-                for _, message in await AgentRepository(db).read_history(
-                    session_id, start_seq=0, through_seq=2**31 - 1
-                )
-            ]
-            assert len(messages) == 1
-            assert isinstance(messages[0], ModelRequest)
+        assert str(caught.value) == "heartbeat connection failed"
     async with database.sessions.begin() as db:
+        messages = [
+            message
+            for _, message in await AgentRepository(db).read_history(
+                session_id, start_seq=0, through_seq=2**31 - 1
+            )
+        ]
+        assert len(messages) == 1 and isinstance(messages[0], ModelRequest)
         assert (
             await db.execute(
                 text("SELECT lock_token FROM session_leases WHERE session_id=:id"),

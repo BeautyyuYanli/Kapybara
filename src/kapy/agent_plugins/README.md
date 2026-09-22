@@ -32,9 +32,8 @@ database, service container, logger or resource backend is injected.
 
 The application execution factory opens the configured model and all plugins in
 identity order inside the runner lease. It creates a base Agent with model,
-settings and static instructions, collects SessionReadyCapability and each
-plugin's capabilities into RunnerExecution, and exits in reverse after SDK graph
-cleanup. The runner installs capabilities when opening the graph; plugins and
+settings and static instructions, collects each plugin's capabilities into
+RunnerExecution, and exits in reverse after SDK graph cleanup. The runner installs capabilities when opening the graph; plugins and
 the base Agent do not install business contributions. Factory failure prevents
 input consumption. State is never implicitly saved. Declarative instructions
 may only read state/generate text: repeated model or compaction evaluation must
@@ -64,9 +63,12 @@ and auxiliary paging runs; use for_run() to isolate each run's mutable state.
 `replace(value, expected_revision=...)` validates outside the transaction, then
 atomically replaces state and revision. A stale UUID raises `StateConflict`:
 plugins reread and decide how to merge. UUIDs have no ordering/count semantics.
-The store is fixed to one binding, operation and data format; it becomes invalid
+The store is fixed to one binding and data format; it becomes invalid
 when its context ends. Each operation owns a separate short database transaction;
-plugin callbacks never receive a transaction or create nested savepoints.
+plugin callbacks never receive a transaction or create nested savepoints. The
+host borrows the admitted operation's SessionLease, locking its row before every
+state read/write and migration/completion commit. Same-owner transactions serialize,
+but revision CAS still rejects stale snapshots from parallel tools.
 
 Before forming each context, the service loads raw config/state and chains pure
 synchronous migrations `n -> n+1`, then validates current types. Only when an
@@ -74,27 +76,32 @@ upgrade is needed does it atomically persist both JSON values, the target data
 version and a new UUID using the original version/revision as CAS. Same-version
 loads only validate, preserving the stored JSON and revision.
 Missing steps, invalid data or newer persisted formats
-fail without partial changes. Conflicts reread/recompute. Custom validators and
+fail without partial changes. Migration runs once before the binding opens;
+ownership loss aborts its fenced save without retry. Custom validators and
 migration functions must perform no I/O or external mutations; they run outside
 transactions, without a plugin instance or SessionContext.
 
-Session and binding statuses share `LifecycleStatus`: ready -> closing -> closed.
-Ready permits execution; it does not promise resources already exist. Close locks
-the session row briefly to record an irreversible decision and move all unclosed
-bindings to closing, also requesting runner cancellation. It then awaits one
-plugin at a time, persists each closed binding, and stops at the first failure.
-Retry skips closed bindings. Only once all bindings are closed is the session
-closed; history, input and ownership records remain queryable. Close does not
-wait for the runner, take its distributed lease, or run a task group.
+Session status advances ready -> closing -> closed. Ready permits execution; it
+never promises resources already exist. Close first acquires the same lease as
+execution. A live owner raises SessionBusy without changing session, bindings,
+cancel or inputs. After admission, close locks the lease and session rows to record
+its irreversible closing decision, then sequentially awaits each unfinished
+binding. Each successful callback is fenced and recorded closed. The binding set
+is fixed, so completing that list suffices to close the session. Retry skips closed
+bindings; legacy closing bindings are simply unfinished. New closes do not write
+binding closing states. History, input and ownership records remain queryable.
 
-State writes, input intake/consumption and closing lock the same session row.
-Execution state access is permitted only while ready. After closing wins,
-execution `replace` raises `LifecycleError` without changing state/revision;
-retrying CAS cannot bypass that decision. Close-scope stores may still save cleanup
-progress while the session and their binding are closing. Concurrent closers may
-observe another completed binding and continue, but unrelated cleanup/database
-errors still propagate. Cancel/timeout stops the current close and preserves its
-committed progress. Plugins must join their tasks and use bounded local cleanup.
+Execution admission checks ready once under its lease. That lifecycle stays stable
+through model/tool/paging and execution cleanup; normal close cannot overlap it.
+The application explicitly passes its lease to the plugin host, while plugin-facing
+SessionContext and callbacks expose no lease. Input intake still locks/checks the
+session in its own transaction. Expired-owner takeover renews during a default
+30-second grace before admission; it does not prove the old process exited. Both
+runner and plugin host fence every protected transaction on the same lease row,
+so persistent ownership safety does not depend on that timing assumption.
+Heartbeat failure cancels business through the lease's AnyIO task group. Plugins
+must join their tasks and use bounded local cleanup. Errors/cancellation preserve
+committed progress; close never requests or consumes runner cancellation.
 
 External allocation and registration are not atomic. Plugins coordinate parallel
 first use, promptly record resource IDs, and on rejected/cancelled registration

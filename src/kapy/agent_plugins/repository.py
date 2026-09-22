@@ -1,38 +1,21 @@
-"""Borrowed short transactions; always lock session before binding for mutations.
+"""Borrowed short transactions for plugin bindings.
 
-The session row serializes closing against resource registration and input intake.
+Execution and close accesses require the host to lock its lease first. Ordinary
+observation, including list_bindings, does not acquire a lease. Lease fencing
+serializes mutations, including same-owner parallel state writes.
 No plugin callback, migration or custom validator executes inside these transactions.
 UUID CAS orders JSON replacements, not external side effects or resource creation.
 """
 
-from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
-if TYPE_CHECKING:
-    from kapy.control.sessions.models import SessionRow
 from kapy.control.types import utc_now
-from kapy.lifecycle import LifecycleError, LifecycleStatus
 
 from .contracts import BindingRecord, PluginData, StateConflict
 from .models import PluginBindingRow
-
-type Operation = Literal["execution", "close"]
-
-
-async def lock_session(db: AsyncSession, session_id: UUID) -> SessionRow:
-    from kapy.control.sessions.models import SessionRow
-
-    row = (
-        await db.execute(
-            select(SessionRow).where(col(SessionRow.id) == session_id).with_for_update()
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        raise LookupError(f"Session {session_id} does not exist")
-    return row
 
 
 class BindingRepository:
@@ -53,18 +36,6 @@ class BindingRepository:
         row = await self.db.get(PluginBindingRow, (session_id, provider, name))
         if row is None:
             raise LookupError(f"Plugin binding {provider}.{name} does not exist")
-        return row
-
-    async def allowed(
-        self, session_id: UUID, provider: str, name: str, operation: Operation
-    ) -> PluginBindingRow:
-        session = await lock_session(self.db, session_id)
-        row = await self.get(session_id, provider, name)
-        expected = LifecycleStatus.READY if operation == "execution" else LifecycleStatus.CLOSING
-        if session.status != expected or (operation == "close" and row.status != expected):
-            raise LifecycleError(
-                f"Plugin {provider}.{name} does not allow {operation} in {session.status}"
-            )
         return row
 
     async def replace(

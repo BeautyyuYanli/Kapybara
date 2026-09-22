@@ -66,6 +66,8 @@ BackgroundTasks are in-process and non-durable, not a job queue. Concurrent star
 intents are resolved by the existing lease. SessionBusy and LifecycleError are absorbed
 in the background; other failures are logged by session ID and exception class,
 and cancellation propagates.
+Close returns 409 while an operation owns a live lease, without starting cleanup
+or requesting cancellation. Retry explicitly after the current operation exits.
 No independent run endpoint is exposed. Submission is not HTTP-retry-idempotent.
 
 List providers/models/sessions with offset=0 and limit=100. Page contains only
@@ -92,7 +94,7 @@ input/history association or execution outcome state is exposed; a valid lease
 neither proves model health nor identifies the preceding run's success.
 
 Router-local error handling returns FastAPI detail objects: 422 validation,
-404 LookupError, 409 identity/lifecycle conflict, 503 plugin close failure (retry
+404 LookupError, 409 identity/lifecycle conflict or busy close, 503 plugin close failure (retry
 the same close call), 502 model discovery, otherwise
 500. Validation details keep only loc/msg/type; upstream exception text, raw
 request data and credentials are not returned. HTTP operation IDs match endpoint

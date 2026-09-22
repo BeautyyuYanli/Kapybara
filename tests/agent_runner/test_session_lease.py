@@ -68,7 +68,7 @@ async def test_competing_acquisitions_and_independent_keys(database):
             pass
 
 
-async def test_expiration_allows_old_owner_until_takeover_and_notifies_loss(database):
+async def test_expiration_allows_old_owner_until_takeover(database):
     session_id = uuid4()
     with pytest.raises(LeaseLost):
         async with open_session_lease(session_id, session_factory=database.sessions) as old:
@@ -76,19 +76,14 @@ async def test_expiration_allows_old_owner_until_takeover_and_notifies_loss(data
             async with database.sessions.begin() as db:
                 assert not await is_session_busy(db, session_id)
                 await old.lock_owned(db)
-            monitor = asyncio.create_task(old.wait_lost())
-            try:
-                async with open_session_lease(session_id, session_factory=database.sessions) as new:
-                    with pytest.raises(LeaseLost):
-                        async with database.sessions.begin() as db:
-                            await old.lock_owned(db)
-                    with pytest.raises(LeaseLost):
-                        await monitor
+            async with open_session_lease(
+                session_id, session_factory=database.sessions, takeover_grace_period=0.01
+            ) as new:
+                with pytest.raises(LeaseLost):
                     async with database.sessions.begin() as db:
-                        await new.lock_owned(db)
-            finally:
-                monitor.cancel()
-                await asyncio.gather(monitor, return_exceptions=True)
+                        await old.lock_owned(db)
+                async with database.sessions.begin() as db:
+                    await new.lock_owned(db)
 
 
 async def test_protected_transaction_blocks_takeover_until_commit(database, wait_for_lock):
@@ -102,7 +97,9 @@ async def test_protected_transaction_blocks_takeover_until_commit(database, wait
             )
             await connection.rollback()
             async with open_session_lease(
-                session_id, session_factory=async_sessionmaker(connection)
+                session_id,
+                session_factory=async_sessionmaker(connection),
+                takeover_grace_period=0.01,
             ) as new:
                 new.check()
 
@@ -141,8 +138,9 @@ async def test_waiting_ownership_check_rechecks_committed_token(database, wait_f
                 await task
 
 
-async def test_heartbeat_failure_wakes_monitor_and_survives_context_exit(database, monkeypatch):
+async def test_heartbeat_failure_cancels_business_and_survives_context_exit(database, monkeypatch):
     update_owned = lease_service._update_owned
+    business_cancelled = False
 
     async def fail_renewal(db, lease, *, release):
         if not release:
@@ -154,9 +152,13 @@ async def test_heartbeat_failure_wakes_monitor_and_survives_context_exit(databas
     with pytest.raises(OSError, match="renewal unavailable"):
         async with open_session_lease(
             session_id, session_factory=database.sessions, heartbeat_interval=0.01
-        ) as lease:
-            with pytest.raises(OSError, match="renewal unavailable"):
-                await asyncio.wait_for(lease.wait_lost(), 5)
+        ):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                business_cancelled = True
+                raise
+    assert business_cancelled
     async with database.sessions.begin() as db:
         assert not await is_session_busy(db, session_id)
 
@@ -435,3 +437,124 @@ async def test_heartbeat_covers_runner_native_graph_cleanup(database, heartbeat_
     finally:
         finish.set()
         await task
+
+
+@pytest.mark.parametrize("grace", [0, -1, float("nan"), float("inf")])
+async def test_invalid_grace_rejected_before_acquisition(database, grace):
+    session_id = uuid4()
+    with pytest.raises(ValueError, match="takeover_grace_period"):
+        async with open_session_lease(
+            session_id, session_factory=database.sessions, takeover_grace_period=grace
+        ):
+            pytest.fail("invalid grace accepted")
+    async with database.sessions.begin() as db:
+        assert (await db.execute(text("SELECT count(*) FROM session_leases"))).scalar_one() == 0
+
+
+async def test_takeover_renews_during_grace_before_business(database, heartbeat_observation):
+    session_id = uuid4()
+    async with database.sessions.begin() as db:
+        await db.execute(
+            text(
+                "INSERT INTO session_leases (session_id, lock_token, heartbeat_at) "
+                "VALUES (:id, :token, clock_timestamp() - interval '1 hour')"
+            ),
+            {"id": session_id, "token": uuid4()},
+        )
+    heartbeat_tasks, renewed = heartbeat_observation
+    entered, finish = asyncio.Event(), asyncio.Event()
+    started = asyncio.get_running_loop().time()
+
+    async def owner():
+        async with open_session_lease(
+            session_id,
+            session_factory=database.sessions,
+            heartbeat_interval=0.01,
+            heartbeat_timeout=0.1,
+            takeover_grace_period=0.2,
+        ):
+            assert asyncio.get_running_loop().time() - started >= 0.2
+            entered.set()
+            await finish.wait()
+
+    task = asyncio.create_task(owner())
+    try:
+        await asyncio.wait_for(renewed.wait(), 5)
+        assert not entered.is_set()
+        with pytest.raises(SessionBusy):
+            async with open_session_lease(session_id, session_factory=database.sessions):
+                pytest.fail("takeover grace lost exclusion")
+        await asyncio.wait_for(entered.wait(), 5)
+    finally:
+        finish.set()
+        await task
+    assert heartbeat_tasks and all(task.done() for task in heartbeat_tasks)
+    # Released acquisitions never pay even a large grace period.
+    async with asyncio.timeout(2):
+        async with open_session_lease(
+            session_id, session_factory=database.sessions, takeover_grace_period=100
+        ):
+            pass
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "renewal_failure", "replaced"])
+async def test_takeover_grace_failure_never_enters_business(database, monkeypatch, outcome):
+    session_id = uuid4()
+    async with database.sessions.begin() as db:
+        await db.execute(
+            text(
+                "INSERT INTO session_leases (session_id, lock_token, heartbeat_at) "
+                "VALUES (:id, :token, clock_timestamp() - interval '1 hour')"
+            ),
+            {"id": session_id, "token": uuid4()},
+        )
+    renewing = asyncio.Event()
+    update_owned = lease_service._update_owned
+    replacement = uuid4()
+
+    async def renewal(db, lease, *, release):
+        if not release:
+            renewing.set()
+            if outcome == "replaced":
+                # Hold renewal before its SQL so only the post-grace ownership
+                # check can reject admission. Scope exit cancels this wait.
+                await asyncio.Event().wait()
+            if outcome == "renewal_failure":
+                raise OSError("renewal unavailable")
+        await update_owned(db, lease, release=release)
+
+    monkeypatch.setattr(lease_service, "_update_owned", renewal)
+
+    async def owner():
+        async with open_session_lease(
+            session_id,
+            session_factory=database.sessions,
+            heartbeat_interval=0.01,
+            takeover_grace_period=0.3,
+        ):
+            pytest.fail("failed grace admitted business")
+
+    task = asyncio.create_task(owner())
+    await asyncio.wait_for(renewing.wait(), 5)
+    if outcome == "cancel":
+        task.cancel()
+        expected = asyncio.CancelledError
+    elif outcome == "renewal_failure":
+        expected = OSError
+    else:
+        async with database.sessions.begin() as db:
+            await db.execute(
+                text("UPDATE session_leases SET lock_token=:token WHERE session_id=:id"),
+                {"id": session_id, "token": replacement},
+            )
+        expected = LeaseLost
+    with pytest.raises(expected):
+        await asyncio.wait_for(task, 5)
+    async with database.sessions.begin() as db:
+        token = (
+            await db.execute(
+                text("SELECT lock_token FROM session_leases WHERE session_id=:id"),
+                {"id": session_id},
+            )
+        ).scalar_one()
+        assert token == (replacement if outcome == "replaced" else None)

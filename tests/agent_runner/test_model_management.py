@@ -655,7 +655,9 @@ async def test_service_uses_configured_timeout_and_renews_while_model_waits(
 
     sdk_http(remote)
     catalog = ModelService(database.sessions)
-    sessions = SessionService(database.sessions, heartbeat_interval=0.01, heartbeat_timeout=30)
+    sessions = SessionService(
+        database.sessions, heartbeat_interval=0.01, heartbeat_timeout=30, takeover_grace_period=0.01
+    )
     provider = await create_provider(catalog)
     await catalog.create_model(
         CreateModel(provider_id=provider.id, model_name="custom", context_window=1000)
@@ -692,3 +694,68 @@ async def test_service_uses_configured_timeout_and_renews_while_model_waits(
         finish.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("application_factory", [False, True])
+@pytest.mark.parametrize("failure", ["heartbeat", "caller_cancel"])
+async def test_cancelled_execution_closes_native_sdk_clients_before_releasing_lease(
+    database, sdk_http, monkeypatch, application_factory, failure
+):
+    from kapy.session_lease import service as lease_service
+
+    requested = asyncio.Event()
+
+    async def remote(request):
+        requested.set()
+        await asyncio.Event().wait()
+        raise AssertionError("cancelled request unexpectedly resumed")
+
+    clients = sdk_http(remote)
+    catalog = ModelService(database.sessions)
+    provider = await create_provider(catalog)
+    await catalog.create_model(
+        CreateModel(provider_id=provider.id, model_name="custom", context_window=1000)
+    )
+    plugins = AgentPluginService(database.sessions, PluginRegistry())
+    sessions = SessionService(
+        database.sessions,
+        plugin_service=plugins,
+        execution_factory=create_execution_factory(plugins) if application_factory else None,
+        heartbeat_interval=0.01,
+    )
+    session = await sessions.create_session(
+        CreateSession(provider_id=provider.id, model_name="custom")
+    )
+    await sessions.enqueue_input(session.id, "queued", "go")
+    update_owned = lease_service._update_owned
+    closed_before_release = []
+
+    async def observe_ownership(db, lease, *, release):
+        if release:
+            closed_before_release.append(bool(clients) and all(c.is_closed for c in clients))
+        elif failure == "heartbeat" and requested.is_set():
+            raise OSError("heartbeat connection failed")
+        await update_owned(db, lease, release=release)
+
+    monkeypatch.setattr(lease_service, "_update_owned", observe_ownership)
+    running = asyncio.create_task(
+        sessions.start_runner(session.id, agent=None if application_factory else Agent())
+    )
+    try:
+        await asyncio.wait_for(requested.wait(), 5)
+        assert clients and not clients[-1].is_closed
+        if failure == "caller_cancel":
+            running.cancel()
+            expected = asyncio.CancelledError
+        else:
+            expected = OSError
+        with pytest.raises(expected):
+            await asyncio.wait_for(running, 5)
+        assert closed_before_release == [True]
+        assert all(client.is_closed for client in clients)
+        assert not await sessions.is_runner_running(session.id)
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        for client in clients:
+            await client.aclose()

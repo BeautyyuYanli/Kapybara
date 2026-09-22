@@ -39,7 +39,7 @@ from kapy.control.sessions import CreateSession, SessionService, UpdateSession
 from kapy.control.sessions.models import SessionRow
 from kapy.interfaces.http import create_session_router
 from kapy.lifecycle import LifecycleError, LifecycleStatus
-from kapy.session_lease import is_session_busy
+from kapy.session_lease import SessionBusy, is_session_busy, open_session_lease
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -114,6 +114,13 @@ async def create(service, *specs):
     )
 
 
+@asynccontextmanager
+async def open_plugins(plugins, session_id):
+    async with open_session_lease(session_id, session_factory=plugins.session_factory) as lease:
+        async with plugins.open_execution(session_id, lease=lease) as bindings:
+            yield bindings
+
+
 async def test_creation_is_atomic_ready_without_lifecycle_callbacks(database, plugin_setup):
     service, plugins, _, _, contexts, events, _ = plugin_setup
     session = await create(service, spec())
@@ -140,7 +147,7 @@ async def test_creation_is_atomic_ready_without_lifecycle_callbacks(database, pl
 async def test_state_copies_uuid_cas_scope_and_close(plugin_setup):
     service, plugins, _, _, contexts, _, _ = plugin_setup
     session = await create(service, spec())
-    async with plugins.open_execution(session.id):
+    async with open_plugins(plugins, session.id):
         ctx = contexts[-1]
         old = await ctx.state.read()
         updated = await ctx.state.replace(
@@ -153,11 +160,11 @@ async def test_state_copies_uuid_cas_scope_and_close(plugin_setup):
             await ctx.state.replace(State(), expected_revision=old.revision)
         ctx.config.label = "memory only"
         assert (await plugins.list_bindings(session.id))[0].config == {"label": "memory"}
-        assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
-        with pytest.raises(LifecycleError):
-            await ctx.state.replace(State(), expected_revision=updated.revision)
-        with pytest.raises(LifecycleError):
-            await ctx.state.read()
+        with pytest.raises(SessionBusy):
+            await service.close_session(session.id)
+        assert (await ctx.state.read()).value.resources == ["resource"]
+    with pytest.raises(LifecycleError):
+        await ctx.state.read()
     assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
     assert (
         await service.update_session(session.id, UpdateSession(title="archived"))
@@ -180,8 +187,8 @@ async def test_sequential_close_stops_and_retry_preserves_progress(plugin_setup)
     assert (await service.get_session(session.id)).status == LifecycleStatus.CLOSING
     assert [b.status for b in await plugins.list_bindings(session.id)] == [
         LifecycleStatus.CLOSED,
-        LifecycleStatus.CLOSING,
-        LifecycleStatus.CLOSING,
+        LifecycleStatus.READY,
+        LifecycleStatus.READY,
     ]
     assert (await plugins.list_bindings(session.id))[1].revision == before["memory"]
     controls["fail_close"] = None
@@ -194,41 +201,27 @@ async def test_sequential_close_stops_and_retry_preserves_progress(plugin_setup)
     ]
 
 
-async def test_concurrent_close_and_late_resource_registration(database):
-    entered, finish = asyncio.Event(), asyncio.Event()
-    contexts = []
-
-    class Plugin(AgentPlugin[Config, State]):
-        @asynccontextmanager
-        async def open_execution(self, ctx):
-            contexts.append(ctx)
-            yield PluginBinding()
-
-        async def close_session(self, ctx):
-            entered.set()
-            await finish.wait()
-            # A competing closer may already have committed closed.
-            await ctx.state.read()
-
-    registry = PluginRegistry()
-    registry.register(PluginDefinition("p", "r", 1, Config, State, Plugin))
-    plugins = AgentPluginService(database.sessions, registry)
-    service = SessionService(database.sessions, plugin_service=plugins)
-    session = await create(service, spec("r", "p"))
-    async with plugins.open_execution(session.id):
-        old = await contexts[0].state.read()
-        closing = asyncio.create_task(service.close_session(session.id))
-        await entered.wait()
-        with pytest.raises(LifecycleError):
-            await contexts[0].state.replace(
-                State(resources=["late"]), expected_revision=old.revision
-            )
-        assert (await plugins.list_bindings(session.id))[0].revision == old.revision
-        competing = asyncio.create_task(service.close_session(session.id))
-        finish.set()
-        results = await asyncio.gather(closing, competing)
-    assert all(item.status == LifecycleStatus.CLOSED for item in results)
-    assert (await plugins.list_bindings(session.id))[0].state is None
+async def test_busy_close_preserves_execution_cancel_and_inputs(plugin_setup):
+    service, plugins, _, _, contexts, events, _ = plugin_setup
+    session = await create(service, spec())
+    pending = await service.enqueue_input(session.id, "queued", "keep pending")
+    await service.request_cancel(session.id)
+    async with open_plugins(plugins, session.id):
+        before = await plugins.list_bindings(session.id)
+        with pytest.raises(SessionBusy):
+            await service.close_session(session.id)
+        assert await plugins.list_bindings(session.id) == before
+        assert (await service.get_session(session.id)).status == LifecycleStatus.READY
+        assert await service.read_cancel(session.id)
+        assert await service.read_inputs(session.id, "queued") == (pending,)
+        previous = await contexts[-1].state.read()
+        await contexts[-1].state.replace(
+            State(resources=["still usable"]), expected_revision=previous.revision
+        )
+    assert events == [("memory", "enter"), ("memory", "exit")]
+    assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
+    assert await service.read_cancel(session.id)
+    assert await service.read_inputs(session.id, "queued") == (pending,)
 
 
 async def test_loading_migrates_config_and_state_atomically(plugin_setup, database):
@@ -247,20 +240,66 @@ async def test_loading_migrates_config_and_state_atomically(plugin_setup, databa
     registry.register(replace(definition, data_version=2, migrations={1: migrate}))
     upgraded = AgentPluginService(database.sessions, registry)
     assert (await upgraded.list_bindings(session.id))[0].data_version == 1
-    async with upgraded.open_execution(session.id):
+    async with open_plugins(upgraded, session.id):
         ctx = contexts[-1]
         assert ctx.config.label == "memory upgraded"
         assert (await ctx.state.read()).value.resources == ["old_resource"]
         persisted = (await upgraded.list_bindings(session.id))[0]
         assert persisted.data_version == 2 and persisted.revision != before.revision
-    async with upgraded.open_execution(session.id):
+    async with open_plugins(upgraded, session.id):
         pass
     assert len(migrated) == 1
     with pytest.raises(PluginOperationError) as error:
-        async with plugins.open_execution(session.id):
+        async with open_plugins(plugins, session.id):
             pass
     assert "newer" in str(error.value.__cause__)
     assert (await upgraded.list_bindings(session.id))[0] == persisted
+
+
+async def test_migration_fences_owner_replaced_after_binding_load(
+    database, plugin_setup, monkeypatch
+):
+    import psycopg
+
+    from kapy.session_lease import LeaseLost
+
+    service, plugins, _, definition, contexts, events, _ = plugin_setup
+    session = await create(service, spec())
+    before = (await plugins.list_bindings(session.id))[0]
+    migrations = []
+
+    def migrate(data):
+        migrations.append(data)
+        return PluginData({"label": "upgraded"}, {"resources": ["preserved resource"]})
+
+    registry = PluginRegistry()
+    upgraded_definition = replace(definition, data_version=2, migrations={1: migrate})
+    registry.register(upgraded_definition)
+    upgraded = AgentPluginService(database.sessions, registry)
+    load = PluginDefinition.load
+
+    def load_then_replace_owner(self, version, data):
+        loaded = load(self, version, data)
+        # The initial binding-read transaction has ended. Inject another owner's
+        # committed token here, independently of the migration save/fencing path.
+        # This test hook uses a separate real connection; migrate itself stays pure.
+        with psycopg.connect(
+            database.url, options=f"-csearch_path={database.schema},pg_catalog"
+        ) as db:
+            db.execute(
+                "UPDATE session_leases SET lock_token=%s WHERE session_id=%s",
+                (uuid4(), session.id),
+            )
+        return loaded
+
+    monkeypatch.setattr(PluginDefinition, "load", load_then_replace_owner)
+    with pytest.raises(PluginOperationError) as caught:
+        async with open_plugins(upgraded, session.id):
+            pytest.fail("lost owner entered plugin execution")
+    assert isinstance(caught.value.__cause__, LeaseLost)
+    assert len(migrations) == 1
+    assert not contexts and not events
+    assert (await plugins.list_bindings(session.id))[0] == before
 
 
 async def test_missing_or_invalid_migration_never_partially_persists(plugin_setup, database):
@@ -272,7 +311,7 @@ async def test_missing_or_invalid_migration_never_partially_persists(plugin_setu
         registry.register(replace(definition, data_version=2, migrations=migrations))
         upgraded = AgentPluginService(database.sessions, registry)
         with pytest.raises(PluginOperationError):
-            async with upgraded.open_execution(session.id):
+            async with open_plugins(upgraded, session.id):
                 pass
         assert (await upgraded.list_bindings(session.id))[0] == before
 
@@ -522,7 +561,7 @@ async def test_lower_runner_factory_runs_inside_lease_and_borrows_no_business_se
     events = []
 
     @asynccontextmanager
-    async def factory():
+    async def factory(lease):
         async with database.sessions.begin() as db:
             assert await is_session_busy(db, session_id)
         events.append("enter")
@@ -614,7 +653,7 @@ async def test_adapter_preserves_native_dispatch_validation_and_scope(plugin_set
         assert part.content == 3
         return ModelResponse(parts=[TextPart("3")])
 
-    async with plugins.open_execution(session.id) as bindings:
+    async with open_plugins(plugins, session.id) as bindings:
         capabilities = PluginCapabilityAdapter.build(
             "acme",
             "memory",
@@ -625,10 +664,10 @@ async def test_adapter_preserves_native_dispatch_validation_and_scope(plugin_set
         agent = Agent(FunctionModel(model), capabilities=capabilities)
         assert (await agent.run("increment")).output == "3"
         assert called == [2]
-        await service.close_session(session.id)
-        with pytest.raises(LifecycleError):
-            await agent.run("increment")
-        assert called == [2]
+    await service.close_session(session.id)
+    with pytest.raises(LifecycleError):
+        await agent.run("increment")
+    assert called == [2]
 
 
 async def test_config_and_state_encoding_round_trips_aliases_and_json(plugin_setup, database):
@@ -645,13 +684,13 @@ async def test_config_and_state_encoding_round_trips_aliases_and_json(plugin_set
     encoded_service = SessionService(database.sessions, plugin_service=encoded_plugins)
     raw: dict[str, JsonValue] = {"resource_label": "ready", "numbers": "[1,2]"}
     session = await create(encoded_service, spec().model_copy(update={"config": raw}))
-    async with encoded_plugins.open_execution(session.id):
+    async with open_plugins(encoded_plugins, session.id):
         context = contexts[-1]
         assert context.config.label == "ready" and context.config.numbers == [1, 2]
         initial = await context.state.read()
         await context.state.replace(Data.model_validate(raw), expected_revision=initial.revision)
         assert (await context.state.read()).value.numbers == [1, 2]
-    async with encoded_plugins.open_execution(session.id):
+    async with open_plugins(encoded_plugins, session.id):
         assert contexts[-1].config.numbers == [1, 2]
         assert (await contexts[-1].state.read()).value.label == "ready"
     (binding,) = await encoded_plugins.list_bindings(session.id)
@@ -669,12 +708,12 @@ async def test_config_and_state_encoding_round_trips_aliases_and_json(plugin_set
         )
     )
     upgraded = AgentPluginService(database.sessions, registry)
-    async with upgraded.open_execution(old.id):
+    async with open_plugins(upgraded, old.id):
         assert contexts[-1].config.numbers == [1, 2]
         assert (await contexts[-1].state.read()).value.numbers == [1, 2]
     (after,) = await upgraded.list_bindings(old.id)
     assert after.data_version == 2 and after.config == after.state == raw
-    async with upgraded.open_execution(old.id):
+    async with open_plugins(upgraded, old.id):
         assert contexts[-1].config.label == "ready"
 
 
@@ -702,7 +741,7 @@ async def test_unreadable_serializer_output_is_never_persisted(plugin_setup, dat
     registry = PluginRegistry()
     registry.register(replace(definition, state_type=Unreadable))
     state_plugins = AgentPluginService(database.sessions, registry)
-    async with state_plugins.open_execution(session.id):
+    async with open_plugins(state_plugins, session.id):
         with pytest.raises(ValidationError):
             await contexts[-1].state.replace(
                 Unreadable(label="valid input"), expected_revision=before.revision
@@ -717,7 +756,7 @@ async def test_unreadable_serializer_output_is_never_persisted(plugin_setup, dat
     )
     upgrading = AgentPluginService(database.sessions, registry)
     with pytest.raises(PluginOperationError):
-        async with upgrading.open_execution(session.id):
+        async with open_plugins(upgrading, session.id):
             pass
     assert (await plugins.list_bindings(session.id))[0] == before
 
@@ -752,18 +791,15 @@ async def test_json_null_root_config_can_be_created_loaded_and_closed(database):
             )
         ).scalar_one()
         assert is_json_null
-    async with plugins.open_execution(session.id):
+    async with open_plugins(plugins, session.id):
         pass
     assert seen == [None]
     assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
 
 
-@pytest.mark.parametrize("suppress_context", [False, True])
-async def test_concurrent_close_preserves_cleanup_error_before_lifecycle_error(
-    database, suppress_context
-):
-    first_entered, second_closed = asyncio.Event(), asyncio.Event()
-    count = 0
+async def test_competing_close_is_busy_and_failure_keeps_progress(database):
+    entered, finish = asyncio.Event(), asyncio.Event()
+    calls = []
 
     class Plugin(AgentPlugin[Config, State]):
         @asynccontextmanager
@@ -771,20 +807,10 @@ async def test_concurrent_close_preserves_cleanup_error_before_lifecycle_error(
             yield PluginBinding()
 
         async def close_session(self, ctx):
-            nonlocal count
-            count += 1
-            if count == 1:
-                first_entered.set()
-                await second_closed.wait()
-                try:
-                    raise RuntimeError("real external cleanup failure")
-                finally:
-                    try:
-                        await ctx.state.read()
-                    except LifecycleError as error:
-                        if suppress_context:
-                            raise error from None
-                        raise
+            calls.append(ctx.session_id)
+            entered.set()
+            await finish.wait()
+            raise RuntimeError("external cleanup failure")
 
     registry = PluginRegistry()
     registry.register(PluginDefinition("p", "close", 1, Config, State, Plugin))
@@ -793,25 +819,25 @@ async def test_concurrent_close_preserves_cleanup_error_before_lifecycle_error(
     session = await create(service, spec("close", "p"))
     first = asyncio.create_task(service.close_session(session.id))
     try:
-        await first_entered.wait()
-        assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
-        second_closed.set()
-        with pytest.raises(PluginOperationError, match="p.close") as caught:
+        await asyncio.wait_for(entered.wait(), 5)
+        with pytest.raises(SessionBusy):
+            await service.close_session(session.id)
+        assert calls == [session.id]
+        assert not await service.read_cancel(session.id)
+        finish.set()
+        with pytest.raises(PluginOperationError) as caught:
             await first
-        lifecycle_error = caught.value.__cause__
-        assert isinstance(lifecycle_error, LifecycleError)
-        assert isinstance(lifecycle_error.__context__, RuntimeError)
-        assert str(lifecycle_error.__context__) == "real external cleanup failure"
+        assert str(caught.value.__cause__) == "external cleanup failure"
+        assert (await service.get_session(session.id)).status == LifecycleStatus.CLOSING
+        assert (await plugins.list_bindings(session.id))[0].status == LifecycleStatus.READY
     finally:
-        second_closed.set()
+        finish.set()
         await asyncio.gather(first, return_exceptions=True)
 
 
-async def test_close_stops_late_ordinary_tool_and_preserves_next_input(
+async def test_busy_close_does_not_cancel_model_or_ordinary_tools(
     database, seed_session, session_model
 ):
-    from kapy.control.sessions.repository import SessionRepository
-
     service = SessionService(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
@@ -823,9 +849,11 @@ async def test_close_stops_late_ordinary_tool_and_preserves_next_input(
         return "result"
 
     async def model(messages, info):
-        model_entered.set()
-        await release_model.wait()
-        return ModelResponse(parts=[ToolCallPart("ordinary_tool", {})])
+        if isinstance(messages[-1].parts[0], UserPromptPart):
+            model_entered.set()
+            await release_model.wait()
+            return ModelResponse(parts=[ToolCallPart("ordinary_tool", {})])
+        return ModelResponse(parts=[TextPart("done")])
 
     session_model(FunctionModel(model))
     agent = Agent(tools=[ordinary_tool])
@@ -833,105 +861,69 @@ async def test_close_stops_late_ordinary_tool_and_preserves_next_input(
     running = asyncio.create_task(service.start_runner(session_id, agent=agent))
     try:
         await asyncio.wait_for(model_entered.wait(), 5)
-        queued = await service.enqueue_input(session_id, "queued", "next")
-        closed = await asyncio.wait_for(service.close_session(session_id), 2)
-        assert closed.status == LifecycleStatus.CLOSED
-        assert not running.done() and not release_model.is_set()
-        # Remove the one-shot advisory signal so it cannot mask persistent checks.
-        async with database.sessions.begin() as db:
-            assert await SessionRepository(db).consume_cancel(session_id)
+        with pytest.raises(SessionBusy):
+            await service.close_session(session_id)
+        assert (await service.get_session(session_id)).status == LifecycleStatus.READY
         assert not await service.read_cancel(session_id)
         release_model.set()
-        with pytest.raises(LifecycleError):
-            await asyncio.wait_for(running, 5)
-        assert tool_calls == []
-        assert await service.read_inputs(session_id, "queued") == (queued,)
-        assert not await service.is_runner_running(session_id)
+        assert (await asyncio.wait_for(running, 5)).output == "done"
+        assert tool_calls == ["called"]
+        assert (await service.close_session(session_id)).status == LifecycleStatus.CLOSED
         with pytest.raises(LifecycleError):
             await service.start_runner(session_id, agent=agent)
-        assert await service.read_inputs(session_id, "queued") == (queued,)
-        assert tool_calls == []
     finally:
         release_model.set()
         running.cancel()
         await asyncio.gather(running, return_exceptions=True)
 
 
-async def test_closing_commit_serializes_resource_registration_and_enqueue(
-    database, monkeypatch, wait_for_lock
-):
+async def test_closing_decision_serializes_input_intake(database, monkeypatch, wait_for_lock):
     from sqlalchemy import text
 
-    from kapy.agent_plugins import repository as binding_repository
+    from kapy.agent_plugins.repository import BindingRepository
     from kapy.control.sessions import service as session_service
-    from kapy.control.sessions.repository import SessionRepository
 
-    contexts = []
-
-    class Plugin(AgentPlugin[Config, State]):
-        @asynccontextmanager
-        async def open_execution(self, ctx):
-            contexts.append(ctx)
-            yield PluginBinding()
-
-    registry = PluginRegistry()
-    registry.register(PluginDefinition("p", "resource", 1, Config, State, Plugin))
-    plugins = AgentPluginService(database.sessions, registry)
-    service = SessionService(database.sessions, plugin_service=plugins)
-    session = await create(service, spec("resource", "p"))
+    service = SessionService(database.sessions)
+    session = await create(service)
     closing_written, commit_closing = asyncio.Event(), asyncio.Event()
-    backend_pids = asyncio.Queue()
-    set_cancel = SessionRepository.set_cancel
-    lock_session = binding_repository.lock_session
+    backend_pid = asyncio.Future()
+    list_bindings = BindingRepository.list
+    lock_session = session_service.lock_session
 
     async def hold_closing(repo, session_id):
-        await set_cancel(repo, session_id)
+        result = await list_bindings(repo, session_id)
         closing_written.set()
         await commit_closing.wait()
+        return result
 
     async def observe_lock(db, session_id):
         task = asyncio.current_task()
-        if task is not None and task.get_name() in {"register-resource", "enqueue-input"}:
-            pid = (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
-            backend_pids.put_nowait(pid)
+        if task is not None and task.get_name() == "enqueue-input":
+            backend_pid.set_result((await db.execute(text("SELECT pg_backend_pid()"))).scalar_one())
         return await lock_session(db, session_id)
 
-    monkeypatch.setattr(SessionRepository, "set_cancel", hold_closing)
-    monkeypatch.setattr(binding_repository, "lock_session", observe_lock)
+    monkeypatch.setattr(BindingRepository, "list", hold_closing)
     monkeypatch.setattr(session_service, "lock_session", observe_lock)
-    tasks: list[asyncio.Task] = []
-    async with plugins.open_execution(session.id):
-        state = contexts[-1].state
-        before = await state.read()
-        closing = asyncio.create_task(service.close_session(session.id))
-        tasks.append(closing)
-        try:
-            await asyncio.wait_for(closing_written.wait(), 5)
-            registration = asyncio.create_task(
-                state.replace(State(resources=["late"]), expected_revision=before.revision),
-                name="register-resource",
-            )
-            enqueue = asyncio.create_task(
-                service.enqueue_input(session.id, "queued", "late"), name="enqueue-input"
-            )
-            tasks.extend([registration, enqueue])
-            for _ in range(2):
-                pid = await asyncio.wait_for(backend_pids.get(), 5)
-                await wait_for_lock(pid)
-            assert not registration.done() and not enqueue.done()
-            commit_closing.set()
-            assert (await asyncio.wait_for(closing, 5)).status == LifecycleStatus.CLOSED
-            for operation in (registration, enqueue):
-                with pytest.raises(LifecycleError):
-                    await asyncio.wait_for(operation, 5)
-            (binding,) = await plugins.list_bindings(session.id)
-            assert binding.state is None and binding.revision == before.revision
-            assert await service.read_inputs(session.id, "queued") == ()
-        finally:
-            commit_closing.set()
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+    closing = asyncio.create_task(service.close_session(session.id))
+    tasks: list[asyncio.Task] = [closing]
+    try:
+        await asyncio.wait_for(closing_written.wait(), 5)
+        enqueue = asyncio.create_task(
+            service.enqueue_input(session.id, "queued", "late"), name="enqueue-input"
+        )
+        tasks.append(enqueue)
+        await wait_for_lock(await asyncio.wait_for(backend_pid, 5))
+        assert not enqueue.done()
+        commit_closing.set()
+        assert (await asyncio.wait_for(closing, 5)).status == LifecycleStatus.CLOSED
+        with pytest.raises(LifecycleError):
+            await enqueue
+        assert await service.read_inputs(session.id, "queued") == ()
+    finally:
+        commit_closing.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def test_sdk_instructions_reject_state_writes_and_restore_tool_permissions(plugin_setup):
@@ -943,7 +935,7 @@ async def test_sdk_instructions_reject_state_writes_and_restore_tool_permissions
     session = await create(service, spec())
     evaluated = []
 
-    async with plugins.open_execution(session.id) as bindings:
+    async with open_plugins(plugins, session.id) as bindings:
         context = contexts[-1]
         initial = await context.state.read()
 
@@ -978,3 +970,196 @@ async def test_sdk_instructions_reject_state_writes_and_restore_tool_permissions
         assert after.revision != initial.revision
     (binding_record,) = await plugins.list_bindings(session.id)
     assert binding_record.state == {"resources": ["saved"]}
+
+
+async def test_parallel_state_replacements_keep_revision_cas(plugin_setup):
+    service, plugins, _, _, contexts, _, _ = plugin_setup
+    session = await create(service, spec())
+    async with open_plugins(plugins, session.id):
+        store = contexts[-1].state
+        before = await store.read()
+        results = await asyncio.gather(
+            store.replace(State(resources=["a"]), expected_revision=before.revision),
+            store.replace(State(resources=["b"]), expected_revision=before.revision),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(result, StateConflict) for result in results) == 1
+        assert (await store.read()).value.resources in (["a"], ["b"])
+
+
+@pytest.mark.parametrize("operation", ["read", "replace"])
+async def test_plugin_state_fences_replaced_owner(database, plugin_setup, operation):
+    from sqlalchemy import text
+
+    from kapy.session_lease import LeaseLost
+
+    service, plugins, _, _, contexts, _, _ = plugin_setup
+    session = await create(service, spec())
+    replacement = uuid4()
+    with pytest.raises(LeaseLost):
+        async with open_plugins(plugins, session.id):
+            store = contexts[-1].state
+            before = await store.read()
+            async with database.sessions.begin() as db:
+                await db.execute(
+                    text("UPDATE session_leases SET lock_token=:token WHERE session_id=:id"),
+                    {"id": session.id, "token": replacement},
+                )
+            with pytest.raises(LeaseLost):
+                if operation == "read":
+                    await store.read()
+                else:
+                    await store.replace(
+                        State(resources=["stale"]), expected_revision=before.revision
+                    )
+    (binding,) = await plugins.list_bindings(session.id)
+    assert binding.state is None and binding.revision == before.revision
+    async with database.sessions.begin() as db:
+        assert (
+            await db.execute(
+                text("SELECT lock_token FROM session_leases WHERE session_id=:id"),
+                {"id": session.id},
+            )
+        ).scalar_one() == replacement
+
+
+async def test_plugin_host_rejects_another_sessions_lease(database, plugin_setup):
+    service, plugins, _, _, _, _, _ = plugin_setup
+    session = await create(service, spec())
+    async with open_session_lease(uuid4(), session_factory=database.sessions) as lease:
+        with pytest.raises(ValueError, match="target session"):
+            async with plugins.open_execution(session.id, lease=lease):
+                pytest.fail("wrong lease accepted")
+        with pytest.raises(ValueError, match="target session"):
+            await plugins.close_binding((await plugins.list_bindings(session.id))[0], lease=lease)
+
+
+async def test_close_lost_ownership_cannot_record_binding_completion(database):
+    from sqlalchemy import text
+
+    from kapy.session_lease import LeaseLost
+
+    class Plugin(AgentPlugin[Config, State]):
+        @asynccontextmanager
+        async def open_execution(self, ctx):
+            yield PluginBinding()
+
+        async def close_session(self, ctx):
+            # Simulate takeover while an already-issued external deletion completes.
+            async with database.sessions.begin() as db:
+                await db.execute(
+                    text("UPDATE session_leases SET lock_token=:token WHERE session_id=:id"),
+                    {"id": ctx.session_id, "token": uuid4()},
+                )
+
+    registry = PluginRegistry()
+    registry.register(PluginDefinition("p", "close", 1, Config, State, Plugin))
+    plugins = AgentPluginService(database.sessions, registry)
+    service = SessionService(database.sessions, plugin_service=plugins)
+    session = await create(service, spec("close", "p"))
+    with pytest.raises(PluginOperationError) as caught:
+        await service.close_session(session.id)
+    assert isinstance(caught.value.__cause__, LeaseLost)
+    assert (await service.get_session(session.id)).status == LifecycleStatus.CLOSING
+    assert (await plugins.list_bindings(session.id))[0].status == LifecycleStatus.READY
+
+
+async def test_http_busy_close_returns_conflict_without_mutation(database, plugin_setup):
+    service, plugins, _, _, _, events, _ = plugin_setup
+    session = await create(service, spec())
+    before = await plugins.list_bindings(session.id)
+    app = FastAPI()
+    app.include_router(create_session_router(service), prefix="/api")
+    async with (
+        open_session_lease(session.id, session_factory=database.sessions),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client,
+    ):
+        response = await client.post(f"/api/sessions/{session.id}/close")
+    assert response.status_code == 409
+    assert (await service.get_session(session.id)).status == LifecycleStatus.READY
+    assert await plugins.list_bindings(session.id) == before
+    assert not await service.read_cancel(session.id) and not events
+
+
+async def test_close_waits_through_takeover_grace_without_deciding_closing(
+    database, heartbeat_observation
+):
+    from sqlalchemy import text
+
+    service = SessionService(database.sessions, heartbeat_interval=0.01, takeover_grace_period=0.3)
+    session = await create(service)
+    async with database.sessions.begin() as db:
+        await db.execute(
+            text(
+                "INSERT INTO session_leases (session_id, lock_token, heartbeat_at) "
+                "VALUES (:id, :token, clock_timestamp() - interval '1 hour')"
+            ),
+            {"id": session.id, "token": uuid4()},
+        )
+    _, renewed = heartbeat_observation
+    closing = asyncio.create_task(service.close_session(session.id))
+    try:
+        await asyncio.wait_for(renewed.wait(), 5)
+        assert (await service.get_session(session.id)).status == LifecycleStatus.READY
+        pending = await service.enqueue_input(session.id, "queued", "accepted during grace")
+        assert not await service.read_cancel(session.id)
+        assert (await asyncio.wait_for(closing, 5)).status == LifecycleStatus.CLOSED
+        assert await service.read_inputs(session.id, "queued") == (pending,)
+    finally:
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+
+
+@pytest.mark.parametrize("cancellation", ["asyncio", "anyio"])
+async def test_cancelled_close_releases_lease_and_retries_unfinished_bindings(
+    database, cancellation
+):
+    import anyio
+
+    entered, cleaned = asyncio.Event(), asyncio.Event()
+    calls = []
+    pause = True
+
+    class Plugin(AgentPlugin[Config, State]):
+        @asynccontextmanager
+        async def open_execution(self, ctx):
+            yield PluginBinding()
+
+        async def close_session(self, ctx):
+            calls.append(ctx.plugin_name)
+            if ctx.plugin_name == "z_last" and pause:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    with anyio.fail_after(1, shield=True):
+                        await ctx.state.read()
+                        cleaned.set()
+
+    registry = PluginRegistry()
+    for name in ("a_first", "z_last"):
+        registry.register(PluginDefinition("p", name, 1, Config, State, Plugin))
+    plugins = AgentPluginService(database.sessions, registry)
+    service = SessionService(database.sessions, plugin_service=plugins)
+    session = await create(service, spec("z_last", "p"), spec("a_first", "p"))
+    if cancellation == "asyncio":
+        task = asyncio.create_task(service.close_session(session.id))
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        async with anyio.create_task_group() as group:
+            group.start_soon(service.close_session, session.id)
+            await asyncio.wait_for(entered.wait(), 5)
+            group.cancel_scope.cancel()
+    assert cleaned.is_set()
+    assert not await service.is_runner_running(session.id)
+    assert (await service.get_session(session.id)).status == LifecycleStatus.CLOSING
+    assert [b.status for b in await plugins.list_bindings(session.id)] == [
+        LifecycleStatus.CLOSED,
+        LifecycleStatus.READY,
+    ]
+    pause = False
+    assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
+    assert calls == ["a_first", "z_last", "z_last"]

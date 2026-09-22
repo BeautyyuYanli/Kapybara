@@ -129,7 +129,10 @@ preview state. Cancellation unwinds the current read or send and closes the live
 Bot API, SQLite, Valkey and core PostgreSQL resources; exit does not set a user
 cancel flag. Existing legacy Telegram state is not imported.
 
-`/close` awaits sequential plugin cleanup and keeps the route/history for inspection.
+`/close` first acquires the session lease, then awaits sequential plugin cleanup
+and keeps the route/history for inspection. A busy lease replies that close has
+not started and completes the inbox command; it is never automatically retried
+as a future close. Use `/cancel` separately and retry `/close` after execution exits.
 Failure preserves closing progress and replies with a retry notice. Input to a
 closing/closed session is rejected without enqueueing; `/new` creates another one.
 `/status` includes the lifecycle status. HTTP and Telegram share the application

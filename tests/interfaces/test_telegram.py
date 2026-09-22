@@ -822,3 +822,25 @@ async def test_close_reports_cleanup_failure_then_user_retry_succeeds(repository
     assert await repository.route(42, 123, 0) == session_id
     sessions.create_session.assert_awaited_once()
     assert not scheduled
+
+
+@pytest.mark.asyncio
+async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp_path):
+    from kapy.session_lease import SessionBusy
+
+    app, sessions, client, _ = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/new")])
+    assert await app.process_once()
+    sessions.close_session.side_effect = SessionBusy("occupied")
+    await repository.ingest(42, [update(2, "/close")])
+    assert await app.process_once()
+    assert "close has not started" in client.send.await_args.args[-1]
+    assert await repository.next_inbox(42) is None
+    assert not await app.process_once()
+    sessions.close_session.assert_awaited_once()
+    sessions.request_cancel.assert_not_awaited()
+    sessions.close_session.side_effect = None
+    await repository.ingest(42, [update(3, "/close")])
+    assert await app.process_once()
+    assert client.send.await_args.args[-1] == "Session closed."
+    assert sessions.close_session.await_count == 2
