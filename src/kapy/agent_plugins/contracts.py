@@ -14,6 +14,7 @@ from typing import Annotated, Any, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, Field, JsonValue
+from pydantic_ai.capabilities import AbstractCapability
 
 from kapy.control.types import DTO
 from kapy.lifecycle import LifecycleStatus
@@ -123,17 +124,25 @@ class PluginTool:
 
 @dataclass(frozen=True)
 class PluginBinding:
-    """Instructions and tools valid within the yielding open_execution context.
+    """Contributions valid within the yielding open_execution context.
 
     Callables may capture the context and resources owned by that execution;
     they must not escape its lifetime. Instructions may be evaluated repeatedly,
     including during recovery and compaction. They only render text/read state:
     no allocation, state writes or external mutations. The host rejects state
     writes while evaluating instructions and restores tool access afterwards.
+
+    Native capabilities are trusted SDK extensions: their hooks/instructions/tools
+    do not receive the adapter's scope checks, read-only guard or tool prefixes.
+    They own valid final tool names and may use captured resources only within
+    this execution. Use for_run() for state local to each SDK run, including
+    auxiliary paging runs. Plugins contribute capabilities; only the host installs
+    them, and the host supplies the session checkpoint ordering boundary.
     """
 
     instructions: Callable[[], Awaitable[str]] | None = None
     tools: tuple[PluginTool, ...] = ()
+    capabilities: tuple[AbstractCapability[Any], ...] = ()
 
 
 @dataclass(frozen=True)

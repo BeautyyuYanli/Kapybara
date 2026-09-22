@@ -9,9 +9,14 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, ValidationError
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRequestNode
+from pydantic_ai.capabilities import AbstractCapability, Capability, PrefixTools
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.tools import Tool
+from pydantic_ai.toolsets import PrefixedToolset, RenamedToolset
+from pydantic_ai.usage import RequestUsage
 from sqlalchemy import func, select
 
 from kapy.agent_plugins import (
@@ -29,6 +34,7 @@ from kapy.agent_plugins import (
 from kapy.agent_plugins.models import PluginBindingRow
 from kapy.agent_runner import RunnerExecution, open_runner
 from kapy.application.agent import create_execution_factory
+from kapy.context_plugins.summary import COMPACTION_PROMPT
 from kapy.control.sessions import CreateSession, SessionService, UpdateSession
 from kapy.control.sessions.models import SessionRow
 from kapy.interfaces.http import create_session_router
@@ -49,7 +55,7 @@ class State(BaseModel):
 @pytest.fixture
 def plugin_setup(database):
     contexts, events = [], []
-    controls = {"fail_close": None, "open_error": False}
+    controls = {"fail_close": None, "open_error": False, "capabilities": lambda ctx: ()}
 
     class Plugin(AgentPlugin[Config, State]):
         @asynccontextmanager
@@ -71,7 +77,9 @@ def plugin_setup(database):
                     return f"Use {ctx.config.label} memory."
 
                 yield PluginBinding(
-                    instructions, (PluginTool("remember", "Save a value", remember),)
+                    instructions,
+                    (PluginTool("remember", "Save a value", remember),),
+                    controls["capabilities"](ctx),
                 )
             finally:
                 events.append((ctx.plugin_name, "exit"))
@@ -303,6 +311,171 @@ async def test_native_tools_instructions_state_and_fresh_execution(
     assert all(request.function_tools[0].name == "acme_memory_remember" for request in requests)
 
 
+async def test_native_capabilities_isolate_runs_and_rewrite_before_checkpoint(
+    plugin_setup, seed_session, session_model
+):
+    service, _, _, _, contexts, events, controls = plugin_setup
+    template_id = uuid4()
+    await seed_session(template_id)
+    template = await service.get_session(template_id)
+    session = await service.create_session(
+        CreateSession(
+            provider_id=template.provider_id,
+            model_name=template.model_name,
+            plugins=[spec()],
+            compaction_threshold_tokens=1,
+        )
+    )
+    runs, before_commits = [], []
+
+    class Rewrite(AbstractCapability):
+        def __init__(self, context):
+            self.context = context
+            self.requests = 0
+
+        async def for_run(self, ctx):
+            fresh = Rewrite(self.context)
+            runs.append(fresh)
+            return fresh
+
+        def get_instructions(self):
+            return "native instructions"
+
+        async def before_model_request(self, ctx, request_context):
+            await self.context.state.read()
+            self.requests += 1
+            return request_context
+
+        async def after_model_request(self, ctx, *, request_context, response):
+            response.parts[0].content += " rewritten"
+            return response
+
+        async def after_node_run(self, ctx, *, node, result):
+            if isinstance(node, ModelRequestNode):
+                if ctx.prompt != COMPACTION_PROMPT:
+                    before_commits.append(len((await service.read_history(session.id)).items))
+                result.model_response.parts.append(TextPart("after node"))
+            return result
+
+    def native_tool() -> str:
+        return "native"
+
+    def capabilities(ctx):
+        return (
+            PrefixTools(wrapped=Capability(tools=[native_tool]), prefix="already"),
+            Rewrite(ctx),
+        )
+
+    controls["capabilities"] = capabilities
+
+    def model(messages, info):
+        assert {tool.name for tool in info.function_tools} == {
+            "acme_memory_remember",
+            "already_native_tool",
+        }
+        assert (info.instructions or "").count("native instructions") == 1
+        assert (info.instructions or "").count("Use memory memory.") == 1
+        summary = messages[-1].parts[-1].content == COMPACTION_PROMPT
+        return ModelResponse(
+            parts=[TextPart("summary" if summary else "business")],
+            usage=RequestUsage(input_tokens=2),
+        )
+
+    session_model(FunctionModel(model))
+    await service.enqueue_input(session.id, "steer", "first")
+    await service.enqueue_input(session.id, "queued", "second")
+    result = await service.start_runner(session.id)
+    assert result.output == "business rewrittenafter node"
+    assert len(runs) == 4 and all(run.requests == 1 for run in runs)
+    assert before_commits == [1, 3]
+    assert events == [("memory", "enter"), ("memory", "exit")]
+    saved = (await service.read_history(session.id)).items
+    assert len(saved) == 4
+    for item in saved[1::2]:
+        assert item.message.parts == [TextPart("business rewritten"), TextPart("after node")]
+    with pytest.raises(LifecycleError):
+        await contexts[0].state.read()
+
+
+@pytest.mark.parametrize("name", ["acme_memory_remember", "invalid-name", "x" * 65])
+async def test_native_tool_names_are_checked_after_composition(
+    plugin_setup, seed_session, session_model, name
+):
+    service, _, _, _, _, events, controls = plugin_setup
+    template_id = uuid4()
+    await seed_session(template_id)
+    template = await service.get_session(template_id)
+    session = await service.create_session(
+        CreateSession(
+            provider_id=template.provider_id, model_name=template.model_name, plugins=[spec()]
+        )
+    )
+    controls["capabilities"] = lambda ctx: (Capability(tools=[Tool(lambda: "native", name=name)]),)
+
+    def model(messages, info):
+        pytest.fail("Invalid tools must fail before the model request")
+
+    session_model(FunctionModel(model))
+    await service.enqueue_input(session.id, "queued", "go")
+    error = UserError if name == "acme_memory_remember" else ValueError
+    with pytest.raises(error):
+        await service.start_runner(session.id)
+    assert events == [("memory", "enter"), ("memory", "exit")]
+    assert not await service.is_runner_running(session.id)
+
+
+@pytest.mark.parametrize("wrapper", ["invalid_prefix", "long_prefix", "valid_rename"])
+async def test_native_tool_names_are_checked_after_wrapper_toolsets(
+    plugin_setup, seed_session, session_model, wrapper
+):
+    service, _, _, _, _, events, controls = plugin_setup
+    template_id = uuid4()
+    await seed_session(template_id)
+    template = await service.get_session(template_id)
+    session = await service.create_session(
+        CreateSession(
+            provider_id=template.provider_id, model_name=template.model_name, plugins=[spec()]
+        )
+    )
+    calls = []
+
+    def native_tool() -> str:
+        calls.append("executed")
+        return "native result"
+
+    class WrappedCapability(Capability):
+        def get_wrapper_toolset(self, toolset):
+            if wrapper == "valid_rename":
+                return RenamedToolset(toolset, name_map={"valid_name": "invalid-name"})
+            prefix = "invalid-prefix" if wrapper == "invalid_prefix" else "x" * 64
+            return PrefixedToolset(toolset, prefix=prefix)
+
+    original_name = "invalid-name" if wrapper == "valid_rename" else "valid_tool"
+    controls["capabilities"] = lambda ctx: (
+        WrappedCapability(tools=[Tool(native_tool, name=original_name)]),
+    )
+
+    def model(messages, info):
+        if wrapper != "valid_rename":
+            pytest.fail("Names produced by wrappers must be checked before the model request")
+        assert {tool.name for tool in info.function_tools} == {"acme_memory_remember", "valid_name"}
+        if isinstance(messages[-1].parts[0], UserPromptPart):
+            return ModelResponse(parts=[ToolCallPart("valid_name", {})])
+        return ModelResponse(parts=[TextPart("done")])
+
+    session_model(FunctionModel(model))
+    await service.enqueue_input(session.id, "queued", "go")
+    if wrapper == "valid_rename":
+        assert (await service.start_runner(session.id)).output == "done"
+        assert calls == ["executed"]
+    else:
+        with pytest.raises(ValueError):
+            await service.start_runner(session.id)
+        assert calls == []
+    assert events == [("memory", "enter"), ("memory", "exit")]
+    assert not await service.is_runner_running(session.id)
+
+
 async def test_open_failure_keeps_input_and_releases_lease(plugin_setup, seed_session):
     service, _, registry, definition, contexts, events, controls = plugin_setup
 
@@ -442,14 +615,14 @@ async def test_adapter_preserves_native_dispatch_validation_and_scope(plugin_set
         return ModelResponse(parts=[TextPart("3")])
 
     async with plugins.open_execution(session.id) as bindings:
-        capability = PluginCapabilityAdapter.build(
+        capabilities = PluginCapabilityAdapter.build(
             "acme",
             "memory",
             PluginBinding(tools=(PluginTool("increment", "Increment an integer", function),)),
             bindings[0][3],
             set(),
         )
-        agent = Agent(FunctionModel(model), capabilities=[capability])
+        agent = Agent(FunctionModel(model), capabilities=capabilities)
         assert (await agent.run("increment")).output == "3"
         assert called == [2]
         await service.close_session(session.id)
@@ -785,7 +958,7 @@ async def test_sdk_instructions_reject_state_writes_and_restore_tool_permissions
             return "Remember the requested value."
 
         provider, name, binding, store = bindings[0]
-        capability = PluginCapabilityAdapter.build(
+        capabilities = PluginCapabilityAdapter.build(
             provider, name, replace(binding, instructions=instructions), store, set()
         )
 
@@ -798,7 +971,7 @@ async def test_sdk_instructions_reject_state_writes_and_restore_tool_permissions
             assert isinstance(messages[-1].parts[0], ToolReturnPart)
             return ModelResponse(parts=[TextPart("done")])
 
-        agent = Agent(FunctionModel(model), capabilities=[capability])
+        agent = Agent(FunctionModel(model), capabilities=capabilities)
         assert (await agent.run("remember")).output == "done"
         after = await context.state.read()
         assert evaluated and after.value.resources == ["saved"]

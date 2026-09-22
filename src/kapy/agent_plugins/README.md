@@ -21,7 +21,8 @@ plugin_provider, plugin_name, config, state)`; no execution UUID, SDK RunContext
 database, service container, logger or resource backend is injected.
 
 - `open_execution(ctx)` is an async context manager yielding `PluginBinding` with
-  an optional asynchronous instructions function and typed `PluginTool` functions.
+  an optional asynchronous instructions function, typed `PluginTool` functions,
+  and a tuple of trusted native SDK capabilities.
   It owns local connections/tasks until exit. Session resources may be allocated
   lazily here or in tools, registered promptly in state, and reused on later runs.
 - `close_session(ctx)` waits for all registered session-owned resources to be
@@ -29,16 +30,35 @@ database, service container, logger or resource backend is injected.
   It must tolerate empty/partial state, repeated calls and concurrent deletion.
   The base implementation is a no-op for plugins without session cleanup.
 
-The execution factory enters all plugins in identity order inside the runner
-lease, builds a fresh Agent and exits in reverse after SDK graph cleanup. Factory
-failure prevents input consumption. State is never implicitly saved. Instructions
+The application execution factory opens the configured model and all plugins in
+identity order inside the runner lease. It creates a base Agent with model,
+settings and static instructions, collects SessionReadyCapability and each
+plugin's capabilities into RunnerExecution, and exits in reverse after SDK graph
+cleanup. The runner installs capabilities when opening the graph; plugins and
+the base Agent do not install business contributions. Factory failure prevents
+input consumption. State is never implicitly saved. Declarative instructions
 may only read state/generate text: repeated model or compaction evaluation must
 not allocate resources. The adapter rejects instruction state writes. Typed tools
 use native SDK validation and `PrefixTools`; final names are
 `provider_plugin_tool`, ASCII alphanumeric/underscore, at most 64 characters.
-Collisions (including ambiguous underscore concatenations) fail; no renaming occurs.
+The adapter returns the prefixed declarative capability followed by the binding's
+native capabilities in declared order. Native capabilities retain their original
+wrapper relationships and receive no automatic prefixes, scope checks, or
+instruction read-only guard. They are trusted SDK code, must supply valid final
+tool names themselves, and may only use captured resources within this execution.
+The model-request boundary checks names after all SDK toolset wrappers, and the
+SDK rejects collisions between native and declarative contributions. The host
+does not rename tools.
 Removed tools/invalid old arguments follow SDK bounded retry semantics during
 checkpoint recovery. Data migrations never rewrite model messages.
+
+SessionExecutionCapability wraps all business capabilities, so response rewrites
+and after-node work complete before the session checkpoint. Plugins need no
+dependency on that host class. Collection order defines the composition chain;
+before hooks run forwards, after hooks backwards, and wrap hooks nest. Use SDK
+get_ordering() for real dependencies; conflicting constraints fail without a
+separate priority system. Instances belong to an execution and may span queued
+and auxiliary paging runs; use for_run() to isolate each run's mutable state.
 
 `StateStore.read` returns an independent typed value and UUID revision.
 `replace(value, expected_revision=...)` validates outside the transaction, then

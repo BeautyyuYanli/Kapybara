@@ -19,9 +19,11 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import FunctionModel
 from pydantic_graph import End
 
+from kapy.agent_plugins import AgentPluginService, PluginRegistry
 from kapy.agent_runner import ContextPage, open_runner
 from kapy.agent_runner.context import ContextInput, PageInput
 from kapy.agent_runner.repository import AgentRepository
+from kapy.application.agent import create_execution_factory
 from kapy.context_plugins import ContextPluginRegistry, ContextPluginSpec, SummaryPlugin
 from kapy.control.sessions import SessionService, UpdateSession
 
@@ -283,10 +285,12 @@ async def test_page_restore_preserves_earlier_completed_call_when_pending_call_r
     assert [entry.seq for entry in saved] == list(range(6))
 
 
+@pytest.mark.parametrize("application_factory", [False, True])
 async def test_context_plugin_factory_config_is_frozen_across_queued_runs(
     database,
     seed_session,
     session_model,
+    application_factory,
 ):
     session_id = uuid4()
     await seed_session(session_id)
@@ -296,8 +300,12 @@ async def test_context_plugin_factory_config_is_frozen_across_queued_runs(
         factories.append(config)
         return SummaryPlugin()
 
+    plugins = AgentPluginService(database.sessions, PluginRegistry())
     sessions = SessionService(
-        database.sessions, context_plugin_registry=ContextPluginRegistry({"kapy/summary": factory})
+        database.sessions,
+        plugin_service=plugins,
+        execution_factory=create_execution_factory(plugins) if application_factory else None,
+        context_plugin_registry=ContextPluginRegistry({"kapy/summary": factory}),
     )
     calls = []
 
@@ -314,10 +322,10 @@ async def test_context_plugin_factory_config_is_frozen_across_queued_runs(
     agent = Agent(FunctionModel(model))
     session_model(agent.model)
     await sessions.enqueue_input(session_id, "steer", "go")
-    result = await sessions.start_runner(session_id, agent=agent)
+    result = await sessions.start_runner(session_id, agent=None if application_factory else agent)
     assert result.finished and result.output == "done"
     assert len(calls) == 2 and factories == [{}]
-    await sessions.start_runner(session_id, agent=agent)
+    await sessions.start_runner(session_id, agent=None if application_factory else agent)
     assert factories == [{}, {"changed": True}]
 
 

@@ -480,14 +480,23 @@ async def shell_server(tmp_path):
     "KAPY_SHELLCTL_TEST_BIN_DIR" not in os.environ,
     reason="Set KAPY_SHELLCTL_TEST_BIN_DIR in a container with built shellctl binaries and tmux",
 )
-async def test_real_shellctl_postgres_and_application_capability(database, shell_server):
+async def test_real_shellctl_postgres_and_application_capability(
+    database, shell_server, seed_session, session_model
+):
     client, remote_dir = shell_server
     plugins = AgentPluginService(database.sessions, create_registry())
-    service = SessionService(database.sessions, plugin_service=plugins)
+    service = SessionService(
+        database.sessions,
+        plugin_service=plugins,
+        execution_factory=create_execution_factory(plugins),
+    )
+    template_id = uuid4()
+    await seed_session(template_id)
+    template = await service.get_session(template_id)
     session = await service.create_session(
         CreateSession(
-            provider_id=uuid4(),
-            model_name="unused",
+            provider_id=template.provider_id,
+            model_name=template.model_name,
             plugins=[
                 PluginSpec(
                     plugin_provider="builtin",
@@ -535,11 +544,9 @@ async def test_real_shellctl_postgres_and_application_capability(database, shell
         observations.append(str(returns[-1].content))
         return ModelResponse(parts=[TextPart("started")])
 
-    factory = create_execution_factory(plugins)
-    async with factory(session.id) as execution:
-        assert (
-            await execution.agent.run("start", model=FunctionModel(run_model))
-        ).output == "started"
+    session_model(FunctionModel(run_model))
+    await service.enqueue_input(session.id, "queued", "start")
+    assert (await service.start_runner(session.id)).output == "started"
     job_id = metadata(observations[0])["job_id"]
     assert not (await client.status(job_id)).done, await anyio.Path(
         remote_dir / "server.log"

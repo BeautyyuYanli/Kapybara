@@ -3,7 +3,8 @@
 from typing import Any
 
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import Capability, PrefixTools
+from pydantic_ai.capabilities import AbstractCapability, Capability, PrefixTools
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import Tool
 
 from .contracts import PluginBinding
@@ -11,11 +12,28 @@ from .registry import check_name
 from .service import ScopedStateStore, _read_only
 
 
+class _PluginCapability(Capability[Any]):
+    """Declarative contribution with name validation after SDK toolset composition."""
+
+    async def before_model_request(
+        self, ctx: RunContext[Any], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        # SDK wrapper toolsets run after prepare_tools and can rename tools.
+        # Check the resulting request definitions; SDK composition owns collisions.
+        for tool in request_context.model_request_parameters.function_tools:
+            check_name(tool.name)
+            if len(tool.name) > 64:
+                raise ValueError(f"Plugin tool name exceeds 64 characters: {tool.name}")
+        return request_context
+
+
 class PluginCapabilityAdapter:
     @staticmethod
     def build(
         provider: str, name: str, binding: PluginBinding, store: ScopedStateStore, names: set[str]
-    ) -> PrefixTools[Any]:
+    ) -> tuple[AbstractCapability[Any], ...]:
+        """Normalize declarative contributions, then retain native capabilities as-is."""
+
         async def check_call(_ctx: RunContext[Any], /, **kwargs: Any) -> None:
             # The SDK validates typed arguments before this hook and owns sync,
             # async and sync-returning-awaitable dispatch. Keep its semantics.
@@ -46,11 +64,14 @@ class PluginCapabilityAdapter:
             finally:
                 _read_only.reset(token)
 
-        return PrefixTools(
-            wrapped=Capability(
-                id=f"{provider}.{name}",
-                instructions=instructions if binding.instructions else None,
-                tools=tools,
+        return (
+            PrefixTools(
+                wrapped=_PluginCapability(
+                    id=f"{provider}.{name}",
+                    instructions=instructions if binding.instructions else None,
+                    tools=tools,
+                ),
+                prefix=f"{provider}_{name}",
             ),
-            prefix=f"{provider}_{name}",
+            *binding.capabilities,
         )

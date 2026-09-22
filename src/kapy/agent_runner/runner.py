@@ -49,6 +49,10 @@ class RunnerExecution[OutputT]:
 
     Factories own their local resources. Graph cleanup precedes factory exit and
     lease release. The lower runner knows neither business sessions nor plugins.
+    Application factories collect business capabilities here, leaving their base
+    Agent unmodified. Main graphs install these once alongside session/output
+    infrastructure; auxiliary paging runs borrow only these business capabilities.
+    Instances can span several runs: use for_run() to isolate run-local state.
     """
 
     agent: Agent[Any, OutputT]

@@ -17,7 +17,10 @@ lease row before business rows. Bypassing that protocol is not automatically fen
 lease. It receives no lease handle. SDK graph cleanup precedes factory exit, which
 precedes lease release. It is recreated on reacquisition; the core still needs no
 business session record and does not import plugin implementations. Application
-factories compose [Agent plugins](../agent_plugins/README.md) with a fresh Agent.
+factories collect [Agent plugins](../agent_plugins/README.md) into
+RunnerExecution.capabilities alongside SessionReadyCapability. Their fresh base
+Agent directly receives the model, model settings, static instructions and output
+type; it carries no business capabilities and needs no model override.
 
 The application owns the configured Agent, deps, PostgreSQL engine and async
 session factory. `kapy db upgrade` migrates `agent_metadata`, `lease_metadata` and the control tables;
@@ -108,6 +111,16 @@ of SDK error recovery. The thin runner owns the lease scope, task constraint,
 graph lifetime and queued/cancel scheduling; SessionLease maintains the heartbeat.
 The runner never writes SDK private history.
 
+`_open_native()` is the main graph's single installation point: its capability
+list is SessionExecutionCapability, OutputCapability, then the execution's
+business capabilities. SessionExecutionCapability declares outermost ordering and
+wraps AbstractCapability, enforcing the checkpoint boundary for every business
+capability. Other capabilities retain deterministic collection order unless SDK
+get_ordering() declares dependencies; conflicts raise an error. List order is the
+composition chain: before hooks run forwards, after hooks backwards, and wrap
+hooks nest. Execution-scoped instances use for_run() for run-local state across
+queued runs and auxiliary paging calls.
+
 The handle keeps a committed working context and a separate SDK graph. Absolute
 history sequences never derive from SDK message indices or virtual context length.
 A new graph receives the assembled view as `message_history`; an existing graph
@@ -195,14 +208,15 @@ before a model request. Stable definitions and history preserve the reusable pre
 actual cache hits depend on the provider, and the newly paged context changes it.
 
 Keep Agent-level max_concurrency=None because its run-wide limiter rejects nested
-page-action runs. Request limits may use ConcurrencyLimitedModel; SessionService
-overrides the original Agent model, so limits on that original model do not apply
-to service-created models.
+page-action runs. Request limits may use ConcurrencyLimitedModel. The service's
+custom Agent adapter overrides that Agent's model, so limits on its original
+model do not apply to the configured service model.
 
-SessionService selects a fresh plugin from context_plugin.name/config for each lease;
-configuration remains fixed across queued/reacquired runners within one start call.
-It resolves a null threshold to 70% of model capacity before execution; unknown
-capacity is an error. Creation with unknown capacity and no threshold stores 183500.
+The application factory selects a fresh plugin from context_plugin.name/config
+for each lease; configuration remains fixed across queued/reacquired runners
+within one start call. SessionService resolves a null threshold to 70% of model
+capacity before execution; unknown capacity is an error. Creation with unknown
+capacity and no threshold stores 183500.
 The registry validates plugin config before input consumption. HTTP and Telegram
 share application composition and only pass stored session configuration.
 

@@ -179,11 +179,13 @@ def session_model(monkeypatch):
     """
     from pydantic_ai.models import infer_model
 
+    from kapy.application import agent as application_agent
     from kapy.control.sessions import service
 
     def use(model):
         model = infer_model(model)
         monkeypatch.setattr(service, "build_model", lambda *args, **kwargs: model)
+        monkeypatch.setattr(application_agent, "build_model", lambda *args, **kwargs: model)
 
     return use
 

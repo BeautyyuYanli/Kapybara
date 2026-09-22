@@ -90,10 +90,10 @@ No remote resources are deleted.
 Sessions have UUID identities, title, model identity, JSON model_settings and two
 paging columns, context_plugin JSON and a ready/closing/closed lifecycle status. create/get/list/update
 and close APIs retain records; there is no physical deletion. Fixed plugin bindings
-are supplied in CreateSession.plugins. The shared application factory creates
-Agent instructions/tools per execution; direct Agent calls remain available for
-sessions without plugins. DTOs
-reject unknown fields. Updates preserve omitted fields and replace supplied JSON
+are supplied in CreateSession.plugins. The shared application factory collects
+business capabilities and creates a fully configured base Agent per execution;
+direct Agent calls remain available for sessions without plugins. DTOs reject
+unknown fields. Updates preserve omitted fields and replace supplied JSON
 objects as a whole; `{}` clears a preset/override. Explicit None is accepted only
 for provider base_url, model context_window and session compaction_threshold_tokens.
 Model switches must supply both provider_id and model_name. Lists use stable
@@ -120,10 +120,23 @@ failure. Plugin choices and lifecycle fields cannot be patched through UpdateSes
 At startup, SessionService reads session/model/provider configuration once in a
 short transaction, then releases it before constructing SDK resources. It merges
 model.settings with session.model_settings at the top level, validates against the
-SDK's protocol Settings type, and uses Agent.override for the model and settings.
-The same values remain active through every queued run and temporary compaction;
+SDK's protocol Settings type, and delegates that snapshot to the application
+execution factory. The factory opens Provider/Model and plugin resources inside
+the lease, creates the Agent with its model/settings, and collects SessionReady,
+plugin capabilities and paging configuration into RunnerExecution. The runner
+installs capabilities when opening the SDK graph. The service does not wrap the
+factory's Agent or append business capabilities. Direct caller-owned Agents use
+a separate adapter with task-local model/settings overrides, retaining their
+prompts, tools, deps and output type. The same configuration values remain active
+through every queued run, lease reacquisition and temporary compaction;
 configuration updates affect the next start. Explicit SDK options retain their
 SDK semantics; no extra runner-specific settings blacklist is applied.
+
+A configured SessionExecutionFactory receives the service, a validated
+SessionExecutionConfig snapshot and the service's ContextPluginRegistry, and yields
+RunnerExecution within its resource context. The default implementation is
+application.agent.create_execution_factory; application.sessions injects it into
+both interfaces. No model or plugin resource exists before lease acquisition.
 
 `SessionService(..., context_plugin_registry=...)` selects an implementation from the
 session's `context_plugin: {"name": "kapy/summary", "config": {}}`. The name is fixed
@@ -169,13 +182,14 @@ get/update/start read the configuration they require, and enqueue/request_cancel
 validate their own references. Empty queue/history/cancel/lease queries return
 empty results or False. Full AgentState and its lease internals stay in the runner. SessionService
 never keeps a database transaction open across model/tool work or output iteration.
-SDK Provider and Model contexts cover the complete startup call and close their
-owned clients after the runner and output publisher exit.
+SDK Provider and Model contexts belong to each execution: they open after lease
+acquisition and close after graph and plugin cleanup, before lease release.
 
 After each lower runner returns and releases its lease, SessionService checks both
-input channels again. Pending input triggers reacquisition under the same SDK and
-publisher contexts; losing this later race returns the preceding result, whereas
-an initial SessionBusy propagates. Execution/cleanup failures are not retried.
+input channels again. Pending input triggers reacquisition with fresh execution
+resources using the same configuration snapshot and publisher; losing this later
+race returns the preceding result, whereas an initial SessionBusy propagates.
+Execution/cleanup failures are not retried.
 This closes the final queue-check/release handoff window without a persistent job
 queue. Cancel ends the current run at a boundary and leaves queued inputs intact.
 

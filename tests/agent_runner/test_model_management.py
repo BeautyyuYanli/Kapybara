@@ -20,7 +20,9 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from kapy.agent_plugins import AgentPluginService, PluginRegistry
 from kapy.agent_runner import SessionBusy, open_runner
+from kapy.application.agent import create_execution_factory
 from kapy.context_plugins.summary import COMPACTION_PROMPT
 from kapy.control.models import (
     CreateModel,
@@ -33,6 +35,7 @@ from kapy.control.models import (
 )
 from kapy.control.models.repository import ModelRepository
 from kapy.control.sessions import CreateSession, SessionService, UpdateSession
+from kapy.control.sessions import service as session_service
 from kapy.session_lease import is_session_busy
 from kapy.session_lease.models import SessionLeaseRow
 
@@ -338,12 +341,25 @@ async def test_create_infers_sdk_capacity_and_openai_discovery_keeps_existing(da
 
 
 @pytest.mark.parametrize("context_tokens,stored_capacity", [(700, 1000), (701, 1000), (700, None)])
+@pytest.mark.parametrize("application_factory", [False, True])
+@pytest.mark.parametrize("reacquire", [False, True])
 async def test_session_configuration_applies_through_queued_runs_and_compaction(
-    single_connection_factory, sdk_http, monkeypatch, context_tokens, stored_capacity
+    single_connection_factory,
+    sdk_http,
+    monkeypatch,
+    context_tokens,
+    stored_capacity,
+    application_factory,
+    reacquire,
 ):
     calls = []
     session_id = None
-    sessions = SessionService(single_connection_factory)
+    plugins = AgentPluginService(single_connection_factory, PluginRegistry())
+    sessions = SessionService(
+        single_connection_factory,
+        plugin_service=plugins,
+        execution_factory=create_execution_factory(plugins) if application_factory else None,
+    )
     catalog = ModelService(single_connection_factory)
     in_scope = []
     completed = []
@@ -351,12 +367,14 @@ async def test_session_configuration_applies_through_queued_runs_and_compaction(
     original_exit = OpenAIChatModel.__aexit__
 
     async def enter(model):
+        assert session_id is not None and await sessions.is_runner_running(session_id)
         result = await original_enter(model)
         in_scope.append(model)
         return result
 
     async def exit(model, *args):
         try:
+            assert session_id is not None and await sessions.is_runner_running(session_id)
             return await original_exit(model, *args)
         finally:
             in_scope.remove(model)
@@ -373,7 +391,8 @@ async def test_session_configuration_applies_through_queued_runs_and_compaction(
         assert in_scope[0].profile["context_window"] == stored_capacity
         assert payload["model"] == "gpt-4.1" and payload["temperature"] == 0.4
         assert payload["max_completion_tokens"] == 25
-        assert any(message["content"] == "caller instructions" for message in payload["messages"])
+        expected = "Be concise and precise." if application_factory else "caller instructions"
+        assert any(message["content"] == expected for message in payload["messages"])
         assert session_id is not None
         # A second transaction must acquire the only connection while the SDK is waiting.
         async with asyncio.timeout(1):
@@ -425,15 +444,35 @@ async def test_session_configuration_applies_through_queued_runs_and_compaction(
         )
     )
     session_id = session.id
-    agent = Agent(instructions="caller instructions", model_settings={"temperature": 0.8})
+    lower_calls = 0
+    run_agent_session = session_service.run_agent_session
+
+    async def run_with_handoff(id, **kwargs):
+        nonlocal lower_calls
+        lower_calls += 1
+        result = await run_agent_session(id, **kwargs)
+        assert not in_scope and all(client.is_closed for client in clients)
+        if reacquire and lower_calls == 1:
+            await sessions.enqueue_input(id, "queued", "after lease release")
+        return result
+
+    monkeypatch.setattr(session_service, "run_agent_session", run_with_handoff)
+    agent = (
+        None
+        if application_factory
+        else Agent(instructions="caller instructions", model_settings={"temperature": 0.8})
+    )
     await sessions.enqueue_input(session.id, "steer", "first")
     await sessions.enqueue_input(session.id, "queued", "second")
     result = await sessions.start_runner(session.id, agent=agent)
     assert result.finished and result.output == "answer"
-    assert calls == ([False, True, False, True] if context_tokens > 700 else [False, False])
-    assert completed and not in_scope
+    turns = 3 if reacquire else 2
+    assert calls == ([False, True] if context_tokens > 700 else [False]) * turns
+    assert len(completed) == (2 if reacquire else 1) and not in_scope
+    assert len({id(model) for model in completed}) == len(completed)
     assert all(client.is_closed for client in clients)
-    assert agent.model is None and agent.model_settings == {"temperature": 0.8}
+    if agent is not None:
+        assert agent.model is None and agent.model_settings == {"temperature": 0.8}
     assert not await sessions.is_runner_running(session.id)
     assert (await sessions.get_session(session.id)).model_settings == {"temperature": 0.9}
 
@@ -520,7 +559,7 @@ async def test_running_status_observes_fresh_done_and_expired_leases(database):
             )
 
 
-async def test_shared_agent_keeps_session_overrides_isolated_and_busy_closes_client(
+async def test_shared_agent_keeps_session_overrides_isolated_and_busy_opens_no_client(
     database, sdk_http
 ):
     entered = asyncio.Queue()
@@ -572,9 +611,10 @@ async def test_shared_agent_keeps_session_overrides_isolated_and_busy_closes_cli
     try:
         async with asyncio.timeout(3):
             assert {await entered.get(), await entered.get()} == {"first", "second"}
+        active_clients = len(clients)
         with pytest.raises(SessionBusy):
             await sessions.start_runner(ids[0], agent=agent)
-        assert clients[-1].is_closed and not clients[0].is_closed
+        assert len(clients) == active_clients and not any(client.is_closed for client in clients)
         finish.set()
         results = await asyncio.gather(*tasks)
         assert [result.output for result in results] == ["first", "second"]

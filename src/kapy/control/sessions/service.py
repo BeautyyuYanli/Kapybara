@@ -11,12 +11,15 @@ import asyncio
 import math
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.models import Model
+from pydantic_ai.providers import Provider
 from pydantic_ai.settings import ModelSettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -43,6 +46,7 @@ from kapy.control.models.runtime import (
     resolve_classes,
     validate_settings,
 )
+from kapy.control.models.types import ModelRecord, ProviderConfig
 from kapy.control.types import utc_now
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
@@ -59,7 +63,28 @@ from .types import (
     UpdateSession,
 )
 
-type SessionExecutionFactory = Callable[[UUID], AbstractAsyncContextManager[RunnerExecution[Any]]]
+
+@dataclass(frozen=True)
+class SessionExecutionConfig:
+    """Validated configuration snapshot reused across one start call's leases.
+
+    Contains values only, without open model/plugin resources. Each execution
+    factory uses this snapshot to own a fresh resource scope inside its lease.
+    """
+
+    session: SessionRecord
+    model: ModelRecord
+    provider: ProviderConfig
+    provider_class: type[Provider]
+    model_class: type[Model]
+    model_settings: ModelSettings
+    compaction_threshold_tokens: int
+
+
+type SessionExecutionFactory = Callable[
+    [SessionService, SessionExecutionConfig, ContextPluginRegistry],
+    AbstractAsyncContextManager[RunnerExecution[Any]],
+]
 
 
 class SessionReadyCapability(AbstractCapability[Any]):
@@ -78,9 +103,9 @@ class SessionService:
 
     The instance stores only borrowed factories/output transport and heartbeat
     and live polling values, plus plugin/execution factories and a context plugin registry. Model
-    configuration is fixed for each start call, which owns its model resources.
-    Each lease acquisition constructs its context plugin and scopes agent overrides
-    to that execution.
+    configuration is fixed for each start call. The execution factory owns model
+    and plugin resources inside each lease. Direct caller-owned Agents use a
+    separate adapter with a task-local model/settings override.
     """
 
     def __init__(
@@ -295,13 +320,15 @@ class SessionService:
         The flush interval is finite and nonnegative; zero schedules background
         publication immediately.
         Session/model/provider configuration is read once and remains fixed across
-        queued runs and page actions. Each lease enters the configured execution factory;
-        direct Agents are supported for sessions without plugins. The Agent keeps its
-        prompts/tools/output type;
-        a task-local override supplies the stored model and merged request settings.
-        Model/settings and default threshold errors precede output publication and
-        lease acquisition; plugin assembly failures still precede input consumption.
-        Provider and Model contexts outlive the complete runner loop.
+        queued runs and page actions. Each lease enters the configured execution factory,
+        which owns all business assembly and execution resources. Direct Agents are
+        supported for sessions without plugins through a separate adapter retaining
+        prompts/tools/output type and overriding only the stored model and settings.
+        Configuration reads, class resolution, settings validation and threshold
+        resolution precede output publication and lease acquisition. Provider/Model
+        resource construction and plugin assembly happen inside the lease; failures
+        still precede input consumption.
+        Provider and Model contexts enclose each leased execution, including page actions.
         After lease release, pending inputs trigger reacquisition with the same
         configuration. Across the entire call, output retains the last non-None
         output, while finished comes from the last normally returned result. Later
@@ -326,6 +353,22 @@ class SessionService:
         )
         provider_cls, model_cls = resolve_classes(config)
         settings = validate_settings(model_cls, model.settings | session.model_settings)
+        execution_config = SessionExecutionConfig(
+            session=session,
+            model=model,
+            provider=config,
+            provider_class=provider_cls,
+            model_class=model_cls,
+            model_settings=cast(ModelSettings, settings),
+            compaction_threshold_tokens=threshold,
+        )
+        if agent is None:
+            assert self._execution_factory is not None
+            execution_factory = partial(
+                self._execution_factory, self, execution_config, self._context_plugin_registry
+            )
+        else:
+            execution_factory = partial(self._open_agent_execution, execution_config, agent, deps)
 
         async def read_batch(channel: InputChannel) -> InputBatch | None:
             await self.require_ready(session_id)
@@ -349,72 +392,69 @@ class SessionService:
             if realtime_output and self._output_service is not None
             else nullcontext(None)
         )
-        async with (
-            build_provider(provider_cls, config) as provider,
-            build_model(
-                model_cls,
-                model.model_name,
-                provider,
-                profile={"context_window": model.context_window},
-            ) as sdk_model,
-        ):
-
-            @asynccontextmanager
-            async def execution_factory() -> AsyncIterator[RunnerExecution[Any]]:
-                await self.require_ready(session_id)
-                if agent is None:
-                    assert self._execution_factory is not None
-                    source = self._execution_factory(session_id)
-                else:
-                    source = nullcontext(RunnerExecution(agent, deps))
-                async with source as execution:
-                    actual = execution.agent
-                    plugin = self._context_plugin_registry.create(session.context_plugin)
-                    with actual.override(
-                        model=sdk_model, model_settings=cast(ModelSettings, settings)
-                    ):
-                        await self.require_ready(session_id)
-                        yield RunnerExecution(
-                            actual,
-                            execution.deps,
-                            plugin,
-                            [*execution.capabilities, SessionReadyCapability(self, session_id)],
-                            compaction_threshold_tokens=threshold,
-                            compaction_replay_turns=session.compaction_replay_turns,
-                        )
-
-            async with publisher as on_output:
-                result: TurnResult[OutputT] | None = None
-                while True:
-                    try:
-                        current = await run_agent_session(
-                            session_id,
-                            execution_factory=execution_factory,
-                            session_factory=self._session_factory,
-                            read_steer=partial(read_batch, "steer"),
-                            read_queued=partial(read_batch, "queued"),
-                            consume_cancel=consume_cancel,
-                            heartbeat_interval=self._heartbeat_interval,
-                            heartbeat_timeout=self._heartbeat_timeout,
-                            on_output=on_output,
-                        )
-                    except SessionBusy:
-                        if result is None:
-                            raise
-                        return result
-                    result = TurnResult(
-                        current.finished,
-                        current.output
-                        if current.output is not None
-                        else (result.output if result is not None else None),
+        async with publisher as on_output:
+            result: TurnResult[OutputT] | None = None
+            while True:
+                try:
+                    current = await run_agent_session(
+                        session_id,
+                        execution_factory=execution_factory,
+                        session_factory=self._session_factory,
+                        read_steer=partial(read_batch, "steer"),
+                        read_queued=partial(read_batch, "queued"),
+                        consume_cancel=consume_cancel,
+                        heartbeat_interval=self._heartbeat_interval,
+                        heartbeat_timeout=self._heartbeat_timeout,
+                        on_output=on_output,
                     )
-                    # Reacquisition creates a fresh execution after lease release.
-                    await self.require_ready(session_id)
-                    if not (
-                        await self.read_inputs(session_id, "queued")
-                        or await self.read_inputs(session_id, "steer")
-                    ):
-                        return result
+                except SessionBusy:
+                    if result is None:
+                        raise
+                    return result
+                result = TurnResult(
+                    current.finished,
+                    current.output
+                    if current.output is not None
+                    else (result.output if result is not None else None),
+                )
+                # Reacquisition creates a fresh execution after lease release.
+                await self.require_ready(session_id)
+                if not (
+                    await self.read_inputs(session_id, "queued")
+                    or await self.read_inputs(session_id, "steer")
+                ):
+                    return result
+
+    @asynccontextmanager
+    async def _open_agent_execution[DepsT, OutputT](
+        self,
+        config: SessionExecutionConfig,
+        agent: Agent[DepsT, OutputT],
+        deps: DepsT,
+    ) -> AsyncIterator[RunnerExecution[OutputT]]:
+        """Adapt a borrowed custom Agent without changing its prompts/tools/output."""
+        session = config.session
+        await self.require_ready(session.id)
+        async with (
+            build_provider(config.provider_class, config.provider) as provider,
+            build_model(
+                config.model_class,
+                config.model.model_name,
+                provider,
+                profile={"context_window": config.model.context_window},
+            ) as model,
+        ):
+            plugin = self._context_plugin_registry.create(session.context_plugin)
+            with agent.override(model=model, model_settings=config.model_settings):
+                await self.require_ready(session.id)
+                yield RunnerExecution(
+                    agent=agent,
+                    deps=deps,
+                    context_plugin=plugin,
+                    capabilities=(SessionReadyCapability(self, session.id),),
+                    compaction_threshold_tokens=config.compaction_threshold_tokens,
+                    compaction_replay_turns=session.compaction_replay_turns,
+                )
 
     async def live(
         self, session_id: UUID, *, after_seq: int = -1
