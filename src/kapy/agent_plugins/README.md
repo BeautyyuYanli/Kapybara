@@ -7,7 +7,7 @@ application registry maps `(plugin_provider, plugin_name)` to one current truste
 positive `data_version`, and optional pure JSON migrations. Register installed
 implementations in `application.agent.create_registry`, or inject a registry into
 `application.sessions.create_session_service`. The default registry includes
-`builtin.shell`; sessions opt in explicitly, so existing sessions gain no tools.
+`builtin.shell` and `builtin.response_rewrite`; sessions opt in explicitly.
 
 A `CreateSession.plugins` item contains only provider, name and config. Duplicate
 identities, missing definitions and invalid config fail before persistence. The
@@ -123,6 +123,53 @@ credentials, external network or writable resource access; the host only validat
 trusted JSON/schema constraints and commits version/revision CAS. Isolation must
 cover filesystem, credentials, process permissions and network, including direct
 DB/HTTP access. RPC, sandbox, installation, quotas and large files are deferred.
+
+## builtin.response_rewrite
+
+Enable this native capability on a new session with an OpenAI-compatible API root:
+
+```json
+{
+  "plugins": [{
+    "plugin_provider": "builtin",
+    "plugin_name": "response_rewrite",
+    "config": {
+      "prompt": "Rewrite the answer concisely, preserving its meaning.",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "api_key": "your-rewrite-api-key"
+    }
+  }]
+}
+```
+
+All three fields are required; prompt/key must be nonblank, and unknown fields or
+URL credentials/query/fragment are rejected before persistence. The prompt is the
+literal system message, without interpolation. The key is hidden from config repr
+and plugin logs, but remains ordinary JSON in binding storage and API reads.
+
+`after_model_request` sends one non-streaming Chat Completions request to the fixed
+model `gemini-3.8-flash`, using only the visible response text as the user message.
+The endpoint must support that model. The client is independent of the primary
+model and capabilities, so it receives no history, thinking or business tools and
+cannot recursively invoke rewriting. Requests have no automatic retries/redirects and a
+60-second total deadline; execution exit allows 5 seconds of shielded client cleanup.
+
+Only completed text-output business responses with normal/unspecified finish reason
+and nonblank text qualify. Structured output, auxiliary runs, non-text parts other
+than independent thinking, tool calls and abnormal finishes are skipped. Rewrites
+must stop normally and contain only usable text: refusals, tool calls, audio and
+unknown provider-specific message fields fall back to the original response. Gemini's
+`extra_content.google.thought_signature` is accepted as opaque metadata and discarded.
+Rewrite failures log only their class; cancellation propagates. Client cleanup failures
+and timeouts also propagate, retaining any active execution error in the exception
+chain. No session resources/state are created.
+
+Successful rewrites replace visible text with one new text part, retaining thinking
+order and response metadata/model/usage. They discard old text-part provider IDs.
+Rewriter tokens do not enter primary-model usage. History/checkpoint and final output
+contain the rewritten answer; original stream deltas remain provisional previews
+until the complete committed message replaces them. Recovery before that commit can
+repeat the external request under the runner's existing checkpoint semantics.
 
 ## builtin.shell
 

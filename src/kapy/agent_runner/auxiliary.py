@@ -3,6 +3,7 @@
 These runs borrow the stable Agent and execution capabilities. They never receive
 SessionExecutionCapability or the runner's business output publisher. History is
 copied once; retry feedback is owned by the SDK's temporary graph.
+Run metadata marks these calls so business-only capabilities can skip them.
 """
 
 import json
@@ -100,6 +101,7 @@ async def run_auxiliary(
         conversation_id=str(session_id),
         deps=deps,
         capabilities=extra,
+        metadata={"kapy_run_kind": "auxiliary"},
         retries={"tools": 2, "output": 2},
     )
     return result.output

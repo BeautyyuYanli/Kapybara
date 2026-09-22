@@ -203,6 +203,9 @@ capabilities. Every invocation copies the complete working history once and appe
 its task prompt. It uses a normal SDK run and SDK retries (tools/output default to 2),
 without SessionExecutionCapability or the runner's pure OutputCapability publisher.
 Auxiliary messages/retries do not write business history, checkpoint or output.
+These runs set native SDK metadata `kapy_run_kind: auxiliary`, allowing capabilities
+such as `builtin.response_rewrite` to skip internal calls without depending on host
+capability types or prompt contents.
 Allowed tools retain their real side effects. conversation_id is the business session
 ID for SDK correlation, not a persistence or prompt-cache switch.
 

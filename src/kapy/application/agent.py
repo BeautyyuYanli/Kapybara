@@ -14,6 +14,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 
 from kapy.agent_plugins import AgentPluginService, PluginRegistry
+from kapy.agent_plugins.builtin.response_rewrite import RESPONSE_REWRITE_PLUGIN
 from kapy.agent_plugins.builtin.shell import SHELL_PLUGIN
 from kapy.agent_plugins.capability import PluginCapabilityAdapter
 from kapy.agent_runner import RunnerExecution
@@ -31,6 +32,7 @@ def create_registry() -> PluginRegistry:
     """Register builtin definitions; sessions opt in through CreateSession.plugins."""
     registry = PluginRegistry()
     registry.register(SHELL_PLUGIN)
+    registry.register(RESPONSE_REWRITE_PLUGIN)
     return registry
 
 
