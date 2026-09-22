@@ -97,7 +97,7 @@ class TurnResult[OutputT]:
 
 
 @dataclass(frozen=True, slots=True)
-class ContextPage:
+class ContextPageRecord:
     """Durable strategy state at an original-history anchor; not a checkpoint."""
 
     anchor_seq: int
@@ -109,4 +109,4 @@ class ContextPage:
 class ResumeState:
     next_step: NextStep
     next_seq: int
-    page: ContextPage | None
+    page: ContextPageRecord | None

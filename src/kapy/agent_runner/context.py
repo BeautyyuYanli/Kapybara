@@ -1,32 +1,76 @@
-"""Context paging contracts and bounded history assembly, independent of summary policy.
+"""Host-owned paging, raw windows and context plugin contracts.
 
-A strategy owns the replaceable prefix. The execution core appends the original
-checkpoint suffix, expanded backwards for tool pairs. Callbacks borrow no live
-transaction; their reads open short transactions bounded by the supplied cursor.
+Plugins process closed pages and supply upper context. The host owns anchors,
+checkpoint/tool-pair protection and final assembly; all reads use short transactions.
 """
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, overload
 from uuid import UUID
 
-from pydantic import JsonValue
+from pydantic import BaseModel, JsonValue
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
+    SystemPromptPart,
     ToolCallPart,
     ToolReturnPart,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .repository import AgentRepository
-from .types import ContextPage, NextStep
+from .types import ContextPageRecord, NextStep
 
 type JsonObject = dict[str, JsonValue]
 type HistoryRows = list[tuple[int, ModelMessage]]
+
+
+class CallAgent(Protocol):
+    """Borrow a stable text-output Agent while on_page is active.
+
+    Await calls sequentially in the runner's owning task. Child-task wrappers,
+    including asyncio.wait_for(call_agent(...), timeout), fail the owner check.
+    result_type validates returned text without changing the SDK output channel.
+    """
+
+    @overload
+    async def __call__(
+        self, prompt: str, *, result_type: None = None, block_other_tools: bool = False
+    ) -> str: ...
+
+    @overload
+    async def __call__[T: BaseModel](
+        self, prompt: str, *, result_type: type[T], block_other_tools: bool = False
+    ) -> T: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ContextPage:
+    payload: JsonObject
+
+
+@dataclass(frozen=True, slots=True)
+class PageInput:
+    previous_page: ContextPage | None
+    messages: Sequence[ModelMessage]
+
+
+@dataclass(frozen=True, slots=True)
+class ContextInput:
+    page: ContextPage
+    messages: Sequence[ModelMessage]
+
+
+class ContextPlugin(Protocol):
+    key: str
+
+    async def on_page(self, page: PageInput, *, call_agent: CallAgent) -> ContextPage: ...
+
+    async def get_context(self, context: ContextInput) -> list[ModelMessage]: ...
 
 
 class ReadHistory(Protocol):
@@ -39,61 +83,9 @@ class ReadHistoryBefore(Protocol):
     async def __call__(self, *, through_seq: int | None = None, limit: int = 64) -> HistoryRows: ...
 
 
-@dataclass(frozen=True, slots=True)
-class PageBoundary:
-    next_step: NextStep
-    last_seq: int
-    previous_anchor_seq: int | None
-    latest_response_seq: int | None
-    response_tokens: tuple[int, int] | None
-
-
-@dataclass(frozen=True, slots=True)
-class PageTurnContext:
-    session_id: UUID
-    anchor_seq: int
-    previous_page: ContextPage | None
-    messages: list[ModelMessage]
-    operation_id: str
-    read_history: ReadHistory
-    read_history_before: ReadHistoryBefore
-
-
-@dataclass(frozen=True, slots=True)
-class ContextAssemblyContext:
-    session_id: UUID
-    page: ContextPage | None
-    prefix_through_seq: int
-    read_history: ReadHistory
-    read_history_before: ReadHistoryBefore
-
-
-type PageTrigger = Callable[[PageBoundary], bool]
-type PageTurnAction = Callable[[PageTurnContext], Awaitable[JsonObject]]
-type ContextAssembler = Callable[[ContextAssemblyContext], Awaitable[list[ModelMessage]]]
-
-
-@dataclass(frozen=True, slots=True)
-class ContextPolicy:
-    """One runner's strategy. key versions the durable payload interpretation."""
-
-    key: str
-    should_turn: PageTrigger
-    on_turn: PageTurnAction | None
-    assemble: ContextAssembler
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.key, str) or not self.key.strip():
-            raise ValueError("Context policy key must be nonempty")
-
-
-async def _full_history(context: ContextAssemblyContext) -> list[ModelMessage]:
-    return [message for _, message in await context.read_history()]
-
-
-def full_history_policy() -> ContextPolicy:
-    """Retain all history, without automatic paging or an external action."""
-    return ContextPolicy("history/v1", lambda boundary: False, None, _full_history)
+def require_nonnegative_int(value: int, name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
 
 
 def bounded_history(
@@ -161,63 +153,146 @@ def close_tool_pairs(rows: Sequence[tuple[int, ModelMessage]], start: int) -> in
         start = earliest
 
 
+def replay_start(rows: Sequence[tuple[int, ModelMessage]], turns: int) -> int | None:
+    """Find an absolute start in an ascending, contiguous suffix ending at the anchor.
+
+    None requests an older page. The caller passes turns > 0. Include the request
+    segment preceding the Nth response, then extend backwards until every local tool
+    reply has its call. A page's extra prefix never becomes part of the window merely
+    because it was fetched. Invalid history with an orphaned reply raises RuntimeError.
+    """
+    responses = [
+        index for index, (_, message) in enumerate(rows) if isinstance(message, ModelResponse)
+    ]
+    if len(responses) < turns:
+        return 0 if rows and rows[0][0] == 0 else None
+    start = responses[-turns]
+    while True:
+        while start > 0 and isinstance(rows[start - 1][1], ModelRequest):
+            start -= 1
+        if start == 0 and rows[0][0] != 0:
+            return None
+        closed = close_tool_pairs(rows, start)
+        if closed is None:
+            return None
+        if closed == start:
+            return rows[start][0]
+        start = closed
+
+
+async def protected_suffix(
+    before: ReadHistoryBefore,
+    *,
+    next_step: NextStep,
+    next_seq: int,
+    after_anchor: int | None = None,
+) -> HistoryRows:
+    """Keep pending checkpoint requests and their tool pairs outside a new page.
+
+    For assembly, also retain all post-anchor rows. Reading backwards avoids loading
+    the closed historical prefix. The returned absolute sequences define the cut.
+    """
+    if next_step == "done" and (after_anchor is None or after_anchor >= next_seq - 1):
+        return []
+    rows: HistoryRows = []
+    cursor = next_seq - 1
+    while True:
+        chunk = await before(through_seq=cursor)
+        if not chunk:
+            raise RuntimeError("Checkpoint history is missing")
+        rows[:0] = reversed(chunk)
+        checkpoint = len(rows)
+        if next_step != "done":
+            checkpoint -= 1
+            expected = ModelResponse if next_step == "handle_response" else ModelRequest
+            if not isinstance(rows[-1][1], expected):
+                raise RuntimeError(f"{next_step} history has an invalid final message")
+            while checkpoint > 0 and isinstance(rows[checkpoint - 1][1], ModelRequest):
+                checkpoint -= 1
+            if checkpoint == 0 and rows[0][0] != 0:
+                cursor = rows[0][0] - 1
+                continue
+        protected = rows[checkpoint][0] if checkpoint < len(rows) else next_seq
+        if after_anchor is not None:
+            protected = min(protected, after_anchor + 1)
+        if protected < rows[0][0]:
+            cursor = rows[0][0] - 1
+            continue
+        index = next((i for i, (seq, _) in enumerate(rows) if seq >= protected), len(rows))
+        closed = close_tool_pairs(rows, index)
+        if closed is not None:
+            return rows[closed:]
+        cursor = rows[0][0] - 1
+
+
+def without_system(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+    """Copy borrowed values and leave the original system parts to the host."""
+    copied = deepcopy(list(messages))
+    for message in copied:
+        if isinstance(message, ModelRequest):
+            message.parts = [
+                part for part in message.parts if not isinstance(part, SystemPromptPart)
+            ]
+    return [message for message in copied if message.parts]
+
+
 async def assemble_working_context(
     *,
     session_id: UUID,
     session_factory: async_sessionmaker[AsyncSession],
     next_step: NextStep,
     next_seq: int,
-    page: ContextPage | None,
-    policy: ContextPolicy,
+    page: ContextPageRecord | None,
+    plugin: ContextPlugin | None,
+    replay_turns: int,
 ) -> list[ModelMessage]:
-    """Protect continuation and post-anchor history before invoking the assembler."""
-    if page is not None and page.policy_key != policy.key:
-        raise ValueError(f"Context page policy {page.policy_key!r} does not match {policy.key!r}")
-    through = next_seq - 1
-    read, before = bounded_history(session_factory, session_id, through)
-    suffix: HistoryRows = []
-    start = next_seq
-    if next_step != "done" or (page is not None and page.anchor_seq < through):
-        rows: HistoryRows = []
-        cursor = through
+    """Assemble system + plugin upper context + the protected current page."""
+    read, before = bounded_history(session_factory, session_id, next_seq - 1)
+    if page is None:
+        return [message for _, message in await read()]
+    if plugin is None or page.policy_key != plugin.key:
+        raise ValueError(
+            f"Context page policy {page.policy_key!r} does not match the context plugin"
+        )
+    suffix = await protected_suffix(
+        before,
+        next_step=next_step,
+        next_seq=next_seq,
+        after_anchor=page.anchor_seq,
+    )
+    # Older pages could include a pending checkpoint. Keep their record but fall
+    # back to raw history rather than replaying its content twice or redoing on_page.
+    if suffix and suffix[0][0] <= page.anchor_seq:
+        return [message for _, message in await read()]
+    rows: HistoryRows = []
+    if replay_turns:
+        cursor = page.anchor_seq
         while True:
             chunk = await before(through_seq=cursor)
             if not chunk:
-                raise RuntimeError("Checkpoint history is missing")
+                raise RuntimeError("Context page history is missing")
             rows[:0] = reversed(chunk)
-            checkpoint = len(rows)
-            if next_step != "done":
-                checkpoint -= 1
-                expected = ModelResponse if next_step == "handle_response" else ModelRequest
-                if not isinstance(rows[-1][1], expected):
-                    raise RuntimeError(f"{next_step} history has an invalid final message")
-                while checkpoint > 0 and isinstance(rows[checkpoint - 1][1], ModelRequest):
-                    checkpoint -= 1
-                if checkpoint == 0 and rows[0][0] != 0:
-                    cursor = rows[0][0] - 1
-                    continue
-            protected = rows[checkpoint][0] if checkpoint < len(rows) else next_seq
-            if page is not None:
-                protected = min(protected, page.anchor_seq + 1)
-            if protected < rows[0][0]:
-                cursor = rows[0][0] - 1
-                continue
-            index = next((i for i, (seq, _) in enumerate(rows) if seq >= protected), len(rows))
-            closed = close_tool_pairs(rows, index)
-            if closed is None:
-                cursor = rows[0][0] - 1
-                continue
-            suffix = rows[closed:]
-            start = suffix[0][0] if suffix else next_seq
-            break
-    prefix_read, prefix_before = bounded_history(session_factory, session_id, start - 1)
-    prefix = await policy.assemble(
-        ContextAssemblyContext(
-            session_id,
-            deepcopy(page),
-            start - 1,
-            prefix_read,
-            prefix_before,
+            start = replay_start(rows, replay_turns)
+            if start is not None:
+                rows = [(seq, message) for seq, message in rows if seq >= start]
+                break
+            cursor = rows[0][0] - 1
+    first = await read(through_seq=0)
+    system = [
+        part
+        for _, message in first
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, SystemPromptPart)
+    ]
+    upper = await plugin.get_context(
+        ContextInput(
+            ContextPage(deepcopy(page.payload)),
+            deepcopy([message for _, message in rows]),
         )
     )
-    return deepcopy([*prefix, *(message for _, message in suffix)])
+    return [
+        *([ModelRequest(parts=deepcopy(system))] if system else []),
+        *without_system(upper),
+        *without_system([message for _, message in suffix]),
+    ]

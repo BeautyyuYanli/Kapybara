@@ -24,7 +24,6 @@ from kapy.agent_output import AgentOutputService
 from kapy.agent_plugins import AgentPluginService, PluginRegistry
 from kapy.agent_plugins.repository import BindingRepository, lock_session
 from kapy.agent_runner import (
-    ContextPolicy,
     HistoryMessage,
     InputBatch,
     MessageCommitted,
@@ -33,10 +32,10 @@ from kapy.agent_runner import (
     SessionBusy,
     TurnResult,
     UserInput,
-    summary_context_policy,
 )
 from kapy.agent_runner import start_runner as run_agent_session
 from kapy.agent_runner.repository import AgentRepository
+from kapy.context_plugins import ContextPluginRegistry, create_default_registry
 from kapy.control.models.repository import ModelRepository
 from kapy.control.models.runtime import (
     build_model,
@@ -44,7 +43,6 @@ from kapy.control.models.runtime import (
     resolve_classes,
     validate_settings,
 )
-from kapy.control.models.types import ModelRecord
 from kapy.control.types import utc_now
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
@@ -75,16 +73,13 @@ class SessionReadyCapability(AbstractCapability[Any]):
         return args
 
 
-type ContextPolicyFactory = Callable[[SessionRecord, ModelRecord, Agent[Any, Any]], ContextPolicy]
-
-
 class SessionService:
     """User-side entry point; configure the same finite heartbeat policy on every worker.
 
     The instance stores only borrowed factories/output transport and heartbeat
-    and live polling values, plus plugin/execution/context-policy factories. Model
+    and live polling values, plus plugin/execution factories and a context plugin registry. Model
     configuration is fixed for each start call, which owns its model resources.
-    Each lease acquisition constructs its execution policy and scopes agent overrides
+    Each lease acquisition constructs its context plugin and scopes agent overrides
     to that execution.
     """
 
@@ -96,7 +91,7 @@ class SessionService:
         heartbeat_interval: float = 10.0,
         heartbeat_timeout: float = 60.0,
         live_poll_interval: float = 5.0,
-        context_policy_factory: ContextPolicyFactory | None = None,
+        context_plugin_registry: ContextPluginRegistry | None = None,
         plugin_service: AgentPluginService | None = None,
         execution_factory: SessionExecutionFactory | None = None,
     ) -> None:
@@ -113,7 +108,7 @@ class SessionService:
         self._output_service = output_service
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
-        self._context_policy_factory = context_policy_factory
+        self._context_plugin_registry = context_plugin_registry or create_default_registry()
         self.plugins = plugin_service or AgentPluginService(session_factory, PluginRegistry())
         self._execution_factory = execution_factory
 
@@ -202,10 +197,13 @@ class SessionService:
 
     async def update_session(self, session_id: UUID, data: UpdateSession) -> SessionRecord:
         """Replace supplied fields; model switches supply both parts of the model identity."""
+        values = data.model_dump(exclude_unset=True)
+        if data.context_plugin is not None:
+            # A supplied plugin spec replaces its config; nested defaults must not
+            # disappear under the PATCH model's recursive exclude_unset behavior.
+            values["context_plugin"] = data.context_plugin.model_dump()
         async with self._session_factory.begin() as db:
-            return await SessionRepository(db).update_session(
-                session_id, data.model_dump(exclude_unset=True)
-            )
+            return await SessionRepository(db).update_session(session_id, values)
 
     async def is_runner_running(self, session_id: UUID) -> bool:
         """Observe lease occupancy with this service's timeout, not Agent generation.
@@ -302,7 +300,7 @@ class SessionService:
         prompts/tools/output type;
         a task-local override supplies the stored model and merged request settings.
         Model/settings and default threshold errors precede output publication and
-        lease acquisition; plugin/policy assembly failures still precede input consumption.
+        lease acquisition; plugin assembly failures still precede input consumption.
         Provider and Model contexts outlive the complete runner loop.
         After lease release, pending inputs trigger reacquisition with the same
         configuration. Across the entire call, output retains the last non-None
@@ -323,10 +321,8 @@ class SessionService:
             raise ValueError("Provide an Agent or configure an execution factory")
         if agent is not None and await self.plugins.list_bindings(session_id):
             raise ValueError("Plugin sessions require the application execution factory")
-        threshold = (
-            resolve_compaction_threshold(session.compaction_threshold_tokens, model.context_window)
-            if self._context_policy_factory is None
-            else None
+        threshold = resolve_compaction_threshold(
+            session.compaction_threshold_tokens, model.context_window
         )
         provider_cls, model_cls = resolve_classes(config)
         settings = validate_settings(model_cls, model.settings | session.model_settings)
@@ -373,16 +369,7 @@ class SessionService:
                     source = nullcontext(RunnerExecution(agent, deps))
                 async with source as execution:
                     actual = execution.agent
-                    policy = (
-                        self._context_policy_factory(session, model, actual)
-                        if self._context_policy_factory is not None
-                        else summary_context_policy(
-                            actual,
-                            deps=execution.deps,
-                            threshold_tokens=cast(int, threshold),
-                            replay_turns=session.compaction_replay_turns,
-                        )
-                    )
+                    plugin = self._context_plugin_registry.create(session.context_plugin)
                     with actual.override(
                         model=sdk_model, model_settings=cast(ModelSettings, settings)
                     ):
@@ -390,8 +377,10 @@ class SessionService:
                         yield RunnerExecution(
                             actual,
                             execution.deps,
-                            policy,
+                            plugin,
                             [*execution.capabilities, SessionReadyCapability(self, session_id)],
+                            compaction_threshold_tokens=threshold,
+                            compaction_replay_turns=session.compaction_replay_turns,
                         )
 
             async with publisher as on_output:

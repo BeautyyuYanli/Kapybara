@@ -316,3 +316,47 @@ async def test_websocket_without_transport_closes_with_internal_error(database):
                 await ws.recv()
             assert closed.value.rcvd is not None
             assert closed.value.rcvd.code == 1011
+
+
+async def test_context_plugin_selection_is_persisted_and_name_is_fixed(database, seed_session):
+    sessions = SessionService(database.sessions)
+    session_id = uuid4()
+    await seed_session(session_id)
+    existing = await sessions.get_session(session_id)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/api/sessions",
+            json={
+                "provider_id": str(existing.provider_id),
+                "model_name": existing.model_name,
+                "context_plugin": {"name": "example/index", "config": {"a": 1, "b": 2}},
+            },
+        )
+        assert created.status_code == 201
+        path = "/api/sessions/" + created.json()["id"]
+        updated = await client.patch(
+            path,
+            json={
+                "context_plugin": {"name": "example/index", "config": {"a": 3}},
+            },
+        )
+        assert updated.status_code == 200
+        assert (await client.get(path)).json()["context_plugin"] == {
+            "name": "example/index",
+            "config": {"a": 3},
+        }
+        rejected = await client.patch(
+            path,
+            json={
+                "context_plugin": {"name": "kapy/summary", "config": {}},
+            },
+        )
+        assert rejected.status_code == 422
+        assert (await client.get(path)).json()["context_plugin"]["name"] == "example/index"
+        default = await client.get(f"/api/sessions/{session_id}")
+        assert default.json()["context_plugin"] == {"name": "kapy/summary", "config": {}}
+        reset = await client.patch(f"/api/sessions/{session_id}", json={"context_plugin": {}})
+        assert reset.status_code == 200
+        assert reset.json()["context_plugin"] == {"name": "kapy/summary", "config": {}}

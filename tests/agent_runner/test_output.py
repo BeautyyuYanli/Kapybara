@@ -26,9 +26,9 @@ from kapy.agent_runner import (
     OutputEvent,
     TextDelta,
     open_runner,
-    summary_context_policy,
 )
 from kapy.agent_runner.repository import AgentRepository
+from kapy.context_plugins import SummaryPlugin
 from kapy.control.sessions import SessionService
 from kapy.session_lease import open_session_lease
 
@@ -292,7 +292,8 @@ async def test_compaction_summary_is_excluded_from_business_output(database):
     async with open_runner(
         session_id,
         agent=agent,
-        context_policy=summary_context_policy(agent, threshold_tokens=1),
+        context_plugin=SummaryPlugin(),
+        compaction_threshold_tokens=1,
         session_factory=database.sessions,
     ) as runner:
         await runner.run(

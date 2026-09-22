@@ -23,13 +23,14 @@ from pydantic_ai.usage import RequestUsage
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from kapy.agent_runner import RunnerLost, open_runner, summary_context_policy
-from kapy.agent_runner.context_summary import (
+from kapy.agent_runner import RunnerLost, open_runner
+from kapy.agent_runner.repository import AgentRepository
+from kapy.context_plugins import SummaryPlugin
+from kapy.context_plugins.summary import (
     COMPACTION_CONTEXT_PROMPT,
     COMPACTION_PROMPT,
     COMPACTION_RESUME_PROMPT,
 )
-from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService, UpdateSession
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -39,9 +40,9 @@ def summary_runner(session_id, *, agent, replay_turns=0, threshold_tokens=None, 
     return open_runner(
         session_id,
         agent=agent,
-        context_policy=summary_context_policy(
-            agent, replay_turns=replay_turns, threshold_tokens=threshold_tokens
-        ),
+        context_plugin=SummaryPlugin(),
+        compaction_replay_turns=replay_turns,
+        compaction_threshold_tokens=threshold_tokens,
         **kwargs,
     )
 
@@ -91,7 +92,7 @@ async def test_manual_summary_preserves_pending_graph_history_and_absolute_seque
         assert not (await runner.turn(steer=["original"])).finished
         before, _ = await snapshot(database, session_id)
         summary = await runner.turn_context_page()
-        assert summary is not None and summary.anchor_seq == 2
+        assert summary is not None and summary.anchor_seq == 0
         assert runner.next_step == "model_request"
         assert (await snapshot(database, session_id))[0] == before
         assert await runner.turn_context_page() == summary
@@ -165,7 +166,7 @@ async def test_rebuild_reads_only_anchor_window_and_tail_and_preserves_resume_bo
     messages.append(ModelRequest(parts=[UserPromptPart("pending")]))
     if next_step == "handle_response":
         messages.append(ModelResponse(parts=[ToolCallPart("work", {}, "pending-call")]))
-    session_id = await seed_history(messages, next_step, compaction_seq=202)
+    session_id = await seed_history(messages, next_step, compaction_seq=197)
     reads = []
     original_read = AgentRepository.read_history
     original_before = AgentRepository.read_history_before
@@ -214,8 +215,9 @@ async def test_rebuild_reads_only_anchor_window_and_tail_and_preserves_resume_bo
         assert reads == loaded
     assert user_texts(received[0]) == [
         COMPACTION_CONTEXT_PROMPT.format(summary_text="saved summary"),
-        "question 99",
+        "question 98",
         COMPACTION_RESUME_PROMPT,
+        "question 99",
         "pending",
     ]
     assert [p.content for m in received[0] for p in m.parts if isinstance(p, SystemPromptPart)] == [
@@ -588,7 +590,7 @@ async def test_automatic_summary_finishes_saved_tools_before_compacting_and_hono
     assert not result.finished and result.output is None
     assert events == ["tool", "summary"]
     rows, summary = await snapshot(database, session_id)
-    assert len(rows) == 3 and summary is not None and summary.anchor_seq == 2
+    assert len(rows) == 3 and summary is not None and summary.anchor_seq == 0
     result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output == "done"
     assert events == ["tool", "summary", "business"]

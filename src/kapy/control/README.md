@@ -88,7 +88,7 @@ deletes its local models without blocking on or rewriting session references.
 No remote resources are deleted.
 
 Sessions have UUID identities, title, model identity, JSON model_settings and two
-compaction columns and a ready/closing/closed lifecycle status. create/get/list/update
+paging columns, context_plugin JSON and a ready/closing/closed lifecycle status. create/get/list/update
 and close APIs retain records; there is no physical deletion. Fixed plugin bindings
 are supplied in CreateSession.plugins. The shared application factory creates
 Agent instructions/tools per execution; direct Agent calls remain available for
@@ -125,30 +125,24 @@ The same values remain active through every queued run and temporary compaction;
 configuration updates affect the next start. Explicit SDK options retain their
 SDK semantics; no extra runner-specific settings blacklist is applied.
 
-`SessionService(..., context_policy_factory=...)` optionally supplies a pure factory
-`(session_record, model_record, agent) -> ContextPolicy`. It runs outside the
-configuration transaction for each newly acquired runner lease, using its actual
-Agent. Its policy covers that execution and paging. Model metadata includes
-context_window. The default constructs summary/v1 using the resolved threshold,
-replay count and borrowed Agent/deps; custom factories need not interpret summary
-fields. HTTP and Telegram both use `application.sessions.create_session_service`.
-The runner core deals only with generic page state and does not import the summary
-strategy. See the [paging contracts](../agent_runner/README.md).
+`SessionService(..., context_plugin_registry=...)` selects an implementation from the
+session's `context_plugin: {"name": "kapy/summary", "config": {}}`. The name is fixed
+on creation. PATCH replaces the supplied config object completely and cannot change
+the name. Constructors validate plugin configuration inside each acquired execution,
+before input consumption. Unknown names or invalid config fail without draining inputs.
+All configuration is snapshotted for a start call; edits apply on the next start.
+HTTP and Telegram share `application.sessions.create_session_service`.
 
-The stored compaction_threshold_tokens must be positive or None. The default
-summary factory resolves None to 70% of model capacity at startup (rounded down,
-at least one). On session creation,
-an omitted/None threshold stays None when model capacity is known; if capacity is
-unknown or the model reference is unresolved, SessionService stores `256 * 1024 * 7 // 10 = 183500`. Explicit thresholds
-are preserved. Updates can clear the threshold to None without applying this
-creation default, and existing sessions are not backfilled. With the default summary
-factory, unknown capacity plus a stored None prevents startup before acquiring
-execution or consuming inputs. A custom factory may ignore these summary fields.
-compaction_replay_turns is a nonnegative integer, defaults to 10, and zero omits
-replay in the replaceable prefix. These are session fields, not arguments to
-SessionService.start_runner. Lower-level callers pass
-`context_policy=summary_context_policy(agent, threshold_tokens=..., replay_turns=..., max_retries=...)`
-to open_runner or start_runner; run and rebuild_context have no compaction arguments.
+The host owns pagination independently of plugin config. A positive
+compaction_threshold_tokens enables paging; null resolves to 70% of model capacity
+at startup. Creation stores 183500 when capacity is unknown and no threshold is
+provided; updates do not apply this default. A stored null with unknown capacity
+fails startup. compaction_replay_turns is nonnegative, defaults to 10, and controls
+the prior original rounds supplied as plugin reference. Only the summary plugin
+chooses to replay these in its returned upper context. Lower-level callers inject
+context_plugin plus separate host threshold/reference options; see the
+[paging contracts](../agent_runner/README.md).
+
 
 Heartbeat interval and timeout are finite constructor settings satisfying
 `0 < interval < timeout`. Every worker using the same session lease table must use the

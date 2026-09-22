@@ -4,12 +4,13 @@ from copy import deepcopy
 from uuid import uuid4
 
 import pytest
-from pydantic_ai import Agent, CallToolsNode, ModelRequestNode
+from pydantic_ai import Agent, CallToolsNode, ModelRequestNode, RunContext
 from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -18,15 +19,10 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import FunctionModel
 from pydantic_graph import End
 
-from kapy.agent_runner import (
-    ContextPolicy,
-    full_history_policy,
-    open_runner,
-    summary_context_policy,
-)
-from kapy.agent_runner.context import ContextAssemblyContext, JsonObject, PageTurnContext
+from kapy.agent_runner import ContextPage, open_runner
+from kapy.agent_runner.context import ContextInput, PageInput
 from kapy.agent_runner.repository import AgentRepository
-from kapy.control.models import ModelService, UpdateModel
+from kapy.context_plugins import ContextPluginRegistry, ContextPluginSpec, SummaryPlugin
 from kapy.control.sessions import SessionService, UpdateSession
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -58,27 +54,27 @@ async def test_custom_page_protects_pending_tool_pair_and_preserves_live_request
     def work() -> str:
         return "result"
 
-    async def action(context: PageTurnContext) -> JsonObject:
-        actions.append(context)
-        assert context.anchor_seq == 2
-        assert context.operation_id == f"{session_id}:memory/v1:2"
-        assert [seq for seq, _ in await context.read_history(through_seq=999)] == [0, 1, 2]
-        return {"note": "remember"}
+    class MemoryPlugin:
+        key = "memory/v1"
 
-    async def assemble(context: ContextAssemblyContext) -> list[ModelMessage]:
-        if context.page is None:
-            return [message for _, message in await context.read_history()]
-        assert context.prefix_through_seq == 0
-        assert [seq for seq, _ in await context.read_history(through_seq=999)] == [0]
-        assert await context.read_history(start_seq=1) == []
-        return [ModelRequest(parts=[UserPromptPart("remember")])]
+        async def on_page(self, page: PageInput, *, call_agent) -> ContextPage:
+            actions.append(page)
+            assert len(page.messages) == 1
+            assert [p.content for p in page.messages[0].parts if isinstance(p, UserPromptPart)] == [
+                "original"
+            ]
+            return ContextPage({"note": "remember"})
 
-    policy = ContextPolicy("memory/v1", lambda boundary: False, action, assemble)
+        async def get_context(self, context: ContextInput) -> list[ModelMessage]:
+            assert len(context.messages) == 1
+            return [ModelRequest(parts=[UserPromptPart("remember")])]
+
+    plugin = MemoryPlugin()
     async with open_runner(
         session_id,
         agent=agent,
         session_factory=database.sessions,
-        context_policy=policy,
+        context_plugin=plugin,
     ) as runner:
         await runner.rebuild_context()
         assert not (await runner.turn(steer=["original"])).finished
@@ -120,24 +116,25 @@ async def test_committed_page_survives_assembly_failure_and_restarts_without_act
     calls = []
     fail = True
 
-    async def action(context: PageTurnContext) -> JsonObject:
-        calls.append(context.operation_id)
-        return {"artifact": "saved"}
+    class ArtifactPlugin:
+        key = "artifact/v1"
 
-    async def assemble(context: ContextAssemblyContext) -> list[ModelMessage]:
-        if context.page is None:
-            return [message for _, message in await context.read_history()]
-        if fail:
-            raise RuntimeError("assembly failed")
-        return [ModelRequest(parts=[UserPromptPart(str(context.page.payload["artifact"]))])]
+        async def on_page(self, page: PageInput, *, call_agent) -> ContextPage:
+            calls.append(page)
+            return ContextPage({"artifact": "saved"})
 
-    policy = ContextPolicy("artifact/v1", lambda boundary: False, action, assemble)
+        async def get_context(self, context: ContextInput) -> list[ModelMessage]:
+            if fail:
+                raise RuntimeError("assembly failed")
+            return [ModelRequest(parts=[UserPromptPart(str(context.page.payload["artifact"]))])]
+
+    plugin = ArtifactPlugin()
     with pytest.raises(RuntimeError, match="assembly failed"):
         async with open_runner(
             session_id,
             agent=Agent("test"),
             session_factory=database.sessions,
-            context_policy=policy,
+            context_plugin=plugin,
         ) as runner:
             await runner.rebuild_context()
             await runner.turn_context_page()
@@ -146,7 +143,7 @@ async def test_committed_page_survives_assembly_failure_and_restarts_without_act
         session_id,
         agent=Agent("test"),
         session_factory=database.sessions,
-        context_policy=policy,
+        context_plugin=plugin,
     ) as runner:
         await runner.rebuild_context()
         page = await runner.turn_context_page()
@@ -162,7 +159,7 @@ async def test_committed_page_survives_assembly_failure_and_restarts_without_act
             await runner.rebuild_context()
 
 
-async def test_full_history_policy_manual_page_has_no_action_or_extra_model_request(
+async def test_no_context_plugin_retains_history_without_creating_a_page(
     database,
     seed_history,
 ):
@@ -181,7 +178,7 @@ async def test_full_history_policy_manual_page_has_no_action_or_extra_model_requ
     ) as runner:
         await runner.rebuild_context()
         page = await runner.turn_context_page()
-        assert page is not None and page.payload == {} and page.policy_key == "history/v1"
+        assert page is None
         assert received == []
         assert (await runner.turn()).output == "done"
     assert len(received) == 1 and received[0][0].parts == original[0].parts
@@ -267,7 +264,8 @@ async def test_page_restore_preserves_earlier_completed_call_when_pending_call_r
         session_id,
         agent=agent,
         session_factory=database.sessions,
-        context_policy=summary_context_policy(agent, replay_turns=0),
+        context_plugin=SummaryPlugin(),
+        compaction_replay_turns=0,
     ) as runner:
         await runner.rebuild_context()
         assert not (await runner.turn()).finished
@@ -285,7 +283,7 @@ async def test_page_restore_preserves_earlier_completed_call_when_pending_call_r
     assert [entry.seq for entry in saved] == list(range(6))
 
 
-async def test_custom_service_factory_bypasses_summary_fields_and_is_frozen_across_queued_runs(
+async def test_context_plugin_factory_config_is_frozen_across_queued_runs(
     database,
     seed_session,
     session_model,
@@ -294,21 +292,22 @@ async def test_custom_service_factory_bypasses_summary_fields_and_is_frozen_acro
     await seed_session(session_id)
     factories = []
 
-    def factory(session, model, agent):
-        factories.append((session.id, model.context_window, agent))
-        return full_history_policy()
+    def factory(config):
+        factories.append(config)
+        return SummaryPlugin()
 
-    sessions = SessionService(database.sessions, context_policy_factory=factory)
-    await sessions.update_session(session_id, UpdateSession(compaction_threshold_tokens=None))
-    session = await sessions.get_session(session_id)
-    await ModelService(database.sessions).update_model(
-        session.provider_id, session.model_name, UpdateModel(context_window=None)
+    sessions = SessionService(
+        database.sessions, context_plugin_registry=ContextPluginRegistry({"kapy/summary": factory})
     )
     calls = []
 
     async def model(messages, info):
         calls.append(True)
         if len(calls) == 1:
+            await sessions.update_session(
+                session_id,
+                UpdateSession(context_plugin=ContextPluginSpec(config={"changed": True})),
+            )
             await sessions.enqueue_input(session_id, "queued", "next")
         return ModelResponse(parts=[TextPart("done")])
 
@@ -317,8 +316,9 @@ async def test_custom_service_factory_bypasses_summary_fields_and_is_frozen_acro
     await sessions.enqueue_input(session_id, "steer", "go")
     result = await sessions.start_runner(session_id, agent=agent)
     assert result.finished and result.output == "done"
-    assert len(calls) == 2 and len(factories) == 1
-    assert factories[0][1] is None
+    assert len(calls) == 2 and factories == [{}]
+    await sessions.start_runner(session_id, agent=agent)
+    assert factories == [{}, {"changed": True}]
 
 
 @pytest.mark.parametrize("payload", [[], {"value": float("nan")}, {"value": object()}])
@@ -330,17 +330,22 @@ async def test_invalid_page_payload_never_commits(database, seed_history, payloa
         ]
     )
 
-    async def invalid(context: PageTurnContext) -> JsonObject:
-        return payload
+    class InvalidPlugin:
+        key = "invalid/v1"
 
-    base = full_history_policy()
-    policy = ContextPolicy("invalid/v1", lambda boundary: False, invalid, base.assemble)
+        async def on_page(self, page, *, call_agent):
+            return ContextPage(payload)
+
+        async def get_context(self, context: ContextInput) -> list[ModelMessage]:
+            return []
+
+    plugin = InvalidPlugin()
     with pytest.raises(ValueError):
         async with open_runner(
             session_id,
             agent=Agent("test"),
             session_factory=database.sessions,
-            context_policy=policy,
+            context_plugin=plugin,
         ) as runner:
             await runner.rebuild_context()
             await runner.turn_context_page()
@@ -393,3 +398,194 @@ async def test_business_hooks_cannot_bypass_durable_execution(database, seed_his
     assert len(saved) == 3
     part = saved[-1].message.parts[0]
     assert isinstance(part, UserPromptPart) and part.content == "new input"
+
+
+async def test_plugin_sees_closed_page_and_reference_only_and_controls_upper_context(
+    database,
+    seed_history,
+):
+    messages = []
+    for i in range(3):
+        messages.extend(
+            [
+                ModelRequest(parts=[UserPromptPart(f"question {i}")]),
+                ModelResponse(parts=[TextPart(f"answer {i}")]),
+            ]
+        )
+    session_id = await seed_history(messages)
+    pages, contexts = [], []
+
+    class IndexPlugin:
+        key = "index/v1"
+
+        async def on_page(self, page, *, call_agent):
+            pages.append(deepcopy(page))
+            return ContextPage({"index": len(pages)})
+
+        async def get_context(self, context: ContextInput) -> list[ModelMessage]:
+            contexts.append(deepcopy(context))
+            # Deliberately omit the reference originals. The host must not append them.
+            return [ModelRequest(parts=[UserPromptPart("indexed upper context")])]
+
+    received = []
+
+    def model(messages, info):
+        received.append(deepcopy(messages))
+        return ModelResponse(parts=[TextPart("new answer")])
+
+    async with open_runner(
+        session_id,
+        agent=Agent(FunctionModel(model)),
+        session_factory=database.sessions,
+        context_plugin=IndexPlugin(),
+        compaction_replay_turns=1,
+    ) as runner:
+        await runner.rebuild_context()
+        first = await runner.turn_context_page()
+        assert first is not None and first.anchor_seq == 5
+        assert len(pages[0].messages) == 6 and pages[0].previous_page is None
+        assert len(contexts[-1].messages) == 2
+        await runner.turn(steer=["current page"])
+        second = await runner.turn_context_page()
+        assert second is not None and second.anchor_seq == 7
+        assert pages[1].previous_page == ContextPage({"index": 1})
+        assert len(pages[1].messages) == 2
+    assert [p.content for m in received[0] for p in m.parts if isinstance(p, UserPromptPart)] == [
+        "indexed upper context",
+        "current page",
+    ]
+    assert len(await history(database, session_id)) == 8
+
+
+async def test_page_auxiliary_borrows_execution_capabilities_and_does_not_persist(
+    database,
+    seed_history,
+):
+    from contextlib import asynccontextmanager
+
+    from pydantic_ai.toolsets import FunctionToolset
+
+    from kapy.agent_runner import RunnerExecution
+
+    prompt_baselines = []
+
+    def dynamic(ctx: RunContext) -> str:
+        prompt_baselines.append(
+            [part.content for part in ctx.messages[0].parts if isinstance(part, SystemPromptPart)]
+        )
+        return "auxiliary system"
+
+    session_id = await seed_history(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart("host system", dynamic_ref=dynamic.__qualname__),
+                    UserPromptPart("original"),
+                ]
+            ),
+            ModelResponse(parts=[TextPart("business answer")]),
+        ]
+    )
+    observations, helpers, tool_calls = [], [], []
+    toolset = FunctionToolset()
+
+    @toolset.tool_plain
+    def work() -> str:
+        tool_calls.append(True)
+        return "worked"
+
+    class StableCapability(AbstractCapability):
+        def get_instructions(self):
+            return "execution instruction"
+
+        def get_toolset(self):
+            return toolset
+
+        async def before_model_request(self, ctx, request_context):
+            observations.append(deepcopy(request_context.model_request_parameters))
+            return request_context
+
+    def model(messages, info):
+        if len(observations) == 1:
+            return ModelResponse(parts=[ToolCallPart("work", {}, "allowed")])
+        return ModelResponse(parts=[TextPart("auxiliary answer")])
+
+    agent = Agent(FunctionModel(model), instructions="fixed")
+    agent.system_prompt(dynamic=True)(dynamic)
+
+    class BorrowPlugin:
+        key = "borrow/v1"
+
+        async def on_page(self, page, *, call_agent):
+            helpers.append(call_agent)
+            assert await call_agent("first auxiliary") == "auxiliary answer"
+            assert (
+                await call_agent("second auxiliary", block_other_tools=True) == "auxiliary answer"
+            )
+            assert len(await history(database, session_id)) == 2
+            return ContextPage({"note": "saved"})
+
+        async def get_context(self, context: ContextInput) -> list[ModelMessage]:
+            calls_before = len(observations)
+            with pytest.raises(RuntimeError, match="only valid"):
+                await helpers[-1]("outside on_page during assembly")
+            assert len(observations) == calls_before
+            return [ModelRequest(parts=[UserPromptPart("upper")])]
+
+    @asynccontextmanager
+    async def factory():
+        yield RunnerExecution(
+            agent, context_plugin=BorrowPlugin(), capabilities=[StableCapability()]
+        )
+
+    async with open_runner(
+        session_id,
+        execution_factory=factory,
+        session_factory=database.sessions,
+    ) as runner:
+        await runner.rebuild_context()
+        await runner.turn_context_page()
+        with pytest.raises(RuntimeError, match="only valid"):
+            await helpers[0]("too late")
+    assert tool_calls == [True]
+    # Each helper invocation must start from the same host-owned nested messages;
+    # the first run's real SDK reevaluation must not leak into the next run.
+    assert prompt_baselines == [["host system"], ["host system"]]
+    # SDK provenance IDs are regenerated per run and never sent as tool definitions.
+    for parameters in observations:
+        for tool in parameters.function_tools:
+            tool.capability_id = None
+    assert observations[0] == observations[1] == observations[2]
+    assert len(await history(database, session_id)) == 2
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        ContextPluginSpec(name="missing/plugin"),
+        ContextPluginSpec(config={"invalid": True}),
+    ],
+)
+async def test_invalid_context_plugin_fails_before_input_consumption(
+    database,
+    seed_session,
+    session_model,
+    spec,
+):
+    session_id = uuid4()
+    await seed_session(session_id)
+    sessions = SessionService(database.sessions)
+    # Name is fixed on creation; this fixture writes the initial stored selection.
+    from kapy.control.sessions.models import SessionRow
+
+    async with database.sessions.begin() as db:
+        row = await db.get(SessionRow, session_id)
+        assert row is not None
+        row.context_plugin = spec.model_dump()
+    await sessions.enqueue_input(session_id, "queued", "retained")
+    agent = Agent("test")
+    session_model(agent.model)
+    with pytest.raises(ValueError):
+        await sessions.start_runner(session_id, agent=agent)
+    assert [row.content for row in await sessions.read_inputs(session_id, "queued")] == ["retained"]
+    assert await history(database, session_id) == ()

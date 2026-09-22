@@ -22,7 +22,7 @@ from valkey.asyncio import Valkey
 
 from kapy.agent_runner.models import agent_metadata
 from kapy.agent_runner.repository import AgentRepository
-from kapy.agent_runner.types import ContextPage, NextStep
+from kapy.agent_runner.types import ContextPageRecord, NextStep
 from kapy.control.database import ControlTable
 from kapy.control.sessions import models as session_models  # noqa: F401
 from kapy.session_lease import open_session_lease
@@ -99,7 +99,7 @@ def seed_history(database):
             if compaction_seq is not None:
                 await repo.save_page(
                     session_id,
-                    ContextPage(compaction_seq, "summary/v1", {"summary": "saved summary"}),
+                    ContextPageRecord(compaction_seq, "summary/v1", {"summary": "saved summary"}),
                 )
         return session_id
 

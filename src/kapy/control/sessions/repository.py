@@ -59,6 +59,9 @@ class SessionRepository:
 
     async def update_session(self, session_id: UUID, values: dict[str, Any]) -> SessionRecord:
         row = await self._session(session_id)
+        if "context_plugin" in values:
+            if values["context_plugin"]["name"] != row.context_plugin["name"]:
+                raise ValueError("context_plugin.name cannot change after session creation")
         row.sqlmodel_update(values | {"updated_at": utc_now()})
         await self._db.flush()
         return SessionRecord.model_validate(row)

@@ -19,7 +19,7 @@ from sqlmodel import col, select
 from kapy.pagination import Page, paginate
 
 from .models import AgentContextPageRow, AgentHistoryRow, AgentStateRow
-from .types import ContextPage, HistoryMessage, NextStep, ResumeState
+from .types import ContextPageRecord, HistoryMessage, NextStep, ResumeState
 
 
 def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
@@ -146,7 +146,7 @@ class AgentRepository:
             for entry in _decode_history((await self._db.execute(statement)).scalars().all())
         ]
 
-    async def read_latest_page(self, session_id: UUID) -> ContextPage | None:
+    async def read_latest_page(self, session_id: UUID) -> ContextPageRecord | None:
         row = (
             await self._db.execute(
                 select(AgentContextPageRow)
@@ -155,9 +155,11 @@ class AgentRepository:
                 .limit(1)
             )
         ).scalar_one_or_none()
-        return None if row is None else ContextPage(row.anchor_seq, row.policy_key, row.payload)
+        return (
+            None if row is None else ContextPageRecord(row.anchor_seq, row.policy_key, row.payload)
+        )
 
-    async def save_page(self, session_id: UUID, page: ContextPage) -> ContextPage:
+    async def save_page(self, session_id: UUID, page: ContextPageRecord) -> ContextPageRecord:
         """Insert one immutable page after lock_owned in the caller's transaction."""
         await self._db.execute(
             insert(AgentContextPageRow).values(

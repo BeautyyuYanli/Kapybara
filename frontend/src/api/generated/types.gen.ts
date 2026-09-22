@@ -223,6 +223,17 @@ export type CompactionPart = {
 };
 
 /**
+ * ContextPluginSpec
+ */
+export type ContextPluginSpec = {
+    /**
+     * Name
+     */
+    name?: string;
+    config?: JsonObject;
+};
+
+/**
  * CreateModel
  */
 export type CreateModel = {
@@ -267,6 +278,7 @@ export type CreateSessionAndSchedule = {
      * Plugins
      */
     plugins?: Array<PluginSpec>;
+    context_plugin?: ContextPluginSpec;
     /**
      * Provider Id
      */
@@ -1256,6 +1268,7 @@ export type SessionInput = {
  * SessionRecord
  */
 export type SessionRecord = {
+    context_plugin: ContextPluginSpec;
     status: LifecycleStatus;
     /**
      * Id
@@ -1767,6 +1780,7 @@ export type UpdateProvider = {
  * UpdateSession
  */
 export type UpdateSession = {
+    context_plugin?: ContextPluginSpec | null;
     /**
      * Title
      */

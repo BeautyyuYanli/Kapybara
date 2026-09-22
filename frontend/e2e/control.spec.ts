@@ -21,6 +21,7 @@ const model: ModelRecord = {
   updated_at: "",
 };
 const session: SessionRecord = {
+  context_plugin: { name: "kapy/summary", config: {} },
   id,
   title: "Demo Session",
   provider_id: id,
@@ -151,7 +152,7 @@ test("session create leaves threshold default to the service and permits zero re
   await expect(
     page.getByText("模型容量未知，创建时将保存默认摘要阈值 183500。"),
   ).toBeVisible();
-  await page.getByLabel("回放轮数", { exact: true }).fill("0");
+  await page.getByLabel("参考轮数", { exact: true }).fill("0");
   const request = page.waitForRequest((request) => request.method() === "POST");
   await page.getByRole("button", { name: "保存 Session" }).click();
   expect((await request).postDataJSON()).toEqual({
@@ -161,6 +162,7 @@ test("session create leaves threshold default to the service and permits zero re
     model_settings: {},
     compaction_threshold_tokens: null,
     compaction_replay_turns: 0,
+    context_plugin: { name: "kapy/summary", config: {} },
   });
   await expect(page.getByRole("heading", { name: "编辑 Session" })).toBeVisible();
 });

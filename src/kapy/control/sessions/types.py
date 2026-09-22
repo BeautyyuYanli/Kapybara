@@ -9,6 +9,7 @@ from pydantic import Field, model_validator
 
 from kapy.agent_plugins.contracts import PluginSpec
 from kapy.agent_runner.types import UserInput
+from kapy.context_plugins.registry import ContextPluginSpec
 from kapy.control.types import DTO, JsonObject, Name, UpdateDTO
 from kapy.lifecycle import LifecycleStatus
 
@@ -35,6 +36,7 @@ class InputSubmission(DTO):
 
 class CreateSession(DTO):
     plugins: list[PluginSpec] = Field(default_factory=list)
+    context_plugin: ContextPluginSpec = Field(default_factory=ContextPluginSpec)
     provider_id: UUID
     model_name: Name
     title: str = Field(default="", max_length=256)
@@ -45,6 +47,7 @@ class CreateSession(DTO):
 
 class UpdateSession(UpdateDTO):
     nullable_fields = frozenset({"compaction_threshold_tokens"})
+    context_plugin: ContextPluginSpec | None = None
     title: str | None = Field(default=None, max_length=256)
     provider_id: UUID | None = None
     model_name: Name | None = None
@@ -60,6 +63,7 @@ class UpdateSession(UpdateDTO):
 
 
 class SessionRecord(DTO):
+    context_plugin: ContextPluginSpec
     status: LifecycleStatus
     id: UUID
     title: str

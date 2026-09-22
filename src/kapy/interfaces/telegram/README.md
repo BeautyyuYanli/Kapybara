@@ -23,7 +23,8 @@ and takes effect immediately without restarting the interface process.
 
 The optional `KAPY_TELEGRAM_SESSION_TEMPLATE` supplies the initial fallback, for example
 `{"provider_id":"00000000-0000-0000-0000-000000000001","model_name":"your-model"}`.
-The template accepts the existing CreateSession fields, including compaction values.
+The template accepts the existing CreateSession fields, including host paging values and context_plugin selection. Existing templates
+without that field default to kapy/summary; the interface has no context logic.
 An omitted template or JSON `null` requires selecting a model before creating a
 session. A saved choice takes precedence over the entire environment template and
 uses normal CreateSession defaults; model presets continue to come from the catalog.

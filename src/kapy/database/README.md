@@ -23,6 +23,10 @@ the configured PostgreSQL schema, but never creates or migrates an interface dat
 Telegram commands only open its SQLite file. Stopping a process never drops data.
 
 Core metadata is explicitly ControlTable, agent_metadata and lease_metadata.
+Sessions also store `context_plugin` JSON with a server default of kapy/summary and
+empty config, backfilling existing session rows through the generated column revision.
+This selection does not add plugin-owned tables or change context-page payloads.
+
 ControlTable includes `plugin_agent_bindings` and the shared session/binding lifecycle
 columns. Agent plugins store small JSON state in this core-owned table; data_version
 migrations transform individual binding data on context loading and are separate

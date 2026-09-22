@@ -8,7 +8,7 @@ shared Agent's deps.
 """
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
@@ -37,18 +37,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kapy.session_lease import SessionLease
 
 from .context import (
-    ContextPolicy,
+    ContextPage,
+    ContextPlugin,
     JsonObject,
-    PageBoundary,
-    PageTurnContext,
+    PageInput,
     assemble_working_context,
     bounded_history,
+    protected_suffix,
+    require_nonnegative_int,
 )
 from .output import OutputCapability
 from .repository import AgentRepository, response_tokens
 from .types import (
     ConsumeCancel,
-    ContextPage,
+    ContextPageRecord,
     HistoryMessage,
     InputBatch,
     MessageCommitted,
@@ -78,11 +80,23 @@ class ExecutionState:
         resume: ResumeState,
         *,
         session_factory: async_sessionmaker[AsyncSession],
-        policy: ContextPolicy,
+        plugin: ContextPlugin | None,
+        threshold_tokens: int | None,
+        replay_turns: int,
         output: OutputCapability,
     ) -> None:
         self.session_id, self.lease = session_id, lease
-        self.session_factory, self.policy, self.output = session_factory, policy, output
+        require_nonnegative_int(replay_turns, "replay_turns")
+        if threshold_tokens is not None:
+            require_nonnegative_int(threshold_tokens, "threshold_tokens")
+            if threshold_tokens == 0:
+                raise ValueError("threshold_tokens must be positive")
+        if plugin is not None and (not isinstance(plugin.key, str) or not plugin.key.strip()):
+            raise ValueError("Context plugin key must be nonempty")
+        if plugin is None and threshold_tokens is not None:
+            raise ValueError("A paging threshold requires a context plugin")
+        self.session_factory, self.plugin, self.output = session_factory, plugin, output
+        self.threshold_tokens, self.replay_turns = threshold_tokens, replay_turns
         self.next_step, self.next_seq, self.page = resume.next_step, resume.next_seq, resume.page
         self.context: list[ModelMessage] | None = None
         self.context_changed = False
@@ -157,7 +171,8 @@ class ExecutionState:
             next_step=self.next_step,
             next_seq=self.next_seq,
             page=self.page,
-            policy=self.policy,
+            plugin=self.plugin,
+            replay_turns=self.replay_turns,
         )
         if first:
             async with self.session_factory.begin() as db:
@@ -171,59 +186,64 @@ class ExecutionState:
         self.context = context
         self.context_changed = True
 
-    async def turn_context_page(self) -> ContextPage | None:
-        context = self.require_context()
+    async def page_anchor(self) -> int:
+        """Keep the pending checkpoint and its tool pairs in the current page."""
+        _, before = bounded_history(self.session_factory, self.session_id, self.next_seq - 1)
+        suffix = await protected_suffix(before, next_step=self.next_step, next_seq=self.next_seq)
+        return suffix[0][0] - 1 if suffix else self.next_seq - 1
+
+    async def turn_context_page(
+        self, on_page: Callable[[ContextPlugin, PageInput], Awaitable[ContextPage]]
+    ) -> ContextPageRecord | None:
+        self.require_context()
         if self.next_step == "handle_response":
             raise ValueError("Cannot turn context page before handling the saved response")
-        anchor = self.next_seq - 1
+        if self.plugin is None:
+            return None
+        anchor = await self.page_anchor()
         async with self.session_factory.begin() as db:
             await self.lease.lock_owned(db)
         self.ensure_usable()
         if anchor < 0:
             return None
-        if self.page is not None and self.page.policy_key != self.policy.key:
-            raise ValueError("Context page policy does not match the injected policy")
-        if self.page is None or self.page.anchor_seq != anchor:
-            read, before = bounded_history(self.session_factory, self.session_id, anchor)
-            action_context = PageTurnContext(
-                self.session_id,
-                anchor,
-                deepcopy(self.page),
-                deepcopy(context),
-                f"{self.session_id}:{self.policy.key}:{anchor}",
-                read,
-                before,
+        if self.page is not None and self.page.policy_key != self.plugin.key:
+            raise ValueError("Context page policy does not match the context plugin")
+        if self.page is None or self.page.anchor_seq < anchor:
+            read, _ = bounded_history(self.session_factory, self.session_id, anchor)
+            rows = await read(start_seq=0 if self.page is None else self.page.anchor_seq + 1)
+            page_input = PageInput(
+                ContextPage(deepcopy(self.page.payload)) if self.page is not None else None,
+                [message for _, message in rows],
             )
-            payload = await self.policy.on_turn(action_context) if self.policy.on_turn else {}
-            # Validate without coercion, then sever mutable callback references. Reject
-            # NaN/Infinity as well: these are not portable durable JSON values.
-            payload = TypeAdapter(JsonObject).validate_python(payload, strict=True)
+            result = await on_page(self.plugin, page_input)
+            # Validate without coercion, then sever mutable callback references.
+            # NaN/Infinity are not portable durable JSON values.
+            payload = TypeAdapter(JsonObject).validate_python(result.payload, strict=True)
             payload = json.loads(json.dumps(payload, allow_nan=False))
             self.ensure_usable()
-            page = ContextPage(anchor, self.policy.key, payload)
+            page = ContextPageRecord(anchor, self.plugin.key, payload)
             async with self.session_factory.begin() as db:
-                repo = AgentRepository(db)
                 await self.lease.lock_owned(db)
-                await repo.save_page(self.session_id, page)
+                await AgentRepository(db).save_page(self.session_id, page)
             self.ensure_usable()
             self.page = page
         await self.rebuild_context()
         return deepcopy(self.page)
 
-    async def maybe_turn_context_page(self) -> bool:
-        boundary = PageBoundary(
-            self.next_step,
-            self.next_seq - 1,
-            self.page.anchor_seq if self.page is not None else None,
-            self.latest_response_seq,
-            self.observed_tokens,
-        )
-        # A custom trigger cannot force repeated actions at the same anchor.
+    async def should_turn_context_page(self) -> bool:
+        previous = self.page.anchor_seq if self.page is not None else -1
         if (
-            self.page is not None and self.page.anchor_seq == boundary.last_seq
-        ) or not self.policy.should_turn(boundary):
+            self.plugin is None
+            or self.threshold_tokens is None
+            or self.latest_response_seq is None
+            or self.observed_tokens is None
+            or self.latest_response_seq <= previous
+            or sum(self.observed_tokens) <= self.threshold_tokens
+        ):
             return False
-        return await self.turn_context_page() is not None
+        # A tool checkpoint can leave the safe anchor behind the latest response.
+        # Require progress so repeated boundary checks cannot repage the same prefix.
+        return await self.page_anchor() > previous
 
 
 class SessionExecutionCapability(AbstractCapability[Any]):

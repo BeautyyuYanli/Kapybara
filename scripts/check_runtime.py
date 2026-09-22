@@ -26,8 +26,8 @@ from valkey.asyncio import Valkey
 
 from kapy.agent_output import AgentOutputService
 from kapy.agent_runner import HistoryMessage, MessageCommitted, TextDelta, open_runner
-from kapy.agent_runner.context_summary import summary_context_policy
 from kapy.agent_runner.repository import AgentRepository
+from kapy.context_plugins import SummaryPlugin
 from kapy.control.models import CreateModel, CreateProvider, ModelService
 from kapy.control.sessions import CreateSession, SessionService, UpdateSession
 from kapy.file_transfer import read_file, write_file
@@ -178,7 +178,7 @@ async def check(
             session_id,
             agent=agent,
             session_factory=factory,
-            context_policy=summary_context_policy(agent),
+            context_plugin=SummaryPlugin(),
         ) as runner:
             await runner.rebuild_context()
             summary = await runner.turn_context_page()

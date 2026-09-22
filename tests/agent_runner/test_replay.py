@@ -11,7 +11,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from kapy.agent_runner.context_summary import replay_start
+from kapy.agent_runner.context import replay_start
 
 
 @pytest.mark.parametrize("page_size", [1, 2, 3, 5, 64])

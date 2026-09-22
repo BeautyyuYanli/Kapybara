@@ -51,6 +51,14 @@ class SessionRow(ControlTable, table=True):
     model_settings: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSON(none_as_null=True), nullable=False)
     )
+    context_plugin: dict[str, Any] = Field(
+        default_factory=lambda: {"name": "kapy/summary", "config": {}},
+        sa_column=Column(
+            JSON(none_as_null=True),
+            nullable=False,
+            server_default='{"name":"kapy/summary","config":{}}',
+        ),
+    )
     compaction_threshold_tokens: int | None = None
     compaction_replay_turns: int = 10
     created_at: datetime = Field(

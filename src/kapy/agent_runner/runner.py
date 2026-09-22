@@ -12,9 +12,10 @@ from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
+from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import UserContent
@@ -24,13 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kapy.session_lease import SessionLease, open_session_lease
 
-from .context import ContextPolicy, full_history_policy
+from .auxiliary import run_auxiliary
+from .context import CallAgent, ContextPage, ContextPlugin, PageInput
 from .execution import ExecutionState, InputPreparation, SessionExecutionCapability
 from .output import OutputCapability
 from .repository import AgentRepository
 from .types import (
     ConsumeCancel,
-    ContextPage,
+    ContextPageRecord,
     InputBatch,
     NextStep,
     OutputCallback,
@@ -51,8 +53,10 @@ class RunnerExecution[OutputT]:
 
     agent: Agent[Any, OutputT]
     deps: Any = None
-    context_policy: ContextPolicy | None = None
+    context_plugin: ContextPlugin | None = None
     capabilities: Sequence[AbstractCapability[Any]] = ()
+    compaction_threshold_tokens: int | None = None
+    compaction_replay_turns: int = 10
 
 
 type ExecutionFactory[OutputT] = Callable[[], AbstractAsyncContextManager[RunnerExecution[OutputT]]]
@@ -63,7 +67,7 @@ class AgentRunner[OutputT]:
 
     Operations are sequential and non-reentrant. Execution failure invalidates the
     handle; user cancel is a normal return preserving the committed checkpoint.
-    The context policy is fixed for the handle's entire lifetime.
+    The context plugin is fixed for the handle's entire lifetime.
     """
 
     def __init__(
@@ -75,8 +79,10 @@ class AgentRunner[OutputT]:
         agent: Agent[Any, OutputT],
         deps: Any,
         session_factory: async_sessionmaker[AsyncSession],
-        context_policy: ContextPolicy | None,
+        context_plugin: ContextPlugin | None,
         capabilities: Sequence[AbstractCapability[Any]] = (),
+        compaction_threshold_tokens: int | None = None,
+        compaction_replay_turns: int = 10,
     ) -> None:
         self._session_id = session_id
         self._agent, self._deps = agent, deps
@@ -87,7 +93,9 @@ class AgentRunner[OutputT]:
             lease,
             state,
             session_factory=session_factory,
-            policy=context_policy if context_policy is not None else full_history_policy(),
+            plugin=context_plugin,
+            threshold_tokens=compaction_threshold_tokens,
+            replay_turns=compaction_replay_turns,
             output=self._output,
         )
         self._owner = asyncio.current_task()
@@ -146,7 +154,7 @@ class AgentRunner[OutputT]:
     ) -> TurnResult[OutputT]:
         """Prepare context and run until done with no steer, checking cancel first.
 
-        Safe boundaries apply the injected policy. Page actions never replace the
+        Safe boundaries apply the host paging settings. Page actions never replace the
         business result. The output callback belongs only to this call; callback
         errors invalidate the handle. Queued input is drained by start_runner.
         """
@@ -166,7 +174,8 @@ class AgentRunner[OutputT]:
                     if self.next_step == "handle_response":
                         result = await self._advance_turn()
                         continue
-                    if await execution.maybe_turn_context_page():
+                    if await execution.should_turn_context_page():
+                        await self._execution.turn_context_page(self._on_page)
                         continue
                     batch = await read_steer()
                     self._ensure_usable()
@@ -192,7 +201,7 @@ class AgentRunner[OutputT]:
                 await self._fail(error)
                 raise
 
-    async def turn_context_page(self) -> ContextPage | None:
+    async def turn_context_page(self) -> ContextPageRecord | None:
         """Force a safe-boundary page action and apply its view; same anchors reuse state.
 
         Requires prepared context. Actions run outside transactions with heartbeat
@@ -200,10 +209,45 @@ class AgentRunner[OutputT]:
         """
         with self._operation():
             try:
-                return await self._execution.turn_context_page()
+                return await self._execution.turn_context_page(self._on_page)
             except BaseException as error:
                 await self._fail(error)
                 raise
+
+    async def _on_page(self, plugin: ContextPlugin, page: PageInput) -> ContextPage:
+        """Lend the helper only until on_page exits, before validation and assembly."""
+        history = self._execution.require_context()
+        active, calling = True, False
+
+        async def call_agent(
+            prompt: str,
+            *,
+            result_type: type[BaseModel] | None = None,
+            block_other_tools: bool = False,
+        ) -> Any:
+            nonlocal calling
+            if not active or asyncio.current_task() is not self._owner or calling:
+                raise RuntimeError("call_agent is only valid sequentially inside on_page")
+            self._ensure_usable()
+            calling = True
+            try:
+                return await run_auxiliary(
+                    self._agent,
+                    prompt,
+                    history=history,
+                    session_id=self._session_id,
+                    deps=self._deps,
+                    capabilities=self._capabilities,
+                    result_type=result_type,
+                    block_other_tools=block_other_tools,
+                )
+            finally:
+                calling = False
+
+        try:
+            return await plugin.on_page(page, call_agent=cast(CallAgent, call_agent))
+        finally:
+            active = False
 
     async def _open_native(self, preparation: InputPreparation | None = None) -> None:
         assert self._native is None
@@ -322,7 +366,9 @@ async def open_runner[DepsT, OutputT](
     execution_factory: ExecutionFactory[OutputT] | None = None,
     session_factory: async_sessionmaker[AsyncSession],
     deps: DepsT = None,
-    context_policy: ContextPolicy | None = None,
+    context_plugin: ContextPlugin | None = None,
+    compaction_threshold_tokens: int | None = None,
+    compaction_replay_turns: int = 10,
     heartbeat_interval: float = 10.0,
     heartbeat_timeout: float = 60.0,
 ) -> AsyncIterator[AgentRunner[OutputT]]:
@@ -347,8 +393,13 @@ async def open_runner[DepsT, OutputT](
     """
     if (agent is None) == (execution_factory is None):
         raise ValueError("Provide exactly one of agent or execution_factory")
-    if execution_factory is not None and (deps is not None or context_policy is not None):
-        raise ValueError("Execution factory owns deps and context policy")
+    if execution_factory is not None and (
+        deps is not None
+        or context_plugin is not None
+        or compaction_threshold_tokens is not None
+        or compaction_replay_turns != 10
+    ):
+        raise ValueError("Execution factory owns deps and context plugin")
     async with open_session_lease(
         session_id,
         session_factory=session_factory,
@@ -359,7 +410,15 @@ async def open_runner[DepsT, OutputT](
             context = execution_factory()
         else:
             assert agent is not None
-            context = nullcontext(RunnerExecution(agent, deps, context_policy))
+            context = nullcontext(
+                RunnerExecution(
+                    agent,
+                    deps,
+                    context_plugin,
+                    compaction_threshold_tokens=compaction_threshold_tokens,
+                    compaction_replay_turns=compaction_replay_turns,
+                )
+            )
         async with context as execution:
             lease.check()
             async with session_factory.begin() as db:
@@ -372,8 +431,10 @@ async def open_runner[DepsT, OutputT](
                 agent=execution.agent,
                 deps=execution.deps,
                 session_factory=session_factory,
-                context_policy=execution.context_policy,
+                context_plugin=execution.context_plugin,
                 capabilities=execution.capabilities,
+                compaction_threshold_tokens=execution.compaction_threshold_tokens,
+                compaction_replay_turns=execution.compaction_replay_turns,
             )
             try:
                 yield runner
@@ -399,7 +460,9 @@ async def start_runner[DepsT, OutputT](
     read_queued: ReadInputs,
     consume_cancel: ConsumeCancel,
     deps: DepsT = None,
-    context_policy: ContextPolicy | None = None,
+    context_plugin: ContextPlugin | None = None,
+    compaction_threshold_tokens: int | None = None,
+    compaction_replay_turns: int = 10,
     heartbeat_interval: float = 10.0,
     heartbeat_timeout: float = 60.0,
     on_output: OutputCallback | None = None,
@@ -415,7 +478,9 @@ async def start_runner[DepsT, OutputT](
         execution_factory=execution_factory,
         session_factory=session_factory,
         deps=deps,
-        context_policy=context_policy,
+        context_plugin=context_plugin,
+        compaction_threshold_tokens=compaction_threshold_tokens,
+        compaction_replay_turns=compaction_replay_turns,
         heartbeat_interval=heartbeat_interval,
         heartbeat_timeout=heartbeat_timeout,
     ) as runner:

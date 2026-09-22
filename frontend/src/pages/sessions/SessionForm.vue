@@ -38,6 +38,8 @@ const draft = reactive({
   provider_id: "",
   model_name: "",
   model_settings: "{}",
+  context_plugin_name: "kapy/summary",
+  context_plugin_config: "{}",
   compaction_threshold_tokens: "",
   compaction_replay_turns: "10",
 });
@@ -54,6 +56,8 @@ watch(resource.data, (data) => {
   if (data)
     Object.assign(draft, data, {
       model_settings: JSON.stringify(data.model_settings, null, 2),
+      context_plugin_name: data.context_plugin.name,
+      context_plugin_config: JSON.stringify(data.context_plugin.config, null, 2),
       compaction_threshold_tokens: data.compaction_threshold_tokens?.toString() ?? "",
       compaction_replay_turns: String(data.compaction_replay_turns),
     });
@@ -82,12 +86,20 @@ async function save() {
   message.value = "";
   fields.value = {};
   let settings: CreateSessionAndSchedule["model_settings"],
+    contextConfig: CreateSessionAndSchedule["model_settings"],
     threshold: number | null,
     replay: number | null;
   try {
     settings = parseObject(draft.model_settings);
   } catch {
     fields.value.model_settings = "请输入 JSON 对象。";
+    error.value = "请修正 JSON。";
+    return;
+  }
+  try {
+    contextConfig = parseObject(draft.context_plugin_config);
+  } catch {
+    fields.value.context_plugin_config = "请输入 JSON 对象。";
     error.value = "请修正 JSON。";
     return;
   }
@@ -111,6 +123,7 @@ async function save() {
       provider_id: draft.provider_id,
       model_name: draft.model_name,
       model_settings: settings,
+      context_plugin: { name: draft.context_plugin_name, config: contextConfig },
       compaction_threshold_tokens: threshold,
       compaction_replay_turns: replay,
     };
@@ -201,8 +214,28 @@ async function save() {
           :error="fields.model_settings"
         />
         <FormField
+          id="context_plugin_name"
+          label="上下文插件"
+          help="创建后不能更换插件；默认摘要使用 kapy/summary。"
+          :error="fields.context_plugin_name || fields.context_plugin"
+          v-slot="f"
+          ><input
+            v-model="draft.context_plugin_name"
+            :id="f.id"
+            required
+            :readonly="Boolean(id)"
+            :aria-describedby="f.describedby"
+            :aria-invalid="f.invalid"
+        /></FormField>
+        <JsonObjectField
+          id="context_plugin_config"
+          v-model="draft.context_plugin_config"
+          label="上下文插件配置 JSON"
+          :error="fields.context_plugin_config"
+        />
+        <FormField
           id="compaction_threshold_tokens"
-          label="摘要阈值（可选）"
+          label="分页阈值（可选）"
           :help="
             id
               ? '留空在下次启动时采用模型容量的 70%；容量未知时需设置阈值。'
@@ -221,8 +254,8 @@ async function save() {
         /></FormField>
         <FormField
           id="compaction_replay_turns"
-          label="回放轮数"
-          help="设为 0 时不回放摘要前的对话。"
+          label="参考轮数"
+          help="提供给插件的分页前原文轮数；默认摘要插件会保留这些原文。"
           :error="fields.compaction_replay_turns"
           v-slot="f"
           ><input

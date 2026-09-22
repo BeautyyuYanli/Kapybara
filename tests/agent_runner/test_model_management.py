@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from kapy.agent_runner import SessionBusy, open_runner
-from kapy.agent_runner.context_summary import COMPACTION_PROMPT
+from kapy.context_plugins.summary import COMPACTION_PROMPT
 from kapy.control.models import (
     CreateModel,
     CreateProvider,

@@ -28,10 +28,10 @@ test("actual FastAPI supports config CRUD and slash model identity", async ({ pa
   await page.getByLabel("Provider", { exact: true }).selectOption(providerId);
   await page.getByLabel("Model", { exact: true }).selectOption("vendor/model");
   await page.getByLabel("标题", { exact: true }).fill("Configuration only");
-  await page.getByLabel("回放轮数", { exact: true }).fill("0");
+  await page.getByLabel("参考轮数", { exact: true }).fill("0");
   await page.getByRole("button", { name: "保存 Session" }).click();
   await expect(page.getByRole("heading", { name: "编辑 Session" })).toBeVisible();
-  await expect(page.getByLabel("回放轮数", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("参考轮数", { exact: true })).toHaveValue("0");
   await page.goto(`${base}models?provider_id=${providerId}`);
   await page.getByRole("button", { name: "删除", exact: true }).click();
   await page.getByRole("button", { name: "确认删除" }).click();

@@ -137,10 +137,24 @@ async def test_core_migrations_preserve_pages_and_execution(database):
                     ),
                     {"session": session_id},
                 )
+                await db.execute(
+                    text(
+                        "INSERT INTO sessions (id, title, provider_id, model_name, model_settings, "
+                        "compaction_replay_turns, created_at, updated_at) "
+                        "VALUES (:session, 'existing', :provider, 'test', '{}', 10, now(), now())"
+                    ),
+                    {"session": session_id, "provider": uuid4()},
+                )
                 # Upgrade from the deployed context-pages head, preserving both
                 # the page and pending execution while moving ownership storage.
                 await db.run_sync(lambda connection: migrate_to(connection, "head"))
                 assert (await db.execute(text("SELECT * FROM agent_context_pages"))).one() == row
+                assert (
+                    await db.execute(text("SELECT context_plugin FROM sessions"))
+                ).scalar_one() == {
+                    "name": "kapy/summary",
+                    "config": {},
+                }
                 assert (
                     await db.execute(text("SELECT next_step FROM agent_states"))
                 ).scalar_one() == "model_request"

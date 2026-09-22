@@ -13,7 +13,7 @@ lease row before business rows. Bypassing that protocol is not automatically fen
 
 `open_runner` and `start_runner` accept either direct `agent`/`deps` or an
 `execution_factory`, exclusively. The factory is an async context manager yielding
-`RunnerExecution(agent, deps, context_policy, capabilities)` inside the acquired
+`RunnerExecution(agent, deps, context_plugin, capabilities)` inside the acquired
 lease. It receives no lease handle. SDK graph cleanup precedes factory exit, which
 precedes lease release. It is recreated on reacquisition; the core still needs no
 business session record and does not import plugin implementations. Application
@@ -96,8 +96,7 @@ execution model. A stale runner may finish external work but cannot commit it.
 
 For manual execution, call `await runner.rebuild_context()` before `turn()` or
 `turn_context_page()`. `run()` prepares context automatically. `turn()` advances
-one complete model/tool batch without automatic paging; `run()` checks the injected
-policy at its existing safe boundaries, including done. Cancel precedes preparation,
+one complete model/tool batch without automatic paging; `run()` checks host paging settings at its existing safe boundaries, including done. Cancel precedes preparation,
 paging and input acceptance. A page action never replaces the business turn result.
 
 `SessionExecutionCapability` owns SDK initialization recovery, input acceptance and
@@ -116,84 +115,96 @@ applies rebuilt context through `before_model_request`, preserving the SDK's fre
 resolved pending content, instructions and metadata. Ordinary turns append their
 committed messages without rereading all history.
 
-`open_runner(..., context_policy=...)` and the lower-level `start_runner` accept one
-`ContextPolicy` for their entire lifetime. Omission selects `full_history_policy()`:
-no automatic trigger/action, with all original history retained. `run` and
-`rebuild_context` have no summary-specific parameters. A policy combines independent
-callbacks rather than requiring a subclass:
+`open_runner(..., context_plugin=...)` and the lower-level `start_runner` borrow
+one `ContextPlugin` for the execution. Omission keeps all history and disables paging.
+`compaction_threshold_tokens` and `compaction_replay_turns` are separate host options;
+None disables the automatic threshold, while an explicit plugin still allows manual
+paging. Thresholds are positive; reference rounds are nonnegative and default to 10.
 
 ```python
-from kapy.agent_runner import open_runner, summary_context_policy
+from kapy.agent_runner import open_runner
+from kapy.context_plugins import SummaryPlugin
 
-policy = summary_context_policy(
-    agent, deps=deps, threshold_tokens=100_000, replay_turns=10, max_retries=2
-)
 async with open_runner(
-    session_id, agent=agent, deps=deps, session_factory=factory, context_policy=policy
+    session_id,
+    agent=agent,
+    deps=deps,
+    session_factory=factory,
+    context_plugin=SummaryPlugin(),
+    compaction_threshold_tokens=100_000,
+    compaction_replay_turns=10,
 ) as runner:
     await runner.rebuild_context()
     page = await runner.turn_context_page()
 ```
 
-`ContextPolicy(key, should_turn, on_turn, assemble)` separates trigger, action and
-assembly. The pure trigger receives `PageBoundary` with checkpoint, current/previous
-anchors and normalized latest-response usage. The optional async action receives
-`PageTurnContext`: session, fixed anchor, prior page, a copied committed view, bounded
-history readers and stable `operation_id` (`session:policy:anchor`). It returns a JSON
-object; absent action stores `{}`. Actions run outside transactions while the lease
-heartbeat continues. External effects may repeat before page commit: use that
-operation ID for idempotency or reconciliation when needed.
+The host chooses a safe anchor before the pending checkpoint suffix, extending the
+suffix backwards to preserve tool pairs. For user(0), tool call(1), tool result(2),
+a model_request checkpoint protects 1..2 and permits anchor 0. A lone pending user
+request cannot be paged. Automatic paging additionally requires the safe anchor to
+advance; repeated boundary checks never repeat an action. Completed response usage
+(input + output, without counting cached tokens twice) must exceed the threshold.
+Unknown usage does not trigger. Auxiliary usage never changes this observation.
 
-The async assembler receives `ContextAssemblyContext` with page payload (or None),
-`prefix_through_seq`, and readers bound to that prefix. `read_history` returns ascending
-inclusive ranges; `read_history_before` returns descending bounded pages. Each call
-uses its own short transaction. The assembler returns only a replacement prefix.
-The core appends original post-anchor history and the pending checkpoint suffix,
-extending backwards to close tool call/result pairs. Even replay zero cannot remove
-a pending request or its required tool results. Strategies must keep their returned
-prefix internally paired and must not rerun actions, consume inputs or mutate history.
+`ContextPlugin.on_page(PageInput, *, call_agent)` receives the previous payload and
+the original messages after its anchor through the new safe anchor. It returns a
+`ContextPage(payload)`; the host validates strict portable JSON, copies it and commits
+`ContextPageRecord(anchor_seq, policy_key, payload)` under the lease. The action runs
+outside a transaction with heartbeat alive. External effects may repeat before
+commit; plugins keep any external artifact references in their payload.
 
-`turn_context_page()` requires prepared context and a model_request/done boundary;
-handle_response must finish its saved tool/output batch first. Empty history returns
-None. It fences the lease, runs the action, validates JSON, fences and commits an
-immutable `agent_context_pages` row, then assembles/applies the new view. Repeated
-calls at one anchor reuse its saved payload. Page state never advances checkpoint
-or absolute history seq. Assembly failure after commit invalidates the handle;
-reopening reassembles the saved page without repeating its action. Stored policy_key
-must match the injected policy; unknown protocols fail instead of losing context.
+`get_context(ContextInput)` receives the saved payload and N original response rounds
+ending at the anchor, expanded backwards for tool pairs. This reference window excludes
+the current page. The host assembles original system information once, the plugin's
+upper context, then every current-page message. It never independently appends the
+reference window. No anchor means original history and no get_context invocation.
 
-`summary_context_policy` implements `summary/v1`: optional token trigger, a temporary
-text summary action, and summary/replay/resume assembly. Positive threshold enables
-automatic summaries when the latest business response's input+output tokens exceed
-it and its seq is later than the previous page anchor. Unknown usage does not trigger;
-cache usage is not counted again and summary usage never changes this observation.
-This is an observed size, not a pre-request limit. `threshold_tokens=None` disables
-automatic paging but still permits manual summaries.
+Same-anchor actions reuse committed state. Rebuild or restart invokes only get_context,
+even if assembly failed after commit; original history and checkpoint seq never change
+because of paging. Stored policy_key must match the plugin key. For a legacy anchor
+that overlaps the protected checkpoint suffix, recovery uses original history for
+that view and preserves the old record. Later safe anchors can advance normally;
+recovery does not rerun the old action or mutate plugin output to remove duplicates.
 
-The summary action runs only input/model nodes of the same configured Agent. Non-text
-responses receive bounded paired format retries; client tools and business output
-validators never execute. Tool definitions, native server tools, settings and request
-hooks remain active. Auxiliary graphs do not receive SessionExecutionCapability or
-business OutputCapability. Keep Agent-level `max_concurrency=None`: its run-wide
-limiter rejects nested page-action graphs. Request limits may use
-`ConcurrencyLimitedModel`; SessionService overrides the original Agent model, so
-limits on that original model do not apply to service-created models.
+The default [summary plugin](../context_plugins/README.md) keeps `summary/v1` and
+`{"summary": text}`. It calls `call_agent(COMPACTION_PROMPT, block_other_tools=True)`
+for ordinary text, then packages the result locally. Its get_context returns the
+summary explanation, reference originals and resume prompt. Other plugins decide
+independently whether to include their reference originals.
 
-The default assembler retains original system parts once, summary, N replay responses
-with backwards tool-pair closure, and a resume prompt; the core appends the protected
-raw suffix. Replay reads are restricted to the replaceable prefix. N is nonnegative;
-zero omits replay, never required continuation. Virtual messages are not persisted
-or accepted as user inputs. Done without new real input remains done.
+`call_agent` must be awaited sequentially in the runner's owning task while the
+current on_page callback is active. Child-task wrappers, including
+`asyncio.wait_for(call_agent(...), timeout)`, fail the owner check. It borrows the
+same stable text-output Agent, deps, overrides, resource scope and ordered execution
+capabilities. Every invocation copies the complete working history once and appends
+its task prompt. It uses a normal SDK run and SDK retries (tools/output default to 2),
+without SessionExecutionCapability or the runner's pure OutputCapability publisher.
+Auxiliary messages/retries do not write business history, checkpoint or output.
+Allowed tools retain their real side effects. conversation_id is the business session
+ID for SDK correlation, not a persistence or prompt-cache switch.
 
-SessionService constructs a policy for each acquired execution outside its configuration
-transaction, using the actual Agent. Configuration stays fixed across queued/reacquired
-runners; each factory owns its policy and plugin contexts. Default summary settings come from the
-session's compaction_threshold_tokens and compaction_replay_turns. A stored None
-threshold resolves to 70% of model capacity or rejects startup if capacity is unknown.
-Creation with unknown capacity and no threshold stores 183500; updates do not default
-it. An injected `context_policy_factory(session, model_record, agent)` may use another
-strategy without interpreting those summary fields. HTTP and Telegram share the
-application's service factory and never choose a context strategy in controllers.
+Optional result_type accepts a Pydantic model and validates text without changing
+the SDK output channel: JSON Schema goes in the appended task prompt, while
+SoftOutputCapability validates text and uses ModelRetry for errors,
+skipping the business output processor/validators. Without result_type the existing
+output path remains active. Independently, block_other_tools adds a capability that
+rejects client tools before argument validation, generating paired retry replies in
+the same SDK loop. It leaves tools/order/instructions/output definitions unchanged.
+Native provider tools cannot be blocked client-side, so this combination is rejected
+before a model request. Stable definitions and history preserve the reusable prefix;
+actual cache hits depend on the provider, and the newly paged context changes it.
+
+Keep Agent-level max_concurrency=None because its run-wide limiter rejects nested
+page-action runs. Request limits may use ConcurrencyLimitedModel; SessionService
+overrides the original Agent model, so limits on that original model do not apply
+to service-created models.
+
+SessionService selects a fresh plugin from context_plugin.name/config for each lease;
+configuration remains fixed across queued/reacquired runners within one start call.
+It resolves a null threshold to 70% of model capacity before execution; unknown
+capacity is an error. Creation with unknown capacity and no threshold stores 183500.
+The registry validates plugin config before input consumption. HTTP and Telegram
+share application composition and only pass stored session configuration.
 
 
 Optional live output is composed by `SessionService`, using an application-owned

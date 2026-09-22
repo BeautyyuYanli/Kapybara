@@ -26,7 +26,7 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_graph import End
 
-from kapy.agent_runner.context_summary import summarize
+from kapy.agent_runner.auxiliary import run_auxiliary
 
 pytestmark = pytest.mark.asyncio
 
@@ -154,73 +154,115 @@ async def test_official_adapter_and_explicit_response_recovery_preserve_call_ids
     assert model_calls == []
 
 
-async def test_compaction_retries_raw_output_without_tools_validators_or_config_changes():
-    received = []
+@pytest.mark.parametrize("structured,block_tools", [(False, True), (True, True), (True, False)])
+async def test_auxiliary_retries_preserve_definitions_and_isolate_history(structured, block_tools):
+    from pydantic import BaseModel
+
+    class Result(BaseModel):
+        count: int
+
+    received, executed, validated = [], [], []
 
     def model(messages, info):
-        received.append(deepcopy(messages))
-        assert info.model_settings == {"temperature": 0.25}
-        assert [tool.name for tool in info.function_tools] == ["work"]
-        assert [tool.name for tool in info.output_tools] == ["final_result"]
-        assert not info.allow_text_output
+        received.append((deepcopy(messages), deepcopy(info)))
         if len(received) == 1:
             return ModelResponse(
                 parts=[
-                    ToolCallPart("work", {}, "work-id"),
-                    ToolCallPart("final_result", {"response": ["not a summary"]}, "output-id"),
+                    ToolCallPart("work", {}, "a"),
+                    ToolCallPart("work", {}, "b"),
                 ]
             )
-        return ModelResponse(
-            parts=[ThinkingPart("hidden"), TextPart(" summary"), TextPart(" text ")]
-        )
+        if structured and len(received) == 2:
+            return ModelResponse(parts=[TextPart('{"count":"3"}')])
+        return ModelResponse(parts=[TextPart('{"count":3}' if structured else "summary")])
 
-    agent = Agent(FunctionModel(model), output_type=list[str], model_settings={"temperature": 0.25})
+    agent = Agent(FunctionModel(model), instructions="stable", model_settings={"temperature": 0.25})
+
+    @agent.system_prompt(dynamic=True)
+    def dynamic() -> str:
+        return "reevaluated system"
 
     @agent.tool_plain
     def work() -> str:
-        raise AssertionError("compaction must not execute client tools")
+        executed.append(True)
+        return "ok"
 
     @agent.output_validator
-    def validate(output: list[str]) -> list[str]:
-        raise AssertionError("compaction must not execute business output validators")
+    def validate(output: str) -> str:
+        validated.append(True)
+        return output + " validated"
 
-    history = [ModelRequest(parts=[UserPromptPart("original")])]
+    # Actual SDK prompt reevaluation replaces an existing ModelRequest's parts.
+    # Sharing those nested message objects would mutate the caller's input.
+    history = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart("original system", dynamic_ref=dynamic.__qualname__),
+                UserPromptPart("original"),
+            ]
+        ),
+        ModelResponse(parts=[TextPart("previous answer")]),
+    ]
     before = deepcopy(history)
     session_id = uuid4()
-    assert (
-        await summarize(agent, history, session_id=session_id, deps=None, max_retries=1)
-        == "summary text"
+    result = await run_auxiliary(
+        agent,
+        "summarize",
+        history=history,
+        session_id=session_id,
+        deps=None,
+        capabilities=[],
+        result_type=Result if structured else None,
+        block_other_tools=block_tools,
     )
+    assert result == (Result(count=3) if structured else "summary validated")
+    assert executed == ([] if block_tools else [True, True])
+    assert validated == ([] if structured else [True])
     assert history == before
-    retry = received[1][-1]
-    assert isinstance(retry, ModelRequest)
     assert [
-        (part.tool_name, part.tool_call_id)
-        for part in retry.parts
-        if isinstance(part, RetryPromptPart)
-    ] == [("work", "work-id"), ("final_result", "output-id")]
-    assert isinstance(received[1][-2], ModelResponse)
-    assert received[1][-2].conversation_id == str(session_id)
+        part.content for part in received[0][0][0].parts if isinstance(part, SystemPromptPart)
+    ] == ["reevaluated system"]
+    assert len(received) == (3 if structured else 2)
+    if structured:
+        # A coercible string is still invalid: the SDK must retry before accepting int.
+        assert any(isinstance(part, RetryPromptPart) for part in received[2][0][-1].parts)
+    for _, info in received:
+        assert info.model_settings == {"temperature": 0.25}
+        assert [tool.name for tool in info.function_tools] == ["work"]
+        assert info.output_tools == [] and info.allow_text_output
+    replies = received[1][0][-1].parts
+    reply_type = RetryPromptPart if block_tools else ToolReturnPart
+    assert [(p.tool_name, p.tool_call_id) for p in replies if isinstance(p, reply_type)] == [
+        ("work", "a"),
+        ("work", "b"),
+    ]
+    assert received[1][0][-2].conversation_id == str(session_id)
 
 
-@pytest.mark.parametrize("incomplete", [False, True])
-async def test_compaction_empty_or_incomplete_response_has_bounded_failure(incomplete):
+async def test_auxiliary_structured_retry_budget_is_bounded():
+    from pydantic import BaseModel
+
+    class Result(BaseModel):
+        count: int
+
     calls = []
 
     def model(messages, info):
         calls.append(deepcopy(messages))
-        return ModelResponse(
-            parts=[TextPart(" ")], state="incomplete" if incomplete else "complete"
-        )
+        return ModelResponse(parts=[TextPart("invalid JSON")])
 
     with pytest.raises(UnexpectedModelBehavior):
-        await summarize(
-            Agent(FunctionModel(model)), [], session_id=uuid4(), deps=None, max_retries=2
+        await run_auxiliary(
+            Agent(FunctionModel(model)),
+            "task",
+            history=[],
+            session_id=uuid4(),
+            deps=None,
+            capabilities=[],
+            result_type=Result,
         )
-    assert len(calls) == (1 if incomplete else 3)
-    if not incomplete:
-        assert isinstance(calls[-1][-1].parts[0], RetryPromptPart)
-        assert len([m for m in calls[-1] if isinstance(m, ModelResponse)]) == 2
+    assert len(calls) == 3
+    assert len([m for m in calls[-1] if isinstance(m, ModelResponse)]) == 2
 
 
 async def test_output_observer_preserves_part_resets_and_ignores_nontext_events():
@@ -269,3 +311,28 @@ async def test_output_observer_preserves_part_resets_and_ignores_nontext_events(
         TextDelta(session_id, 9, 0, "text", "append", " \n"),
         TextDelta(session_id, 9, 1, "thinking", "replace", ""),
     ]
+
+
+async def test_auxiliary_blocking_rejects_native_tools_before_model_request():
+    from pydantic_ai.native_tools import WebSearchTool
+
+    calls = []
+
+    def model(messages, info):
+        calls.append(True)
+        return ModelResponse(parts=[TextPart("should not run")])
+
+    from pydantic_ai.capabilities import NativeTool
+
+    agent = Agent(FunctionModel(model), capabilities=[NativeTool(WebSearchTool())])
+    with pytest.raises(ValueError, match="native server tools"):
+        await run_auxiliary(
+            agent,
+            "task",
+            history=[],
+            session_id=uuid4(),
+            deps=None,
+            capabilities=[],
+            block_other_tools=True,
+        )
+    assert calls == []
