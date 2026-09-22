@@ -14,13 +14,16 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
 
 from kapy.agent_plugins import AgentPluginService, PluginRegistry
+from kapy.agent_plugins.builtin.shell import SHELL_PLUGIN
 from kapy.agent_plugins.capability import PluginCapabilityAdapter
 from kapy.agent_runner import RunnerExecution
 
 
 def create_registry() -> PluginRegistry:
-    """Register installed builtin implementations here; no examples loaded by default."""
-    return PluginRegistry()
+    """Register builtin definitions; sessions opt in through CreateSession.plugins."""
+    registry = PluginRegistry()
+    registry.register(SHELL_PLUGIN)
+    return registry
 
 
 def create_agent(*, capabilities: Sequence[AbstractCapability[Any]] = ()) -> Agent[None, str]:
