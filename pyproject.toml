@@ -9,6 +9,7 @@ dependencies = [
     "anyio>=4.15.1",
     "fastapi>=0.141.1",
     "httpx2>=2.12.0",
+    "kapy-shellctl",
     "logfire>=5.0.0",
     "platformdirs>=4.11.7",
     "psycopg[binary,pool]>=3.3.5",
@@ -35,7 +36,18 @@ build-backend = "uv_build"
 [tool.ruff]
 target-version = "py314"
 line-length = 100
-extend-exclude = ["prototype"]
+extend-exclude = [
+    "prototype",
+    "packages/shellctl/server",
+    "packages/shellctl/src",
+    "packages/shellctl/tests/upstream",
+]
+
+[tool.uv.workspace]
+members = ["packages/shellctl"]
+
+[tool.uv.sources]
+kapy-shellctl = { workspace = true }
 
 [tool.uv.build-backend]
 source-exclude = ["prototype/**"]

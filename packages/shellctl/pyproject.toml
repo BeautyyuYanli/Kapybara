@@ -1,0 +1,20 @@
+[project]
+name = "kapy-shellctl"
+version = "0.1.0"
+description = "Vendored Dify shellctl SDK, packaged independently for Kapy"
+readme = "README.md"
+requires-python = ">=3.12"
+license-files = ["LICENSE"]
+dependencies = ["httpx2>=2.12.0,<3", "pydantic>=2.12.5,<3"]
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "shellctl"
+source-exclude = ["server/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: uses the real shellctl server and tmux"]

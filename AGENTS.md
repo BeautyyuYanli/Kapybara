@@ -5,6 +5,9 @@ Agent Runner、上下文压缩，以及基于 Valkey Pub/Sub 的实时输出和�
 HTTP 和 Telegram 作为独立接口进程，直接调用这些服务。HTTP 同时挂载配置前端。
 
 主实现位于 `src/kapy/`，测试位于 `tests/`，模块直接通过 `kapy.*` 导入。
+独立引入的 shellctl 位于 [packages/shellctl](packages/shellctl/README.md)，包含
+Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
+`scripts/vendor_shellctl.py` 按固定 commit 同步，勿手工编辑脚本管理的路径。
 早期实现及其测试、脚本原样归档在 `prototype/`，不参与当前安装、构建和默认检查。
 `kapy` 命令提供 `interface` 与 `db` 两个入口；旧控制面 CLI 随原型一起归档。
 

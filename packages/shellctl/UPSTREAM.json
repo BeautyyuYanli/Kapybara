@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/langgenius/dify.git",
+  "commit": "509f3407a5e3dfd7b7cb93b35f08084fabd12f3e",
+  "paths": {
+    "dify-agent-runtime": "server",
+    "dify-agent/src/shellctl": "src/shellctl",
+    "dify-agent/tests/local/shellctl": "tests/upstream",
+    "LICENSE": "LICENSE"
+  }
+}

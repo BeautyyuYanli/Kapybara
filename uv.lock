@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = ">=3.14"
 
+[manifest]
+members = [
+    "kapy",
+    "kapy-shellctl",
+]
+
 [[package]]
 name = "aiosqlite"
 version = "0.22.1"
@@ -593,6 +599,7 @@ dependencies = [
     { name = "anyio" },
     { name = "fastapi" },
     { name = "httpx2" },
+    { name = "kapy-shellctl" },
     { name = "logfire" },
     { name = "platformdirs" },
     { name = "psycopg", extra = ["binary", "pool"] },
@@ -625,6 +632,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.15.1" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx2", specifier = ">=2.12.0" },
+    { name = "kapy-shellctl", editable = "packages/shellctl" },
     { name = "logfire", specifier = ">=5.0.0" },
     { name = "platformdirs", specifier = ">=4.11.7" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.5" },
@@ -648,6 +656,21 @@ dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "ruff", specifier = ">=0.16.6" },
+]
+
+[[package]]
+name = "kapy-shellctl"
+version = "0.1.0"
+source = { editable = "packages/shellctl" }
+dependencies = [
+    { name = "httpx2" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx2", specifier = ">=2.12.0,<3" },
+    { name = "pydantic", specifier = ">=2.12.5,<3" },
 ]
 
 [[package]]

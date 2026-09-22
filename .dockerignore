@@ -4,6 +4,8 @@
 .venv
 .context
 prototype
+packages/shellctl/server
+packages/shellctl/tests
 .local
 __pycache__
 .pytest_cache
