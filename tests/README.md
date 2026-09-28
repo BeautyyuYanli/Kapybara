@@ -10,6 +10,13 @@ an isolated filesystem and real subprocesses:
 docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests
 ```
 
+Interface lifespan and Temporal runner tests require a running Temporal service
+(`docker compose up -d temporal`). Compose sets
+`KAPY_TEMPORAL_ADDRESS=temporal:7233` for runtime (host default:
+`localhost:7233`). Runner tests use unique Workflow IDs/task queues and a local HTTP
+server for the actual SDK model protocols. See
+[`runner_duarable`](../src/kapy/runner_duarable/README.md).
+
 Database tests own disposable PostgreSQL schemas and Valkey namespaces. The normal
 suite uses deterministic SDK models; the live credential test is opt-in. Browser
 checks and the isolated frontend API host are documented in `frontend/README.md`.

@@ -15,6 +15,56 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+  temporal:
+    image: temporalio/auto-setup:1.29.1
+    environment:
+      DB: postgres12
+      POSTGRES_SEEDS: postgres
+      DB_PORT: 5432
+      POSTGRES_USER: kapy
+      POSTGRES_PWD: kapy-local
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      ENABLE_ES: "false"
+    ports:
+      - "127.0.0.1:${KAPY_TEMPORAL_PORT:-7233}:7233"
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+  runner-worker:
+    image: kapy-v2:tmpv2
+    build: .
+    init: true
+    command: ["python", "-m", "kapy.runner_duarable.worker"]
+    user: "10001:10001"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 30s
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
+      KAPY_DATABASE_SCHEMA: ${KAPY_DATABASE_SCHEMA:-kapy_tmpv2}
+      KAPY_VALKEY_URL: redis://valkey:6379/0
+      KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_tmpv2}
+      KAPY_TEMPORAL_ADDRESS: temporal:7233
+      KAPY_TEMPORAL_NAMESPACE: ${KAPY_TEMPORAL_NAMESPACE:-default}
+      KAPY_TEMPORAL_TASK_QUEUE: ${KAPY_TEMPORAL_TASK_QUEUE:-kapy-runner}
+    volumes:
+      - ./src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    mem_limit: 2g
+    pids_limit: 256
   valkey:
     image: valkey/valkey:8-alpine
     # Output uses Pub/Sub: there are no messages to persist or expire.
@@ -41,6 +91,9 @@ services:
       XDG_STATE_HOME: /var/lib/kapy/state
       KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
       KAPY_DATABASE_SCHEMA: ${KAPY_DATABASE_SCHEMA:-kapy_tmpv2}
+      KAPY_TEMPORAL_ADDRESS: temporal:7233
+      KAPY_TEMPORAL_NAMESPACE: ${KAPY_TEMPORAL_NAMESPACE:-default}
+      KAPY_TEMPORAL_TASK_QUEUE: ${KAPY_TEMPORAL_TASK_QUEUE:-kapy-runner}
       KAPY_VALKEY_URL: redis://valkey:6379/0
       KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_tmpv2}
       KAPY_OUTPUT_FLUSH_INTERVAL: ${KAPY_OUTPUT_FLUSH_INTERVAL:-0.5}
@@ -58,6 +111,8 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
+      temporal:
+        condition: service_healthy
     mem_limit: 2g
     pids_limit: 256
   telegram:
@@ -73,6 +128,9 @@ services:
       XDG_STATE_HOME: /var/lib/kapy/state
       KAPY_DATABASE_URL: postgresql://kapy:kapy-local@postgres:5432/kapy
       KAPY_DATABASE_SCHEMA: ${KAPY_DATABASE_SCHEMA:-kapy_tmpv2}
+      KAPY_TEMPORAL_ADDRESS: temporal:7233
+      KAPY_TEMPORAL_NAMESPACE: ${KAPY_TEMPORAL_NAMESPACE:-default}
+      KAPY_TEMPORAL_TASK_QUEUE: ${KAPY_TEMPORAL_TASK_QUEUE:-kapy-runner}
       KAPY_VALKEY_URL: redis://valkey:6379/0
       KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_tmpv2}
       KAPY_OUTPUT_FLUSH_INTERVAL: ${KAPY_OUTPUT_FLUSH_INTERVAL:-0.5}
@@ -86,6 +144,8 @@ services:
       postgres:
         condition: service_healthy
       valkey:
+        condition: service_healthy
+      temporal:
         condition: service_healthy
     mem_limit: 2g
     pids_limit: 256

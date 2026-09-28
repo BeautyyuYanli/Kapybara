@@ -1,5 +1,10 @@
 # HTTP interface
 
+The application lifespan initializes one Temporal Client alongside its database
+and Valkey resources. Handlers can borrow it from
+`request.app.state.resources.temporal_client`; they must not create a connection
+per request. The Temporal service must be reachable at application startup.
+
 `create_router(models, sessions, *, agent=None, deps=None, realtime_output=True,
 output_flush_interval=0.5)` returns an APIRouter under `/api`. The separate
 `create_model_router` and `create_session_router` omit the prefix, for custom mounts.

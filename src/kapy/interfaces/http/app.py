@@ -49,6 +49,7 @@ def create_app(settings: HttpSettings) -> FastAPI:
             app.include_router(router)
             if settings.frontend_dist is not None:
                 app.include_router(create_frontend_router(settings.frontend_dist))
+            app.state.resources = resources
             try:
                 yield
             finally:
@@ -59,6 +60,7 @@ def create_app(settings: HttpSettings) -> FastAPI:
                 # Remove lifespan-installed routes if a test/application re-enters lifespan.
                 del app.router.routes[initial_route_count:]
                 app.openapi_schema = None
+                del app.state.resources
 
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(_InflightRequests, active=active)

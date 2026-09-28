@@ -7,12 +7,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from temporalio.client import Client
 from valkey.asyncio import Valkey
 
 from .settings import CommonSettings
@@ -39,6 +41,20 @@ async def open_core_database(settings: CommonSettings) -> AsyncIterator[AsyncEng
 class Resources:
     core_session_factory: async_sessionmaker[AsyncSession]
     valkey: Valkey
+    temporal_client: Client
+
+
+async def connect_temporal(settings: CommonSettings) -> Client:
+    """Connect once per process using the Agent payload converter and sandbox plugin.
+
+    Temporal's Client has no explicit close API. Owners retain it for their
+    lifespan and finish users (including Workers) before releasing references.
+    """
+    return await Client.connect(
+        settings.temporal_address,
+        namespace=settings.temporal_namespace,
+        plugins=[PydanticAIPlugin()],
+    )
 
 
 @asynccontextmanager
@@ -46,6 +62,9 @@ async def open_resources(settings: CommonSettings) -> AsyncIterator[Resources]:
     async with open_core_database(settings) as engine:
         client = Valkey.from_url(settings.valkey_url.get_secret_value())
         try:
-            yield Resources(async_sessionmaker(engine, expire_on_commit=False), client)
+            temporal_client = await connect_temporal(settings)
+            yield Resources(
+                async_sessionmaker(engine, expire_on_commit=False), client, temporal_client
+            )
         finally:
             await client.aclose()

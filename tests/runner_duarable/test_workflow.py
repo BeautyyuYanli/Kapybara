@@ -1,0 +1,253 @@
+"""Exercise the real Temporal sandbox and SDK protocols against a local HTTP server.
+
+Start Compose's temporal service and set KAPY_TEMPORAL_ADDRESS=temporal:7233 when
+running inside the runtime container. Every test owns a unique task queue and
+Workflow ID; no remote model credentials or API calls are used.
+"""
+
+import asyncio
+import json
+import os
+from collections.abc import Iterator
+from contextlib import suppress
+from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from pydantic import ValidationError
+from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+from temporalio import activity
+from temporalio.client import Client
+from temporalio.worker import Replayer, Worker
+
+from kapy.application.resources import connect_temporal
+from kapy.application.settings import CommonSettings
+from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow, agent
+from kapy.runner_duarable.worker import serve
+
+
+@pytest.fixture
+def endpoint() -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    requests: list[dict[str, Any]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(
+                {
+                    "path": self.path,
+                    "body": body,
+                    "headers": {key.lower(): value for key, value in self.headers.items()},
+                }
+            )
+            if self.path.endswith("/chat/completions"):
+                response = {
+                    "id": "chat_test",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": body["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "done"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            elif self.path.endswith("/responses"):
+                response = {
+                    "id": "resp_test",
+                    "object": "response",
+                    "created_at": 1,
+                    "model": body["model"],
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "msg_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": "done", "annotations": []}],
+                        }
+                    ],
+                }
+            else:
+                response = {
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "done"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "modelVersion": "gemini-2.5-flash",
+                }
+            payload = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def make_config(base_url: str, protocol: str = "OpenAIChatModel") -> DurableExecutionConfig:
+    google = protocol == "GoogleModel"
+    return DurableExecutionConfig(
+        provider_class=(
+            "pydantic_ai.providers.google:GoogleProvider"
+            if google
+            else "pydantic_ai.providers.openai:OpenAIProvider"
+        ),
+        model_class=f"pydantic_ai.models.{'google' if google else 'openai'}:{protocol}",
+        model_name="gemini-2.5-flash" if google else "gpt-4o-mini",
+        api_key="test-secret",
+        base_url=base_url,
+        model_settings={"temperature": 0.25},
+        context_window=12345,
+    )
+
+
+def test_input_round_trip_and_validation():
+    data = RunnerInput(user_prompt="hello", config=make_config("http://localhost:9999"))
+    assert RunnerInput.model_validate_json(data.model_dump_json()) == data
+    assert "test-secret" not in repr(data)
+    assert data.config.model_dump()["api_key"] == "test-secret"
+    for overrides in (
+        {"api_key": " "},
+        {"base_url": "http://user:pass@localhost"},
+        {"context_window": 0},
+        {"provider_kwargs": {"http_client": "invalid"}},
+        {"model_class": "without_separator"},
+    ):
+        with pytest.raises(ValidationError):
+            DurableExecutionConfig.model_validate(data.config.model_dump() | overrides)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_class", [OpenAIChatModel, OpenAIResponsesModel, GoogleModel])
+async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class):
+    base_url, requests = endpoint
+    config = make_config(base_url, model_class.__name__)
+    original_request = model_class.request
+    models = []
+
+    async def checked_request(self, *args, **kwargs):
+        assert activity.in_activity(), "Model I/O escaped the Activity boundary"
+        assert self.context_window == 12345
+        models.append(self)
+        return await original_request(self, *args, **kwargs)
+
+    monkeypatch.setattr(model_class, "request", checked_request)
+    client = await Client.connect(
+        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+        plugins=[PydanticAIPlugin()],
+    )
+    queue = f"runner-test-{uuid4()}"
+    async with Worker(
+        client, task_queue=queue, workflows=[RunnerWorkflow], plugins=[AgentPlugin(agent)]
+    ):
+        handle = await client.start_workflow(
+            RunnerWorkflow.run,
+            RunnerInput(user_prompt="hello", config=config),
+            id=queue,
+            task_queue=queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        assert await asyncio.wait_for(handle.result(), 35) == "done"
+        history = await handle.fetch_history()
+    assert len(requests) == 1
+    assert models and all(model.provider._own_http_client.is_closed for model in models)
+    body = requests[0]["body"]
+    if model_class is GoogleModel:
+        assert body["generationConfig"]["temperature"] == 0.25
+        assert body["contents"][0]["parts"] == [{"text": "hello"}]
+    else:
+        assert body["temperature"] == 0.25
+        assert body["model"] == "gpt-4o-mini"
+        assert requests[0]["headers"]["authorization"] == "Bearer test-secret"
+    await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
+        history
+    )
+    assert len(requests) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failed_activity_closes_model(endpoint, monkeypatch):
+    from pydantic_ai.exceptions import UserError
+    from temporalio.client import WorkflowFailureError
+
+    base_url, requests = endpoint
+    models = []
+
+    async def fail_request(self, *args, **kwargs):
+        assert activity.in_activity()
+        models.append(self)
+        raise UserError("invalid model request")
+
+    monkeypatch.setattr(OpenAIChatModel, "request", fail_request)
+    client = await Client.connect(
+        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+        plugins=[PydanticAIPlugin()],
+    )
+    queue = f"runner-failure-{uuid4()}"
+    async with Worker(
+        client, task_queue=queue, workflows=[RunnerWorkflow], plugins=[AgentPlugin(agent)]
+    ):
+        with pytest.raises(WorkflowFailureError):
+            await client.execute_workflow(
+                RunnerWorkflow.run,
+                RunnerInput(user_prompt="hello", config=make_config(base_url)),
+                id=queue,
+                task_queue=queue,
+                execution_timeout=timedelta(seconds=15),
+            )
+    assert len(models) == 1  # SDK classifies UserError as non-retryable.
+    assert models[0].provider._own_http_client.is_closed
+    assert requests == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_application_client_and_worker_entry(endpoint):
+    base_url, requests = endpoint
+    settings = CommonSettings.model_validate(
+        {**os.environ, "KAPY_TEMPORAL_TASK_QUEUE": f"entry-test-{uuid4()}"}
+    )
+    client = await connect_temporal(settings)
+    worker_task = asyncio.create_task(serve(settings))
+    try:
+        result = await asyncio.wait_for(
+            client.execute_workflow(
+                RunnerWorkflow.run,
+                RunnerInput(user_prompt="hello", config=make_config(base_url)),
+                id=settings.temporal_task_queue,
+                task_queue=settings.temporal_task_queue,
+                execution_timeout=timedelta(seconds=15),
+            ),
+            timeout=20,
+        )
+        assert result == "done"
+        assert len(requests) == 1
+    finally:
+        worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(worker_task, timeout=20)

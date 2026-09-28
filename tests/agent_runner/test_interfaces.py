@@ -1,4 +1,4 @@
-"""Interface wiring against real PostgreSQL/Valkey; Telegram network sends are captured."""
+"""Interface wiring against PostgreSQL, Valkey and Temporal; Telegram sends are captured."""
 
 import asyncio
 import os
@@ -399,12 +399,17 @@ async def test_http_interface_serves_http_without_credentials(database, monkeypa
     monkeypatch.delenv("KAPY_CONTROL_TOKEN", raising=False)
     settings = HttpSettings(
         common=CommonSettings(
+            temporal_address=os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
             database_url=SecretStr(database.url),
             database_schema=database.schema,
         ),
     )
     app = create_app(settings)
     async with app.router.lifespan_context(app):
+        from temporalio.api.workflowservice.v1 import GetSystemInfoRequest
+
+        temporal_client = app.state.resources.temporal_client
+        await temporal_client.workflow_service.get_system_info(GetSystemInfoRequest())
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://test"
         ) as client:
@@ -447,7 +452,9 @@ async def test_http_shutdown_joins_background_runner_before_resources_close(
     app = create_app(
         HttpSettings(
             common=CommonSettings(
-                database_url=SecretStr(database.url), database_schema=database.schema
+                temporal_address=os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+                database_url=SecretStr(database.url),
+                database_schema=database.schema,
             ),
         )
     )
@@ -491,7 +498,9 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
     await migrate_telegram(path, "upgrade")
     settings = TelegramSettings(
         common=CommonSettings(
-            database_url=SecretStr(database.url), database_schema=database.schema
+            temporal_address=os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+            database_url=SecretStr(database.url),
+            database_schema=database.schema,
         ),
         database_path=path,
         bot_token="unused",
@@ -644,7 +653,9 @@ async def test_http_interface_mounts_existing_frontend_with_api(database, tmp_pa
     app = create_app(
         HttpSettings(
             common=CommonSettings(
-                database_url=SecretStr(database.url), database_schema=database.schema
+                temporal_address=os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+                database_url=SecretStr(database.url),
+                database_schema=database.schema,
             ),
             frontend_dist=tmp_path,
         )

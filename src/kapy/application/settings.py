@@ -18,6 +18,15 @@ class CommonSettings(BaseModel):
         default=SecretStr("valkey://127.0.0.1:56379/0"), validation_alias="KAPY_VALKEY_URL"
     )
     valkey_namespace: str = Field(default="kapy_tmpv2", validation_alias="KAPY_VALKEY_NAMESPACE")
+    temporal_address: str = Field(
+        default="localhost:7233", min_length=1, validation_alias="KAPY_TEMPORAL_ADDRESS"
+    )
+    temporal_namespace: str = Field(
+        default="default", min_length=1, validation_alias="KAPY_TEMPORAL_NAMESPACE"
+    )
+    temporal_task_queue: str = Field(
+        default="kapy-runner", min_length=1, validation_alias="KAPY_TEMPORAL_TASK_QUEUE"
+    )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO", validation_alias="KAPY_LOG_LEVEL"
     )

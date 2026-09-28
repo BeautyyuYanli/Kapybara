@@ -18,6 +18,9 @@ The equivalent direct entry is `python -m kapy.interfaces.<name>.main ...`.
 Each process creates its own core PostgreSQL pool, Valkey client, SessionService
 and text Agent using ordinary application/ factories. They communicate through
 core tables and a common Valkey output namespace, never shared Python objects.
+Each process also connects one Temporal Client in `open_resources()`, exposed as
+`resources.temporal_client`. HTTP stores the resources on `app.state.resources`
+for request handlers. This does not change the existing session execution path.
 Both use identical prompt/tool/dependency construction in application/agent.py;
 this initial Agent has text output and no tools. SessionService resolves the
 provider and model from the core catalog on each runner start.
@@ -30,6 +33,9 @@ Common environment values (read only during command execution):
 | KAPY_DATABASE_SCHEMA | kapy_tmpv2 |
 | KAPY_VALKEY_URL | valkey://127.0.0.1:56379/0 |
 | KAPY_VALKEY_NAMESPACE | kapy_tmpv2 (channel prefix adds :agent-output) |
+| KAPY_TEMPORAL_ADDRESS | localhost:7233 |
+| KAPY_TEMPORAL_NAMESPACE | default |
+| KAPY_TEMPORAL_TASK_QUEUE | kapy-runner |
 | KAPY_LOG_LEVEL | INFO |
 | KAPY_HEARTBEAT_INTERVAL / KAPY_HEARTBEAT_TIMEOUT | 10 / 60 seconds |
 | KAPY_TAKEOVER_GRACE_PERIOD | 30 seconds, after expired-token takeover |
