@@ -53,8 +53,6 @@ async def resolve_model(ctx: ModelResolutionContext[RunnerDeps], model_id: str) 
 agent = Agent(
     name="runner_duarable",
     model=MODEL_ID,
-    instructions="Be concise and precise.",
-    output_type=str,
     deps_type=RunnerDeps,
     capabilities=[TemporalDurability(), ResolveModelId(resolve_model), HistoryRecordCapability()],
 )
