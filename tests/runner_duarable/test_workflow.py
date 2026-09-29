@@ -19,6 +19,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
+from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart, UserPromptPart
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from temporalio import activity
@@ -27,7 +28,10 @@ from temporalio.worker import Replayer, Worker
 
 from kapy.application.resources import connect_temporal
 from kapy.application.settings import CommonSettings
+from kapy.control.sessions.repository import SessionRepository
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow, agent
+from kapy.runner_duarable.activities import RunnerStateActivities
+from kapy.runner_duarable.types import SaveRunnerStateInput
 from kapy.runner_duarable.worker import serve
 
 
@@ -125,7 +129,12 @@ def make_config(base_url: str, protocol: str = "OpenAIChatModel") -> DurableExec
 
 
 def test_input_round_trip_and_validation():
-    data = RunnerInput(user_prompt="hello", config=make_config("http://localhost:9999"))
+    data = RunnerInput(
+        session_id=uuid4(),
+        runner_state_version=0,
+        user_prompt="hello",
+        config=make_config("http://localhost:9999"),
+    )
     assert RunnerInput.model_validate_json(data.model_dump_json()) == data
     assert "test-secret" not in repr(data)
     assert data.config.model_dump()["api_key"] == "test-secret"
@@ -138,12 +147,22 @@ def test_input_round_trip_and_validation():
     ):
         with pytest.raises(ValidationError):
             DurableExecutionConfig.model_validate(data.config.model_dump() | overrides)
+    for version in (-1, True, 1.0, "1"):
+        with pytest.raises(ValidationError):
+            RunnerInput.model_validate(data.model_dump() | {"runner_state_version": version})
+        with pytest.raises(ValidationError):
+            SaveRunnerStateInput.model_validate(
+                {"session_id": data.session_id, "expected_version": version, "runner_state": ""}
+            )
+    for field in ("session_id", "runner_state_version"):
+        with pytest.raises(ValidationError):
+            RunnerInput.model_validate(data.model_dump(exclude={field}))
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_class", [OpenAIChatModel, OpenAIResponsesModel, GoogleModel])
-async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class):
+async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, runner_database):
     base_url, requests = endpoint
     config = make_config(base_url, model_class.__name__)
     original_request = model_class.request
@@ -162,17 +181,38 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class):
     )
     queue = f"runner-test-{uuid4()}"
     async with Worker(
-        client, task_queue=queue, workflows=[RunnerWorkflow], plugins=[AgentPlugin(agent)]
+        client,
+        task_queue=queue,
+        workflows=[RunnerWorkflow],
+        activities=[RunnerStateActivities(runner_database.sessions).save_runner_state],
+        plugins=[AgentPlugin(agent)],
     ):
         handle = await client.start_workflow(
             RunnerWorkflow.run,
-            RunnerInput(user_prompt="hello", config=config),
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state_version=0,
+                user_prompt="hello",
+                config=config,
+            ),
             id=queue,
             task_queue=queue,
             execution_timeout=timedelta(seconds=30),
         )
         assert await asyncio.wait_for(handle.result(), 35) == "done"
         history = await handle.fetch_history()
+    async with runner_database.sessions.begin() as db:
+        repo = SessionRepository(db)
+        state, version = await repo.read_runner_state(runner_database.session_id)
+        saved_at = (await repo.get_session(runner_database.session_id)).updated_at
+    assert state is not None and version == 1
+    messages = ModelMessagesTypeAdapter.validate_json(state)
+    assert any(
+        isinstance(part, UserPromptPart) and part.content == "hello"
+        for message in messages
+        for part in message.parts
+    )
+    assert any(isinstance(part, TextPart) and part.content == "done" for part in messages[-1].parts)
     assert len(requests) == 1
     assert models and all(model.provider._own_http_client.is_closed for model in models)
     body = requests[0]["body"]
@@ -187,16 +227,24 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class):
         history
     )
     assert len(requests) == 1
+    async with runner_database.sessions.begin() as db:
+        repo = SessionRepository(db)
+        assert await repo.read_runner_state(runner_database.session_id) == (state, 1)
+        assert (await repo.get_session(runner_database.session_id)).updated_at == saved_at
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_failed_activity_closes_model(endpoint, monkeypatch):
+async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_database):
     from pydantic_ai.exceptions import UserError
     from temporalio.client import WorkflowFailureError
 
     base_url, requests = endpoint
     models = []
+    async with runner_database.sessions.begin() as db:
+        await SessionRepository(db).save_runner_state(
+            runner_database.session_id, expected_version=0, runner_state="previous"
+        )
 
     async def fail_request(self, *args, **kwargs):
         assert activity.in_activity()
@@ -210,12 +258,21 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch):
     )
     queue = f"runner-failure-{uuid4()}"
     async with Worker(
-        client, task_queue=queue, workflows=[RunnerWorkflow], plugins=[AgentPlugin(agent)]
+        client,
+        task_queue=queue,
+        workflows=[RunnerWorkflow],
+        activities=[RunnerStateActivities(runner_database.sessions).save_runner_state],
+        plugins=[AgentPlugin(agent)],
     ):
         with pytest.raises(WorkflowFailureError):
             await client.execute_workflow(
                 RunnerWorkflow.run,
-                RunnerInput(user_prompt="hello", config=make_config(base_url)),
+                RunnerInput(
+                    session_id=runner_database.session_id,
+                    runner_state_version=1,
+                    user_prompt="hello",
+                    config=make_config(base_url),
+                ),
                 id=queue,
                 task_queue=queue,
                 execution_timeout=timedelta(seconds=15),
@@ -223,14 +280,23 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch):
     assert len(models) == 1  # SDK classifies UserError as non-retryable.
     assert models[0].provider._own_http_client.is_closed
     assert requests == []
+    async with runner_database.sessions.begin() as db:
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
+            "previous",
+            1,
+        )
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_application_client_and_worker_entry(endpoint):
+async def test_application_client_and_worker_entry(endpoint, runner_database):
     base_url, requests = endpoint
     settings = CommonSettings.model_validate(
-        {**os.environ, "KAPY_TEMPORAL_TASK_QUEUE": f"entry-test-{uuid4()}"}
+        {
+            **os.environ,
+            "KAPY_DATABASE_SCHEMA": runner_database.settings.database_schema,
+            "KAPY_TEMPORAL_TASK_QUEUE": f"entry-test-{uuid4()}",
+        }
     )
     client = await connect_temporal(settings)
     worker_task = asyncio.create_task(serve(settings))
@@ -238,7 +304,12 @@ async def test_application_client_and_worker_entry(endpoint):
         result = await asyncio.wait_for(
             client.execute_workflow(
                 RunnerWorkflow.run,
-                RunnerInput(user_prompt="hello", config=make_config(base_url)),
+                RunnerInput(
+                    session_id=runner_database.session_id,
+                    runner_state_version=0,
+                    user_prompt="hello",
+                    config=make_config(base_url),
+                ),
                 id=settings.temporal_task_queue,
                 task_queue=settings.temporal_task_queue,
                 execution_timeout=timedelta(seconds=15),
@@ -247,7 +318,111 @@ async def test_application_client_and_worker_entry(endpoint):
         )
         assert result == "done"
         assert len(requests) == 1
+        async with runner_database.sessions.begin() as db:
+            state, version = await SessionRepository(db).read_runner_state(
+                runner_database.session_id
+            )
+            assert state is not None and version == 1
     finally:
         worker_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(worker_task, timeout=20)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_save_retries_after_commit_without_incrementing_again(endpoint, runner_database):
+    from temporalio.exceptions import ApplicationError
+
+    base_url, requests = endpoint
+    saver = RunnerStateActivities(runner_database.sessions)
+    observations = []
+    inputs = []
+
+    @activity.defn(name="kapy.save_runner_state")
+    async def lose_first_ack(data: SaveRunnerStateInput) -> None:
+        inputs.append(data)
+        await saver.save_runner_state(data)
+        async with runner_database.sessions.begin() as db:
+            repo = SessionRepository(db)
+            observations.append(
+                (
+                    await repo.read_runner_state(data.session_id),
+                    (await repo.get_session(data.session_id)).updated_at,
+                )
+            )
+        if activity.info().attempt == 1:
+            raise ApplicationError("simulated lost acknowledgment after commit")
+
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-retry-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[RunnerWorkflow],
+        activities=[lose_first_ack],
+        plugins=[AgentPlugin(agent)],
+    ):
+        result = await client.execute_workflow(
+            RunnerWorkflow.run,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state_version=0,
+                user_prompt="hello",
+                config=make_config(base_url),
+            ),
+            id=queue,
+            task_queue=queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+    assert result == "done" and len(requests) == 1
+    assert len(inputs) == 2 and inputs[0] == inputs[1]
+    assert len(observations) == 2 and observations[0] == observations[1]
+    assert observations[0][0][1] == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [False, True])
+async def test_save_business_errors_fail_workflow(endpoint, runner_database, missing):
+    from temporalio.client import WorkflowFailureError
+    from temporalio.exceptions import ActivityError, ApplicationError
+
+    base_url, requests = endpoint
+    async with runner_database.sessions.begin() as db:
+        await SessionRepository(db).save_runner_state(
+            runner_database.session_id, expected_version=0, runner_state="previous"
+        )
+    saver = RunnerStateActivities(runner_database.sessions)
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-save-failure-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[RunnerWorkflow],
+        activities=[saver.save_runner_state],
+        plugins=[AgentPlugin(agent)],
+    ):
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await client.execute_workflow(
+                RunnerWorkflow.run,
+                RunnerInput(
+                    session_id=uuid4() if missing else runner_database.session_id,
+                    runner_state_version=0,
+                    user_prompt="hello",
+                    config=make_config(base_url),
+                ),
+                id=queue,
+                task_queue=queue,
+                execution_timeout=timedelta(seconds=15),
+            )
+    assert isinstance(exc_info.value.cause, ActivityError)
+    cause = exc_info.value.cause.cause
+    assert isinstance(cause, ApplicationError) and cause.non_retryable
+    assert cause.type == ("SessionNotFound" if missing else "RunnerStateConflict")
+    assert len(requests) == 1
+    async with runner_database.sessions.begin() as db:
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
+            "previous",
+            1,
+        )

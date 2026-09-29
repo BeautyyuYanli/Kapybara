@@ -1,12 +1,15 @@
 # Temporal Agent runner
 
-`RunnerWorkflow.run(RunnerInput)` executes one fresh `agent.run()` and returns its
-string output. It does not read session/model tables or acquire a lease. Callers
-resolve provider/model configuration and merge and validate settings before
-constructing the input:
+`RunnerWorkflow.run(RunnerInput)` executes one fresh `agent.run()`, saves its final
+state through `kapy.save_runner_state`, then returns its string output. It does not
+restore an earlier conversation or acquire a lease. Callers resolve provider/model
+configuration, merge and validate settings, and read the existing session's state
+version before constructing the input:
 
 ```python
 RunnerInput(
+    session_id=session_id,  # An existing session UUID.
+    runner_state_version=0,  # Use read_runner_state() for an existing snapshot.
     user_prompt="Hello",
     config=DurableExecutionConfig(
         provider_class="pydantic_ai.providers.openai:OpenAIProvider",
@@ -17,6 +20,36 @@ RunnerInput(
     ),
 )
 ```
+
+`SessionRepository.read_runner_state(id)` returns `(opaque_state, version)` from
+the same row; a missing session raises `LookupError`. New sessions start at
+`(None, 0)`. The Workflow fixes the base version in its input and serializes
+`result.all_messages_json().decode("utf-8")` after a successful run, including the
+final message. The session layer stores this as an opaque string, without parsing
+it or exposing it through session DTOs/HTTP. Each successful save replaces the
+previous snapshot; independent runs do not accumulate prior conversations.
+
+`SessionRepository.save_runner_state(id, expected_version=..., runner_state=...)`
+borrows a transaction and locks the session row. Matching the current version
+replaces the state, increments the version once, and updates `updated_at`. If the
+current version is already `expected_version + 1` and the string matches exactly,
+the save succeeds without changes. Any other version/string mismatch raises
+`ValueError`. Two concurrent distinct results from the same base version cannot
+both commit. The same base version and string count as one submission, regardless
+of Workflow identity; retrying never refreshes the base version. Configuration
+updates and lifecycle changes do not increment this version.
+
+The save Activity owns and commits its database transaction before returning. It
+has a 30-second start-to-close timeout and uses Temporal's default retry policy
+for transient failures. Missing sessions and state conflicts become non-retryable
+`ApplicationError`s with types `SessionNotFound` and `RunnerStateConflict`. Save
+failure propagates to the Workflow. Replay uses Temporal's recorded completion;
+if a commit succeeded but its acknowledgment was lost, repository idempotency
+handles the repeated Activity. Agent failure leaves the previous snapshot intact.
+Cancellation or timeout during saving cannot undo an already committed transaction,
+so an unsuccessful Workflow may still have saved state. Saving never changes the
+session's lifecycle status. Automatic state restoration and partial failure/cancel
+snapshots are outside this runner's contract.
 
 The module defines its own Agent at module scope. It reuses Provider/Model
 construction helpers, but does not import the legacy application Agent factory.
@@ -42,7 +75,9 @@ The Worker uses the same `open_resources()` factory as the interfaces, owning
 its own PostgreSQL pool, Valkey client, and Temporal Client. Its resource scope
 encloses the Worker so Activities finish before resource cleanup. Database and
 Valkey connections are lazy; these process-local objects must not enter Workflow
-inputs or state. Activity resource injection is separate from this entry point.
+inputs or state. The entry point constructs `RunnerStateActivities` with
+`resources.core_session_factory` and registers its bound save method alongside
+`AgentPlugin(agent)`. Custom Workers must register this Activity as well.
 
 The Worker and interface processes share `KAPY_TEMPORAL_ADDRESS` (default
 `localhost:7233`), `KAPY_TEMPORAL_NAMESPACE` (`default`), and

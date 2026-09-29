@@ -17,16 +17,19 @@ from temporalio.worker import Worker
 from kapy.application.resources import open_resources
 from kapy.application.settings import CommonSettings
 
+from .activities import RunnerStateActivities
 from .agent import agent
 from .workflow import RunnerWorkflow
 
 
 async def serve(settings: CommonSettings) -> None:
     async with open_resources(settings) as resources:
+        state_activities = RunnerStateActivities(resources.core_session_factory)
         async with Worker(
             resources.temporal_client,
             task_queue=settings.temporal_task_queue,
             workflows=[RunnerWorkflow],
+            activities=[state_activities.save_runner_state],
             plugins=[AgentPlugin(agent)],
             graceful_shutdown_timeout=timedelta(seconds=15),
         ):

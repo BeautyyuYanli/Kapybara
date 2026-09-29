@@ -6,6 +6,7 @@ Settings are final values, not overrides of a Worker-local model catalogue.
 """
 
 from typing import Self
+from uuid import UUID
 
 from pydantic import Field, SecretStr, model_validator
 
@@ -47,5 +48,17 @@ class DurableExecutionConfig(DTO):
 
 
 class RunnerInput(DTO):
+    """The caller fixes the session and base version before starting the Workflow."""
+
+    session_id: UUID
+    runner_state_version: int = Field(ge=0, strict=True)
     user_prompt: str
     config: DurableExecutionConfig
+
+
+class SaveRunnerStateInput(DTO):
+    """Every Activity retry retains this exact version and encoded state."""
+
+    session_id: UUID
+    expected_version: int = Field(ge=0, strict=True)
+    runner_state: str

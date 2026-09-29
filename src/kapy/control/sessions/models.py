@@ -1,7 +1,8 @@
 """Session configuration, FIFO inputs and a coalescing cancellation bit.
 
-Configuration does not own runner state. Model references may dangle; services use
-no physical FKs; input and agent rows use the same session identifier.
+Sessions store the latest opaque runner snapshot and its submission version; the
+runner owns the encoding. Model references may dangle; services use no physical
+FKs; input and agent rows use the same session identifier.
 """
 
 from datetime import datetime
@@ -61,6 +62,10 @@ class SessionRow(ControlTable, table=True):
     )
     compaction_threshold_tokens: int | None = None
     compaction_replay_turns: int = 10
+    runner_state: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    runner_state_version: int = Field(
+        default=0, sa_column=Column(BigInteger, nullable=False, server_default="0")
+    )
     created_at: datetime = Field(
         default_factory=utc_now, sa_column=Column(DateTime(timezone=True), nullable=False)
     )

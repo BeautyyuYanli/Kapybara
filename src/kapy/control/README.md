@@ -102,6 +102,12 @@ creation-time/identity order with offset >= 0 and limit between 1 and 200, retur
 latest matching page in ascending seq order; before_seq is exclusive and has_more
 means older history exists. History and ordinary lists share kapy.pagination.
 
+The session repository also stores an opaque runner state string and a submission
+version, initially NULL/0. The runner owns the encoding; these fields are absent
+from session configuration DTOs. Internal read/save methods expose an atomic
+state/version pair and versioned replacement, including idempotent retries. See
+the [Temporal runner](../runner_duarable/README.md) for its save contract.
+
 
 Session creation validates plugin config before saving ready session/binding records
 in one transaction; it does not allocate external resources. `close_session(id)`

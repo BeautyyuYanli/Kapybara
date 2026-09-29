@@ -156,6 +156,11 @@ async def test_core_migrations_preserve_pages_and_execution(database):
                     "config": {},
                 }
                 assert (
+                    await db.execute(
+                        text("SELECT runner_state, runner_state_version FROM sessions")
+                    )
+                ).one() == (None, 0)
+                assert (
                     await db.execute(text("SELECT next_step FROM agent_states"))
                 ).scalar_one() == "model_request"
                 assert (await db.execute(text("SELECT seq FROM agent_history"))).scalar_one() == 10

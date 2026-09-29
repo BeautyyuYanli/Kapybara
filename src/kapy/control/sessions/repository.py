@@ -21,9 +21,13 @@ _input_adapter = TypeAdapter(UserInput)
 
 
 async def lock_session(db: AsyncSession, session_id: UUID) -> SessionRow:
+    """Lock and refresh the row even when this Session already loaded an older version."""
     row = (
         await db.execute(
-            select(SessionRow).where(col(SessionRow.id) == session_id).with_for_update()
+            select(SessionRow)
+            .where(col(SessionRow.id) == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if row is None:
@@ -49,6 +53,43 @@ class SessionRepository:
 
     async def get_session(self, session_id: UUID) -> SessionRecord:
         return SessionRecord.model_validate(await self._session(session_id))
+
+    async def read_runner_state(self, session_id: UUID) -> tuple[str | None, int]:
+        """Read one opaque snapshot/version pair; missing sessions raise LookupError."""
+        row = (
+            await self._db.execute(
+                select(SessionRow.runner_state, SessionRow.runner_state_version).where(
+                    col(SessionRow.id) == session_id
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            raise LookupError(f"Session {session_id} does not exist")
+        return row.runner_state, row.runner_state_version
+
+    async def save_runner_state(
+        self, session_id: UUID, *, expected_version: int, runner_state: str
+    ) -> None:
+        """Replace opaque state under a row lock, borrowing the caller's transaction.
+
+        Matching expected_version replaces state and increments the version. A
+        retry succeeds unchanged only at expected_version + 1 with an identical
+        string. All other version/string mismatches raise ValueError, including
+        retries after further advancement. Missing sessions raise LookupError.
+        The runner owns serialization and no state is parsed.
+        """
+        if expected_version < 0:
+            raise ValueError("expected_version must be nonnegative")
+        row = await lock_session(self._db, session_id)
+        if row.runner_state_version == expected_version:
+            row.runner_state = runner_state
+            row.runner_state_version = expected_version + 1
+            row.updated_at = utc_now()
+            await self._db.flush()
+        elif not (
+            row.runner_state_version == expected_version + 1 and row.runner_state == runner_state
+        ):
+            raise ValueError(f"Session {session_id} runner state version conflicts")
 
     async def list_sessions(
         self, *, provider_id: UUID | None, model_name: str | None, offset: int, limit: int

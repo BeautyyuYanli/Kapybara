@@ -1,8 +1,9 @@
 """Standalone Temporal runner; callers own Client and Worker lifecycle.
 
 Use the SDK PydanticAIPlugin for payload/sandbox configuration and register
-`agent` through AgentPlugin alongside RunnerWorkflow. This module does not
-resolve database configuration, acquire leases, or install business plugins.
+`agent` through AgentPlugin alongside RunnerWorkflow and the save method of
+RunnerStateActivities. This module does not resolve database configuration,
+acquire leases, or install business plugins.
 """
 
 from temporalio import workflow

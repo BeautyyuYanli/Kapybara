@@ -26,6 +26,11 @@ Core metadata is explicitly ControlTable, agent_metadata and lease_metadata.
 Sessions also store `context_plugin` JSON with a server default of kapy/summary and
 empty config, backfilling existing session rows through the generated column revision.
 This selection does not add plugin-owned tables or change context-page payloads.
+Sessions also retain the latest opaque `runner_state` TEXT and its BIGINT
+`runner_state_version`. The generated column revision initializes existing rows
+to NULL/0, without deriving state from legacy history. The runner owns encoding;
+the session repository owns versioned, idempotent replacement. These columns are
+internal storage and are absent from ordinary session configuration DTOs.
 
 ControlTable includes `plugin_agent_bindings` and the shared session/binding lifecycle
 columns. Agent plugins store small JSON state in this core-owned table; data_version
