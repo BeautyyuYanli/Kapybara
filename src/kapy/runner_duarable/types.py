@@ -9,6 +9,7 @@ from typing import Self
 from uuid import UUID
 
 from pydantic import Field, SecretStr, model_validator
+from pydantic_ai.messages import ModelMessage
 
 from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
@@ -48,12 +49,29 @@ class DurableExecutionConfig(DTO):
 
 
 class RunnerInput(DTO):
-    """The caller fixes the session and base version before starting the Workflow."""
+    """The caller reads state and version together and serializes runs per session."""
 
     session_id: UUID
     runner_state_version: int = Field(ge=0, strict=True)
+    runner_state: str | None
     user_prompt: str
     config: DurableExecutionConfig
+    next_seq: int | None = Field(default=None, ge=0, strict=True)
+
+
+class RunnerDeps(DTO):
+    """Fixed run input; next_seq is a one-time starting point, never a counter."""
+
+    config: DurableExecutionConfig
+    session_id: UUID
+    next_seq: int | None = Field(default=None, ge=0, strict=True)
+
+
+class RecordHistoryInput(DTO):
+    """One atomic batch; every message carries its database seq in metadata."""
+
+    session_id: UUID
+    messages: list[ModelMessage]
 
 
 class SaveRunnerStateInput(DTO):

@@ -18,18 +18,17 @@ from temporalio import workflow
 
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
 
-from .types import DurableExecutionConfig
+from .history import HistoryRecordCapability
+from .types import RunnerDeps
 
 MODEL_ID = "kapy-configured"
 
 
-async def resolve_model(
-    ctx: ModelResolutionContext[DurableExecutionConfig], model_id: str
-) -> Model | None:
+async def resolve_model(ctx: ModelResolutionContext[RunnerDeps], model_id: str) -> Model | None:
     if model_id != MODEL_ID:
         return None
     try:
-        config = ctx.deps
+        config = ctx.deps.config
         provider_config = config.provider_config()
         # Class imports select installed code, not Workflow state. Do not re-import
         # SDK providers and their transitive dependencies inside the sandbox.
@@ -54,9 +53,9 @@ async def resolve_model(
 agent = Agent(
     name="runner_duarable",
     model=MODEL_ID,
-    deps_type=DurableExecutionConfig,
-    capabilities=[TemporalDurability(), ResolveModelId(resolve_model)],
     instructions="Be concise and precise.",
     output_type=str,
+    deps_type=RunnerDeps,
+    capabilities=[TemporalDurability(), ResolveModelId(resolve_model), HistoryRecordCapability()],
 )
 """Register this Agent once through the SDK's AgentPlugin on the Worker."""

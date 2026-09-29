@@ -132,6 +132,7 @@ def test_input_round_trip_and_validation():
     data = RunnerInput(
         session_id=uuid4(),
         runner_state_version=0,
+        runner_state=None,
         user_prompt="hello",
         config=make_config("http://localhost:9999"),
     )
@@ -151,10 +152,12 @@ def test_input_round_trip_and_validation():
         with pytest.raises(ValidationError):
             RunnerInput.model_validate(data.model_dump() | {"runner_state_version": version})
         with pytest.raises(ValidationError):
+            RunnerInput.model_validate(data.model_dump() | {"next_seq": version})
+        with pytest.raises(ValidationError):
             SaveRunnerStateInput.model_validate(
                 {"session_id": data.session_id, "expected_version": version, "runner_state": ""}
             )
-    for field in ("session_id", "runner_state_version"):
+    for field in ("session_id", "runner_state_version", "runner_state"):
         with pytest.raises(ValidationError):
             RunnerInput.model_validate(data.model_dump(exclude={field}))
 
@@ -184,7 +187,10 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[RunnerStateActivities(runner_database.sessions).save_runner_state],
+        activities=[
+            RunnerStateActivities(runner_database.sessions).record_history,
+            RunnerStateActivities(runner_database.sessions).save_runner_state,
+        ],
         plugins=[AgentPlugin(agent)],
     ):
         handle = await client.start_workflow(
@@ -192,6 +198,7 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
             RunnerInput(
                 session_id=runner_database.session_id,
                 runner_state_version=0,
+                runner_state=None,
                 user_prompt="hello",
                 config=config,
             ),
@@ -206,6 +213,12 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
         state, version = await repo.read_runner_state(runner_database.session_id)
         saved_at = (await repo.get_session(runner_database.session_id)).updated_at
     assert state is not None and version == 1
+    from kapy.agent_runner.repository import AgentRepository
+
+    async with runner_database.sessions.begin() as db:
+        stored = await AgentRepository(db).read_history_entries(runner_database.session_id)
+    assert [entry.seq for entry in stored] == [0, 1]
+    assert [entry.message.metadata for entry in stored] == [{"seq": 0}, {"seq": 1}]
     messages = ModelMessagesTypeAdapter.validate_json(state)
     assert any(
         isinstance(part, UserPromptPart) and part.content == "hello"
@@ -261,7 +274,10 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_databa
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[RunnerStateActivities(runner_database.sessions).save_runner_state],
+        activities=[
+            RunnerStateActivities(runner_database.sessions).record_history,
+            RunnerStateActivities(runner_database.sessions).save_runner_state,
+        ],
         plugins=[AgentPlugin(agent)],
     ):
         with pytest.raises(WorkflowFailureError):
@@ -270,6 +286,7 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_databa
                 RunnerInput(
                     session_id=runner_database.session_id,
                     runner_state_version=1,
+                    runner_state=None,
                     user_prompt="hello",
                     config=make_config(base_url),
                 ),
@@ -307,6 +324,7 @@ async def test_application_client_and_worker_entry(endpoint, runner_database):
                 RunnerInput(
                     session_id=runner_database.session_id,
                     runner_state_version=0,
+                    runner_state=None,
                     user_prompt="hello",
                     config=make_config(base_url),
                 ),
@@ -360,7 +378,7 @@ async def test_save_retries_after_commit_without_incrementing_again(endpoint, ru
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[lose_first_ack],
+        activities=[lose_first_ack, saver.record_history],
         plugins=[AgentPlugin(agent)],
     ):
         result = await client.execute_workflow(
@@ -368,6 +386,7 @@ async def test_save_retries_after_commit_without_incrementing_again(endpoint, ru
             RunnerInput(
                 session_id=runner_database.session_id,
                 runner_state_version=0,
+                runner_state=None,
                 user_prompt="hello",
                 config=make_config(base_url),
             ),
@@ -400,7 +419,7 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[saver.save_runner_state],
+        activities=[saver.record_history, saver.save_runner_state],
         plugins=[AgentPlugin(agent)],
     ):
         with pytest.raises(WorkflowFailureError) as exc_info:
@@ -409,6 +428,7 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
                 RunnerInput(
                     session_id=uuid4() if missing else runner_database.session_id,
                     runner_state_version=0,
+                    runner_state=None,
                     user_prompt="hello",
                     config=make_config(base_url),
                 ),
@@ -426,3 +446,168 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
             "previous",
             1,
         )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workflow_restores_state_and_continues_marks(endpoint, runner_database):
+    from kapy.agent_runner.repository import AgentRepository
+
+    base_url, requests = endpoint
+    saver = RunnerStateActivities(runner_database.sessions)
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-restore-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[RunnerWorkflow],
+        activities=[saver.record_history, saver.save_runner_state],
+        plugins=[AgentPlugin(agent)],
+    ):
+        for prompt in ("first", "follow-up"):
+            async with runner_database.sessions.begin() as db:
+                state, version = await SessionRepository(db).read_runner_state(
+                    runner_database.session_id
+                )
+            assert (
+                await client.execute_workflow(
+                    RunnerWorkflow.run,
+                    RunnerInput(
+                        session_id=runner_database.session_id,
+                        runner_state_version=version,
+                        runner_state=state,
+                        next_seq=100 if version == 0 else None,
+                        user_prompt=prompt,
+                        config=make_config(base_url),
+                    ),
+                    id=f"{queue}-{version}",
+                    task_queue=queue,
+                    execution_timeout=timedelta(seconds=15),
+                )
+                == "done"
+            )
+    assert len(requests) == 2
+    assert [(m["role"], m["content"]) for m in requests[1]["body"]["messages"]] == [
+        ("user", "first"),
+        ("assistant", "done"),
+        ("user", "follow-up"),
+    ]
+    async with runner_database.sessions.begin() as db:
+        state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
+        entries = await AgentRepository(db).read_history_entries(runner_database.session_id)
+    assert state is not None and version == 2
+    messages = ModelMessagesTypeAdapter.validate_json(state)
+    assert [m.metadata for m in messages] == [{"seq": seq} for seq in range(100, 104)]
+    assert [entry.seq for entry in entries] == list(range(100, 104))
+    # History normalizes usage into token columns; runner_state retains SDK usage.
+    assert ModelMessagesTypeAdapter.dump_python(
+        [entry.message for entry in entries], exclude={"__all__": {"usage"}}
+    ) == ModelMessagesTypeAdapter.dump_python(messages, exclude={"__all__": {"usage"}})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["not-json", '{"history": []}', '[{"kind": "invalid"}]'])
+async def test_invalid_state_fails_workflow_before_model_call(endpoint, runner_database, state):
+    from temporalio.client import WorkflowFailureError
+    from temporalio.exceptions import ApplicationError
+
+    from kapy.agent_runner.repository import AgentRepository
+
+    base_url, requests = endpoint
+    saver = RunnerStateActivities(runner_database.sessions)
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-invalid-state-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[RunnerWorkflow],
+        activities=[saver.record_history, saver.save_runner_state],
+        plugins=[AgentPlugin(agent)],
+    ):
+        with pytest.raises(WorkflowFailureError) as error:
+            await client.execute_workflow(
+                RunnerWorkflow.run,
+                RunnerInput(
+                    session_id=runner_database.session_id,
+                    runner_state_version=0,
+                    runner_state=state,
+                    user_prompt="hello",
+                    config=make_config(base_url),
+                ),
+                id=queue,
+                task_queue=queue,
+                execution_timeout=timedelta(seconds=15),
+            )
+    assert isinstance(error.value.cause, ApplicationError)
+    assert error.value.cause.type == "UserError"
+    assert requests == []
+    async with runner_database.sessions.begin() as db:
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
+            None,
+            0,
+        )
+        assert await AgentRepository(db).read_history_entries(runner_database.session_id) == ()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_history_activity_lost_ack_retries_same_batch_and_replays(endpoint, runner_database):
+    from temporalio.exceptions import ApplicationError
+
+    from kapy.agent_runner.repository import AgentRepository
+    from kapy.runner_duarable.types import RecordHistoryInput
+
+    base_url, requests = endpoint
+    saver = RunnerStateActivities(runner_database.sessions)
+    inputs = []
+
+    @activity.defn(name="kapy.record_history")
+    async def lose_first_ack(data: RecordHistoryInput) -> None:
+        inputs.append(data)
+        await saver.record_history(data)
+        if activity.info().attempt == 1:
+            raise ApplicationError("simulated history commit with lost acknowledgment")
+
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-history-retry-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[RunnerWorkflow],
+        activities=[lose_first_ack, saver.save_runner_state],
+        plugins=[AgentPlugin(agent)],
+    ):
+        handle = await client.start_workflow(
+            RunnerWorkflow.run,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state_version=0,
+                runner_state=None,
+                next_seq=50,
+                user_prompt="hello",
+                config=make_config(base_url),
+            ),
+            id=queue,
+            task_queue=queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        assert await handle.result() == "done"
+        history = await handle.fetch_history()
+    assert len(requests) == 1
+    assert len(inputs) == 4 and inputs[0] == inputs[1] and inputs[2] == inputs[3]
+    assert [m.metadata for m in inputs[0].messages] == [{"seq": 50}, {"seq": 51}]
+    assert [m.metadata for m in inputs[2].messages] == [{"seq": 50}]
+    async with runner_database.sessions.begin() as db:
+        entries = await AgentRepository(db).read_history_entries(runner_database.session_id)
+        state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
+    assert [entry.seq for entry in entries] == [50, 51]
+    assert state is not None and version == 1
+    assert [m.metadata for m in ModelMessagesTypeAdapter.validate_json(state)] == [
+        {"seq": 50},
+        {"seq": 51},
+    ]
+    await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
+        history
+    )
+    assert len(inputs) == 4 and len(requests) == 1

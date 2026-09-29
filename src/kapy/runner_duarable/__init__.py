@@ -1,7 +1,7 @@
 """Standalone Temporal runner; callers own Client and Worker lifecycle.
 
 Use the SDK PydanticAIPlugin for payload/sandbox configuration and register
-`agent` through AgentPlugin alongside RunnerWorkflow and the save method of
+`agent` through AgentPlugin alongside RunnerWorkflow and both methods of
 RunnerStateActivities. This module does not resolve database configuration,
 acquire leases, or install business plugins.
 """
@@ -12,7 +12,16 @@ from temporalio import workflow
 # reuse those modules instead of reinitializing their types in each sandbox.
 with workflow.unsafe.imports_passed_through():
     from .agent import agent
-    from .types import DurableExecutionConfig, RunnerInput
+    from .history import HistoryRecordCapability
+    from .types import DurableExecutionConfig, RecordHistoryInput, RunnerDeps, RunnerInput
 from .workflow import RunnerWorkflow
 
-__all__ = ["DurableExecutionConfig", "RunnerInput", "RunnerWorkflow", "agent"]
+__all__ = [
+    "DurableExecutionConfig",
+    "HistoryRecordCapability",
+    "RecordHistoryInput",
+    "RunnerDeps",
+    "RunnerInput",
+    "RunnerWorkflow",
+    "agent",
+]

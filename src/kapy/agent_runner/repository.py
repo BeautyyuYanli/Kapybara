@@ -1,9 +1,10 @@
 """Runner history and checkpoints, borrowing one caller-owned transaction.
 
-Mutations and input/cancel consumption must follow SessionLease.lock_owned in the
-same transaction, taking the lease row before business rows. No method acquires a
-lease, commits, or manages session lifetime. Usage is normalized outside message
-JSON; message parts retain the SDK's official codec.
+Legacy checkpoint mutations follow SessionLease.lock_owned in the same
+transaction. Temporal upsert_history is a separate overwrite contract: its
+caller serializes session runs without using legacy checkpoints or leases.
+No method acquires a lease, commits, or manages session lifetime. Usage is
+normalized outside message JSON; message parts retain the SDK's official codec.
 """
 
 from collections.abc import Sequence
@@ -28,6 +29,32 @@ def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
     if usage.input_tokens > 0 and usage.output_tokens >= 0:
         return usage.input_tokens, usage.output_tokens
     return None
+
+
+def _encode_history(
+    session_id: UUID, sequences: Sequence[int], messages: Sequence[ModelMessage]
+) -> list[dict[str, Any]]:
+    payloads = ModelMessagesTypeAdapter.dump_python(list(messages), mode="json")
+    rows: list[dict[str, Any]] = []
+    for seq, message, payload in zip(sequences, messages, payloads, strict=True):
+        kind = payload.pop("kind")
+        parts = payload.pop("parts")
+        payload.pop("usage", None)
+        finish_reason = payload.pop("finish_reason", None)
+        tokens = response_tokens(message) if isinstance(message, ModelResponse) else None
+        rows.append(
+            dict(
+                session_id=session_id,
+                seq=seq,
+                kind=kind,
+                message={"parts": parts},
+                message_metadata=payload,
+                finish_reason=finish_reason,
+                input_tokens=tokens[0] if tokens is not None else None,
+                output_tokens=tokens[1] if tokens is not None else None,
+            )
+        )
+    return rows
 
 
 def _decode_history(rows: Sequence[AgentHistoryRow]) -> tuple[HistoryMessage, ...]:
@@ -101,7 +128,7 @@ class AgentRepository:
     async def read_history_entries(
         self, session_id: UUID, *, after_seq: int = -1
     ) -> tuple[HistoryMessage, ...]:
-        """Read original history after an absolute cursor, including for unstarted sessions."""
+        """Read after a seq cursor; overwrites at/before that cursor are not returned."""
         if isinstance(after_seq, bool) or not isinstance(after_seq, int) or after_seq < -1:
             raise ValueError("after_seq must be an integer >= -1")
         statement = (
@@ -206,27 +233,7 @@ class AgentRepository:
         DTOs derive from the INSERT payload, without another database read. They
         must only be published after the caller's transaction has committed.
         """
-        payloads = ModelMessagesTypeAdapter.dump_python(list(messages), mode="json")
-        rows: list[dict[str, Any]] = []
-        for offset, payload in enumerate(payloads):
-            kind = payload.pop("kind")
-            parts = payload.pop("parts")
-            payload.pop("usage", None)
-            finish_reason = payload.pop("finish_reason", None)
-            message = messages[offset]
-            tokens = response_tokens(message) if isinstance(message, ModelResponse) else None
-            rows.append(
-                dict(
-                    session_id=session_id,
-                    seq=start_seq + offset,
-                    kind=kind,
-                    message={"parts": parts},
-                    message_metadata=payload,
-                    finish_reason=finish_reason,
-                    input_tokens=tokens[0] if tokens is not None else None,
-                    output_tokens=tokens[1] if tokens is not None else None,
-                )
-            )
+        rows = _encode_history(session_id, range(start_seq, start_seq + len(messages)), messages)
         await self._db.execute(
             update(AgentStateRow)
             .where(col(AgentStateRow.session_id) == session_id)
@@ -235,3 +242,40 @@ class AgentRepository:
         if rows:
             await self._db.execute(insert(AgentHistoryRow), rows)
         return _decode_history([AgentHistoryRow(**row) for row in rows])
+
+    async def upsert_history(self, session_id: UUID, messages: Sequence[ModelMessage]) -> None:
+        """Overwrite a batch by metadata.seq, without touching checkpoint or lease state.
+
+        The caller owns the transaction and serializes writes for this session.
+        Identical and changed retries are both legal; created_at stays unchanged.
+        Invalid or duplicate seq values fail before any rows are written.
+        """
+        sequences: list[int] = []
+        seen: set[int] = set()
+        for message in messages:
+            seq = (message.metadata or {}).get("seq")
+            if type(seq) is not int or seq < 0:
+                raise ValueError("History metadata.seq must be a nonnegative integer")
+            if seq in seen:
+                raise ValueError("A history batch cannot contain duplicate seq values")
+            seen.add(seq)
+            sequences.append(seq)
+        rows = _encode_history(session_id, sequences, messages)
+        if rows:
+            statement = pg_insert(AgentHistoryRow).values(rows)
+            await self._db.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["session_id", "seq"],
+                    set_={
+                        name: statement.excluded[name]
+                        for name in (
+                            "kind",
+                            "message",
+                            "message_metadata",
+                            "finish_reason",
+                            "input_tokens",
+                            "output_tokens",
+                        )
+                    },
+                )
+            )

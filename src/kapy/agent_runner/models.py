@@ -1,4 +1,8 @@
-"""Execution position, append-only messages and context pages, without physical FKs."""
+"""Execution position, messages and context pages, without physical FKs.
+
+Legacy checkpoints append history; the Temporal runner may overwrite a history
+row by (session_id, seq). Callers must not mix these writers for one session.
+"""
 
 from datetime import datetime
 from typing import Any, ClassVar

@@ -29,7 +29,7 @@ async def serve(settings: CommonSettings) -> None:
             resources.temporal_client,
             task_queue=settings.temporal_task_queue,
             workflows=[RunnerWorkflow],
-            activities=[state_activities.save_runner_state],
+            activities=[state_activities.record_history, state_activities.save_runner_state],
             plugins=[AgentPlugin(agent)],
             graceful_shutdown_timeout=timedelta(seconds=15),
         ):
