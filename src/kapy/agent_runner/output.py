@@ -6,17 +6,11 @@ from uuid import UUID
 
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import (
-    AgentStreamEvent,
-    PartDeltaEvent,
-    PartStartEvent,
-    TextPart,
-    TextPartDelta,
-    ThinkingPart,
-    ThinkingPartDelta,
-)
+from pydantic_ai.messages import AgentStreamEvent
 
-from .types import OutputCallback, TextDelta
+from kapy.agent_output.deltas import to_text_delta
+
+from .types import OutputCallback
 
 
 class OutputCapability(AbstractCapability[Any]):
@@ -42,25 +36,7 @@ class OutputCapability(AbstractCapability[Any]):
         async for event in stream:
             callback, seq = self.callback, self.response_seq
             if callback is not None and seq is not None:
-                match event:
-                    case PartStartEvent(index=index, part=TextPart(content=text)):
-                        await callback(
-                            TextDelta(self.session_id, seq, index, "text", "replace", text)
-                        )
-                    case PartStartEvent(index=index, part=ThinkingPart(content=text)):
-                        await callback(
-                            TextDelta(self.session_id, seq, index, "thinking", "replace", text)
-                        )
-                    case PartDeltaEvent(index=index, delta=TextPartDelta(content_delta=text)) if (
-                        text
-                    ):
-                        await callback(
-                            TextDelta(self.session_id, seq, index, "text", "append", text)
-                        )
-                    case PartDeltaEvent(
-                        index=index, delta=ThinkingPartDelta(content_delta=text)
-                    ) if text:
-                        await callback(
-                            TextDelta(self.session_id, seq, index, "thinking", "append", text)
-                        )
+                delta = to_text_delta(event, session_id=self.session_id, response_seq=seq)
+                if delta is not None:
+                    await callback(delta)
             yield event

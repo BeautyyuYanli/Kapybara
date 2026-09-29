@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 from collections.abc import Iterator
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -17,7 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
 from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart, UserPromptPart
 from pydantic_ai.models.google import GoogleModel
@@ -26,11 +26,12 @@ from temporalio import activity
 from temporalio.client import Client
 from temporalio.worker import Replayer, Worker
 
+from kapy.agent_runner import MessageCommitted, OutputEvent, TextDelta
 from kapy.application.resources import connect_temporal
 from kapy.application.settings import CommonSettings
 from kapy.control.sessions.repository import SessionRepository
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow, agent
-from kapy.runner_duarable.activities import RunnerStateActivities
+from kapy.runner_duarable.activities import RunnerActivities
 from kapy.runner_duarable.types import SaveRunnerStateInput
 from kapy.runner_duarable.worker import serve
 
@@ -49,6 +50,8 @@ def endpoint() -> Iterator[tuple[str, list[dict[str, Any]]]]:
                     "headers": {key.lower(): value for key, value in self.headers.items()},
                 }
             )
+            response: dict[str, Any]
+            chunks: list[dict[str, Any]]
             if self.path.endswith("/chat/completions"):
                 response = {
                     "id": "chat_test",
@@ -90,9 +93,76 @@ def endpoint() -> Iterator[tuple[str, list[dict[str, Any]]]]:
                     ],
                     "modelVersion": "gemini-2.5-flash",
                 }
-            payload = json.dumps(response).encode()
+            if self.path.endswith("/chat/completions"):
+                assert body["stream"]
+                chunks = [
+                    {
+                        "id": "chat_test",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": body["model"],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": text},
+                                "finish_reason": reason,
+                            }
+                        ],
+                    }
+                    for text, reason in [("do", None), ("ne", None), ("", "stop")]
+                ]
+            elif self.path.endswith("/responses"):
+                assert body["stream"]
+                item = response["output"][0]
+                part = item["content"][0]
+                chunks = [
+                    {"type": "response.created", "response": {**response, "output": []}},
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {**item, "content": []},
+                    },
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": "msg_test",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {**part, "text": ""},
+                    },
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_test",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "done",
+                    },
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": "msg_test",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": "done",
+                    },
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": "msg_test",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": part,
+                    },
+                    {"type": "response.output_item.done", "output_index": 0, "item": item},
+                    {"type": "response.completed", "response": response},
+                ]
+                for index, chunk in enumerate(chunks):
+                    chunk["sequence_number"] = index
+            else:
+                assert "streamGenerateContent" in self.path
+                chunks = [response]
+            payload = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks).encode()
+            if self.path.endswith("/chat/completions"):
+                payload += b"data: [DONE]\n\n"
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -152,8 +222,6 @@ def test_input_round_trip_and_validation():
         with pytest.raises(ValidationError):
             RunnerInput.model_validate(data.model_dump() | {"runner_state_version": version})
         with pytest.raises(ValidationError):
-            RunnerInput.model_validate(data.model_dump() | {"next_seq": version})
-        with pytest.raises(ValidationError):
             SaveRunnerStateInput.model_validate(
                 {"session_id": data.session_id, "expected_version": version, "runner_state": ""}
             )
@@ -168,16 +236,26 @@ def test_input_round_trip_and_validation():
 async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, runner_database):
     base_url, requests = endpoint
     config = make_config(base_url, model_class.__name__)
-    original_request = model_class.request
+    original_request = model_class.request_stream
     models = []
 
+    @asynccontextmanager
     async def checked_request(self, *args, **kwargs):
         assert activity.in_activity(), "Model I/O escaped the Activity boundary"
         assert self.context_window == 12345
         models.append(self)
-        return await original_request(self, *args, **kwargs)
+        async with original_request(self, *args, **kwargs) as stream:
+            yield stream
 
-    monkeypatch.setattr(model_class, "request", checked_request)
+    monkeypatch.setattr(model_class, "request_stream", checked_request)
+    broadcasts: list[OutputEvent] = []
+    publish = runner_database.outputs._publish
+
+    async def observe_publish(session_id, payload):
+        await publish(session_id, payload)
+        broadcasts.extend(TypeAdapter(list[OutputEvent]).validate_json(payload))
+
+    monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
     client = await Client.connect(
         os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
         plugins=[PydanticAIPlugin()],
@@ -188,8 +266,8 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
         task_queue=queue,
         workflows=[RunnerWorkflow],
         activities=[
-            RunnerStateActivities(runner_database.sessions).record_history,
-            RunnerStateActivities(runner_database.sessions).save_runner_state,
+            RunnerActivities(runner_database.sessions, runner_database.outputs).record_messages,
+            RunnerActivities(runner_database.sessions, runner_database.outputs).save_runner_state,
         ],
         plugins=[AgentPlugin(agent)],
     ):
@@ -218,7 +296,19 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
     async with runner_database.sessions.begin() as db:
         stored = await AgentRepository(db).read_history_entries(runner_database.session_id)
     assert [entry.seq for entry in stored] == [0, 1]
-    assert [entry.message.metadata for entry in stored] == [{"seq": 0}, {"seq": 1}]
+    assert [
+        (e.message.seq, e.message.authoritative)
+        for e in broadcasts
+        if isinstance(e, MessageCommitted)
+    ] == [(0, False), (0, True), (1, True)]
+    assert [(e.response_seq, e.text) for e in broadcasts if isinstance(e, TextDelta)] == [
+        (1, "done")
+    ]
+    published_before_replay = list(broadcasts)
+    assert [entry.message.metadata for entry in stored] == [
+        {"seq": 0, "authoritative": True},
+        {"seq": 1, "authoritative": True},
+    ]
     messages = ModelMessagesTypeAdapter.validate_json(state)
     assert any(
         isinstance(part, UserPromptPart) and part.content == "hello"
@@ -239,7 +329,7 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
     await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
         history
     )
-    assert len(requests) == 1
+    assert len(requests) == 1 and broadcasts == published_before_replay
     async with runner_database.sessions.begin() as db:
         repo = SessionRepository(db)
         assert await repo.read_runner_state(runner_database.session_id) == (state, 1)
@@ -259,12 +349,14 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_databa
             runner_database.session_id, expected_version=0, runner_state="previous"
         )
 
+    @asynccontextmanager
     async def fail_request(self, *args, **kwargs):
         assert activity.in_activity()
         models.append(self)
         raise UserError("invalid model request")
+        yield  # pragma: no cover - retain the SDK async context manager contract
 
-    monkeypatch.setattr(OpenAIChatModel, "request", fail_request)
+    monkeypatch.setattr(OpenAIChatModel, "request_stream", fail_request)
     client = await Client.connect(
         os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
         plugins=[PydanticAIPlugin()],
@@ -275,8 +367,8 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_databa
         task_queue=queue,
         workflows=[RunnerWorkflow],
         activities=[
-            RunnerStateActivities(runner_database.sessions).record_history,
-            RunnerStateActivities(runner_database.sessions).save_runner_state,
+            RunnerActivities(runner_database.sessions, runner_database.outputs).record_messages,
+            RunnerActivities(runner_database.sessions, runner_database.outputs).save_runner_state,
         ],
         plugins=[AgentPlugin(agent)],
     ):
@@ -353,7 +445,7 @@ async def test_save_retries_after_commit_without_incrementing_again(endpoint, ru
     from temporalio.exceptions import ApplicationError
 
     base_url, requests = endpoint
-    saver = RunnerStateActivities(runner_database.sessions)
+    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
     observations = []
     inputs = []
 
@@ -378,7 +470,7 @@ async def test_save_retries_after_commit_without_incrementing_again(endpoint, ru
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[lose_first_ack, saver.record_history],
+        activities=[lose_first_ack, saver.record_messages],
         plugins=[AgentPlugin(agent)],
     ):
         result = await client.execute_workflow(
@@ -412,14 +504,14 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
         await SessionRepository(db).save_runner_state(
             runner_database.session_id, expected_version=0, runner_state="previous"
         )
-    saver = RunnerStateActivities(runner_database.sessions)
+    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-save-failure-{uuid4()}"
     async with Worker(
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[saver.record_history, saver.save_runner_state],
+        activities=[saver.record_messages, saver.save_runner_state],
         plugins=[AgentPlugin(agent)],
     ):
         with pytest.raises(WorkflowFailureError) as exc_info:
@@ -454,14 +546,14 @@ async def test_workflow_restores_state_and_continues_marks(endpoint, runner_data
     from kapy.agent_runner.repository import AgentRepository
 
     base_url, requests = endpoint
-    saver = RunnerStateActivities(runner_database.sessions)
+    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-restore-{uuid4()}"
     async with Worker(
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[saver.record_history, saver.save_runner_state],
+        activities=[saver.record_messages, saver.save_runner_state],
         plugins=[AgentPlugin(agent)],
     ):
         for prompt in ("first", "follow-up"):
@@ -476,7 +568,6 @@ async def test_workflow_restores_state_and_continues_marks(endpoint, runner_data
                         session_id=runner_database.session_id,
                         runner_state_version=version,
                         runner_state=state,
-                        next_seq=100 if version == 0 else None,
                         user_prompt=prompt,
                         config=make_config(base_url),
                     ),
@@ -497,8 +588,10 @@ async def test_workflow_restores_state_and_continues_marks(endpoint, runner_data
         entries = await AgentRepository(db).read_history_entries(runner_database.session_id)
     assert state is not None and version == 2
     messages = ModelMessagesTypeAdapter.validate_json(state)
-    assert [m.metadata for m in messages] == [{"seq": seq} for seq in range(100, 104)]
-    assert [entry.seq for entry in entries] == list(range(100, 104))
+    assert [m.metadata for m in messages] == [
+        {"seq": seq, "authoritative": True} for seq in range(4)
+    ]
+    assert [entry.seq for entry in entries] == list(range(4))
     # History normalizes usage into token columns; runner_state retains SDK usage.
     assert ModelMessagesTypeAdapter.dump_python(
         [entry.message for entry in entries], exclude={"__all__": {"usage"}}
@@ -515,14 +608,14 @@ async def test_invalid_state_fails_workflow_before_model_call(endpoint, runner_d
     from kapy.agent_runner.repository import AgentRepository
 
     base_url, requests = endpoint
-    saver = RunnerStateActivities(runner_database.sessions)
+    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-invalid-state-{uuid4()}"
     async with Worker(
         client,
         task_queue=queue,
         workflows=[RunnerWorkflow],
-        activities=[saver.record_history, saver.save_runner_state],
+        activities=[saver.record_messages, saver.save_runner_state],
         plugins=[AgentPlugin(agent)],
     ):
         with pytest.raises(WorkflowFailureError) as error:
@@ -556,16 +649,16 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(endpoint
     from temporalio.exceptions import ApplicationError
 
     from kapy.agent_runner.repository import AgentRepository
-    from kapy.runner_duarable.types import RecordHistoryInput
+    from kapy.runner_duarable.types import MessageBatch
 
     base_url, requests = endpoint
-    saver = RunnerStateActivities(runner_database.sessions)
+    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
     inputs = []
 
     @activity.defn(name="kapy.record_history")
-    async def lose_first_ack(data: RecordHistoryInput) -> None:
+    async def lose_first_ack(data: MessageBatch) -> None:
         inputs.append(data)
-        await saver.record_history(data)
+        await saver.record_messages(data)
         if activity.info().attempt == 1:
             raise ApplicationError("simulated history commit with lost acknowledgment")
 
@@ -584,7 +677,6 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(endpoint
                 session_id=runner_database.session_id,
                 runner_state_version=0,
                 runner_state=None,
-                next_seq=50,
                 user_prompt="hello",
                 config=make_config(base_url),
             ),
@@ -596,16 +688,16 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(endpoint
         history = await handle.fetch_history()
     assert len(requests) == 1
     assert len(inputs) == 4 and inputs[0] == inputs[1] and inputs[2] == inputs[3]
-    assert [m.metadata for m in inputs[0].messages] == [{"seq": 50}, {"seq": 51}]
-    assert [m.metadata for m in inputs[2].messages] == [{"seq": 50}]
+    assert [(m.seq, m.authoritative) for m in inputs[0].messages] == [(0, False)]
+    assert [(m.seq, m.authoritative) for m in inputs[2].messages] == [(0, True), (1, True)]
     async with runner_database.sessions.begin() as db:
         entries = await AgentRepository(db).read_history_entries(runner_database.session_id)
         state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
-    assert [entry.seq for entry in entries] == [50, 51]
+    assert [entry.seq for entry in entries] == [0, 1]
     assert state is not None and version == 1
     assert [m.metadata for m in ModelMessagesTypeAdapter.validate_json(state)] == [
-        {"seq": 50},
-        {"seq": 51},
+        {"seq": 0, "authoritative": True},
+        {"seq": 1, "authoritative": True},
     ]
     await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
         history

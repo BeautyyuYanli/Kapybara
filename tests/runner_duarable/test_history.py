@@ -1,4 +1,4 @@
-"""History marks follow real SDK nodes; only the Temporal persistence boundary is stubbed."""
+"""Recording boundaries follow real SDK nodes; only Activity persistence is stubbed."""
 
 import asyncio
 from copy import deepcopy
@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic_ai import Agent, ModelRequestNode, RunContext
-from pydantic_ai.capabilities import AbstractCapability, AgentNode, CapabilityOrdering, NodeResult
+from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering, Hooks
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -20,13 +20,14 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.run import AgentRunResult
 
-from kapy.runner_duarable import DurableExecutionConfig, HistoryRecordCapability, RunnerDeps
-from kapy.runner_duarable.types import RecordHistoryInput
+from kapy.runner_duarable import DurableExecutionConfig, MessageRecordCapability, RunnerDeps
+from kapy.runner_duarable.recording import record_before_model_request
+from kapy.runner_duarable.types import MessageBatch
 
 pytestmark = pytest.mark.asyncio
 
 
-def make_deps(next_seq: int | None = None) -> RunnerDeps:
+def make_deps() -> RunnerDeps:
     return RunnerDeps(
         config=DurableExecutionConfig(
             provider_class="pydantic_ai.providers.openai:OpenAIProvider",
@@ -35,12 +36,11 @@ def make_deps(next_seq: int | None = None) -> RunnerDeps:
             api_key="test-secret",
         ),
         session_id=uuid4(),
-        next_seq=next_seq,
     )
 
 
 @pytest.fixture
-def recorded(monkeypatch) -> list[RecordHistoryInput]:
+def recorded(monkeypatch) -> list[MessageBatch]:
     batches = []
 
     async def record(name, data, *, start_to_close_timeout):
@@ -49,198 +49,215 @@ def recorded(monkeypatch) -> list[RecordHistoryInput]:
         batches.append(deepcopy(data))
         await asyncio.sleep(0)
 
-    monkeypatch.setattr("kapy.runner_duarable.history.workflow.execute_activity", record)
+    monkeypatch.setattr("kapy.runner_duarable.recording.workflow.execute_activity", record)
     return batches
 
 
-def seqs(messages: list[ModelMessage]) -> list[int]:
-    result = []
-    for message in messages:
-        assert message.metadata is not None
-        result.append(message.metadata["seq"])
-    return result
+def metadata(message: ModelMessage) -> dict[str, Any]:
+    assert message.metadata is not None
+    return message.metadata
 
 
-class FinishRequest(AbstractCapability[RunnerDeps]):
-    """Business hooks must run before the recorder, even if both request outermost."""
+def request_hook() -> Hooks:
+    return Hooks(
+        model_request=record_before_model_request,
+        ordering=CapabilityOrdering(position="innermost", requires=[MessageRecordCapability]),
+    )
+
+
+class FinishMessages(AbstractCapability[RunnerDeps]):
+    """Business hooks finalize messages before recording, even when also outermost."""
 
     def get_ordering(self) -> CapabilityOrdering:
         return CapabilityOrdering(position="outermost")
 
-    async def after_node_run(
-        self,
-        ctx: RunContext[RunnerDeps],
-        *,
-        node: AgentNode[RunnerDeps],
-        result: NodeResult[RunnerDeps],
-    ) -> NodeResult[RunnerDeps]:
+    async def wrap_model_request(self, ctx, *, request_context, handler):
+        request = ctx.messages[-1]
+        request.metadata = {**(request.metadata or {}), "prepared": True}
+        return await handler(request_context)
+
+    async def after_node_run(self, ctx, *, node, result):
         if isinstance(node, ModelRequestNode):
             request = next(m for m in reversed(ctx.messages) if isinstance(m, ModelRequest))
-            request.metadata = {**(request.metadata or {}), "source": "business"}
+            request.metadata = {**(request.metadata or {}), "finished": True}
         return result
 
     async def after_run(
         self, ctx: RunContext[RunnerDeps], *, result: AgentRunResult[Any]
     ) -> AgentRunResult[Any]:
-        request = next(m for m in reversed(result.all_messages()) if isinstance(m, ModelRequest))
-        request.parts = [*request.parts, UserPromptPart("final request content")]
+        result.all_messages().append(ModelRequest(parts=[UserPromptPart("next run")]))
         return result
 
 
-async def test_tools_explicit_start_and_final_request_overwrite(recorded):
+async def test_three_boundaries_finalize_then_record_and_predict_response(recorded):
+    from pydantic_ai.models.function import FunctionModel
+
+    predicted = []
+
+    async def respond(messages, info):
+        predicted.append(deps.response_seq)
+        assert messages[-1].metadata == {"prepared": True, "seq": 0, "authoritative": False}
+        assert recorded[-1].messages[0].message == messages[-1]
+        return ModelResponse(parts=[TextPart("done")])
+
+    deps = make_deps()
     agent = Agent(
-        TestModel(),
+        FunctionModel(respond),
         deps_type=RunnerDeps,
-        capabilities=[HistoryRecordCapability(), FinishRequest()],
+        capabilities=[MessageRecordCapability(), FinishMessages(), request_hook()],
     )
-
-    @agent.tool_plain
-    def work() -> str:
-        return "ok"
-
-    deps = make_deps(100)
     result = await agent.run("go", deps=deps)
-    assert [seqs(batch.messages) for batch in recorded] == [[100, 101], [102, 103], [102]]
-    assert seqs(result.all_messages()) == [100, 101, 102, 103]
-    assert deps.next_seq == 100
-    assert all(batch.session_id == deps.session_id for batch in recorded)
-    initial_request, final_request = recorded[1].messages[0], recorded[-1].messages[0]
-    assert initial_request.metadata == final_request.metadata == {"source": "business", "seq": 102}
-    assert len(final_request.parts) == len(initial_request.parts) + 1
-    assert final_request.parts[-1] == UserPromptPart(
-        "final request content", timestamp=final_request.parts[-1].timestamp
-    )
+    assert [[(m.seq, m.authoritative) for m in b.messages] for b in recorded] == [
+        [(0, False)],
+        [(0, True), (1, True)],
+        [(2, False)],
+    ]
+    assert recorded[1].messages[0].message.metadata == {
+        "prepared": True,
+        "finished": True,
+        "seq": 0,
+        "authoritative": True,
+    }
+    assert [m.metadata for m in result.all_messages()][-2:] == [
+        {"seq": 1, "authoritative": True},
+        {"seq": 2, "authoritative": False},
+    ]
+    assert predicted == [1] and deps.response_seq is None
 
 
-async def test_output_tool_closing_request_recorded_once(recorded):
+async def test_tools_and_output_tool_tail_use_same_recording_boundaries(recorded):
     agent = Agent(
         TestModel(custom_output_args=["one"]),
         output_type=list[str],
         deps_type=RunnerDeps,
-        capabilities=[HistoryRecordCapability()],
-    )
-    result = await agent.run("go", deps=make_deps())
-    assert result.output == ["one"]
-    assert [seqs(batch.messages) for batch in recorded] == [[0, 1], [2]]
-    assert isinstance(recorded[-1].messages[0].parts[0], ToolReturnPart)
-    assert seqs(result.all_messages()) == [0, 1, 2]
-
-
-async def test_restore_merged_suffix_uses_last_remaining_mark(recorded):
-    agent = Agent(TestModel(), deps_type=RunnerDeps, capabilities=[HistoryRecordCapability()])
-    history = [
-        ModelRequest(parts=[UserPromptPart("first")], metadata={"seq": 8}),
-        ModelResponse(parts=[TextPart("reply")], metadata={"seq": 9}),
-        ModelRequest(parts=[UserPromptPart("second")], metadata={"seq": 10}),
-        ModelRequest(parts=[UserPromptPart("third")], metadata={"seq": 11}),
-    ]
-    result = await agent.run("new", deps=make_deps(), message_history=history)
-    assert [seqs(batch.messages) for batch in recorded] == [[10, 11, 12], [11]]
-    merged = recorded[0].messages[0]
-    assert [part.content for part in merged.parts] == ["second", "third"]
-    assert seqs(result.all_messages()) == [8, 9, 10, 11, 12]
-
-
-@pytest.mark.parametrize("next_seq", [None, 50])
-async def test_no_anchor_requires_explicit_start_for_nonempty_history(recorded, next_seq):
-    agent = Agent(TestModel(), deps_type=RunnerDeps, capabilities=[HistoryRecordCapability()])
-    history = [
-        ModelRequest(parts=[UserPromptPart("first")], metadata={"seq": 10}),
-        ModelRequest(parts=[UserPromptPart("second")], metadata={"seq": 11}),
-    ]
-    if next_seq is None:
-        with pytest.raises(UserError, match="no seq anchor"):
-            await agent.run("new", deps=make_deps(), message_history=history)
-        assert recorded == []
-    else:
-        result = await agent.run("new", deps=make_deps(next_seq), message_history=history)
-        assert seqs(result.all_messages()) == [50, 51, 52]
-
-
-@pytest.mark.parametrize("start", [None, 100])
-async def test_restore_numbered_history_and_unnumbered_tail(recorded, start):
-    history = [
-        ModelRequest(parts=[UserPromptPart("old")], metadata={"seq": 5}),
-        ModelResponse(parts=[TextPart("reply")], metadata={"seq": 10}),
-        ModelRequest(parts=[UserPromptPart("pending")]),
-    ]
-    agent = Agent(TestModel(), deps_type=RunnerDeps, capabilities=[HistoryRecordCapability()])
-    result = await agent.run("new", deps=make_deps(start), message_history=history)
-    expected = start if start is not None else 11
-    assert seqs(result.all_messages()) == [5, 10, expected, expected + 1, expected + 2]
-
-
-@pytest.mark.parametrize(
-    "metadata,start,error",
-    [
-        ({"seq": True}, None, "nonnegative integer"),
-        ({"seq": -1}, None, "nonnegative integer"),
-        ({"seq": 1.5}, None, "nonnegative integer"),
-        ({"seq": "1"}, None, "nonnegative integer"),
-        ({"seq": None}, None, "nonnegative integer"),
-        ({"seq": 5}, 5, "greater than"),
-        ({"seq": 5}, 4, "greater than"),
-    ],
-)
-async def test_invalid_marks_and_colliding_start_fail(recorded, metadata, start, error):
-    agent = Agent(TestModel(), deps_type=RunnerDeps, capabilities=[HistoryRecordCapability()])
-    history = [ModelResponse(parts=[TextPart("old")], metadata=metadata)]
-    with pytest.raises(UserError, match=error):
-        await agent.run("go", deps=make_deps(start), message_history=history)
-    assert recorded == []
-
-
-async def test_lost_all_marks_after_first_record_cannot_reuse_explicit_start(recorded):
-    class LoseMarks(AbstractCapability[RunnerDeps]):
-        async def after_node_run(self, ctx, *, node, result):
-            if isinstance(node, ModelRequestNode) and len(ctx.messages) > 2:
-                for message in ctx.messages:
-                    message.metadata = None
-            return result
-
-    agent = Agent(
-        TestModel(),
-        deps_type=RunnerDeps,
-        capabilities=[HistoryRecordCapability(), LoseMarks()],
+        capabilities=[MessageRecordCapability(), request_hook()],
     )
 
     @agent.tool_plain
     def work() -> str:
         return "ok"
 
-    with pytest.raises(UserError, match="no seq anchor"):
-        await agent.run("go", deps=make_deps(100))
-    assert [seqs(batch.messages) for batch in recorded] == [[100, 101]]
+    result = await agent.run("go", deps=make_deps())
+    assert result.output == ["one"]
+    assert [[(m.seq, m.authoritative) for m in b.messages] for b in recorded] == [
+        [(0, False)],
+        [(0, True), (1, True)],
+        [(2, False)],
+        [(2, True), (3, True)],
+        [(4, False)],
+    ]
+    assert isinstance(recorded[-1].messages[0].message.parts[0], ToolReturnPart)
 
 
-async def test_failed_activity_does_not_mark_live_history(monkeypatch):
-    observed = []
+async def test_restore_merged_non_authoritative_tail_restarts_after_authority(recorded):
+    agent = Agent(
+        TestModel(),
+        deps_type=RunnerDeps,
+        capabilities=[MessageRecordCapability(), request_hook()],
+    )
+    history = [
+        ModelRequest(parts=[UserPromptPart("first")], metadata={"seq": 5, "authoritative": True}),
+        ModelResponse(parts=[TextPart("reply")], metadata={"seq": 10, "authoritative": True}),
+        ModelRequest(
+            parts=[UserPromptPart("second")], metadata={"seq": 90, "authoritative": False}
+        ),
+        ModelRequest(parts=[UserPromptPart("third")], metadata={"seq": 90}),
+    ]
+    result = await agent.run("new", deps=make_deps(), message_history=history)
+    assert [[m.seq for m in b.messages] for b in recorded] == [[11, 12], [11, 12, 13]]
+    assert [part.content for part in recorded[0].messages[0].message.parts] == ["second", "third"]
+    assert [metadata(m)["seq"] for m in result.all_messages()] == [5, 10, 11, 12, 13]
+    assert all(metadata(m)["authoritative"] for m in result.all_messages())
 
-    class Observe(AbstractCapability[RunnerDeps]):
-        async def after_node_run(self, ctx, *, node, result):
-            if isinstance(node, ModelRequestNode):
-                observed.extend(ctx.messages)
-            return result
+
+async def test_non_authoritative_positions_never_advance_anchor(recorded):
+    messages = [
+        ModelResponse(parts=[TextPart("old")], metadata={"seq": 90}),
+        ModelRequest(parts=[UserPromptPart("tail")], metadata={"seq": 90, "authoritative": False}),
+    ]
+    recorder, deps = MessageRecordCapability(), make_deps()
+    assert await recorder.record_messages(deps, messages, authoritative=False) == 2
+    assert [m.metadata for m in messages] == [
+        {"seq": 0, "authoritative": False},
+        {"seq": 1, "authoritative": False},
+    ]
+    assert await recorder.record_messages(deps, messages, authoritative=True) == 2
+    assert [[m.seq for m in b.messages] for b in recorded] == [[0, 1], [0, 1]]
+    assert await recorder.record_messages(deps, messages, authoritative=False) == 2
+    assert len(recorded) == 2
+
+
+@pytest.mark.parametrize(
+    "metadata,error",
+    [
+        ({"seq": True}, "nonnegative integer"),
+        ({"seq": -1}, "nonnegative integer"),
+        ({"seq": "1"}, "nonnegative integer"),
+        ({"seq": None}, "nonnegative integer"),
+        ({"authoritative": "true"}, "boolean"),
+        ({"authoritative": True}, "requires metadata.seq"),
+    ],
+)
+async def test_invalid_metadata_rejected(recorded, metadata, error):
+    with pytest.raises(UserError, match=error):
+        await MessageRecordCapability().record_messages(
+            make_deps(), [ModelResponse(parts=[], metadata=metadata)], authoritative=False
+        )
+    assert recorded == []
+
+
+@pytest.mark.parametrize("seq", [5, 4])
+async def test_authoritative_marks_must_increase(recorded, seq):
+    messages: list[ModelMessage] = [
+        ModelResponse(parts=[], metadata={"seq": value, "authoritative": True})
+        for value in (5, seq)
+    ]
+    with pytest.raises(UserError, match="strictly increasing"):
+        await MessageRecordCapability().record_messages(make_deps(), messages, authoritative=True)
+    assert recorded == []
+
+
+async def test_failed_recording_keeps_live_metadata_and_independent_copy(monkeypatch):
+    message = ModelRequest(parts=[UserPromptPart("original")], metadata={"source": "business"})
 
     async def fail(name, data, **kwargs):
-        assert seqs(data.messages) == [50, 51]
-        assert all(message.metadata is None for message in observed)
+        assert data.messages[0].seq == 0 and data.messages[0].authoritative
+        data.messages[0].message.parts.clear()
+        assert message.metadata == {"source": "business"} and message.parts
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr("kapy.runner_duarable.history.workflow.execute_activity", fail)
-    agent = Agent(
-        TestModel(), deps_type=RunnerDeps, capabilities=[HistoryRecordCapability(), Observe()]
-    )
+    monkeypatch.setattr("kapy.runner_duarable.recording.workflow.execute_activity", fail)
     with pytest.raises(RuntimeError, match="database unavailable"):
-        await agent.run("go", deps=make_deps(50))
-    assert len(observed) == 2
-    assert all(message.metadata is None for message in observed)
+        await MessageRecordCapability().record_messages(make_deps(), [message], authoritative=True)
+    assert message.metadata == {"source": "business"} and message.parts
 
 
-async def test_same_agent_isolates_concurrent_runs(recorded):
-    agent = Agent(TestModel(), deps_type=RunnerDeps, capabilities=[HistoryRecordCapability()])
+async def test_model_failure_clears_prediction_and_retains_provisional_request(recorded):
+    from pydantic_ai.models.function import FunctionModel
+
+    deps = make_deps()
+
+    async def fail(messages, info):
+        assert deps.response_seq == 1
+        raise RuntimeError("model failed")
+
+    agent = Agent(
+        FunctionModel(fail),
+        deps_type=RunnerDeps,
+        capabilities=[MessageRecordCapability(), request_hook()],
+    )
+    with pytest.raises(RuntimeError, match="model failed"):
+        await agent.run("go", deps=deps)
+    assert deps.response_seq is None
+    assert [[(m.seq, m.authoritative) for m in b.messages] for b in recorded] == [[(0, False)]]
+
+
+async def test_shared_agent_runs_keep_independent_positions(recorded):
+    agent = Agent(
+        TestModel(), deps_type=RunnerDeps, capabilities=[MessageRecordCapability(), request_hook()]
+    )
     results = await asyncio.gather(
         agent.run("first", deps=make_deps()), agent.run("second", deps=make_deps())
     )
-    assert [seqs(result.all_messages()) for result in results] == [[0, 1], [0, 1]]
+    assert [[metadata(m)["seq"] for m in r.all_messages()] for r in results] == [[0, 1], [0, 1]]
     assert len({batch.session_id for batch in recorded}) == 2

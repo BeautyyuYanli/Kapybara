@@ -31,7 +31,7 @@ class RunnerWorkflow:
             data.user_prompt,
             model=MODEL_ID,
             model_settings=cast(ModelSettings, data.config.model_settings),
-            deps=RunnerDeps(config=data.config, session_id=data.session_id, next_seq=data.next_seq),
+            deps=RunnerDeps(config=data.config, session_id=data.session_id),
             message_history=history,
         )
         await workflow.execute_activity(

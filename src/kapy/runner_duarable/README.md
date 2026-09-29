@@ -13,7 +13,6 @@ RunnerInput(
     session_id=session_id,  # An existing session UUID.
     runner_state_version=version,
     runner_state=runner_state,  # Required; None for a new session.
-    # next_seq=100,  # Optional explicit start for the first new batch only.
     user_prompt="Hello",
     config=DurableExecutionConfig(
         provider_class="pydantic_ai.providers.openai:OpenAIProvider",
@@ -32,7 +31,7 @@ using `ModelMessagesTypeAdapter.validate_json()` and passes the message list to
 `agent.run(message_history=...)`. Invalid JSON or message structure raises SDK
 `UserError` and fails the Workflow; it never silently starts over. After success,
 `result.all_messages_json().decode("utf-8")` saves the complete accumulated history,
-including metadata seq marks and the final message. State remains a bare SDK
+including metadata seq/authoritative marks and the final message. State remains a bare SDK
 message-array JSON string, without a wrapper or cumulative run usage. The session
 layer stores it opaquely and does not expose it through session DTOs/HTTP.
 
@@ -58,61 +57,80 @@ so an unsuccessful Workflow may still have saved state. Saving never changes the
 session's lifecycle status. Partial failure/cancel snapshots are outside this
 runner's contract.
 
-## History recording
+## Message recording and realtime output
 
-`HistoryRecordCapability` is registered on the shared Agent, with a fresh instance
-per run. It wraps all other capabilities so its `after_node_run` observes their
-final mutations. After every `ModelRequestNode`, it scans `ctx.messages` for the
-last `metadata["seq"]` and records the entire unnumbered suffix. `after_run` records
-any remaining suffix (including output-tool return messages) and overwrites the
-last `ModelRequest` at its existing seq, capturing its final content. A Request
-already in the new suffix is included only once. Other numbered messages are not
-compared for edits or automatically rewritten.
+`MessageRecordCapability` is a stateless capability on the shared Agent. Three
+boundaries record the entire suffix after the last authoritative SDK message:
 
-Each message has one nonnegative integer seq; other metadata keys survive marking.
-Retained marks must increase in history order, but gaps are allowed. Numbering is:
+| Boundary | authoritative | Ordering |
+| --- | --- | --- |
+| Before the model request | False | Innermost `Hooks(model_request=...)`, directly outside Temporal dispatch |
+| After each ModelRequestNode | True | Last `after_node_run`, after business hooks finalize messages |
+| After the run | False | Last `after_run`, including any output-tool return tail |
 
-- With no explicit start, continue after the last retained seq.
-- `RunnerDeps.next_seq` holds the caller's optional first-batch start. It must be
-  greater than the last retained mark. It stays unchanged; only the run-local
-  first-record flag changes after successful persistence. Later batches derive
-  numbering from history, never from a separate counter or database `MAX(seq)`.
-- An initially empty history can start at 0 before its first recorded batch.
-  Otherwise, no retained marks means an unused explicit `next_seq` is required.
-  Restored unnumbered tails are ordinary pending messages.
+The recorder wraps all capabilities so reverse post-hook execution makes it last.
+Register business wrappers, including other innermost peers, before the request
+hook. This hook is later than SDK `before_model_request`: instructions and business
+request preparation have finished before it records and predicts the response.
 
-SDK initialization can merge requests and drop their metadata. There is no
-`before_model_request` repair hook: if a retained seq 9 precedes old requests
-10/11 merged without marks, the merged message is recorded as 10, and subsequent
-messages start at 11. Existing rows may be overwritten. seq identifies a database
-row, not a permanent identity across history transforms. Business capabilities
-must keep retained marks ordered and keep all messages needing incremental
-recording after the last mark. Rebuilding messages must preserve metadata when
-original numbering is needed. Losing all marks after a batch is an error, even
-for a run that originally started empty or supplied an explicit start.
+Only messages with `metadata.authoritative=True` anchor numbering. Their
+`metadata.seq` values must be nonnegative strict integers and strictly increasing;
+gaps are allowed. Missing authority means False; invalid flag/seq types fail.
+Every message after the last authoritative one gets numbered again, starting at
+that seq + 1 (or zero without an anchor). Non-authoritative seq values may repeat
+or be stale; they never advance the anchor. There is no caller-supplied start,
+run-local counter, or database maximum-seq query.
 
-The capability makes independent copies, assigns their seq values, and awaits
-`kapy.record_history` before marking the live messages. The Activity commits a
-single transaction through `AgentRepository.upsert_history()`; failure leaves
-new live messages unmarked. `RecordHistoryInput` carries the session UUID and SDK
-messages with metadata seq, using the SDK Pydantic Temporal converter. Invalid or
-duplicate batch seq values fail as non-retryable `InvalidHistory`; transient
-failures use Temporal's default retries and a 30-second start-to-close timeout.
-Replay applies marks again using recorded Activity completions.
+The recorder deep-copies this suffix, assigns seq and authoritative in SDK
+metadata, and creates `HistoryMessage(session_id, seq, authoritative, message)`
+from the same values. One `kapy.record_history` Activity commits the entire batch,
+then broadcasts `MessageCommitted` snapshots from those exact input DTOs. Only
+after acknowledgment does the recorder mark live SDK messages. Failure never
+prematurely marks them. Empty suffixes do not schedule an Activity. The request
+hook sets `RunnerDeps.response_seq` to the next position while invoking the model
+handler, then clears it in `finally`. Model Activities inherit that prediction;
+retries reuse it.
 
-The existing `agent_history` primary key `(session_id, seq)` uses upsert semantics.
-Same-seq content changes are legal. An overwrite replaces kind, parts, metadata,
-finish reason and normalized token columns, clearing obsolete nullable values;
-`created_at` stays unchanged. No checkpoint, lease, state or input queue is touched
-by this Activity. There is no schema migration, conflict-content comparison or
-revision arbitration: callers serialize session runs, and commit order wins.
+Business hooks must preserve the authoritative prefix. Once the node's messages
+are authoritative, later hooks may only change non-authoritative tails or append
+new messages. There is no final Request rewrite. During a model request, do not
+insert or reorder messages before the response: that would invalidate the predicted
+seq used by provisional deltas. Content changes are allowed. Node-after recording
+always uses actual SDK history; no cross-seq preview migration is provided.
 
-History batches and the final runner-state save are separate transactions. A
+`RunnerActivities.record_messages(MessageBatch)` retains the registered Activity
+name `kapy.record_history` and a 30-second timeout. Its transaction calls
+`AgentRepository.upsert_history(session_id, entries)` with explicit DTO fields.
+The `agent_history.authoritative` column sits alongside seq; the generated migration
+initializes existing rows to False. JSON is opaque payload for storage decisions:
+seq and authority are never extracted from JSON or reconciled with SDK metadata.
+History DTOs take both attributes from columns. Existing SDK payload encoding and
+normalized token columns remain unchanged; full events retain all input SDK fields,
+including usage details, without a database reconstruction.
+
+Upsert unconditionally replaces `(session_id, seq)`, including authoritative and
+nullable fields, while preserving created_at. Invalid seq/authority, mismatched
+session IDs, and duplicate positions within a batch fail as non-retryable
+`InvalidHistory`. Authority is a producer convention, not a conflict condition.
+Transient failures retry normally: repeated writes and broadcasts are allowed,
+and full output events replace the same key regardless of authority or seq order.
+Only a committed batch is published. Transport failures do not roll back history;
+commit followed by a crash can miss broadcasts. No outbox or exactly-once contract
+is added. Replay of completed Activities performs no storage or output I/O.
+
+History batches and the final runner-state save remain separate transactions. A
 failed run may leave recorded history while the previous state remains available.
 Rerunning from that state can overwrite rows, and uncovered rows are not deleted.
-History therefore is not a mirror of the last successful snapshot. `after_seq`
-queries do not return updates at an already-consumed seq. This runner does not
-publish `MessageCommitted` events or implement realtime update delivery.
+The successful state includes seq/authority metadata, including a non-authoritative
+after-run tail that can be re-numbered in the next run. History is not a mirror of
+the last successful state. `after_seq` queries cannot recover earlier overwrites.
+
+Use `AgentOutputService.subscribe()` for this output path. A full snapshot replaces
+the same key and clears its provisional text; later deltas form a fresh preview,
+never append into the complete message itself. `SessionService.live()` assumes
+contiguous append-only history and is not this runner's consumer; HTTP and Telegram
+execution are not switched to Temporal here. Transport buffering and close behavior
+are described in [the runner output contract](../agent_runner/README.md).
 
 The module defines its own Agent at module scope. It reuses Provider/Model
 construction helpers, but does not import the legacy application Agent factory.
@@ -134,14 +152,28 @@ Workflow and Activity tasks. It uses `PydanticAIPlugin()` on its Client and
 business plugins. SIGTERM and SIGINT shut down the Worker; running Activities
 receive up to 15 seconds to finish before cancellation.
 
-The Worker uses the same `open_resources()` factory as the interfaces, owning
-its own PostgreSQL pool, Valkey client, and Temporal Client. Its resource scope
-encloses the Worker so Activities finish before resource cleanup. Database and
-Valkey connections are lazy; these process-local objects must not enter Workflow
-inputs or state. The entry point constructs `RunnerStateActivities` with
-`resources.core_session_factory` and registers both `record_history` and
-`save_runner_state` alongside `AgentPlugin(agent)`. Custom Workers must register
-both bound methods as well.
+The Worker owns PostgreSQL and Valkey clients through `open_resources()`. It
+creates one `AgentOutputService` with prefix `settings.valkey_namespace +
+":agent-output"`, injects it into `RunnerActivities`, and binds it with
+`bind_output_service()` before starting Worker tasks. Register both
+`record_messages` and `save_runner_state` alongside `AgentPlugin(agent)`; custom
+Workers must also establish the binding around their entire Worker lifetime.
+
+`RunnerActivityContext` borrows this service in its constructor. SDK default
+context deserialization and `dataclasses.replace()` copies both call this
+constructor, so all asynchronous Activities on the Worker loop share the resource.
+The service is excluded from SDK serialization and is never placed in deps, state,
+or Workflow inputs. Module passthrough keeps the context binding's identity shared;
+Workflow code never reads the binding or uses network clients. The same module-level
+Agent registers the context type and `handle_deltas` for Workflow and AgentPlugin.
+
+The SDK owns the model Activity stream. `handle_deltas` consumes it completely and
+maps text/thinking events through the same `to_text_delta` function as the legacy
+OutputCapability. Tool-only streams are drained without text output. Each invocation
+owns a publisher; successful completion flushes its tail before Activity return.
+Worker shutdown finishes Activities before unbinding and closing Valkey/database
+resources. Publishers own only their buffers and tasks; the output service borrows
+the client and needs no separate close operation.
 
 The Worker and interface processes share `KAPY_TEMPORAL_ADDRESS` (default
 `localhost:7233`), `KAPY_TEMPORAL_NAMESPACE` (`default`), and
@@ -165,11 +197,11 @@ constructors/profile preparation must not perform external I/O. No requests are
 made from Workflow code. Client construction also occurs during replay; pin SDK
 and model/provider code consistently with in-flight Workflow definitions.
 
-Compared with the proposal's lazy descriptor, this uses the actual SDK model
-without duplicating protocol behavior. It allocates and closes clients during
-Workflow-side resolution, rather than prohibiting client construction entirely.
-The protocol tests cover OpenAI Chat, OpenAI Responses, and Google, including
-sandbox execution, Activity cleanup, and replay without repeating HTTP requests.
+Workflow-side resolution uses the actual SDK model without duplicating protocol
+behavior, allocating and closing clients during resolution. The protocol tests
+cover OpenAI Chat, OpenAI Responses, and Google SSE, including sandbox execution,
+Activity cleanup, realtime snapshots/deltas, and replay without repeating HTTP
+requests or broadcasts.
 
 `docker compose up -d runner-worker` starts the Worker and pinned auto-setup server.
 It creates `temporal` and `temporal_visibility` databases on the existing

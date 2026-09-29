@@ -295,7 +295,7 @@ async def test_unfilled_predecessor_gap_waits_then_polls_contiguous_history(
     async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
         async with direct_publisher(valkey_client, session_id) as callback:
-            await callback(MessageCommitted(HistoryMessage(session_id, 2, response())))
+            await callback(MessageCommitted(HistoryMessage(session_id, 2, False, response())))
         waiting = asyncio.create_task(anext(events))
         try:
             await asyncio.sleep(0.06)

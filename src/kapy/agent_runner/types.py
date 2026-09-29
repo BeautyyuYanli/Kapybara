@@ -1,4 +1,4 @@
-"""Runner values, normalized history and transient events; no transport or session CRUD."""
+"""Runner values, message snapshots and transient events; no transport or session CRUD."""
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -20,10 +20,15 @@ type ConsumeCancel = Callable[[AsyncSession], Awaitable[bool]]
 
 @dataclass(frozen=True, slots=True)
 class HistoryMessage:
-    """One original history row, using the same normalized message codec as storage."""
+    """SDK message value at a session position, with explicit recording authority.
+
+    Authority is a producer contract, not a restriction on same-key replacement.
+    Storage reads these attributes from columns, never from message metadata.
+    """
 
     session_id: UUID
-    seq: int
+    seq: Annotated[int, Field(strict=True, ge=0)]
+    authoritative: Annotated[bool, Field(strict=True)]
     message: ModelMessage
 
 

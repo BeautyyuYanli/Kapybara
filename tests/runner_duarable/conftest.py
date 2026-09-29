@@ -9,11 +9,14 @@ import psycopg
 import pytest_asyncio
 from psycopg import sql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from valkey.asyncio import Valkey
 
+from kapy.agent_output import AgentOutputService
 from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
 from kapy.control.sessions.models import SessionRow
 from kapy.database.schema import migrate
+from kapy.runner_duarable.context import bind_output_service
 
 
 @dataclass
@@ -21,6 +24,7 @@ class RunnerDatabase:
     settings: CommonSettings
     sessions: async_sessionmaker[AsyncSession]
     session_id: UUID
+    outputs: AgentOutputService
 
 
 @pytest_asyncio.fixture
@@ -35,7 +39,10 @@ async def runner_database() -> AsyncIterator[RunnerDatabase]:
             session_id = uuid4()
             async with sessions.begin() as db:
                 db.add(SessionRow(id=session_id, provider_id=uuid4(), model_name="test"))
-            yield RunnerDatabase(settings, sessions, session_id)
+            async with Valkey.from_url(settings.valkey_url.get_secret_value()) as client:
+                outputs = AgentOutputService(client, channel_prefix=f"runner-test:{uuid4()}")
+                with bind_output_service(outputs):
+                    yield RunnerDatabase(settings, sessions, session_id, outputs)
     finally:
         async with await psycopg.AsyncConnection.connect(
             settings.database_url.get_secret_value(), autocommit=True

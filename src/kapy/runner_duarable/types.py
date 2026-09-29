@@ -9,8 +9,8 @@ from typing import Self
 from uuid import UUID
 
 from pydantic import Field, SecretStr, model_validator
-from pydantic_ai.messages import ModelMessage
 
+from kapy.agent_runner.types import HistoryMessage
 from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
 from kapy.control.types import DTO, JsonObject, Name
@@ -56,22 +56,21 @@ class RunnerInput(DTO):
     runner_state: str | None
     user_prompt: str
     config: DurableExecutionConfig
-    next_seq: int | None = Field(default=None, ge=0, strict=True)
 
 
 class RunnerDeps(DTO):
-    """Fixed run input; next_seq is a one-time starting point, never a counter."""
+    """Run input plus the current request's provisional response position."""
 
     config: DurableExecutionConfig
     session_id: UUID
-    next_seq: int | None = Field(default=None, ge=0, strict=True)
+    response_seq: int | None = Field(default=None, ge=0, strict=True)
 
 
-class RecordHistoryInput(DTO):
-    """One atomic batch; every message carries its database seq in metadata."""
+class MessageBatch(DTO):
+    """One atomic batch with explicit positions, authority and complete SDK messages."""
 
     session_id: UUID
-    messages: list[ModelMessage]
+    messages: list[HistoryMessage]
 
 
 class SaveRunnerStateInput(DTO):

@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, ClassVar
 from uuid import UUID
 
-from sqlalchemy import JSON, CheckConstraint, Column, DateTime, MetaData, Text, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, Column, DateTime, MetaData, Text, false, func
 from sqlmodel import Field, SQLModel
 
 agent_metadata = MetaData()
@@ -40,6 +40,9 @@ class AgentHistoryRow(SQLModel, table=True):
 
     session_id: UUID = Field(primary_key=True)
     seq: int = Field(primary_key=True)
+    authoritative: bool = Field(
+        default=False, sa_column=Column(Boolean, nullable=False, server_default=false())
+    )
     kind: str = Field(sa_type=Text)
     created_at: datetime = Field(
         sa_column=Column(

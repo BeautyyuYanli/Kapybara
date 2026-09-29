@@ -50,16 +50,20 @@ class AgentOutputService:
 
         A finite nonnegative interval bounds batching; zero wakes the task at once.
         Ordinary callback/transport failures never reach the producer. Full buffers,
-        recovery and closing discard events. Every exit cancels sending without a
-        final flush; cancellation and errors in the context body still propagate.
+        recovery and closing discard new events. Normal exit drains in-flight and
+        buffered output within two seconds. Exceptional exit discards it; body
+        exceptions and cancellation still propagate.
         """
         if not math.isfinite(flush_interval) or flush_interval < 0:
             raise ValueError("flush_interval must be finite and nonnegative")
         publisher = _Publisher(self, session_id, flush_interval)
         try:
             yield publisher.write
-        finally:
-            await publisher.close()
+        except BaseException:
+            await publisher.close(flush=False)
+            raise
+        else:
+            await publisher.close(flush=True)
 
     async def _command(self, *args: str | bytes) -> None:
         # Borrow independently of subscriber settings, with one deadline for the
@@ -91,12 +95,11 @@ class AgentOutputService:
         """
         ready, changed = asyncio.Event(), asyncio.Event()
         buffer: list[OutputEvent] = []
-        complete_seq = -1
         failure: Exception | None = None
         finished = False
 
         async def receive() -> None:
-            nonlocal buffer, complete_seq, failure, finished
+            nonlocal buffer, failure, finished
             try:
                 async with self._client.pubsub() as pubsub:
                     async with asyncio.timeout(1.0):
@@ -123,7 +126,7 @@ class AgentOutputService:
                             for event in batch:
                                 if _session_id(event) != session_id:
                                     raise ValueError("Output event belongs to another session")
-                                candidate, complete_seq = _merge(buffer, event, complete_seq)
+                                candidate = _merge(buffer, event)
                                 if len(_BATCH_ADAPTER.dump_json(candidate)) > _MAX_SUBSCRIBER_BYTES:
                                     if isinstance(event, TextDelta):
                                         continue
@@ -183,28 +186,30 @@ def _session_id(event: OutputEvent) -> UUID:
     return event.message.session_id if isinstance(event, MessageCommitted) else event.session_id
 
 
-def _merge(
-    buffer: list[OutputEvent], event: OutputEvent, complete_seq: int
-) -> tuple[list[OutputEvent], int]:
+def _message_key(event: OutputEvent) -> tuple[UUID, int]:
+    if isinstance(event, MessageCommitted):
+        return event.message.session_id, event.message.seq
+    return event.session_id, event.response_seq
+
+
+def _merge(buffer: list[OutputEvent], event: OutputEvent) -> list[OutputEvent]:
     """Build a candidate without mutating a buffer that may reject it for capacity.
 
     Only undelivered parts merge; replacing with empty text remains meaningful.
-    Moving a merged part to the tail preserves the latest arrival position, while
-    complete messages retain their relative order. No delivery cursor lives here.
+    Full snapshots replace only their own key, regardless of seq or authority.
+    Later deltas form a new preview and never merge across a same-key snapshot.
+    A merged event moves to the latest arrival position. No delivery cursor lives here.
     """
     if isinstance(event, MessageCommitted):
-        complete_seq = max(complete_seq, event.message.seq)
-        return [
-            item
-            for item in buffer
-            if isinstance(item, MessageCommitted) or item.response_seq > complete_seq
-        ] + [event], complete_seq
-    if event.response_seq <= complete_seq:
-        return buffer, complete_seq
+        return [item for item in buffer if _message_key(item) != _message_key(event)] + [event]
     candidate: list[OutputEvent] = []
     for item in buffer:
-        if isinstance(item, TextDelta) and (item.response_seq, item.part_index, item.part_kind) == (
-            event.response_seq,
+        if isinstance(item, TextDelta) and (
+            _message_key(item),
+            item.part_index,
+            item.part_kind,
+        ) == (
+            _message_key(event),
             event.part_index,
             event.part_kind,
         ):
@@ -213,7 +218,7 @@ def _merge(
         else:
             candidate.append(item)
     candidate.append(event)
-    return candidate, complete_seq
+    return candidate
 
 
 class _Publisher:
@@ -228,7 +233,6 @@ class _Publisher:
         self._session_id = session_id
         self._interval = interval
         self._buffer: list[OutputEvent] = []
-        self._size = 2
         self._deadline = 0.0
         self._wake = asyncio.Event()
         self._closed = False
@@ -241,8 +245,8 @@ class _Publisher:
         try:
             if _session_id(event) != self._session_id:
                 raise ValueError("Output event belongs to another session")
-            encoded = _BATCH_ADAPTER.dump_json([event])[1:-1]
-            size = self._size + len(encoded) + bool(self._buffer)
+            candidate = _merge(self._buffer, event)
+            size = len(_BATCH_ADAPTER.dump_json(candidate))
             if size > _MAX_BATCH_BYTES:
                 if self._buffer:
                     self._deadline = 0.0
@@ -250,26 +254,21 @@ class _Publisher:
                 return
             if not self._buffer:
                 self._deadline = asyncio.get_running_loop().time() + self._interval
-            self._buffer.append(event)
-            self._size = size
+            self._buffer = candidate
             if size == _MAX_BATCH_BYTES or isinstance(event, MessageCommitted):
                 self._deadline = 0.0
             self._wake.set()
         except Exception as error:
             logger.warning("Dropped invalid agent output (%s)", type(error).__name__)
 
-    def _clear(self) -> None:
-        self._buffer.clear()
-        self._size = 2
-
     async def _run(self) -> None:
         try:
-            while True:
+            while not self._closed or self._buffer:
                 await self._wake.wait()
                 self._wake.clear()
                 if not self._buffer:
                     continue
-                delay = self._deadline - asyncio.get_running_loop().time()
+                delay = 0.0 if self._closed else self._deadline - asyncio.get_running_loop().time()
                 if delay > 0:
                     try:
                         async with asyncio.timeout(delay):
@@ -279,30 +278,23 @@ class _Publisher:
                     else:
                         continue
                 batch, self._buffer = self._buffer, []
-                self._clear()
-                merged: list[OutputEvent] = []
-                complete_seq = -1
-                for event in batch:
-                    merged, complete_seq = _merge(merged, event, complete_seq)
-                if not merged:
-                    continue
-                payload = _BATCH_ADAPTER.dump_json(merged)
-                if len(payload) > _MAX_BATCH_BYTES:
-                    continue
+                payload = _BATCH_ADAPTER.dump_json(batch)
                 try:
                     await self._service._publish(self._session_id, payload)
                 except AuthenticationError, AuthorizationError:
                     raise
                 except ValkeyConnectionError, ValkeyTimeoutError, TimeoutError, OSError:
+                    if self._closed:
+                        raise
                     self._accepting = False
-                    self._clear()
+                    self._buffer.clear()
                     logger.warning("Agent output recovering for session %s", self._session_id)
                     await self._recover()
                     self._accepting = True
                     logger.info("Agent output recovered for session %s", self._session_id)
         except Exception as error:
             self._accepting = False
-            self._clear()
+            self._buffer.clear()
             logger.warning("Agent output disabled (%s)", type(error).__name__)
 
     async def _recover(self) -> None:
@@ -316,8 +308,16 @@ class _Publisher:
                 continue
             return
 
-    async def close(self) -> None:
+    async def close(self, *, flush: bool) -> None:
         self._closed = True
-        self._clear()
-        self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
+        self._wake.set()
+        try:
+            if flush and self._accepting:
+                async with asyncio.timeout(2.0):
+                    await asyncio.shield(self._task)
+        except TimeoutError:
+            logger.warning("Agent output close timed out for session %s", self._session_id)
+        finally:
+            self._buffer.clear()
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)

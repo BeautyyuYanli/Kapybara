@@ -31,21 +31,24 @@ def response_tokens(response: ModelResponse) -> tuple[int, int] | None:
     return None
 
 
-def _encode_history(
-    session_id: UUID, sequences: Sequence[int], messages: Sequence[ModelMessage]
-) -> list[dict[str, Any]]:
-    payloads = ModelMessagesTypeAdapter.dump_python(list(messages), mode="json")
+def _encode_history(messages: Sequence[HistoryMessage]) -> list[dict[str, Any]]:
+    payloads = ModelMessagesTypeAdapter.dump_python(
+        [entry.message for entry in messages], mode="json"
+    )
     rows: list[dict[str, Any]] = []
-    for seq, message, payload in zip(sequences, messages, payloads, strict=True):
+    for entry, payload in zip(messages, payloads, strict=True):
         kind = payload.pop("kind")
         parts = payload.pop("parts")
         payload.pop("usage", None)
         finish_reason = payload.pop("finish_reason", None)
-        tokens = response_tokens(message) if isinstance(message, ModelResponse) else None
+        tokens = (
+            response_tokens(entry.message) if isinstance(entry.message, ModelResponse) else None
+        )
         rows.append(
             dict(
-                session_id=session_id,
-                seq=seq,
+                session_id=entry.session_id,
+                seq=entry.seq,
+                authoritative=entry.authoritative,
                 kind=kind,
                 message={"parts": parts},
                 message_metadata=payload,
@@ -70,7 +73,7 @@ def _decode_history(rows: Sequence[AgentHistoryRow]) -> tuple[HistoryMessage, ..
         payloads.append(payload)
     messages = ModelMessagesTypeAdapter.validate_python(payloads)
     return tuple(
-        HistoryMessage(row.session_id, row.seq, message)
+        HistoryMessage(row.session_id, row.seq, row.authoritative, message)
         for row, message in zip(rows, messages, strict=True)
     )
 
@@ -233,7 +236,12 @@ class AgentRepository:
         DTOs derive from the INSERT payload, without another database read. They
         must only be published after the caller's transaction has committed.
         """
-        rows = _encode_history(session_id, range(start_seq, start_seq + len(messages)), messages)
+        rows = _encode_history(
+            [
+                HistoryMessage(session_id, start_seq + offset, False, message)
+                for offset, message in enumerate(messages)
+            ]
+        )
         await self._db.execute(
             update(AgentStateRow)
             .where(col(AgentStateRow.session_id) == session_id)
@@ -243,24 +251,26 @@ class AgentRepository:
             await self._db.execute(insert(AgentHistoryRow), rows)
         return _decode_history([AgentHistoryRow(**row) for row in rows])
 
-    async def upsert_history(self, session_id: UUID, messages: Sequence[ModelMessage]) -> None:
-        """Overwrite a batch by metadata.seq, without touching checkpoint or lease state.
+    async def upsert_history(self, session_id: UUID, messages: Sequence[HistoryMessage]) -> None:
+        """Overwrite explicit positions and authority without reading payload metadata.
 
         The caller owns the transaction and serializes writes for this session.
         Identical and changed retries are both legal; created_at stays unchanged.
         Invalid or duplicate seq values fail before any rows are written.
         """
-        sequences: list[int] = []
         seen: set[int] = set()
         for message in messages:
-            seq = (message.metadata or {}).get("seq")
+            seq = message.seq
             if type(seq) is not int or seq < 0:
-                raise ValueError("History metadata.seq must be a nonnegative integer")
+                raise ValueError("History seq must be a nonnegative integer")
+            if type(message.authoritative) is not bool:
+                raise ValueError("History authoritative must be a boolean")
+            if message.session_id != session_id:
+                raise ValueError("History message belongs to another session")
             if seq in seen:
                 raise ValueError("A history batch cannot contain duplicate seq values")
             seen.add(seq)
-            sequences.append(seq)
-        rows = _encode_history(session_id, sequences, messages)
+        rows = _encode_history(messages)
         if rows:
             statement = pg_insert(AgentHistoryRow).values(rows)
             await self._db.execute(
@@ -269,6 +279,7 @@ class AgentRepository:
                     set_={
                         name: statement.excluded[name]
                         for name in (
+                            "authoritative",
                             "kind",
                             "message",
                             "message_metadata",

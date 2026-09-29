@@ -2,7 +2,7 @@
 
 Use the SDK PydanticAIPlugin for payload/sandbox configuration and register
 `agent` through AgentPlugin alongside RunnerWorkflow and both methods of
-RunnerStateActivities. This module does not resolve database configuration,
+RunnerActivities. This module does not resolve database configuration,
 acquire leases, or install business plugins.
 """
 
@@ -12,14 +12,14 @@ from temporalio import workflow
 # reuse those modules instead of reinitializing their types in each sandbox.
 with workflow.unsafe.imports_passed_through():
     from .agent import agent
-    from .history import HistoryRecordCapability
-    from .types import DurableExecutionConfig, RecordHistoryInput, RunnerDeps, RunnerInput
+    from .recording import MessageRecordCapability
+    from .types import DurableExecutionConfig, MessageBatch, RunnerDeps, RunnerInput
 from .workflow import RunnerWorkflow
 
 __all__ = [
     "DurableExecutionConfig",
-    "HistoryRecordCapability",
-    "RecordHistoryInput",
+    "MessageRecordCapability",
+    "MessageBatch",
     "RunnerDeps",
     "RunnerInput",
     "RunnerWorkflow",

@@ -10,7 +10,7 @@ Workflow-side model inference. HTTP requests only execute inside Activities.
 """
 
 from pydantic_ai import Agent
-from pydantic_ai.capabilities import ResolveModelId
+from pydantic_ai.capabilities import CapabilityOrdering, Hooks, ResolveModelId
 from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model, ModelResolutionContext
@@ -18,7 +18,9 @@ from temporalio import workflow
 
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
 
-from .history import HistoryRecordCapability
+from .context import RunnerActivityContext
+from .output import handle_deltas
+from .recording import MessageRecordCapability, record_before_model_request
 from .types import RunnerDeps
 
 MODEL_ID = "kapy-configured"
@@ -54,6 +56,20 @@ agent = Agent(
     name="runner_duarable",
     model=MODEL_ID,
     deps_type=RunnerDeps,
-    capabilities=[TemporalDurability(), ResolveModelId(resolve_model), HistoryRecordCapability()],
+    capabilities=[
+        MessageRecordCapability(),
+        ResolveModelId(resolve_model),
+        Hooks(
+            model_request=record_before_model_request,
+            ordering=CapabilityOrdering(
+                position="innermost",
+                wraps=[TemporalDurability],
+                requires=[MessageRecordCapability],
+            ),
+        ),
+        TemporalDurability(
+            run_context_type=RunnerActivityContext, event_stream_handler=handle_deltas
+        ),
+    ],
 )
 """Register this Agent once through the SDK's AgentPlugin on the Worker."""

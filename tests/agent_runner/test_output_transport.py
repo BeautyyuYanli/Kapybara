@@ -31,7 +31,7 @@ async def test_ready_subscription_broadcast_batch_order_and_cleanup(valkey_clien
     first = delta(session_id, "hello", op="replace")
     second = delta(session_id, " world")
     committed = MessageCommitted(
-        HistoryMessage(session_id, 1, ModelResponse(parts=[TextPart("hello world")]))
+        HistoryMessage(session_id, 1, False, ModelResponse(parts=[TextPart("hello world")]))
     )
     channel = f"kapy:agent-output:{session_id}"
     async with outputs.subscribe(session_id) as left, outputs.subscribe(session_id) as right:
@@ -85,7 +85,7 @@ async def test_immediate_and_encoded_size_flush(valkey_client, interval, texts):
 
 
 @pytest.mark.parametrize("failed", [False, True])
-async def test_exit_always_drops_pending_output(valkey_client, failed):
+async def test_normal_exit_flushes_and_failed_exit_discards_pending_output(valkey_client, failed):
     session_id = uuid4()
     outputs = AgentOutputService(valkey_client)
     async with valkey_client.pubsub() as raw:
@@ -100,7 +100,9 @@ async def test_exit_always_drops_pending_output(valkey_client, failed):
         except RuntimeError as error:
             assert str(error) == "business failure"
         message = await raw.get_message(timeout=0.05)
-        assert message is None
+        assert (message is None) == failed
+        if not failed:
+            assert ADAPTER.validate_json(message["data"]) == [delta(session_id)]
         assert callback is not None
         await callback(delta(session_id))  # Closed callbacks remain harmless.
     assert not any(task.get_name() == f"agent-output:{session_id}" for task in asyncio.all_tasks())
@@ -292,7 +294,9 @@ async def test_blocked_network_never_blocks_callback_and_buffers_are_bounded(
             for _ in range(100):
                 await callback(delta(session_id, "界" * 12_000))
             await callback(delta(session_id, "界" * 30_000))
-            await callback(MessageCommitted(HistoryMessage(session_id, 1, ModelResponse(parts=[]))))
+            await callback(
+                MessageCommitted(HistoryMessage(session_id, 1, False, ModelResponse(parts=[])))
+            )
         release.set()
         await sent.wait()
     assert all(len(payload) <= 64 * 1024 for payload in batches)
@@ -371,7 +375,7 @@ async def test_unrecoverable_publish_error_disables_without_reaching_producer(
 @pytest.mark.parametrize("transport", ["publisher", "subscriber"])
 async def test_merge_replace_append_parts_and_complete_coverage(valkey_client, transport):
     session_id = uuid4()
-    commit = MessageCommitted(HistoryMessage(session_id, 1, ModelResponse(parts=[])))
+    commit = MessageCommitted(HistoryMessage(session_id, 1, False, ModelResponse(parts=[])))
     empty = TextDelta(session_id, 2, 0, "text", "replace", "")
     thinking = TextDelta(session_id, 2, 0, "thinking", "append", "thought")
     text = TextDelta(session_id, 2, 1, "text", "append", "ab")
@@ -387,7 +391,7 @@ async def test_merge_replace_append_parts_and_complete_coverage(valkey_client, t
         TextDelta(session_id, 2, 1, "text", "append", "a"),
         TextDelta(session_id, 2, 1, "text", "append", "b"),
     ]
-    expected = [commit, thinking, empty, text]
+    expected = [commit, delta(session_id, "late"), thinking, empty, text]
     outputs = AgentOutputService(valkey_client)
     channel = f"kapy:agent-output:{session_id}"
     async with asyncio.timeout(2):
@@ -409,7 +413,7 @@ async def test_merge_replace_append_parts_and_complete_coverage(valkey_client, t
                 await valkey_client.publish(
                     channel, ADAPTER.dump_json([delta(session_id), following])
                 )
-                assert await anext(events) == [following]
+                assert await anext(events) == [delta(session_id), following]
 
 
 async def test_subscriber_receives_and_releases_failed_connection_without_consumption(
@@ -448,13 +452,15 @@ async def test_subscriber_capacity_drops_delta_update_but_preserves_complete_mes
         )
         assert await anext(events) == [original]
         commit = MessageCommitted(
-            HistoryMessage(session_id, 1, ModelResponse(parts=[TextPart("x" * 600_000)]))
+            HistoryMessage(session_id, 1, False, ModelResponse(parts=[TextPart("x" * 600_000)]))
         )
         future = TextDelta(session_id, 2, 0, "text", "append", "y" * 600_000)
         await valkey_client.publish(channel, ADAPTER.dump_json([future, commit]))
         assert await anext(events) == [commit]
         too_big = MessageCommitted(
-            HistoryMessage(session_id, 2, ModelResponse(parts=[TextPart("x" * (1024 * 1024))]))
+            HistoryMessage(
+                session_id, 2, False, ModelResponse(parts=[TextPart("x" * (1024 * 1024))])
+            )
         )
         await valkey_client.publish(channel, ADAPTER.dump_json([too_big]))
         with pytest.raises(BufferError):
@@ -467,7 +473,7 @@ async def test_subscriber_accumulated_commits_overflow_without_silent_eviction(v
     channel = f"kapy:agent-output:{session_id}"
     commits: list[OutputEvent] = [
         MessageCommitted(
-            HistoryMessage(session_id, seq, ModelResponse(parts=[TextPart("x" * 600_000)]))
+            HistoryMessage(session_id, seq, False, ModelResponse(parts=[TextPart("x" * 600_000)]))
         )
         for seq in range(2)
     ]
@@ -571,3 +577,102 @@ async def test_cancellation_during_subscription_confirmation_joins_receiver(valk
     assert not any(
         task.get_name() == f"agent-output-subscribe:{session_id}" for task in asyncio.all_tasks()
     )
+
+
+@pytest.mark.parametrize("transport", ["publisher", "subscriber"])
+async def test_full_snapshots_overwrite_only_their_key_without_authority_gating(
+    valkey_client, transport
+):
+    session_id = uuid4()
+    outputs = AgentOutputService(valkey_client)
+    provisional = MessageCommitted(HistoryMessage(session_id, 42, False, ModelResponse(parts=[])))
+    authoritative = MessageCommitted(
+        HistoryMessage(session_id, 42, True, ModelResponse(parts=[TextPart("final")]))
+    )
+    other = MessageCommitted(HistoryMessage(session_id, 43, False, ModelResponse(parts=[])))
+    other_preview = TextDelta(session_id, 40, 0, "text", "replace", "unrelated")
+    same_preview = TextDelta(session_id, 42, 0, "text", "append", "covered")
+    following = TextDelta(session_id, 42, 0, "text", "append", "new attempt")
+    batch = [
+        provisional,
+        other,
+        other_preview,
+        same_preview,
+        authoritative,
+        authoritative,
+        following,
+    ]
+    expected = [other, other_preview, authoritative, following]
+    async with asyncio.timeout(3):
+        if transport == "publisher":
+            async with valkey_client.pubsub() as raw:
+                await raw.subscribe(f"kapy:agent-output:{session_id}")
+                await raw.get_message(timeout=None)
+                async with outputs.publisher(session_id) as publish:
+                    for event in batch:
+                        await publish(event)
+                assert (
+                    ADAPTER.validate_json((await raw.get_message(timeout=None))["data"]) == expected
+                )
+        else:
+            async with outputs.subscribe(session_id) as events:
+                await valkey_client.publish(
+                    f"kapy:agent-output:{session_id}", ADAPTER.dump_json(batch)
+                )
+                assert await anext(events) == expected
+                # Delivered authority creates no permanent filter; duplicate and
+                # non-authoritative replacements remain ordinary same-key snapshots.
+                for event in (authoritative, provisional):
+                    await valkey_client.publish(
+                        f"kapy:agent-output:{session_id}", ADAPTER.dump_json([event])
+                    )
+                    assert await anext(events) == [event]
+
+
+async def test_normal_close_drains_inflight_then_remaining_buffer(valkey_client, monkeypatch):
+    outputs, session_id = AgentOutputService(valkey_client), uuid4()
+    sending, release, closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    sent = []
+
+    async def publish(requested_session, payload):
+        sent.append(ADAPTER.validate_json(payload))
+        if len(sent) == 1:
+            sending.set()
+            await release.wait()
+
+    monkeypatch.setattr(outputs, "_publish", publish)
+
+    async def produce():
+        async with outputs.publisher(session_id, flush_interval=0) as write:
+            await write(delta(session_id, "first"))
+            await sending.wait()
+            await write(delta(session_id, "remaining"))
+            closing.set()
+
+    task = asyncio.create_task(produce())
+    async with asyncio.timeout(3):
+        await closing.wait()
+        assert not task.done()
+        release.set()
+        await task
+    assert sent == [[delta(session_id, "first")], [delta(session_id, "remaining")]]
+
+
+async def test_close_deadline_cancels_inflight_and_joins_sender(valkey_client, monkeypatch, caplog):
+    outputs, session_id = AgentOutputService(valkey_client), uuid4()
+    sending, stopped = asyncio.Event(), asyncio.Event()
+
+    async def stalled_publish(*args):
+        sending.set()
+        try:
+            await asyncio.Future()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(outputs, "_publish", stalled_publish)
+    async with asyncio.timeout(3):
+        async with outputs.publisher(session_id, flush_interval=0) as write:
+            await write(delta(session_id))
+            await sending.wait()
+    assert stopped.is_set() and "close timed out" in caplog.text
+    assert not any(task.get_name() == f"agent-output:{session_id}" for task in asyncio.all_tasks())

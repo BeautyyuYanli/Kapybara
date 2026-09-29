@@ -275,7 +275,10 @@ ordinary node hooks and a native graph retained across successive run calls.
 `text` or `thinking`. `replace` initializes/clears a part, `append` adds text without
 trimming. `response_seq` is the next absolute history sequence captured before the
 model request. `MessageCommitted.message` is a `HistoryMessage(session_id, seq,
-message)`, using the same normalized usage and official SDK codec as history reads.
+authoritative, message)`. Legacy checkpoints set authoritative=False and use the
+same normalized usage and official SDK codec as history reads. The
+[Temporal runner](../runner_duarable/README.md) uses the same DTO with explicit
+authority and complete SDK input snapshots, including all usage fields.
 Both input and response/tool-result checkpoints publish after commit, reusing the
 INSERT payload with no extra SELECT or RETURNING. State-only checkpoints emit
 nothing. A committed message replaces all temporary parts at its sequence; it
@@ -305,16 +308,23 @@ encodes and buffers locally: it never waits on network I/O and drops ordinary er
 overflow, oversized events, and events during recovery or after close. First arrival
 starts the batching deadline; commits, capacity and zero interval wake the background
 task immediately. `SessionService.start_runner(output_flush_interval=...)` forwards
-this interval. Before encoding each batch, the sender merges pending deltas by
-(response_seq, part_index, part_kind): append joins text, replace discards earlier
-text (including an empty replacement), and commits remove deltas through their seq.
-Only this unsent batch participates; already delivered text is not retained.
+this interval. Pending deltas merge by (session_id, response_seq, part_index,
+part_kind): append joins text and replace discards earlier text, including an empty
+replacement. A full snapshot removes only its same-key buffered snapshots and
+deltas, moving the new snapshot to the latest arrival position. Other keys are
+unchanged. Later same-key deltas form a new preview; they never merge across a
+complete snapshot or append into complete message content. Only undelivered data
+participates; seq order and authority impose no permanent filter.
 One task sends and recovers connections, including with zero interval.
 Each network attempt has a one-second deadline. Failed batches are discarded;
 recoverable failures trigger a one-second delay and a bounded PING probe until
 recovery, independently of new events. Unrecoverable errors disable that publisher.
-Every context exit drops pending output and cancels/joins the task without a final
-flush, so the final commit notification may be recovered through database polling.
+Normal context exit stops accepting events, skips the batching delay, and drains
+in-flight and remaining output using the same sender. Closing has a total two-second
+deadline, keeps the one-second network deadline, and never starts recovery. Failure
+or timeout discards the remainder and joins the task. Exceptional or cancelled exit
+discards the buffer immediately and cancels/joins the sender, preserving the original
+exception. Delivery remains best effort even on normal exit.
 `subscribe()` starts one receiver that owns connection setup, acknowledgement and
 cleanup. The outer context waits for readiness and always cancels/joins the receiver,
 even before the first iterator read. The receiver keeps merging incoming events
@@ -322,8 +332,8 @@ into one flat list while the consumer is busy. Each read takes the whole list an
 replaces it with an empty one, without waiting to fill a batch. Previously delivered
 lists are never mutated. No busy polling or additional database task is involved.
 
-The subscriber uses the same merge rules across all undelivered network batches;
-its maximum observed commit seq also rejects late covered deltas. Pending JSON is
+The subscriber uses the same merge rules across all undelivered network batches.
+Repeated or smaller-seq snapshots overwrite normally; there is no completion watermark. Pending JSON is
 limited to 1 MiB: overflowing delta updates leave the old buffer intact; commits
 first evict deltas, then raise BufferError if complete messages alone cannot fit.
 The limit excludes decoded network input and batches already handed to consumers.
@@ -335,9 +345,9 @@ iterator. Shared clients stay open.
 The channel is `{channel_prefix}:{session_id}` and carries nonempty JSON arrays of
 these two events. Prefixes must isolate environments because Pub/Sub ignores the
 Valkey database number. This uses ordinary PUBLISH/SUBSCRIBE, including with a
-direct-node async client in Cluster, not sharded Pub/Sub. No database schema changes,
-Valkey keys, TTLs or output heartbeat are required; the execution lease heartbeat
-retains its existing purpose.
+direct-node async client in Cluster, not sharded Pub/Sub. The transport has no
+database dependency, Valkey keys, TTLs or output heartbeat; the execution lease
+heartbeat retains its existing purpose.
 
 The relevant tests are `tests/agent_runner`. The SDK contract tests require no
 services. Integration tests use real PostgreSQL at `KAPY_DATABASE_URL` (defaulting

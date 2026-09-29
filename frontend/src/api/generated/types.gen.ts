@@ -454,7 +454,10 @@ export type HttpValidationError = {
 /**
  * HistoryMessage
  *
- * One original history row, using the same normalized message codec as storage.
+ * SDK message value at a session position, with explicit recording authority.
+ *
+ * Authority is a producer contract, not a restriction on same-key replacement.
+ * Storage reads these attributes from columns, never from message metadata.
  */
 export type HistoryMessage = {
     /**
@@ -465,6 +468,10 @@ export type HistoryMessage = {
      * Seq
      */
     seq: number;
+    /**
+     * Authoritative
+     */
+    authoritative: boolean;
     /**
      * Message
      */
@@ -2215,7 +2222,10 @@ export type FilePartWritable = {
 /**
  * HistoryMessage
  *
- * One original history row, using the same normalized message codec as storage.
+ * SDK message value at a session position, with explicit recording authority.
+ *
+ * Authority is a producer contract, not a restriction on same-key replacement.
+ * Storage reads these attributes from columns, never from message metadata.
  */
 export type HistoryMessageWritable = {
     /**
@@ -2226,6 +2236,10 @@ export type HistoryMessageWritable = {
      * Seq
      */
     seq: number;
+    /**
+     * Authoritative
+     */
+    authoritative: boolean;
     /**
      * Message
      */

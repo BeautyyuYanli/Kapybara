@@ -625,7 +625,9 @@ async def test_telegram_serve_draft_pacing_uses_publisher_setting(
         for index in range(3):
             yield [TextDelta(target, 0, 0, "text", "replace", str(index))]
             await sent[index].wait()
-        yield [MessageCommitted(HistoryMessage(target, 0, ModelResponse([TextPart("final")])))]
+        yield [
+            MessageCommitted(HistoryMessage(target, 0, False, ModelResponse([TextPart("final")])))
+        ]
         settled.set()
         await asyncio.Future()
 

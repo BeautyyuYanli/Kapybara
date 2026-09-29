@@ -427,7 +427,7 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
         try:
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("input")]))
+                    HistoryMessage(session_id, 0, False, ModelRequest([UserPromptPart("input")]))
                 ),
                 TextDelta(session_id, 1, 0, "text", "replace", "old"),
             ]
@@ -438,13 +438,13 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
             await preview_sent.wait()
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 1, ModelResponse([TextPart("complete")]))
+                    HistoryMessage(session_id, 1, False, ModelResponse([TextPart("complete")]))
                 ),
                 MessageCommitted(
-                    HistoryMessage(session_id, 2, ModelRequest([UserPromptPart("next")]))
+                    HistoryMessage(session_id, 2, False, ModelRequest([UserPromptPart("next")]))
                 ),
                 MessageCommitted(
-                    HistoryMessage(session_id, 3, ModelResponse([TextPart("second")]))
+                    HistoryMessage(session_id, 3, False, ModelResponse([TextPart("second")]))
                 ),
             ]
             replayed.set()
@@ -489,13 +489,15 @@ async def test_buffer_overflow_resumes_after_last_delivered_commit(repository, m
             if len(cursors) == 1:
                 yield [
                     MessageCommitted(
-                        HistoryMessage(session_id, 0, ModelResponse([TextPart("first")]))
+                        HistoryMessage(session_id, 0, False, ModelResponse([TextPart("first")]))
                     )
                 ]
                 assert (await repository.get_delivery(key)).after_seq == 0
                 raise BufferError("Output subscription buffer is full")
             yield [
-                MessageCommitted(HistoryMessage(session_id, 1, ModelResponse([TextPart("second")])))
+                MessageCommitted(
+                    HistoryMessage(session_id, 1, False, ModelResponse([TextPart("second")]))
+                )
             ]
             recovered.set()
             await asyncio.Future()
@@ -566,7 +568,9 @@ async def test_delivery_waits_for_draft_before_reading_and_closes_on_cancel(repo
             yield [TextDelta(session_id, 0, 0, "text", "replace", "preview")]
             reads.append("final")
             yield [
-                MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))
+                MessageCommitted(
+                    HistoryMessage(session_id, 0, False, ModelResponse([TextPart("final")]))
+                )
             ]
         finally:
             closed.set()
@@ -764,6 +768,7 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
                 HistoryMessage(
                     session_id,
                     0,
+                    False,
                     ModelResponse([TextPart(name + " final")]),
                 )
             )

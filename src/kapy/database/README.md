@@ -32,6 +32,12 @@ to NULL/0, without deriving state from legacy history. The runner owns encoding;
 the session repository owns versioned, idempotent replacement. These columns are
 internal storage and are absent from ordinary session configuration DTOs.
 
+`agent_history.authoritative` is a non-null boolean column beside seq, defaulting
+to False for existing rows and legacy checkpoints. Temporal recording supplies it
+explicitly; upserts overwrite it with the payload, without authority conflicts.
+Storage decisions use columns, never JSON metadata. The SDK retains its separate
+seq/authority metadata for run restoration and numbering.
+
 ControlTable includes `plugin_agent_bindings` and the shared session/binding lifecycle
 columns. Agent plugins store small JSON state in this core-owned table; data_version
 migrations transform individual binding data on context loading and are separate
