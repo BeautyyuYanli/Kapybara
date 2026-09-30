@@ -119,8 +119,8 @@ replays locally; no old runner is restarted. Pending sends finish before the nex
 event, and messages without display text can acknowledge an authoritative position.
 
 Private chats (including topics) receive replace/append draft previews rendered once
-per consumed batch. A thinking page ends at the first newline after more than 600
-Unicode characters, followed by a `---` separator. The next page starts counting
+per consumed batch. A thinking page ends at the first newline after more than 400
+Unicode characters, using `\n---\n\n` as the page separator. The next page starts counting
 from zero; the previous completed page stays visible until the next page completes.
 Large batches show only the latest completed page and the growing page. Without a
 qualifying newline, a page keeps growing (subject to the normal draft send limit).

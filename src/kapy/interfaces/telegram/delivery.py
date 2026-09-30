@@ -64,10 +64,10 @@ class Preview:
             # Recompute from parts so replacements and merged batches use the same pages.
             # Keep the last completed page until the growing page also ends at a newline.
             previous, start = 0, 0
-            while (end := thinking.find("\n", start + 601)) != -1:
+            while (end := thinking.find("\n", start + 401)) != -1:
                 previous, start = start, end + 1
             if start:
-                return thinking[previous:start] + "---\n" + thinking[start:], False
+                return thinking[previous:start] + "---\n\n" + thinking[start:], False
             return thinking, False
         return self.progress, False
 
