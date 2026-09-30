@@ -25,17 +25,34 @@ docker compose up -d --wait postgres valkey temporal
 docker compose run --rm runtime kapy db upgrade
 docker compose run --rm telegram kapy interface telegram db upgrade
 docker compose up -d runner-worker runtime telegram
+# 可选：启动本地数据库和 Workflow 面板。
+docker compose up -d drizzle-gateway temporal-ui
 docker compose ps
 ```
 
 | 服务 | 用途 | 宿主机入口 |
 | --- | --- | --- |
 | `postgres` | durable runner_state、history，以及旧 checkpoint、compaction、输入队列和取消状态 | `127.0.0.1:55432` |
+| `drizzle-gateway` | PostgreSQL 网页面板，浏览编辑数据和执行 SQL | `127.0.0.1:5050` |
 | `valkey` | 按 session 广播临时输出；无离线消息、TTL 或持久化 | `127.0.0.1:56379` |
 | `temporal` | 持久化 Workflow 调度与恢复；数据保存在 PostgreSQL 的独立数据库 | `127.0.0.1:7233` |
+| `temporal-ui` | Workflow、Activity 和事件历史网页面板 | `127.0.0.1:8080` |
 | `runner-worker` | 执行 durable Workflow 和 Activity，持有模型及输出资源 | 无入站端口 |
 | `runtime` | 非 root 的 HTTP 接口和配置前端 | `0.0.0.0:8000`，前端 `/app/` |
 | `telegram` | 独立 Telegram session 接口，通过 Bot API 长轮询 | 无入站端口 |
+
+Drizzle Gateway 在 `http://localhost:5050/`，管理员密码默认为 `kapy-local`，
+可通过 `KAPY_DRIZZLE_MASTERPASS` 修改。首次使用时，在面板添加 PostgreSQL
+连接：主机 `postgres`、端口 `5432`、数据库 `kapy`、用户名 `kapy`、
+密码 `kapy-local`。进入连接后，选择 `KAPY_DATABASE_SCHEMA` 对应的 schema
+查看业务表；`public` 不一定包含业务数据。连接和面板配置保存在
+`drizzle-data` 命名卷。
+该面板直接连接现有数据库，无需在项目中引入 Drizzle ORM。
+Temporal UI 在 `http://localhost:8080/`，直接连接 `temporal:7233`，默认打开
+`KAPY_TEMPORAL_NAMESPACE` 指定的 namespace（未设置时为 `default`）。
+两个面板默认监听宿主机回环地址。需要局域网访问时，在 `.env` 中将
+`KAPY_PANEL_HOST` 设为宿主机的局域网 IP，重新执行
+`docker compose up -d drizzle-gateway temporal-ui`，通过该 IP 和对应端口访问。
 
 HTTP 直接启动入口和 Telegram 普通文本均提交到 Temporal，需同时运行
 `runner-worker` 才会执行；接口进程不自带 Worker。详见
@@ -59,7 +76,8 @@ HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
 `/model` 不带参数显示当前默认值。尚未选择模型时 bot 仍可启动，并提示配置命令。
 `KAPY_TELEGRAM_SESSION_TEMPLATE` 可作为没有已保存选择时的初始默认模板。
 可用 `KAPY_HTTP_PORT` / `KAPY_POSTGRES_PORT` / `KAPY_VALKEY_PORT` /
-`KAPY_TEMPORAL_PORT` 更改映射端口。
+`KAPY_TEMPORAL_PORT` / `KAPY_DRIZZLE_PORT` / `KAPY_TEMPORAL_UI_PORT`
+更改映射端口。
 
 ## 验证
 

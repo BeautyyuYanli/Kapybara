@@ -15,6 +15,18 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+  drizzle-gateway:
+    image: ghcr.io/drizzle-team/gateway:1.6.2
+    environment:
+      PORT: "4983"
+      MASTERPASS: ${KAPY_DRIZZLE_MASTERPASS:-kapy-local}
+    ports:
+      - "${KAPY_PANEL_HOST:-127.0.0.1}:${KAPY_DRIZZLE_PORT:-5050}:4983"
+    volumes:
+      - drizzle-data:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
   temporal:
     image: temporalio/auto-setup:1.29.1
     environment:
@@ -35,6 +47,21 @@ services:
       retries: 30
     depends_on:
       postgres:
+        condition: service_healthy
+  temporal-ui:
+    image: temporalio/ui:2.54.1
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_DEFAULT_NAMESPACE: ${KAPY_TEMPORAL_NAMESPACE:-default}
+    ports:
+      - "${KAPY_PANEL_HOST:-127.0.0.1}:${KAPY_TEMPORAL_UI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    depends_on:
+      temporal:
         condition: service_healthy
   runner-worker:
     image: kapy-v2:tmpv2
@@ -151,5 +178,6 @@ services:
     pids_limit: 256
 volumes:
   postgres-data:
+  drizzle-data:
   runtime-data:
   telegram-data:
