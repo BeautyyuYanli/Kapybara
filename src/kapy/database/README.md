@@ -34,7 +34,11 @@ internal storage and are absent from ordinary session configuration DTOs.
 
 `agent_history.authoritative` is a non-null boolean column beside seq, defaulting
 to False for existing rows and legacy checkpoints. Temporal recording supplies it
-explicitly; upserts overwrite it with the payload, without authority conflicts.
+explicitly. Under the session row lock, history writes preserve the existing
+authoritative prefix, including numeric gaps: stale inputs are silently discarded
+and advancing authority deletes provisional rows at/below the new boundary. The
+`(session_id, authoritative, seq)` index serves boundary lookup and provisional
+cleanup; the generated index revision leaves existing data unchanged.
 Storage decisions use columns, never JSON metadata. The SDK retains its separate
 seq/authority metadata for run restoration and numbering.
 

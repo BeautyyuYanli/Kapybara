@@ -32,7 +32,7 @@ from kapy.application.settings import CommonSettings
 from kapy.control.sessions.repository import SessionRepository
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow, agent
 from kapy.runner_duarable.activities import RunnerActivities
-from kapy.runner_duarable.types import SaveRunnerStateInput
+from kapy.runner_duarable.types import MessageBatch, SaveRunnerStateInput
 from kapy.runner_duarable.worker import serve
 
 
@@ -545,7 +545,7 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
     cause = exc_info.value.cause.cause
     assert isinstance(cause, ApplicationError) and cause.non_retryable
     assert cause.type == ("SessionNotFound" if missing else "RunnerStateConflict")
-    assert len(requests) == 1
+    assert len(requests) == (0 if missing else 1)
     async with runner_database.sessions.begin() as db:
         assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
             "previous",
@@ -658,15 +658,24 @@ async def test_invalid_state_fails_workflow_before_model_call(endpoint, runner_d
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_history_activity_lost_ack_retries_same_batch_and_replays(endpoint, runner_database):
+async def test_history_activity_lost_ack_retries_same_batch_and_replays(
+    endpoint, runner_database, monkeypatch
+):
     from temporalio.exceptions import ApplicationError
 
     from kapy.agent_runner.repository import AgentRepository
-    from kapy.runner_duarable.types import MessageBatch
 
     base_url, requests = endpoint
     saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
     inputs = []
+    broadcasts = []
+    publish = runner_database.outputs._publish
+
+    async def observe_publish(session_id, payload):
+        await publish(session_id, payload)
+        broadcasts.extend(TypeAdapter(list[OutputEvent]).validate_json(payload))
+
+    monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
 
     @activity.defn(name="kapy.record_history")
     async def lose_first_ack(data: MessageBatch) -> None:
@@ -712,10 +721,17 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(endpoint
         {"seq": 0, "authoritative": True},
         {"seq": 1, "authoritative": True},
     ]
+    assert [
+        (e.message.seq, e.message.authoritative)
+        for e in broadcasts
+        if isinstance(e, MessageCommitted)
+    ] == [(0, False), (0, False), (0, True), (1, True)]
+    published_before_replay = list(broadcasts)
     await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
         history
     )
     assert len(inputs) == 4 and len(requests) == 1
+    assert broadcasts == published_before_replay
 
 
 @pytest.mark.integration

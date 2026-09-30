@@ -108,8 +108,12 @@ task, queue consumer or recovery scan is installed.
 Each delivery consumes SessionService.live batches in order, with its persisted
 after_seq. Only fully delivered authoritative messages advance this cursor for
 durable sessions. Delta and non-authoritative complete messages update temporary
-previews; authoritative ModelResponse text becomes a formal message. Complete
-messages replace previews at their own seq only. Existing legacy sessions are
+previews; authoritative ModelResponse text becomes a formal message. Provisional
+messages replace previews at their own seq. Once authority is fully
+delivered or a non-text message is applied, delivery discards previews at/below the
+new cursor, including positions deleted when storage seals a numeric gap. Previews
+at larger seq remain; tool progress from the applied message is then displayed.
+Existing legacy sessions are
 identified by their old checkpoint and retain append-only delivery, deduplicating
 replays locally; no old runner is restarted. Pending sends finish before the next
 event, and messages without display text can acknowledge an authoritative position.

@@ -22,7 +22,6 @@ type ConsumeCancel = Callable[[AsyncSession], Awaitable[bool]]
 class HistoryMessage:
     """SDK message value at a session position, with explicit recording authority.
 
-    Authority is a producer contract, not a restriction on same-key replacement.
     Storage reads these attributes from columns, never from message metadata.
     """
 

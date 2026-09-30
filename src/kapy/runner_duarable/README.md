@@ -78,29 +78,37 @@ Only messages with `metadata.authoritative=True` anchor numbering. Their
 gaps are allowed. Missing authority means False; invalid flag/seq types fail.
 Every message after the last authoritative one gets numbered again, starting at
 that seq + 1 (or zero without an anchor). Non-authoritative seq values may repeat
-or be stale; they never advance the anchor. There is no caller-supplied start,
+or be stale; they never advance the anchor. Non-authoritative messages before the
+last anchor are silently ignored without changing their metadata; SDK working
+history need not form an authoritative prefix. There is no caller-supplied start,
 run-local counter, or database maximum-seq query.
 
 The recorder deep-copies this suffix, assigns seq and authoritative in SDK
 metadata, and creates `HistoryMessage(session_id, seq, authoritative, message)`
 from the same values. One `kapy.record_history` Activity commits the entire batch,
-then broadcasts `MessageCommitted` snapshots from those exact input DTOs. Only
+then broadcasts `MessageCommitted` snapshots from the accepted input DTOs. Only
 after acknowledgment does the recorder mark live SDK messages. Failure never
-prematurely marks them. Empty suffixes do not schedule an Activity. The request
+prematurely marks them. Database filtering does not restore stored payloads into
+SDK messages or runner state. Empty suffixes do not schedule an Activity. The request
 hook sets `RunnerDeps.response_seq` to the next position while invoking the model
 handler, then clears it in `finally`. Model Activities inherit that prediction;
 retries reuse it.
 
-Business hooks must preserve the authoritative prefix. Once the node's messages
-are authoritative, later hooks may only change non-authoritative tails or append
-new messages. There is no final Request rewrite. During a model request, do not
+Business hooks preserve authoritative message content and numbering. Once the
+node's messages are authoritative, later hooks may change provisional messages or
+append new messages; the recorder only processes the suffix after the last anchor.
+There is no final Request rewrite. During a model request, do not
 insert or reorder messages before the response: that would invalidate the predicted
 seq used by provisional deltas. Content changes are allowed. Node-after recording
 always uses actual SDK history; no cross-seq preview migration is provided.
 
 `RunnerActivities.record_messages(MessageBatch)` retains the registered Activity
-name `kapy.record_history` and a 30-second timeout. Its transaction calls
+name `kapy.record_history` and a 30-second timeout. Its transaction locks the
+session row with `SELECT id FOR UPDATE` before calling
 `AgentRepository.upsert_history(session_id, entries)` with explicit DTO fields.
+Other direct writers must hold the same row lock through commit. Different sessions
+can write concurrently; no lock spans output publication. A missing session fails
+with non-retryable `SessionNotFound`.
 The `agent_history.authoritative` column sits alongside seq; the generated migration
 initializes existing rows to False. JSON is opaque payload for storage decisions:
 seq and authority are never extracted from JSON or reconciled with SDK metadata.
@@ -110,28 +118,41 @@ including usage details, without a database reconstruction.
 `MessageBatch` uses `extra="ignore"` so control DTO strictness does not reject
 provider-specific fields in nested SDK usage; the SDK codec preserves those fields.
 
-Upsert unconditionally replaces `(session_id, seq)`, including authoritative and
-nullable fields, while preserving created_at. Invalid seq/authority, mismatched
-session IDs, and duplicate positions within a batch fail as non-retryable
-`InvalidHistory`. Authority is a producer convention, not a conflict condition.
-Transient failures retry normally: repeated writes and broadcasts are allowed,
-and full output events replace the same key regardless of authority or seq order.
-Only a committed batch is published. Transport failures do not roll back history;
-commit followed by a crash can miss broadcasts. No outbox or exactly-once contract
-is added. Replay of completed Activities performs no storage or output I/O.
+For each batch, the stored maximum authoritative seq is the fixed old boundary H0
+(-1 without authority). All authoritative inputs above H0 are accepted, independent
+of their input order; inputs at/below H0 are silently discarded, protecting existing
+messages and numeric gaps alike. H1 is the maximum of H0 and accepted authoritative
+positions. Only provisional inputs above H1 are accepted. Upsert replaces accepted
+positions, including nullable fields, while preserving created_at, then deletes
+stored provisional rows at/below H1. Uncovered provisional rows above H1 remain.
+A `(session_id, authoritative, seq)` index supports boundary lookup and cleanup
+without scanning confirmed history. Nonempty valid batches clean old provisional
+rows even when all inputs are discarded; an empty batch performs no history I/O.
+
+Invalid seq/authority, mismatched session IDs and duplicate batch positions fail
+as non-retryable `InvalidHistory`, before any writes. The repository returns accepted
+input DTOs in input order; the Activity publishes only those DTOs after committing,
+without reconstructing payloads from the database. An empty accepted set creates
+no publisher. Transient failures retry normally: provisional retries can replace
+and broadcast again, while already committed authoritative inputs are discarded.
+Transport failures do not roll back history; commit followed by a crash can miss
+broadcasts, recovered by periodic history reads or gap backfill. No outbox or
+exactly-once contract is added. Replay of completed Activities performs no storage
+or output I/O. Raw broadcasts may still arrive late or out of order.
 
 History batches and the final runner-state save remain separate transactions. A
 failed run may leave recorded history while the previous state remains available.
-Rerunning from that state can overwrite rows, and uncovered rows are not deleted.
 The successful state includes seq/authority metadata, including a non-authoritative
 after-run tail that can be re-numbered in the next run. History is not a mirror of
-the last successful state. `after_seq` queries cannot recover earlier overwrites.
+the last successful state. Storage filtering preserves the confirmed prefix but
+does not reconcile stale runner state, so callers still serialize session runs and
+do not restart failed runs from an older successful snapshot.
 
 HTTP and Telegram use `SessionService.start_durable_runner()`, which serializes
 starts with a short session row lock and the fixed `kapy-runner:{session_id}`
 Workflow ID. It admits a new execution only initially or after COMPLETED, so
-terminal failures cannot silently restart from an older state and overwrite an
-already confirmed authoritative prefix. It rejects business plugin bindings and
+terminal failures cannot silently restart execution from an older state that no
+longer matches the confirmed history. It rejects business plugin bindings and
 legacy checkpoints; queues, cancel flags and compaction settings remain unused.
 
 `SessionService.live(after_seq=-1)` joins history with Pub/Sub and periodic reads.
@@ -143,8 +164,11 @@ authoritative prefix's content and membership must remain immutable. An inconsis
 history prefix fails the stream. Periodic reads recover missed commits independently
 of preview traffic; unconfirmed suffixes can replay. Client acknowledgement may lag
 the connection cursor and must reflect only fully applied messages.
-Complete snapshots replace the same key and clear that key's preview; later deltas
-form a new preview. Clear previews when reconnecting. Direct
+Provisional snapshots replace the same key and clear that key's preview. After
+fully applying authority and advancing after_seq, clients discard all provisional
+snapshots and previews at/below that cursor: confirmation may have deleted them
+without a separate deletion event. Later positions retain their previews. Clear
+previews when reconnecting. Direct
 `AgentOutputService.subscribe()` remains available for callers owning their replay
 policy. Transport buffering is described in [the output contract](../agent_runner/README.md).
 

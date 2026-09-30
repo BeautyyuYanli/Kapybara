@@ -1,7 +1,8 @@
 """Record the non-authoritative suffix at request, node and run boundaries.
 
-Only authoritative SDK metadata anchors numbering. Storage and output overwrite
-positions unconditionally; business hooks must preserve the authoritative prefix.
+Only authoritative SDK metadata anchors numbering. Non-authoritative messages
+before the last anchor are silently ignored. Storage independently protects the
+confirmed database prefix; discarded input is not restored into SDK history.
 """
 
 from copy import deepcopy
@@ -57,6 +58,7 @@ class MessageRecordCapability(AbstractCapability[RunnerDeps]):
 
         Non-authoritative marks are replaceable estimates. All messages after the
         last authoritative one are re-numbered, even if they already have a seq.
+        Earlier non-authoritative messages are ignored without changing their marks.
         Empty suffixes perform no Activity. Failure leaves live metadata intact.
         """
         last_seq, start = -1, 0

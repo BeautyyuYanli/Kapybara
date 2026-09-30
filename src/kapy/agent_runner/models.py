@@ -1,14 +1,25 @@
 """Execution position, messages and context pages, without physical FKs.
 
-Legacy checkpoints append history; the Temporal runner may overwrite a history
-row by (session_id, seq). Callers must not mix these writers for one session.
+Legacy checkpoints append history; the Temporal runner may replace provisional
+rows while preserving a confirmed prefix. Do not mix these writers for one session.
 """
 
 from datetime import datetime
 from typing import Any, ClassVar
 from uuid import UUID
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, Column, DateTime, MetaData, Text, false, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Index,
+    MetaData,
+    Text,
+    false,
+    func,
+)
 from sqlmodel import Field, SQLModel
 
 agent_metadata = MetaData()
@@ -36,6 +47,7 @@ class AgentHistoryRow(SQLModel, table=True):
         CheckConstraint("kind IN ('request', 'response')"),
         CheckConstraint("input_tokens IS NULL OR input_tokens >= 0"),
         CheckConstraint("output_tokens IS NULL OR output_tokens >= 0"),
+        Index("ix_agent_history_session_authoritative_seq", "session_id", "authoritative", "seq"),
     )
 
     session_id: UUID = Field(primary_key=True)

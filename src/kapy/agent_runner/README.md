@@ -309,7 +309,10 @@ Transactions end before yielding. Backpressure pauses polling, not background
 reception. Each live call owns at most one subscription read and joins it before
 closing. Errors end the generator; runner completion does not. Reconnect clears
 previews and resumes from the applied authoritative prefix. Complete messages
-replace only their own seq's preview; later deltas establish a new preview. Missing
+replace their own seq's preview; after fully applying authoritative messages,
+consumers also discard provisional snapshots and previews at/below the confirmed
+cursor. Durable storage may delete those rows when authority seals numeric gaps,
+without emitting deletion events. Later positions keep their previews. Missing
 subscribers lose deltas. There is no outbox or durable delta cursor.
 
 `AgentOutputService.publisher(flush_interval=0.5)` buffers at most 64 KiB of encoded

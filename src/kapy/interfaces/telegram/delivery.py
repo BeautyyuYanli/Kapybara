@@ -197,6 +197,11 @@ class TelegramDelivery:
                         else:
                             row.after_seq = event.message.seq
                             await self.repository.save_delivery(row)
+                        # Authority may seal a gap by deleting older provisional rows.
+                        # Clear those previews only after delivery acknowledges the prefix.
+                        if not legacy and preview.seq <= row.after_seq:
+                            preview = Preview(unavailable=preview.unavailable)
+                        if not text:
                             for part in message.parts:
                                 if isinstance(part, ToolCallPart):
                                     preview.progress = f"Calling tool: {part.tool_name}"

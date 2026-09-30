@@ -1,5 +1,7 @@
-"""Real Temporal codecs, PostgreSQL overwrites and committed full-message broadcasts."""
+"""Real Temporal codecs, PostgreSQL write boundaries and committed full-message broadcasts."""
 
+import asyncio
+from contextlib import aclosing, asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
 from uuid import uuid4
@@ -15,13 +17,17 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.usage import RequestUsage
+from sqlalchemy import event, text
+from sqlmodel import col, select
 from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 
 from kapy.agent_runner import HistoryMessage, MessageCommitted
 from kapy.agent_runner.models import AgentHistoryRow, AgentStateRow
 from kapy.agent_runner.repository import AgentRepository
-from kapy.control.sessions.repository import SessionRepository
+from kapy.control.sessions import SessionService
+from kapy.control.sessions.models import SessionRow
+from kapy.control.sessions.repository import SessionRepository, lock_session
 from kapy.runner_duarable.activities import RunnerActivities
 from kapy.runner_duarable.types import MessageBatch
 
@@ -61,7 +67,7 @@ async def test_message_payload_round_trip_preserves_sdk_binary_and_usage():
 
 
 @pytest.mark.integration
-async def test_overwrite_columns_and_broadcast_complete_input_after_commit(
+async def test_provisional_overwrite_and_broadcast_complete_input_after_commit(
     runner_database, monkeypatch
 ):
     session_id, outputs = runner_database.session_id, runner_database.outputs
@@ -77,7 +83,7 @@ async def test_overwrite_columns_and_broadcast_complete_input_after_commit(
             input_tokens=100, output_tokens=20, cache_read_tokens=50, details={"extra": 7}
         ),
     )
-    entry = HistoryMessage(session_id, 10, True, response)
+    entry = HistoryMessage(session_id, 10, False, response)
     first = MessageBatch(session_id=session_id, messages=[entry])
     publish = outputs._publish
 
@@ -95,7 +101,7 @@ async def test_overwrite_columns_and_broadcast_complete_input_after_commit(
         assert await anext(events) == [MessageCommitted(entry)]
         async with runner_database.sessions.begin() as db:
             row = await db.get(AgentHistoryRow, (session_id, 10))
-            assert row is not None and row.authoritative
+            assert row is not None and not row.authoritative
             created_at = row.created_at
             assert (row.finish_reason, row.input_tokens, row.output_tokens) == ("stop", 100, 20)
         replacement = ModelRequest(
@@ -171,26 +177,223 @@ async def test_invalid_batch_does_not_write_or_broadcast(runner_database, monkey
         assert await AgentRepository(db).read_history_entries(session_id) == ()
 
 
+def history(session_id, seq, authoritative, content="message"):
+    return HistoryMessage(session_id, seq, authoritative, ModelRequest([UserPromptPart(content)]))
+
+
 @pytest.mark.integration
-async def test_upsert_borrows_transaction_and_keeps_uncovered_rows(runner_database):
+async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_database, monkeypatch):
     session_id = runner_database.session_id
-    entry = HistoryMessage(session_id, 8, True, ModelRequest(parts=[UserPromptPart("kept")]))
+    activities = RunnerActivities(runner_database.sessions, runner_database.outputs)
+    initial = [history(session_id, 0, True), history(session_id, 10, True)]
+    provisional = [history(session_id, seq, False) for seq in (11, 12, 14, 18)]
+    await activities.record_messages(
+        MessageBatch(session_id=session_id, messages=initial + provisional)
+    )
     async with runner_database.sessions.begin() as db:
-        await AgentRepository(db).upsert_history(session_id, [entry])
+        before = await db.get(AgentHistoryRow, (session_id, 12))
+        created_at = before.created_at
+
+    published = []
+
+    @asynccontextmanager
+    async def publisher(requested_session):
+        assert requested_session == session_id
+        # The lock and transaction must already be released before publishing.
+        async with runner_database.sessions.begin() as db:
+            await db.execute(
+                select(SessionRow.id)
+                .where(col(SessionRow.id) == session_id)
+                .with_for_update(nowait=True)
+            )
+            stored = await AgentRepository(db).read_history_entries(session_id)
+            assert [(e.seq, e.authoritative) for e in stored] == [
+                (0, True),
+                (10, True),
+                (12, True),
+                (15, True),
+                (16, False),
+                (18, False),
+            ]
+
+        async def publish(message):
+            published.append(message)
+
+        yield publish
+
+    monkeypatch.setattr(runner_database.outputs, "publisher", publisher)
+    batch = [
+        history(session_id, 5, True, "old gap"),
+        history(session_id, 10, True, "changed old A"),
+        history(session_id, 15, True),
+        history(session_id, 12, True),
+        history(session_id, 13, False),
+        history(session_id, 16, False),
+    ]
+    await activities.record_messages(MessageBatch(session_id=session_id, messages=batch))
+    assert published == [MessageCommitted(batch[i]) for i in (2, 3, 5)]
+    async with runner_database.sessions.begin() as db:
+        stored = await AgentRepository(db).read_history_entries(session_id)
+        assert stored[:2] == tuple(initial)
+        assert (await db.get(AgentHistoryRow, (session_id, 12))).created_at == created_at
+        assert stored[-1] == provisional[-1]
+
+    def unexpected_publisher(*args):
+        pytest.fail("discarded inputs must not create a publisher")
+
+    monkeypatch.setattr(runner_database.outputs, "publisher", unexpected_publisher)
+    await activities.record_messages(
+        MessageBatch(
+            session_id=session_id,
+            messages=[
+                history(session_id, 10, False, "downgrade"),
+                history(session_id, 12, True, "different retry"),
+                history(session_id, 13, True, "newly sealed gap"),
+                batch[2],
+            ],
+        )
+    )
+    await activities.record_messages(MessageBatch(session_id=session_id, messages=[]))
+    async with runner_database.sessions.begin() as db:
+        assert await AgentRepository(db).read_history_entries(session_id) == stored
+
+
+@pytest.mark.integration
+async def test_upsert_borrows_transaction_and_returns_accepted_inputs(runner_database):
+    session_id = runner_database.session_id
+    initial = [
+        history(session_id, 0, True),
+        history(session_id, 1, False),
+        history(session_id, 4, False),
+    ]
+    async with runner_database.sessions.begin() as db:
+        await lock_session(db, session_id)
+        assert await AgentRepository(db).upsert_history(session_id, initial) == tuple(initial)
     with pytest.raises(RuntimeError, match="rollback"):
         async with runner_database.sessions.begin() as db:
-            await AgentRepository(db).upsert_history(
-                session_id,
-                [
-                    replace(
-                        entry,
-                        authoritative=False,
-                        message=ModelResponse(parts=[TextPart("rolled back")]),
-                    )
-                ],
-            )
+            await lock_session(db, session_id)
+            entry = history(session_id, 3, True)
+            assert await AgentRepository(db).upsert_history(session_id, [entry]) == (entry,)
+            assert [e.seq for e in await AgentRepository(db).read_history_entries(session_id)] == [
+                0,
+                3,
+                4,
+            ]
             raise RuntimeError("rollback")
     async with runner_database.sessions.begin() as db:
-        await AgentRepository(db).upsert_history(session_id, [replace(entry, seq=3)])
-        entries = await AgentRepository(db).read_history_entries(session_id)
-        assert [e.seq for e in entries] == [3, 8] and entries[-1] == entry
+        assert await AgentRepository(db).read_history_entries(session_id) == tuple(initial)
+
+
+@pytest.mark.integration
+async def test_discarded_nonempty_batch_cleans_existing_invalid_prefix(runner_database):
+    session_id = runner_database.session_id
+    async with runner_database.sessions.begin() as db:
+        await lock_session(db, session_id)
+        await AgentRepository(db).upsert_history(
+            session_id, [history(session_id, 0, False), history(session_id, 2, False)]
+        )
+        # Construct legacy/corrupt storage explicitly; production writes cannot create N,A.
+        await db.execute(text("UPDATE agent_history SET authoritative = true WHERE seq = 2"))
+        assert await AgentRepository(db).upsert_history(session_id, []) == ()
+        assert [e.seq for e in await AgentRepository(db).read_history_entries(session_id)] == [0, 2]
+        assert (
+            await AgentRepository(db).upsert_history(session_id, [history(session_id, 1, True)])
+            == ()
+        )
+        assert [e.seq for e in await AgentRepository(db).read_history_entries(session_id)] == [2]
+
+
+@pytest.mark.integration
+async def test_record_missing_session_is_non_retryable_and_does_not_publish(
+    runner_database, monkeypatch
+):
+    session_id = uuid4()
+
+    def unexpected_publisher(*args):
+        pytest.fail("missing sessions must not publish")
+
+    monkeypatch.setattr(runner_database.outputs, "publisher", unexpected_publisher)
+    with pytest.raises(ApplicationError) as error:
+        await RunnerActivities(runner_database.sessions, runner_database.outputs).record_messages(
+            MessageBatch(session_id=session_id, messages=[history(session_id, 0, True)])
+        )
+    assert error.value.type == "SessionNotFound" and error.value.non_retryable
+    async with runner_database.sessions.begin() as db:
+        assert await AgentRepository(db).read_history_entries(session_id) == ()
+
+
+@pytest.mark.integration
+async def test_record_serializes_session_writes_before_reading_boundary(runner_database):
+    session_id, other_id = runner_database.session_id, uuid4()
+    activities = RunnerActivities(runner_database.sessions, runner_database.outputs)
+    async with runner_database.sessions.begin() as db:
+        db.add(SessionRow(id=other_id, provider_id=uuid4(), model_name="test"))
+    attempted_lock = asyncio.Event()
+    engine = runner_database.sessions.kw["bind"]
+
+    def before_execute(connection, cursor, statement, parameters, context, executemany):
+        if "FOR UPDATE" in statement:
+            attempted_lock.set()
+
+    task = None
+    try:
+        async with runner_database.sessions.begin() as db:
+            await lock_session(db, session_id)
+            await AgentRepository(db).upsert_history(session_id, [history(session_id, 2, True)])
+            event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
+            task = asyncio.create_task(
+                activities.record_messages(
+                    MessageBatch(session_id=session_id, messages=[history(session_id, 1, False)])
+                )
+            )
+            async with asyncio.timeout(2):
+                await attempted_lock.wait()
+                # A different session must commit while the first writer holds its lock.
+                await activities.record_messages(
+                    MessageBatch(session_id=other_id, messages=[history(other_id, 1, False)])
+                )
+            assert not task.done()
+        async with asyncio.timeout(2):
+            await task
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", before_execute)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    async with runner_database.sessions.begin() as db:
+        assert [
+            (e.seq, e.authoritative)
+            for e in await AgentRepository(db).read_history_entries(session_id)
+        ] == [(2, True)]
+        assert [
+            (e.seq, e.authoritative)
+            for e in await AgentRepository(db).read_history_entries(other_id)
+        ] == [(1, False)]
+
+
+@pytest.mark.integration
+async def test_commit_before_broadcast_failure_recovers_without_retry_publication(
+    runner_database, monkeypatch
+):
+    session_id, outputs = runner_database.session_id, runner_database.outputs
+    activities = RunnerActivities(runner_database.sessions, outputs)
+    sessions = SessionService(
+        runner_database.sessions, output_service=outputs, live_poll_interval=0.02
+    )
+    provisional = history(session_id, 1, False)
+    await activities.record_messages(MessageBatch(session_id=session_id, messages=[provisional]))
+    final = history(session_id, 3, True)
+    data = MessageBatch(session_id=session_id, messages=[final])
+
+    def lose_broadcast(*args):
+        raise RuntimeError("lost before broadcast")
+
+    async with aclosing(sessions.live(session_id)) as batches:
+        assert await anext(batches) == [MessageCommitted(provisional)]
+        monkeypatch.setattr(outputs, "publisher", lose_broadcast)
+        with pytest.raises(RuntimeError, match="lost before broadcast"):
+            await activities.record_messages(data)
+        # Retry must not even open the still-failing publisher for the committed A.
+        await activities.record_messages(data)
+        async with asyncio.timeout(2):
+            assert await anext(batches) == [MessageCommitted(final)]

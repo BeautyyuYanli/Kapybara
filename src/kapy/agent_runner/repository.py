@@ -1,8 +1,8 @@
 """Runner history and checkpoints, borrowing one caller-owned transaction.
 
 Legacy checkpoint mutations follow SessionLease.lock_owned in the same
-transaction. Temporal upsert_history is a separate overwrite contract: its
-caller serializes session runs without using legacy checkpoints or leases.
+transaction. Temporal upsert_history protects the confirmed prefix: its caller
+locks the session row in the same transaction, without using legacy leases.
 No method acquires a lease, commits, or manages session lifetime. Usage is
 normalized outside message JSON; message parts retain the SDK's official codec.
 """
@@ -12,7 +12,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse
-from sqlalchemy import func, insert, update
+from sqlalchemy import delete, func, insert, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
@@ -251,12 +251,18 @@ class AgentRepository:
             await self._db.execute(insert(AgentHistoryRow), rows)
         return _decode_history([AgentHistoryRow(**row) for row in rows])
 
-    async def upsert_history(self, session_id: UUID, messages: Sequence[HistoryMessage]) -> None:
-        """Overwrite explicit positions and authority without reading payload metadata.
+    async def upsert_history(
+        self, session_id: UUID, messages: Sequence[HistoryMessage]
+    ) -> tuple[HistoryMessage, ...]:
+        """Protect the confirmed prefix and return accepted input DTOs in input order.
 
-        The caller owns the transaction and serializes writes for this session.
-        Identical and changed retries are both legal; created_at stays unchanged.
-        Invalid or duplicate seq values fail before any rows are written.
+        The caller holds the session row lock through commit. All new authoritative
+        positions are judged against the same stored boundary; provisional inputs
+        at/below the resulting boundary are silently discarded. Older provisional
+        rows in that range are removed, sealing numeric gaps as well as messages.
+        JSON metadata never determines authority. Invalid or duplicate positions
+        reject the whole batch; an empty batch does nothing. Accepted overwrites
+        preserve created_at. Only publish returned DTOs after committing.
         """
         seen: set[int] = set()
         for message in messages:
@@ -270,7 +276,31 @@ class AgentRepository:
             if seq in seen:
                 raise ValueError("A history batch cannot contain duplicate seq values")
             seen.add(seq)
-        rows = _encode_history(messages)
+        if not messages:
+            return ()
+        last_authoritative = (
+            await self._db.execute(
+                select(AgentHistoryRow.seq)
+                .where(
+                    col(AgentHistoryRow.session_id) == session_id,
+                    col(AgentHistoryRow.authoritative).is_(True),
+                )
+                .order_by(col(AgentHistoryRow.seq).desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        old_boundary = -1 if last_authoritative is None else last_authoritative
+        new_boundary = max(
+            (message.seq for message in messages if message.authoritative),
+            default=old_boundary,
+        )
+        new_boundary = max(old_boundary, new_boundary)
+        accepted = tuple(
+            message
+            for message in messages
+            if message.seq > (old_boundary if message.authoritative else new_boundary)
+        )
+        rows = _encode_history(accepted)
         if rows:
             statement = pg_insert(AgentHistoryRow).values(rows)
             await self._db.execute(
@@ -290,3 +320,13 @@ class AgentRepository:
                     },
                 )
             )
+        # Promote same-position N rows first so they keep their original created_at.
+        # Even an entirely discarded batch repairs pre-existing N rows below the boundary.
+        await self._db.execute(
+            delete(AgentHistoryRow).where(
+                col(AgentHistoryRow.session_id) == session_id,
+                col(AgentHistoryRow.authoritative).is_(False),
+                col(AgentHistoryRow.seq) <= new_boundary,
+            )
+        )
+        return accepted

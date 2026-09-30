@@ -261,3 +261,37 @@ async def test_shared_agent_runs_keep_independent_positions(recorded):
     )
     assert [[metadata(m)["seq"] for m in r.all_messages()] for r in results] == [[0, 1], [0, 1]]
     assert len({batch.session_id for batch in recorded}) == 2
+
+
+@pytest.mark.parametrize("leading_authority", [False, True])
+@pytest.mark.parametrize("with_tail", [False, True])
+async def test_recorder_ignores_provisional_messages_before_last_anchor(
+    recorded, leading_authority, with_tail
+):
+    messages: list[ModelMessage] = []
+    if leading_authority:
+        messages.append(
+            ModelResponse([TextPart("first")], metadata={"seq": 1, "authoritative": True})
+        )
+    ignored = ModelRequest(
+        [UserPromptPart("ignored")], metadata={"seq": 90, "authoritative": False}
+    )
+    messages.extend(
+        [ignored, ModelResponse([TextPart("anchor")], metadata={"seq": 5, "authoritative": True})]
+    )
+    original = deepcopy(messages)
+    if with_tail:
+        messages.append(
+            ModelRequest([UserPromptPart("tail")], metadata={"seq": 2, "authoritative": False})
+        )
+    next_seq = await MessageRecordCapability().record_messages(
+        make_deps(), messages, authoritative=True
+    )
+    assert next_seq == (7 if with_tail else 6)
+    assert messages[: len(original)] == original
+    if with_tail:
+        assert len(recorded) == 1
+        assert [(m.seq, m.authoritative) for m in recorded[0].messages] == [(6, True)]
+        assert metadata(messages[-1]) == {"seq": 6, "authoritative": True}
+    else:
+        assert recorded == []

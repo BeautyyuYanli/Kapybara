@@ -102,7 +102,10 @@ close it with 1003; accepted-connection failures close it with 1011. Disconnect
 closes the generator and subscription even when idle, without cancelling the runner.
 A connection can span multiple runs. Temporary deltas have no replay guarantee:
 clear them on reconnect and resume from the last fully applied authoritative prefix. Delta and provisional
-message positions never advance that cursor. Legacy append-only consumers may
+message positions never advance that cursor. After fully applying an authoritative
+message, discard all provisional snapshots and previews at/below the new cursor,
+including numeric gaps; storage may delete them without a deletion event. Keep
+previews at later positions. Legacy append-only consumers may
 continue using their applied seq but must deduplicate repeated provisional history.
 
 Frontends may replace their pending-input list from read_inputs after submissions,

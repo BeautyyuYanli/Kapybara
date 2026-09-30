@@ -11,7 +11,14 @@ from uuid import uuid4
 import httpx2
 import pytest
 import pytest_asyncio
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -900,3 +907,54 @@ async def test_durable_busy_and_ambiguous_start_are_not_retried_as_queued_input(
     assert "busy" in client.send.call_args_list[0].args[2]
     assert "/status" in client.send.call_args_list[1].args[2]
     assert "secret" not in str(client.send.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preview_seq", [1, 4])
+@pytest.mark.parametrize("complete_kind", ["text", "request", "tool_call", "tool_return"])
+async def test_durable_confirmation_clears_covered_previews_and_keeps_future(
+    repository, preview_seq, complete_kind
+):
+    row = await delivery_row(repository)
+    sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
+    client = AsyncMock(spec=TelegramClient)
+    messages = {
+        "text": ModelResponse([TextPart("final")]),
+        "request": ModelRequest([UserPromptPart("input")]),
+        "tool_call": ModelResponse([ToolCallPart("test_tool", {}, "call")]),
+        "tool_return": ModelRequest([ToolReturnPart("test_tool", "done", "call")]),
+    }
+    progress = {"tool_call": "Calling tool: test_tool", "tool_return": "Tool finished: test_tool"}
+
+    async def send(chat_id, thread_id, content, **kwargs):
+        if "draft_id" not in kwargs:
+            assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
+
+    client.send.side_effect = send
+
+    async def live(session_id, *, after_seq):
+        yield [TextDelta(session_id, preview_seq, 0, "text", "replace", "preview")]
+        assert client.send.call_args.args[2] == "preview"
+        client.send.reset_mock()
+        # Permit a stale draft to refresh if it was incorrectly retained.
+        future_time = time.monotonic() + 21
+        from unittest.mock import patch
+
+        with patch("kapy.interfaces.telegram.delivery.time.monotonic", return_value=future_time):
+            yield [MessageCommitted(HistoryMessage(session_id, 3, True, messages[complete_kind]))]
+        assert (await repository.get_delivery(delivery_key(row))).after_seq == 3
+
+    sessions.live = live
+    await TelegramDelivery(client, sessions, repository, 42).consume(row)
+    drafts = [call.args[2] for call in client.send.call_args_list if "draft_id" in call.kwargs]
+    assert drafts == (
+        ["preview"]
+        if preview_seq > 3
+        else [progress[complete_kind]]
+        if complete_kind in progress
+        else []
+    )
+    assert [
+        call.args[2] for call in client.send.call_args_list if "draft_id" not in call.kwargs
+    ] == (["final"] if complete_kind == "text" else [])

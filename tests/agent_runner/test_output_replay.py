@@ -17,6 +17,7 @@ from valkey.exceptions import ConnectionError as ValkeyConnectionError
 
 from kapy.agent_output import AgentOutputService
 from kapy.agent_runner import HistoryMessage, MessageCommitted, OutputEvent, TextDelta
+from kapy.agent_runner.models import AgentHistoryRow
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
 
@@ -623,7 +624,17 @@ async def test_inconsistent_history_prefix_fails_without_confirming_later_messag
         if read_boundary != "initial":
             assert await anext(batches) == [MessageCommitted(initial)]
         async with database.sessions.begin() as db:
-            await AgentRepository(db).upsert_history(session_id, [provisional, inconsistent])
+            await AgentRepository(db).upsert_history(session_id, [provisional])
+            # Bypass the guarded writer to exercise detection of corrupt/legacy history.
+            db.add(
+                AgentHistoryRow(
+                    session_id=session_id,
+                    seq=inconsistent.seq,
+                    authoritative=True,
+                    kind="response",
+                    message={"parts": [{"part_kind": "text", "content": "must not acknowledge"}]},
+                )
+            )
         if read_boundary == "backfill":
             async with direct_publisher(valkey_client, session_id) as publish:
                 await publish(MessageCommitted(inconsistent))
@@ -722,3 +733,31 @@ async def test_authoritative_live_keeps_broadcast_usage_details(database, valkey
             await publish(MessageCommitted(entry))
         async with asyncio.timeout(2):
             assert await next_committed(events) == entry
+
+
+@pytest.mark.parametrize("broadcast", [False, True])
+async def test_deleted_provisional_gap_recovers_authority_and_filters_late_preview(
+    database, valkey_client, broadcast
+):
+    session_id = uuid4()
+    outputs = AgentOutputService(valkey_client)
+    sessions = SessionService(database.sessions, output_service=outputs, live_poll_interval=0.02)
+    provisional = HistoryMessage(session_id, 1, False, response("temporary"))
+    async with database.sessions.begin() as db:
+        await AgentRepository(db).upsert_history(session_id, [provisional])
+    async with individual_events(sessions, session_id) as events:
+        assert await next_committed(events) == provisional
+        final = (await append(database, session_id, [response("final")], 3))[0]
+        async with database.sessions.begin() as db:
+            assert await AgentRepository(db).read_history_entries(session_id) == (final,)
+        if broadcast:
+            async with direct_publisher(valkey_client, session_id) as publish:
+                await publish(MessageCommitted(final))
+        async with asyncio.timeout(2):
+            assert await next_committed(events) == final
+            future = TextDelta(session_id, 4, 0, "text", "replace", "future")
+            async with direct_publisher(valkey_client, session_id) as publish:
+                await publish(MessageCommitted(provisional))
+                await publish(TextDelta(session_id, 1, 0, "text", "append", "late"))
+                await publish(future)
+            assert await anext(events) == future
