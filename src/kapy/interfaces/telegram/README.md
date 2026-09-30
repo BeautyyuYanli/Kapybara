@@ -119,7 +119,11 @@ replays locally; no old runner is restarted. Pending sends finish before the nex
 event, and messages without display text can acknowledge an authoritative position.
 
 Private chats (including topics) receive replace/append draft previews rendered once
-per consumed batch. Delivery awaits that send, including retries and chat pacing,
+per consumed batch. Thinking previews turn pages every 500 Unicode characters:
+completed pages are cleared rather than retained as a sliding tail, and an exact
+page boundary displays `…` until more text arrives. Large batches show only the
+current page. Answer text takes precedence over thinking.
+Delivery awaits that send, including retries and chat pacing,
 before reading the next batch. SessionService/AgentOutput retain incoming output
 and merge pending deltas during this wait; the interface has no read-ahead task,
 coalescing timer or output queue. Preview state only retains the text and draft ID

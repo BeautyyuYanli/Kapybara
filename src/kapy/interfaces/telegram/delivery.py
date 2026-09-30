@@ -60,7 +60,11 @@ class Preview:
         thinking = "".join(
             value for (_, kind), value in sorted(self.parts.items()) if kind == "thinking"
         )
-        return thinking[-2000:] or self.progress, False
+        if thinking:
+            # Drop completed 500-character pages, including at an exact boundary.
+            # A nonempty placeholder replaces the old draft while the next page is empty.
+            return thinking[len(thinking) // 500 * 500 :] or "…", False
+        return self.progress, False
 
 
 class TelegramDelivery:

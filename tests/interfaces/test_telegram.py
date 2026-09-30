@@ -466,6 +466,47 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
 
 
 @pytest.mark.asyncio
+async def test_thinking_preview_turns_pages_and_resets_on_replacement(repository):
+    row = await delivery_row(repository)
+    client = AsyncMock(spec=TelegramClient)
+
+    async def live(session_id, *, after_seq):
+        for seq, part, kind, op, content in [
+            (0, 0, "thinking", "replace", "思" * 499),
+            (0, 0, "thinking", "append", "考"),
+            (0, 1, "thinking", "replace", "新"),
+            (0, 1, "thinking", "append", "页😀"),
+            (0, 1, "thinking", "append", "续" * 1000),
+            (0, 0, "thinking", "replace", "重置"),
+            (1, 0, "thinking", "replace", "新的回复"),
+            (1, 1, "text", "replace", "answer"),
+            (1, 0, "thinking", "append", "思" * 500),
+        ]:
+            yield [TextDelta(session_id, seq, part, kind, op, content)]
+
+    sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
+    sessions.live = live
+    await TelegramDelivery(client, sessions, repository, 42).consume(row)
+
+    calls = client.send.call_args_list
+    assert [call.args[2] for call in calls] == [
+        "思" * 499,
+        "…",
+        "新",
+        "新页😀",
+        "续" * 3,
+        "续" * 5,
+        "新的回复",
+        "answer",
+    ]
+    assert all(call.kwargs["draft_id"] == calls[0].kwargs["draft_id"] for call in calls[:6])
+    assert all(not call.kwargs["rich"] for call in calls[:-1])
+    assert calls[-1].kwargs["rich"]
+    assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
+
+
+@pytest.mark.asyncio
 async def test_connection_failure_resumes_after_last_delivered_commit(repository, monkeypatch):
     row = await delivery_row(repository)
     key = delivery_key(row)
