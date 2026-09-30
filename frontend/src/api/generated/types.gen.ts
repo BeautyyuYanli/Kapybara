@@ -383,6 +383,20 @@ export type DocumentUrlOutput = {
 };
 
 /**
+ * DurableRun
+ */
+export type DurableRun = {
+    /**
+     * Workflow Id
+     */
+    workflow_id: string;
+    /**
+     * Run Id
+     */
+    run_id: string;
+};
+
+/**
  * ErrorDetails
  */
 export type ErrorDetails = {
@@ -1359,6 +1373,16 @@ export type SpeechPart = {
      * Part Kind
      */
     part_kind?: 'speech';
+};
+
+/**
+ * StartDurableRunner
+ */
+export type StartDurableRunner = {
+    /**
+     * User Prompt
+     */
+    user_prompt: string;
 };
 
 /**
@@ -3231,6 +3255,36 @@ export type IsRunnerRunningResponses = {
 };
 
 export type IsRunnerRunningResponse = IsRunnerRunningResponses[keyof IsRunnerRunningResponses];
+
+export type StartDurableRunnerData = {
+    body: StartDurableRunner;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/runner';
+};
+
+export type StartDurableRunnerErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type StartDurableRunnerError = StartDurableRunnerErrors[keyof StartDurableRunnerErrors];
+
+export type StartDurableRunnerResponses = {
+    /**
+     * Successful Response
+     */
+    202: DurableRun;
+};
+
+export type StartDurableRunnerResponse = StartDurableRunnerResponses[keyof StartDurableRunnerResponses];
 
 export type ReadCancelData = {
     body?: never;

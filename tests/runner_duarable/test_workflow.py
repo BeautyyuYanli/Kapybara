@@ -73,6 +73,13 @@ def endpoint() -> Iterator[tuple[str, list[dict[str, Any]]]]:
                     "created_at": 1,
                     "model": body["model"],
                     "status": "completed",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                    },
                     "output": [
                         {
                             "id": "msg_test",
@@ -111,6 +118,12 @@ def endpoint() -> Iterator[tuple[str, list[dict[str, Any]]]]:
                     }
                     for text, reason in [("do", None), ("ne", None), ("", "stop")]
                 ]
+                chunks[-1]["usage"] = {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "completion_tokens_details": {"reasoning_tokens": 0},
+                }
             elif self.path.endswith("/responses"):
                 assert body["stream"]
                 item = response["output"][0]
@@ -703,3 +716,141 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(endpoint
         history
     )
     assert len(inputs) == 4 and len(requests) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_session_service_runs_successive_prompts_and_telegram_delivery(
+    endpoint, runner_database, tmp_path
+):
+    """Real Worker/SDK/state/live wiring; only the external Telegram send is mocked."""
+    from unittest.mock import AsyncMock
+
+    from pydantic import SecretStr
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from kapy.application.resources import Resources
+    from kapy.application.sessions import create_session_service
+    from kapy.control.models import CreateModel, CreateProvider, ModelService
+    from kapy.control.sessions import CreateSession
+    from kapy.interfaces.telegram.client import TelegramClient
+    from kapy.interfaces.telegram.controller import TelegramController
+    from kapy.interfaces.telegram.delivery import TelegramDelivery
+    from kapy.interfaces.telegram.repository import TelegramRepository, delivery_key
+    from kapy.interfaces.telegram.schema import migrate
+    from kapy.interfaces.telegram.settings import TelegramSettings
+    from kapy.interfaces.telegram.storage import open_storage
+
+    base_url, requests = endpoint
+    models = ModelService(runner_database.sessions)
+    provider = await models.create_provider(
+        CreateProvider(
+            name="durable-service-test",
+            provider_class="pydantic_ai.providers.openai:OpenAIProvider",
+            model_class="pydantic_ai.models.openai:OpenAIChatModel",
+            api_key=SecretStr("local-test"),
+            base_url=base_url,
+        )
+    )
+    await models.create_model(
+        CreateModel(
+            provider_id=provider.id,
+            model_name="gpt-4o-mini",
+            settings={"temperature": 0.1, "max_tokens": 20},
+            context_window=12345,
+        )
+    )
+    temporal = await Client.connect(
+        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"), plugins=[PydanticAIPlugin()]
+    )
+    queue = f"service-test-{uuid4()}"
+    sessions = create_session_service(
+        Resources(runner_database.sessions, runner_database.valkey, temporal),
+        runner_database.settings.model_copy(update={"temporal_task_queue": queue}),
+    )
+    template = CreateSession(
+        provider_id=provider.id,
+        model_name="gpt-4o-mini",
+        model_settings={"temperature": 0.5},
+        context_plugin={"name": "not-installed", "config": {}},
+    )
+    path = tmp_path / "telegram.sqlite3"
+    await migrate(path, "upgrade")
+    activities = RunnerActivities(runner_database.sessions, runner_database.outputs)
+    async with (
+        open_storage(path) as storage,
+        Worker(
+            temporal,
+            task_queue=queue,
+            workflows=[RunnerWorkflow],
+            activities=[activities.record_messages, activities.save_runner_state],
+            plugins=[AgentPlugin(agent)],
+        ),
+    ):
+        repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
+        telegram = AsyncMock(spec=TelegramClient)
+        controller = TelegramController(
+            client=telegram,
+            sessions=sessions,
+            models=models,
+            repository=repository,
+            settings=TelegramSettings(
+                bot_token="unused",
+                allowed_chat_ids={123},
+                database_path=path,
+                session_template=template,
+            ),
+            bot_id=42,
+            username="test_bot",
+        )
+        await repository.ingest(
+            42,
+            [
+                {
+                    "update_id": 1,
+                    "message": {
+                        "chat": {"id": 123, "type": "private"},
+                        "from": {"id": 1},
+                        "text": "first prompt",
+                    },
+                }
+            ],
+        )
+        assert await controller.process_once()
+        session_id = await repository.route(42, 123, 0)
+        assert session_id is not None
+        first = temporal.get_workflow_handle(f"kapy-runner:{session_id}")
+        assert await asyncio.wait_for(first.result(), 30) == "done"
+        second = await sessions.start_durable_runner(session_id, user_prompt="second prompt")
+        assert await asyncio.wait_for(second.result(), 30) == "done"
+        assert len(requests) == 2
+        assert requests[0]["headers"]["authorization"] == "Bearer local-test"
+        assert requests[0]["body"]["temperature"] == 0.5
+        assert requests[0]["body"]["max_completion_tokens"] == 20
+        assert [message["content"] for message in requests[1]["body"]["messages"]] == [
+            "first prompt",
+            "done",
+            "second prompt",
+        ]
+        async with runner_database.sessions.begin() as db:
+            state, version = await SessionRepository(db).read_runner_state(session_id)
+        assert state is not None and version == 2
+        assert not await sessions.has_legacy_checkpoint(session_id)
+        assert not await sessions.is_durable_runner_running(session_id)
+        assert not await sessions.read_inputs(session_id, "queued")
+        (row,) = await repository.deliveries(42)
+        follower = asyncio.create_task(
+            TelegramDelivery(telegram, sessions, repository, 42).consume(row)
+        )
+        try:
+            async with asyncio.timeout(5):
+                while (await repository.get_delivery(delivery_key(row))).after_seq < 3:  # noqa: ASYNC110
+                    await asyncio.sleep(0.01)
+            assert [
+                call.args[2]
+                for call in telegram.send.call_args_list
+                if "draft_id" not in call.kwargs
+            ] == ["done", "done"]
+        finally:
+            follower.cancel()
+            await asyncio.gather(follower, return_exceptions=True)

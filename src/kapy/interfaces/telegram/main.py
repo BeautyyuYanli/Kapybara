@@ -1,6 +1,6 @@
 """One standalone Telegram process owns all its tasks, clients and database pools.
 
-The CLI registry only calls main. Shutdown cancels and joins workers/runners before
+The CLI registry only calls main. Shutdown cancels and joins interface tasks before
 closing clients; it does not submit a user cancellation or stop external services.
 """
 
@@ -10,17 +10,14 @@ import logging
 import signal
 import sys
 from pathlib import Path
-from uuid import UUID
 
 import httpx2
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from kapy.agent_runner import SessionBusy
 from kapy.application.resources import open_resources
 from kapy.application.sessions import create_session_service
 from kapy.control.models import ModelService
-from kapy.lifecycle import LifecycleError, LifecycleStatus
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .controller import COMMANDS, TelegramController
@@ -68,31 +65,7 @@ async def serve(settings: TelegramSettings) -> None:
                     raise
                 await asyncio.sleep(retry_delay(error, failures))
                 failures += 1
-        runners: dict[UUID, asyncio.Task[None]] = {}
-        accepting = True
-
-        async def run_runner(session_id: UUID) -> None:
-            try:
-                if (await sessions.get_session(session_id)).status != LifecycleStatus.READY:
-                    return
-                await sessions.start_runner(
-                    session_id,
-                    realtime_output=settings.common.realtime_output,
-                    output_flush_interval=settings.common.output_flush_interval,
-                )
-            except SessionBusy, LifecycleError:
-                pass
-            except Exception as error:
-                logger.error("Runner failed for session %s: %s", session_id, type(error).__name__)
-            finally:
-                runners.pop(session_id, None)
-
         async with asyncio.TaskGroup() as tasks:
-
-            def schedule_runner(session_id: UUID) -> None:
-                if accepting and session_id not in runners:
-                    runners[session_id] = tasks.create_task(run_runner(session_id))
-
             controller = TelegramController(
                 client=client,
                 sessions=sessions,
@@ -101,22 +74,11 @@ async def serve(settings: TelegramSettings) -> None:
                 settings=settings,
                 bot_id=bot["id"],
                 username=bot["username"],
-                schedule_runner=schedule_runner,
             )
-            try:
-                tasks.create_task(controller.poll())
-                tasks.create_task(controller.process())
-                tasks.create_task(
-                    TelegramDelivery(
-                        client,
-                        sessions,
-                        repository,
-                        bot["id"],
-                    ).run()
-                )
-                await asyncio.Future()
-            finally:
-                accepting = False
+            tasks.create_task(controller.poll())
+            tasks.create_task(controller.process())
+            tasks.create_task(TelegramDelivery(client, sessions, repository, bot["id"]).run())
+            await asyncio.Future()
 
 
 async def _serve_with_signals(settings: TelegramSettings) -> None:

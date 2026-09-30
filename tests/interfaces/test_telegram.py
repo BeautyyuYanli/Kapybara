@@ -5,7 +5,7 @@ import time
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx2
@@ -15,6 +15,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from temporalio.client import WorkflowHandle
 
 from kapy.agent_plugins import PluginOperationError
 from kapy.agent_runner import HistoryMessage, MessageCommitted, TextDelta
@@ -70,16 +71,16 @@ def update(update_id, text="hello", *, chat=123, thread=0, **message):
 
 def controller(repository, tmp_path):
     sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
     sessions.create_session.return_value = SimpleNamespace(id=uuid4())
     sessions.get_session.return_value = SimpleNamespace(status=LifecycleStatus.READY)
     sessions.submit_input.return_value = InputSubmission(
         input=SessionInput(1, "hello"),
         should_start_runner=True,
     )
-    sessions.is_runner_running.return_value = False
+    sessions.is_durable_runner_running.return_value = False
     sessions.read_inputs.return_value = ()
     client = AsyncMock(spec=TelegramClient)
-    scheduled = []
     result = TelegramController(
         client=client,
         sessions=sessions,
@@ -88,9 +89,8 @@ def controller(repository, tmp_path):
         settings=settings(tmp_path),
         bot_id=42,
         username="kapy_bot",
-        schedule_runner=scheduled.append,
     )
-    return result, sessions, client, scheduled
+    return result, sessions, client
 
 
 def test_xdg_path_resolution_is_at_construction(monkeypatch, tmp_path):
@@ -147,7 +147,7 @@ async def test_sqlite_upgrade_is_idempotent_and_transactions_rollback(tmp_path):
 async def test_unconfigured_model_keeps_bot_available_without_creating_session(
     repository, tmp_path, message
 ):
-    app, sessions, client, scheduled = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     app.settings = TelegramSettings(
         bot_token="secret", allowed_chat_ids={123}, database_path=tmp_path / "state.sqlite3"
     )
@@ -157,12 +157,11 @@ async def test_unconfigured_model_keeps_bot_available_without_creating_session(
     assert "/model <provider UUID> <model name>" in client.send.call_args_list[0].args[2]
     assert "/help" in client.send.call_args_list[1].args[2]
     sessions.create_session.assert_not_awaited()
-    assert scheduled == []
 
 
 @pytest.mark.asyncio
 async def test_model_command_without_session_only_saves_default(repository, tmp_path):
-    app, sessions, _, scheduled = controller(repository, tmp_path)
+    app, sessions, _ = controller(repository, tmp_path)
     app.settings = app.settings.model_copy(update={"session_template": None})
     provider_id = uuid4()
     await repository.ingest(42, [update(1, f"/model {provider_id} new-model")])
@@ -175,14 +174,13 @@ async def test_model_command_without_session_only_saves_default(repository, tmp_
     sessions.create_session.assert_awaited_once_with(
         CreateSession(provider_id=provider_id, model_name="new-model")
     )
-    assert not scheduled
 
 
 @pytest.mark.asyncio
 async def test_model_command_updates_session_and_persists_default_after_restart(
     repository, tmp_path
 ):
-    app, sessions, client, scheduled = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1, "/new", thread=17)])
     await app.process_once()
     target = await repository.route(42, 123, 17)
@@ -194,11 +192,10 @@ async def test_model_command_updates_session_and_persists_default_after_restart(
     )
     assert "Current session updated" in client.send.call_args_list[-1].args[2]
     assert await repository.route(42, 123, 17) == target
-    assert not scheduled
 
     async with open_storage(tmp_path / "telegram.sqlite3") as engine:
         restored = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
-        restarted, new_sessions, new_client, new_scheduled = controller(restored, tmp_path)
+        restarted, new_sessions, new_client = controller(restored, tmp_path)
         await restored.ingest(42, [update(3, "/model"), update(4, "/new", thread=18)])
         await restarted.process_once()
         assert str(provider_id) in new_client.send.call_args.args[2]
@@ -208,14 +205,13 @@ async def test_model_command_updates_session_and_persists_default_after_restart(
             CreateSession(provider_id=provider_id, model_name=model_name)
         )
         new_sessions.update_session.assert_not_awaited()
-        assert not new_scheduled
         assert await restored.default_model(99) is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["malformed", "unknown", "unauthorized", "session-update"])
 async def test_failed_model_choice_preserves_previous_default(repository, tmp_path, failure):
-    app, sessions, _, scheduled = controller(repository, tmp_path)
+    app, sessions, _ = controller(repository, tmp_path)
     models = AsyncMock(spec=ModelService)
     app.models = models
     old_provider, old_model = uuid4(), "old-model"
@@ -245,12 +241,11 @@ async def test_failed_model_choice_preserves_previous_default(repository, tmp_pa
     if failure != "session-update":
         sessions.update_session.assert_not_awaited()
         sessions.create_session.assert_not_awaited()
-    assert not scheduled
 
 
 @pytest.mark.asyncio
 async def test_model_retry_keeps_session_progress_before_saving_default(repository, tmp_path):
-    app, sessions, client, _ = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     models = AsyncMock(spec=ModelService)
     app.models = models
     await repository.ingest(42, [update(1, "/new")])
@@ -279,7 +274,7 @@ async def test_model_retry_keeps_session_progress_before_saving_default(reposito
 
 @pytest.mark.asyncio
 async def test_inbox_dedup_topics_and_session_business_only(repository, tmp_path):
-    app, sessions, client, scheduled = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     batch = [
         update(1),
         update(2, "/providers"),
@@ -293,10 +288,11 @@ async def test_inbox_dedup_topics_and_session_business_only(repository, tmp_path
         assert await app.process_once()
     assert not await app.process_once()
     sessions.create_session.assert_awaited_once()
-    sessions.submit_input.assert_awaited_once()
-    assert sessions.submit_input.call_args.args[1].channel == "queued"
-    assert scheduled == [sessions.create_session.return_value.id]
-    assert await repository.route(42, 123, 0) == scheduled[0]
+    sessions.submit_input.assert_not_awaited()
+    sessions.start_durable_runner.assert_awaited_once_with(
+        sessions.create_session.return_value.id, user_prompt="hello"
+    )
+    assert await repository.route(42, 123, 0) == sessions.create_session.return_value.id
     assert await repository.route(42, 123, 1) is None
     assert [call.args[2] for call in client.send.call_args_list] == [
         "Unknown command. Use /help.",
@@ -306,7 +302,7 @@ async def test_inbox_dedup_topics_and_session_business_only(repository, tmp_path
 
 @pytest.mark.asyncio
 async def test_retry_after_confirmation_does_not_resubmit_or_recreate(repository, tmp_path):
-    app, sessions, client, scheduled = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1, "/new first")])
     client.send.side_effect = TelegramFailure(503)
     await app.process_once()
@@ -317,14 +313,14 @@ async def test_retry_after_confirmation_does_not_resubmit_or_recreate(repository
     client.send.side_effect = None
     await app.process_once()
     sessions.create_session.assert_awaited_once()
-    sessions.submit_input.assert_awaited_once()
-    assert len(scheduled) == 1
+    sessions.start_durable_runner.assert_awaited_once()
+    sessions.submit_input.assert_not_awaited()
     assert await repository.next_inbox(42) is None
 
 
 @pytest.mark.asyncio
 async def test_stale_binding_is_cleared_without_recreating_session(repository, tmp_path):
-    app, sessions, _, _ = controller(repository, tmp_path)
+    app, sessions, _ = controller(repository, tmp_path)
     await repository.ingest(42, [update(1), update(2, "/status")])
     await app.process_once()
     sessions.get_session.side_effect = LookupError("missing")
@@ -334,32 +330,17 @@ async def test_stale_binding_is_cleared_without_recreating_session(repository, t
 
 
 @pytest.mark.asyncio
-async def test_recovery_schedules_only_idle_sessions_with_pending_input(repository, tmp_path):
-    app, sessions, _, scheduled = controller(repository, tmp_path)
-    queued, steer, active, empty, closing, closed = (uuid4() for _ in range(6))
-    sessions.create_session.side_effect = [
-        SimpleNamespace(id=session_id)
-        for session_id in (queued, steer, active, empty, closing, closed)
+async def test_explicit_queue_commands_never_start_runner(repository, tmp_path):
+    app, sessions, _ = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/queue queued"), update(2, "/steer steer")])
+    await app.process_once()
+    await app.process_once()
+    assert [call.args[1].channel for call in sessions.submit_input.await_args_list] == [
+        "queued",
+        "steer",
     ]
-    await repository.ingest(42, [update(index, "/new") for index in range(1, 7)])
-    for _ in range(6):
-        await app.process_once()
-    channels = {
-        queued: {"queued": (SessionInput(1, "queued input"),), "steer": ()},
-        steer: {"queued": (), "steer": (SessionInput(2, "steer input"),)},
-        active: {"queued": (SessionInput(3, "busy input"),), "steer": ()},
-        empty: {"queued": (), "steer": ()},
-        closing: {"queued": (SessionInput(4, "closing input"),), "steer": ()},
-        closed: {"queued": (), "steer": (SessionInput(5, "closed steer"),)},
-    }
-    statuses = {closing: LifecycleStatus.CLOSING, closed: LifecycleStatus.CLOSED}
-    sessions.get_session.side_effect = lambda session_id: SimpleNamespace(
-        status=statuses.get(session_id, LifecycleStatus.READY)
-    )
-    sessions.is_runner_running.side_effect = lambda session_id: session_id == active
-    sessions.read_inputs.side_effect = lambda session_id, channel: channels[session_id][channel]
-    await app.recover()
-    assert set(scheduled) == {queued, steer} and len(scheduled) == 2
+    sessions.start_durable_runner.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
 
 
 async def delivery_row(repository, *, text="", chat_type="private", chat_id=123):
@@ -427,7 +408,7 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
         try:
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 0, False, ModelRequest([UserPromptPart("input")]))
+                    HistoryMessage(session_id, 0, True, ModelRequest([UserPromptPart("input")]))
                 ),
                 TextDelta(session_id, 1, 0, "text", "replace", "old"),
             ]
@@ -438,13 +419,13 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
             await preview_sent.wait()
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 1, False, ModelResponse([TextPart("complete")]))
+                    HistoryMessage(session_id, 1, True, ModelResponse([TextPart("complete")]))
                 ),
                 MessageCommitted(
-                    HistoryMessage(session_id, 2, False, ModelRequest([UserPromptPart("next")]))
+                    HistoryMessage(session_id, 2, True, ModelRequest([UserPromptPart("next")]))
                 ),
                 MessageCommitted(
-                    HistoryMessage(session_id, 3, False, ModelResponse([TextPart("second")]))
+                    HistoryMessage(session_id, 3, True, ModelResponse([TextPart("second")]))
                 ),
             ]
             replayed.set()
@@ -453,6 +434,7 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
             closed.set()
 
     sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     delivery = TelegramDelivery(client, sessions, repository, 42)
     task = asyncio.create_task(delivery.consume(row))
@@ -489,14 +471,14 @@ async def test_buffer_overflow_resumes_after_last_delivered_commit(repository, m
             if len(cursors) == 1:
                 yield [
                     MessageCommitted(
-                        HistoryMessage(session_id, 0, False, ModelResponse([TextPart("first")]))
+                        HistoryMessage(session_id, 0, True, ModelResponse([TextPart("first")]))
                     )
                 ]
                 assert (await repository.get_delivery(key)).after_seq == 0
                 raise BufferError("Output subscription buffer is full")
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 1, False, ModelResponse([TextPart("second")]))
+                    HistoryMessage(session_id, 1, True, ModelResponse([TextPart("second")]))
                 )
             ]
             recovered.set()
@@ -506,6 +488,7 @@ async def test_buffer_overflow_resumes_after_last_delivered_commit(repository, m
 
     monkeypatch.setattr("kapy.interfaces.telegram.delivery.retry_delay", lambda *args: 0)
     sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     task = asyncio.create_task(TelegramDelivery(client, sessions, repository, 42).follow(key))
     try:
@@ -569,13 +552,14 @@ async def test_delivery_waits_for_draft_before_reading_and_closes_on_cancel(repo
             reads.append("final")
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 0, False, ModelResponse([TextPart("final")]))
+                    HistoryMessage(session_id, 0, True, ModelResponse([TextPart("final")]))
                 )
             ]
         finally:
             closed.set()
 
     sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     task = asyncio.create_task(TelegramDelivery(client, sessions, repository, 42).consume(row))
     try:
@@ -615,6 +599,7 @@ async def test_draft_retry_and_plain_fallback_finish_before_next_read(repository
         assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
 
     sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     await TelegramDelivery(client, sessions, repository, 42).consume(row)
     assert [call.kwargs["rich"] for call in client.send.call_args_list] == [True, True, False]
@@ -656,6 +641,7 @@ async def test_discovery_retry_preserves_existing_followers(repository, monkeypa
 
     monkeypatch.setattr(module, "retry_delay", lambda *args: 0)
     sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     task = asyncio.create_task(
         TelegramDelivery(AsyncMock(spec=TelegramClient), sessions, repository, 42).run()
@@ -674,7 +660,7 @@ async def test_discovery_retry_preserves_existing_followers(repository, monkeypa
 async def test_bound_steer_and_cancel_use_session_business_without_rescheduling(
     repository, tmp_path
 ):
-    app, sessions, client, scheduled = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(
         42,
         [
@@ -698,30 +684,30 @@ async def test_bound_steer_and_cancel_use_session_business_without_rescheduling(
     )
     await app.process_once()
     sessions.request_cancel.assert_awaited_once_with(target)
-    client.send.assert_awaited_once_with(123, 17, "Cancellation requested.")
+    client.send.assert_awaited_once_with(
+        123, 17, "Cancellation flag saved; durable execution does not consume it."
+    )
     sessions.create_session.assert_awaited_once()
-    assert not scheduled
 
 
 @pytest.mark.asyncio
 async def test_recreated_controller_retries_submission_to_durably_bound_session(
     repository, tmp_path
 ):
-    app, sessions, _, scheduled = controller(repository, tmp_path)
+    app, sessions, _ = controller(repository, tmp_path)
     content = "retain this input"
-    sessions.submit_input.side_effect = [
+    sessions.start_durable_runner.side_effect = [
         OperationalError("submit_input", {}, Exception("temporary connection failure")),
-        InputSubmission(input=SessionInput(11, content), should_start_runner=True),
+        Mock(spec=WorkflowHandle),
     ]
     await repository.ingest(42, [update(1, "/new " + content, thread=17)])
     with pytest.raises(OperationalError):
         await app.process_once()
     target = await repository.route(42, 123, 17)
-    assert target is not None and not scheduled
+    assert target is not None
 
     async with open_storage(tmp_path / "telegram.sqlite3") as engine:
         restored = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
-        retried_schedule = []
         restarted = TelegramController(
             client=AsyncMock(spec=TelegramClient),
             sessions=sessions,
@@ -730,18 +716,20 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
             settings=settings(tmp_path),
             bot_id=42,
             username="kapy_bot",
-            schedule_runner=retried_schedule.append,
         )
         await restarted.process_once()
         assert await restored.route(42, 123, 17) == target
         assert await restored.next_inbox(42) is None
     sessions.create_session.assert_awaited_once()
     # Two attempts are expected: the failed call's business effect may be ambiguous.
-    assert [call.args for call in sessions.submit_input.await_args_list] == [
-        (target, SubmitInput(content=content, channel="queued")),
-        (target, SubmitInput(content=content, channel="queued")),
+    assert [call.args for call in sessions.start_durable_runner.await_args_list] == [
+        (target,),
+        (target,),
     ]
-    assert retried_schedule == [target]
+    assert all(
+        call.kwargs == {"user_prompt": content}
+        for call in sessions.start_durable_runner.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -768,13 +756,14 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
                 HistoryMessage(
                     session_id,
                     0,
-                    False,
+                    True,
                     ModelResponse([TextPart(name + " final")]),
                 )
             )
         ]
 
     sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     delivery = TelegramDelivery(client, sessions, repository, 42)
     tasks = [asyncio.create_task(delivery.consume(group))]
@@ -801,7 +790,7 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
 
 @pytest.mark.asyncio
 async def test_close_reports_cleanup_failure_then_user_retry_succeeds(repository, tmp_path):
-    app, sessions, client, scheduled = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1, "/new")])
     assert await app.process_once()
     session_id = await repository.route(42, 123, 0)
@@ -826,14 +815,13 @@ async def test_close_reports_cleanup_failure_then_user_retry_succeeds(repository
     assert attempts == [session_id, session_id]
     assert await repository.route(42, 123, 0) == session_id
     sessions.create_session.assert_awaited_once()
-    assert not scheduled
 
 
 @pytest.mark.asyncio
 async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp_path):
     from kapy.session_lease import SessionBusy
 
-    app, sessions, client, _ = controller(repository, tmp_path)
+    app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1, "/new")])
     assert await app.process_once()
     sessions.close_session.side_effect = SessionBusy("occupied")
@@ -849,3 +837,65 @@ async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp
     assert await app.process_once()
     assert client.send.await_args.args[-1] == "Session closed."
     assert sessions.close_session.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_provisional_messages_preview_until_authoritative_delivery(repository):
+    row = await delivery_row(repository)
+    sessions = AsyncMock(spec=SessionService)
+    sessions.has_legacy_checkpoint.return_value = False
+    client = AsyncMock(spec=TelegramClient)
+
+    async def live(session_id, *, after_seq):
+        request = ModelRequest([UserPromptPart("input")])
+        provisional = ModelResponse([TextPart("provisional")])
+        yield [MessageCommitted(HistoryMessage(session_id, 0, False, request))]
+        yield [TextDelta(session_id, 1, 0, "text", "replace", "preview")]
+        yield [MessageCommitted(HistoryMessage(session_id, 1, False, provisional))]
+        yield [MessageCommitted(HistoryMessage(session_id, 0, False, request))]
+        assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
+        assert all("draft_id" in call.kwargs for call in client.send.call_args_list)
+        yield [
+            MessageCommitted(HistoryMessage(session_id, 0, True, request)),
+            MessageCommitted(
+                HistoryMessage(session_id, 1, True, ModelResponse([TextPart("final")]))
+            ),
+        ]
+        # Applied authority is idempotent even if live repeats an event.
+        yield [
+            MessageCommitted(
+                HistoryMessage(session_id, 1, True, ModelResponse([TextPart("final")]))
+            )
+        ]
+
+    sessions.live = live
+    await TelegramDelivery(client, sessions, repository, 42).consume(row)
+    assert (await repository.get_delivery(delivery_key(row))).after_seq == 1
+    assert [
+        call.args[2] for call in client.send.call_args_list if "draft_id" not in call.kwargs
+    ] == ["final"]
+
+
+@pytest.mark.asyncio
+async def test_durable_busy_and_ambiguous_start_are_not_retried_as_queued_input(
+    repository, tmp_path
+):
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from kapy.session_lease import SessionBusy
+
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1), update(2, "next")])
+    sessions.start_durable_runner.side_effect = [
+        SessionBusy("busy"),
+        RPCError("secret", RPCStatusCode.DEADLINE_EXCEEDED, b""),
+    ]
+    await app.process_once()
+    await app.process_once()
+    # RPC errors are recorded as a reply; following attempts only send that reply.
+    await app.process_once()
+    assert sessions.start_durable_runner.await_count == 2
+    sessions.submit_input.assert_not_awaited()
+    assert "busy" in client.send.call_args_list[0].args[2]
+    assert "/status" in client.send.call_args_list[1].args[2]
+    assert "secret" not in str(client.send.call_args_list)

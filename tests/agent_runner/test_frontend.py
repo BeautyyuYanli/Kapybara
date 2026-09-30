@@ -3,7 +3,6 @@
 import httpx
 import pytest
 from fastapi import FastAPI
-from pydantic_ai import Agent
 
 from kapy.control.models import ModelService
 from kapy.control.sessions import SessionService
@@ -57,9 +56,7 @@ async def test_native_spa_fallback_preserves_api_assets_and_lifespan(tmp_path):
 async def test_provider_kwargs_round_trip_and_patch_keeps_key_write_only(database):
     app = FastAPI()
     app.include_router(
-        create_router(
-            ModelService(database.sessions), SessionService(database.sessions), agent=Agent("test")
-        )
+        create_router(ModelService(database.sessions), SessionService(database.sessions))
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://local"

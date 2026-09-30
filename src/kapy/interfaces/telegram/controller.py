@@ -12,16 +12,22 @@ their existing model snapshot until the next run.
 import asyncio
 import logging
 import time
-from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.exc import SQLAlchemyError
+from temporalio.service import RPCError
 
 from kapy.agent_plugins import PluginOperationError
 from kapy.control.models import ModelService
-from kapy.control.sessions import CreateSession, SessionService, SubmitInput, UpdateSession
-from kapy.lifecycle import LifecycleError, LifecycleStatus
+from kapy.control.sessions import (
+    CreateSession,
+    DurableRunnerConflict,
+    SessionService,
+    SubmitInput,
+    UpdateSession,
+)
+from kapy.lifecycle import LifecycleError
 from kapy.session_lease import SessionBusy
 
 from .client import TelegramClient, TelegramFailure, retry_delay
@@ -32,10 +38,10 @@ from .settings import TelegramSettings
 logger = logging.getLogger(__name__)
 COMMANDS = {
     "new": "Create a new session",
-    "queue": "Queue input",
-    "steer": "Steer the current run",
+    "queue": "Store queued input (not consumed by durable runner)",
+    "steer": "Store steer input (not consumed by durable runner)",
     "status": "Show session status",
-    "cancel": "Request cancellation",
+    "cancel": "Store cancel flag (not consumed by durable runner)",
     "close": "Close this session and release its registered resources",
     "model": "Set the session model and bot default, or show the default",
     "help": "Show commands",
@@ -55,12 +61,10 @@ class TelegramController:
         settings: TelegramSettings,
         bot_id: int,
         username: str,
-        schedule_runner: Callable[[UUID], None],
     ) -> None:
         self.client, self.sessions, self.repository = client, sessions, repository
         self.models = models
         self.settings, self.bot_id, self.username = settings, bot_id, username
-        self.schedule_runner = schedule_runner
 
     async def poll(self) -> None:
         failures = 0
@@ -140,7 +144,7 @@ class TelegramController:
         if not isinstance(message.get("text"), str):
             return {"command": "reply", "reply": "Only text messages are supported."}
         text = message["text"]
-        command = "queue"
+        command = "run"
         explicit = text.startswith("/")
         if explicit:
             words = text.split(maxsplit=1)
@@ -213,9 +217,26 @@ class TelegramController:
                 await self.repository.bind(item, action, session.id)
                 action = dict(item.resolved_action or {})
             session_id = UUID(action["session_id"])
-            if command in {"queue", "steer", "new"}:
+            if command in {"run", "new"}:
                 if action["text"] and not action.get("submitted"):
-                    submission = await self.sessions.submit_input(
+                    try:
+                        await self.sessions.start_durable_runner(
+                            session_id, user_prompt=action["text"]
+                        )
+                    except SessionBusy:
+                        action["reply"] = "Session is busy; this text was not submitted."
+                    except DurableRunnerConflict:
+                        action["reply"] = (
+                            "Previous Workflow did not complete. Use /new to continue."
+                        )
+                    else:
+                        action["submitted"] = True
+                    await self.repository.save_action(item, action)
+                if command == "new" and "reply" not in action:
+                    action["reply"] = "New session created."
+            elif command in {"queue", "steer"}:
+                if action["text"] and not action.get("submitted"):
+                    await self.sessions.submit_input(
                         session_id,
                         SubmitInput(
                             content=action["text"],
@@ -224,10 +245,6 @@ class TelegramController:
                     )
                     action["submitted"] = True
                     await self.repository.save_action(item, action)
-                    if submission.should_start_runner:
-                        self.schedule_runner(session_id)
-                if command == "new":
-                    action["reply"] = "New session created."
             elif command == "close":
                 try:
                     await self.sessions.close_session(session_id)
@@ -237,16 +254,16 @@ class TelegramController:
                     action["reply"] = "Session closed."
             elif command == "cancel":
                 await self.sessions.request_cancel(session_id)
-                action["reply"] = "Cancellation requested."
+                action["reply"] = "Cancellation flag saved; durable execution does not consume it."
             elif command == "status":
                 session = await self.sessions.get_session(session_id)
-                running = await self.sessions.is_runner_running(session_id)
+                running = await self.sessions.is_durable_runner_running(session_id)
                 cancelled = await self.sessions.read_cancel(session_id)
                 queued = await self.sessions.read_inputs(session_id, "queued")
                 steer = await self.sessions.read_inputs(session_id, "steer")
                 action["reply"] = (
                     f"Session: {session_id}\nStatus: {session.status}\n"
-                    f"Lease: {'busy' if running else 'idle'}\n"
+                    f"Workflow: {'running' if running else 'idle'}\n"
                     f"Cancellation requested: {cancelled}\n"
                     f"Queued: {len(queued)}; steer: {len(steer)}"
                 )
@@ -271,6 +288,13 @@ class TelegramController:
                 handled=error.code in {400, 403},
                 next_attempt_at=time.time() + retry_delay(error),
             )
+        except RPCError:
+            # A failed start RPC may already have been accepted. Do not resubmit
+            # automatically: the next status query observes the fixed Workflow ID.
+            await self.repository.save_action(
+                item,
+                {"command": "reply", "reply": "Unable to confirm Workflow state. Use /status."},
+            )
         except PluginOperationError:
             await self.repository.save_action(
                 item, {"command": "reply", "reply": "Plugin cleanup failed. Use /close to retry."}
@@ -294,28 +318,9 @@ class TelegramController:
             )
         return True
 
-    async def recover(self) -> None:
-        """Schedule only known Telegram sessions with pending input and no valid lease."""
-        for session_id in {row.session_id for row in await self.repository.deliveries(self.bot_id)}:
-            try:
-                session = await self.sessions.get_session(session_id)
-            except LookupError:
-                continue
-            if session.status != LifecycleStatus.READY:
-                continue
-            if not await self.sessions.is_runner_running(session_id) and (
-                await self.sessions.read_inputs(session_id, "queued")
-                or await self.sessions.read_inputs(session_id, "steer")
-            ):
-                self.schedule_runner(session_id)
-
     async def process(self) -> None:
-        next_recovery = 0.0
         while True:
             try:
-                if time.monotonic() >= next_recovery:
-                    await self.recover()
-                    next_recovery = time.monotonic() + self.settings.recovery_interval
                 if not await self.process_once():
                     await asyncio.sleep(0.25)
             except SQLAlchemyError:

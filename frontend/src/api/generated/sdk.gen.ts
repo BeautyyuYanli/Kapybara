@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { CloseSessionData, CloseSessionErrors, CloseSessionResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionAndScheduleData, CreateSessionAndScheduleErrors, CreateSessionAndScheduleResponses, DeleteInputData, DeleteInputErrors, DeleteInputResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProviderData, DeleteProviderErrors, DeleteProviderResponses, DiscoverModelsData, DiscoverModelsErrors, DiscoverModelsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProviderData, GetProviderErrors, GetProviderResponses, GetSessionData, GetSessionErrors, GetSessionResponses, IsRunnerRunningData, IsRunnerRunningErrors, IsRunnerRunningResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ReadCancelData, ReadCancelErrors, ReadCancelResponses, ReadHistoryData, ReadHistoryErrors, ReadHistoryResponses, ReadInputsData, ReadInputsErrors, ReadInputsResponses, RequestCancelData, RequestCancelErrors, RequestCancelResponses, SubmitInputAndScheduleData, SubmitInputAndScheduleErrors, SubmitInputAndScheduleResponses, UpdateModelData, UpdateModelErrors, UpdateModelResponses, UpdateProviderData, UpdateProviderErrors, UpdateProviderResponses, UpdateSessionData, UpdateSessionErrors, UpdateSessionResponses } from './types.gen';
+import type { CloseSessionData, CloseSessionErrors, CloseSessionResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionAndScheduleData, CreateSessionAndScheduleErrors, CreateSessionAndScheduleResponses, DeleteInputData, DeleteInputErrors, DeleteInputResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProviderData, DeleteProviderErrors, DeleteProviderResponses, DiscoverModelsData, DiscoverModelsErrors, DiscoverModelsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProviderData, GetProviderErrors, GetProviderResponses, GetSessionData, GetSessionErrors, GetSessionResponses, IsRunnerRunningData, IsRunnerRunningErrors, IsRunnerRunningResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ReadCancelData, ReadCancelErrors, ReadCancelResponses, ReadHistoryData, ReadHistoryErrors, ReadHistoryResponses, ReadInputsData, ReadInputsErrors, ReadInputsResponses, RequestCancelData, RequestCancelErrors, RequestCancelResponses, StartDurableRunnerData, StartDurableRunnerErrors, StartDurableRunnerResponses, SubmitInputAndScheduleData, SubmitInputAndScheduleErrors, SubmitInputAndScheduleResponses, UpdateModelData, UpdateModelErrors, UpdateModelResponses, UpdateProviderData, UpdateProviderErrors, UpdateProviderResponses, UpdateSessionData, UpdateSessionErrors, UpdateSessionResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -166,6 +166,18 @@ export const deleteInput = <ThrowOnError extends boolean = false>(options: Optio
  * Is Runner Running
  */
 export const isRunnerRunning = <ThrowOnError extends boolean = false>(options: Options<IsRunnerRunningData, ThrowOnError>): RequestResult<IsRunnerRunningResponses, IsRunnerRunningErrors, ThrowOnError> => (options.client ?? client).get<IsRunnerRunningResponses, IsRunnerRunningErrors, ThrowOnError>({ url: '/api/sessions/{session_id}/runner', ...options });
+
+/**
+ * Start Durable Runner
+ */
+export const startDurableRunner = <ThrowOnError extends boolean = false>(options: Options<StartDurableRunnerData, ThrowOnError>): RequestResult<StartDurableRunnerResponses, StartDurableRunnerErrors, ThrowOnError> => (options.client ?? client).post<StartDurableRunnerResponses, StartDurableRunnerErrors, ThrowOnError>({
+    url: '/api/sessions/{session_id}/runner',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
 
 /**
  * Read Cancel

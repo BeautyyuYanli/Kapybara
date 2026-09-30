@@ -1,7 +1,7 @@
 """Session HTTP composition and WebSocket transport; services own all queue/history logic.
 
-BackgroundTasks are in-process and unpersisted. The host owns services, SDK Agent
-and dependencies until its requests and their background work have finished.
+Direct execution awaits Temporal start confirmation; queue/cancel APIs only persist
+legacy inputs. Borrowed services outlive requests and WebSocket subscriptions.
 """
 
 import asyncio
@@ -10,12 +10,11 @@ from contextlib import aclosing
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Path, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Path, Response, WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter
-from pydantic_ai import Agent
 from starlette.websockets import WebSocketState
 
-from kapy.agent_runner import HistoryMessage, OutputEvent, SessionBusy
+from kapy.agent_runner import HistoryMessage, OutputEvent
 from kapy.control.sessions import (
     CreateSession,
     InputChannel,
@@ -25,57 +24,26 @@ from kapy.control.sessions import (
     SubmitInput,
     UpdateSession,
 )
-from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import Page
 
 from .dependencies import HistoryPage, LiveCursor, OffsetPage
 from .errors import ControlRoute
-from .types import CreateSessionAndSchedule
+from .types import CreateSessionAndSchedule, DurableRun, StartDurableRunner
 
 _logger = logging.getLogger(__name__)
 _output_adapter = TypeAdapter(list[OutputEvent])
 
 
-def create_session_router[DepsT, OutputT](
-    sessions: SessionService,
-    *,
-    agent: Agent[DepsT, OutputT] | None = None,
-    deps: DepsT = None,
-    realtime_output: bool = True,
-    output_flush_interval: float = 0.5,
-) -> APIRouter:
+def create_session_router(sessions: SessionService) -> APIRouter:
     router = APIRouter(route_class=ControlRoute)
 
-    async def _run_runner(session_id: UUID) -> None:
-        try:
-            if (await sessions.get_session(session_id)).status != LifecycleStatus.READY:
-                return
-            await sessions.start_runner(
-                session_id,
-                agent=agent,
-                deps=deps,
-                realtime_output=realtime_output,
-                output_flush_interval=output_flush_interval,
-            )
-        except SessionBusy, LifecycleError:
-            return
-        except Exception as error:
-            _logger.error("Runner failed for session %s: %s", session_id, type(error).__name__)
-
-    def _schedule_runner(tasks: BackgroundTasks, session_id: UUID) -> None:
-        tasks.add_task(_run_runner, session_id)
-
     @router.post("/sessions", status_code=201, operation_id="create_session_and_schedule")
-    async def create_session_and_schedule(
-        data: CreateSessionAndSchedule, background_tasks: BackgroundTasks
-    ) -> SessionRecord:
+    async def create_session_and_schedule(data: CreateSessionAndSchedule) -> SessionRecord:
         session = await sessions.create_session(
             CreateSession.model_validate(data.model_dump(exclude={"input"}))
         )
         if data.input is not None:
-            submission = await sessions.submit_input(session.id, data.input)
-            if submission.should_start_runner:
-                _schedule_runner(background_tasks, session.id)
+            await sessions.submit_input(session.id, data.input)
         return session
 
     @router.get("/sessions", operation_id="list_sessions")
@@ -101,12 +69,8 @@ def create_session_router[DepsT, OutputT](
     @router.post(
         "/sessions/{session_id}/inputs", status_code=202, operation_id="submit_input_and_schedule"
     )
-    async def submit_input_and_schedule(
-        session_id: UUID, data: SubmitInput, background_tasks: BackgroundTasks
-    ) -> SessionInput:
+    async def submit_input_and_schedule(session_id: UUID, data: SubmitInput) -> SessionInput:
         submission = await sessions.submit_input(session_id, data)
-        if submission.should_start_runner:
-            _schedule_runner(background_tasks, session_id)
         return submission.input
 
     @router.get("/sessions/{session_id}/inputs", operation_id="read_inputs")
@@ -119,10 +83,17 @@ def create_session_router[DepsT, OutputT](
     async def delete_input(session_id: UUID, input_id: Annotated[int, Path(gt=0)]) -> bool:
         return await sessions.delete_input(session_id, input_id)
 
+    @router.post(
+        "/sessions/{session_id}/runner", status_code=202, operation_id="start_durable_runner"
+    )
+    async def start_durable_runner(session_id: UUID, data: StartDurableRunner) -> DurableRun:
+        handle = await sessions.start_durable_runner(session_id, user_prompt=data.user_prompt)
+        assert handle.result_run_id is not None
+        return DurableRun(workflow_id=handle.id, run_id=handle.result_run_id)
+
     @router.get("/sessions/{session_id}/runner", operation_id="is_runner_running")
     async def is_runner_running(session_id: UUID) -> bool:
-        # Compatibility route: lease occupancy does not mean the Agent is generating.
-        return await sessions.is_runner_running(session_id)
+        return await sessions.is_durable_runner_running(session_id)
 
     @router.post("/sessions/{session_id}/cancel", status_code=202, operation_id="request_cancel")
     async def request_cancel(session_id: UUID) -> Response:

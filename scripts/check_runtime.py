@@ -75,7 +75,7 @@ async def check(
         )
     )
     session_id = session.id
-    committed: list[HistoryMessage] = []
+    committed: dict[int, HistoryMessage] = {}
     deltas: list[TextDelta] = []
     changed = asyncio.Event()
     tool_calls = 0
@@ -85,7 +85,8 @@ async def check(
             async for batch in batches:
                 for event in batch:
                     if isinstance(event, MessageCommitted):
-                        committed.append(event.message)
+                        # Legacy history can replay under the shared live contract.
+                        committed[event.message.seq] = event.message
                         changed.set()
                     else:
                         deltas.append(event)
@@ -149,7 +150,9 @@ async def check(
                         while len(committed) < len(history):
                             await changed.wait()
                             changed.clear()
-                    assert committed == list(history), "Live DTOs differ from database history"
+                    assert [committed[row.seq] for row in history] == list(history), (
+                        "Live DTOs differ from database history"
+                    )
                 finally:
                     observer.cancel()
 

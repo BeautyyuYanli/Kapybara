@@ -16,14 +16,13 @@ kapy interface telegram serve
 
 The equivalent direct entry is `python -m kapy.interfaces.<name>.main ...`.
 Each process creates its own core PostgreSQL pool, Valkey client, SessionService
-and text Agent using ordinary application/ factories. They communicate through
-core tables and a common Valkey output namespace, never shared Python objects.
-Each process also connects one Temporal Client in `open_resources()`, exposed as
-`resources.temporal_client`. HTTP stores the resources on `app.state.resources`
-for request handlers. This does not change the existing session execution path.
-Both use identical prompt/tool/dependency construction in application/agent.py;
-this initial Agent has text output and no tools. SessionService resolves the
-provider and model from the core catalog on each runner start.
+and Temporal Client through `open_resources()`. They communicate through core tables
+and a common Valkey output namespace. HTTP also exposes these borrowed resources
+on `app.state.resources`. SessionService resolves configuration per direct runner
+start, and submits the existing RunnerWorkflow to the common Temporal task queue.
+An independent `python -m kapy.runner_duarable.worker` owns Agent/model resources;
+neither interface runs the legacy Agent or starts a Worker. Queue/cancel and
+configuration APIs remain available, with their existing storage semantics.
 
 Common environment values (read only during command execution):
 
@@ -42,7 +41,8 @@ Common environment values (read only during command execution):
 | KAPY_REALTIME_OUTPUT | true |
 | KAPY_OUTPUT_FLUSH_INTERVAL | 0.5 seconds |
 
-All workers sharing core tables must use compatible heartbeat and Agent settings.
+Legacy lease users sharing core tables must use compatible heartbeat settings.
+The durable Worker owns model/output policy and does not use those leases.
 No command implicitly reads `.env`; export configuration or use `uv run --env-file`.
 Private interface databases do not inherit the core URL or schema. The process manager's
 own local database retains its existing independent lifecycle.

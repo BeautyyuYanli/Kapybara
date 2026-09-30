@@ -8,12 +8,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
+from temporalio.service import RPCError
 
 from kapy.agent_plugins import PluginOperationError
 from kapy.control.models.types import (
     ModelAlreadyExists,
     ModelDiscoveryError,
 )
+from kapy.control.sessions import DurableRunnerConflict
 from kapy.lifecycle import LifecycleError
 from kapy.session_lease import SessionBusy
 
@@ -35,8 +37,14 @@ class ControlRoute(APIRoute):
                 ]
                 return JSONResponse(status_code=422, content={"detail": detail})
             except SessionBusy:
+                return JSONResponse(status_code=409, content={"detail": "Session busy"})
+            except DurableRunnerConflict:
                 return JSONResponse(
-                    status_code=409, content={"detail": "Session busy; close has not started"}
+                    status_code=409, content={"detail": "Previous Workflow did not complete"}
+                )
+            except RPCError:
+                return JSONResponse(
+                    status_code=503, content={"detail": "Unable to confirm Workflow state"}
                 )
             except LifecycleError:
                 return JSONResponse(

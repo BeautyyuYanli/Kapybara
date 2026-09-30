@@ -4,7 +4,7 @@ import asyncio
 import os
 import socket
 from contextlib import asynccontextmanager
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -12,7 +12,6 @@ import uvicorn
 import websockets
 from fastapi import FastAPI
 from pydantic import TypeAdapter
-from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
@@ -29,7 +28,6 @@ from kapy.control.sessions import SessionService
 from kapy.interfaces.http import create_router
 from kapy.interfaces.http.app import create_app
 from kapy.interfaces.http.settings import HttpSettings
-from kapy.session_lease.models import SessionLeaseRow
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -37,12 +35,14 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 def application(database, sessions):
     app = FastAPI()
     app.include_router(
-        create_router(ModelService(database.sessions), sessions, agent=Agent("test")),
+        create_router(ModelService(database.sessions), sessions),
     )
     return app
 
 
-async def test_http_create_input_background_and_withdrawal(database, seed_session, monkeypatch):
+async def test_http_create_and_queue_preserve_storage_without_scheduling(
+    database, seed_session, monkeypatch
+):
     sessions = SessionService(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
@@ -69,9 +69,8 @@ async def test_http_create_input_background_and_withdrawal(database, seed_sessio
         assert response.status_code == 201
         assert response.json()["compaction_threshold_tokens"] is None
         created_id = response.json()["id"]
-        assert str(starts[0][0]) == created_id and starts[0][1][0].content == "first"
-        assert starts[0][2]["realtime_output"] is True
-        assert starts[0][2]["output_flush_interval"] == 0.5
+        assert starts == []
+        assert (await sessions.read_inputs(UUID(created_id), "queued"))[0].content == "first"
         response = await client.post(f"/api/sessions/{created_id}/inputs", json={"content": "next"})
         assert response.status_code == 202
         input_id = response.json()["id"]
@@ -81,12 +80,8 @@ async def test_http_create_input_background_and_withdrawal(database, seed_sessio
         assert (
             await client.delete(f"/api/sessions/{created_id}/inputs/{input_id}")
         ).json() is False
-        token = uuid4()
-        async with database.sessions.begin() as db:
-            db.add(SessionLeaseRow(session_id=starts[0][0], lock_token=token))
         response = await client.post(f"/api/sessions/{created_id}/inputs", json={"content": "busy"})
-        assert response.status_code == 202 and len(starts) == 2
-        assert (await client.get(f"/api/sessions/{created_id}/runner")).json() is True
+        assert response.status_code == 202 and starts == []
         cancelled = await client.post(f"/api/sessions/{created_id}/cancel")
         assert cancelled.status_code == 202 and cancelled.content == b""
         assert (await client.get(f"/api/sessions/{created_id}/cancel")).json() is True
@@ -103,7 +98,7 @@ async def test_http_create_input_background_and_withdrawal(database, seed_sessio
                 "compaction_threshold_tokens": None,
             },
         )
-        assert empty.status_code == 201 and len(starts) == 2
+        assert empty.status_code == 201 and not starts
         assert empty.json()["compaction_threshold_tokens"] == 183500
         saved = await client.get(f"/api/sessions/{empty.json()['id']}")
         assert saved.json()["compaction_threshold_tokens"] == 183500
@@ -158,7 +153,6 @@ async def test_http_history_pages_and_canonical_model_paths(database, seed_histo
             "items": [],
             "has_more": False,
         }
-        assert (await client.get(f"/api/sessions/{missing}/runner")).json() is False
         assert (await client.get(f"/api/sessions/{missing}/cancel")).json() is False
         for path in (
             "/api/models?limit=201",
@@ -213,37 +207,35 @@ async def serve(app):
                 await task
 
 
-async def test_http_accepts_input_before_background_runner_finishes(
-    database, seed_session, monkeypatch
-):
+async def test_http_waits_for_durable_start_confirmation(database, seed_session, monkeypatch):
+    from types import SimpleNamespace
+
     sessions = SessionService(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
-    started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    started, release = asyncio.Event(), asyncio.Event()
 
     async def start(session_id, **kwargs):
         started.set()
-        try:
-            await release.wait()
-        finally:
-            finished.set()
+        await release.wait()
+        return SimpleNamespace(id=f"kapy-runner:{session_id}", result_run_id="accepted-run")
 
-    monkeypatch.setattr(sessions, "start_runner", start)
-    async with serve(application(database, sessions)) as base:
+    monkeypatch.setattr(sessions, "start_durable_runner", start)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
+    ) as client:
+        request = asyncio.create_task(
+            client.post(f"/api/sessions/{session_id}/runner", json={"user_prompt": "direct"})
+        )
         try:
-            async with httpx.AsyncClient(base_url=base.replace("ws://", "http://", 1)) as client:
-                async with asyncio.timeout(3):
-                    response = await client.post(
-                        f"/api/sessions/{session_id}/inputs", json={"content": "run later"}
-                    )
-                    await started.wait()
-                assert response.status_code == 202
-                assert not finished.is_set()
+            await asyncio.wait_for(started.wait(), 2)
+            assert not request.done()
+            release.set()
+            result = await request
+            assert result.status_code == 202 and result.json()["run_id"] == "accepted-run"
         finally:
             release.set()
-            if started.is_set():
-                async with asyncio.timeout(3):
-                    await finished.wait()
+            await request
 
 
 async def test_websocket_replay_live_frames_and_idle_subscription_cleanup(
@@ -268,7 +260,9 @@ async def test_websocket_replay_live_frames_and_idle_subscription_cleanup(
             async with outputs.publisher(session_id, flush_interval=0) as publish:
                 await publish(delta)
                 async with asyncio.timeout(2):
-                    assert adapter.validate_json(await ws.recv()) == [delta]
+                    events = adapter.validate_json(await ws.recv())
+                    assert events[-1] == delta
+                    assert all(isinstance(event, MessageCommitted) for event in events[:-1])
         async with asyncio.timeout(2):
             # Valkey has no notification API for another connection unsubscribing.
             while (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1]:  # noqa: ASYNC110

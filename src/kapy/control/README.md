@@ -58,6 +58,36 @@ async def example(database_url: str, api_key: str, model_name: str):
         await engine.dispose()
 ```
 
+## Durable execution used by HTTP and Telegram
+
+Construct SessionService with borrowed `temporal_client` and `temporal_task_queue`
+(the application factory injects both). `await start_durable_runner(id,
+user_prompt="...")` submits one string prompt and returns the Temporal
+`WorkflowHandle[RunnerWorkflow, str]` after start confirmation. Await its `result()`
+only when model completion is needed. `is_durable_runner_running(id)` observes the
+fixed `kapy-runner:{id}` Workflow; only explicit NOT_FOUND means absent, and RPC
+failures propagate. Calls have a finite 10-second RPC timeout.
+
+A short session row lock coordinates admission with other starts and close. It
+covers readiness/configuration checks, Workflow status, the atomic state/version
+read, and start confirmation; no legacy lease or model execution occurs inside
+this transaction. Fixed Workflow IDs reject concurrent runs. Only first execution
+or a preceding COMPLETED execution admits a new run. Non-successful terminal
+status raises DurableRunnerConflict; normal Activity retries and Worker recovery
+continue the same Workflow. An ambiguous start error never retries automatically.
+
+Provider values and merged model/session settings become DurableExecutionConfig;
+the interface validates protocol settings without constructing SDK resources.
+The Worker owns resources, output and saving. Business plugin bindings and legacy
+checkpoints are rejected; context/compaction configuration, pending inputs and
+cancel flags remain stored but unused. Do not mix legacy/durable writers in one
+session or bypass this admission boundary. Closing checks durable status under
+the same row lock before changing lifecycle, and keeps its existing lease for
+plugin cleanup. Neither closing, legacy cancel flags nor interface shutdown stops
+Temporal execution. Queue APIs remain independently usable during execution or
+Temporal unavailability. The in-process example above uses the retained legacy API;
+the lease/execution-factory descriptions below apply to that legacy runner.
+
 Providers have UUID identities and immutable importable Provider/Model class
 references. The supported model protocols are OpenAIChatModel,
 OpenAIResponsesModel and GoogleModel, including compatible subclasses. Provider
@@ -112,7 +142,8 @@ the [Temporal runner](../runner_duarable/README.md) for its save contract.
 Session creation validates plugin config before saving ready session/binding records
 in one transaction; it does not allocate external resources. `close_session(id)`
 first acquires the shared session lease. SessionBusy leaves all business state,
-inputs and cancel flags unchanged. After admission it records closing, cleans fixed
+inputs and cancel flags unchanged. After admission it checks durable Workflow status under the session row lock;
+active execution is busy and query failures propagate. It then records closing, cleans fixed
 bindings sequentially, and records each completed binding and then the session as
 closed. Failure preserves progress; explicit retry skips completed bindings. Close
 never changes cancellation flags. Registered cleanup is confirmed; lost-owner
@@ -149,8 +180,8 @@ reacquisition: in the same short transaction, first `await lease.lock_owned(db)`
 then `await service.require_ready(config.session.id, db=db)`, before creating any
 model or plugin resources. An acquired lease does not imply READY, and the status
 in the configuration snapshot may be stale. The default implementation is
-application.agent.create_execution_factory; application.sessions injects it into
-both interfaces.
+application.agent.create_execution_factory; application.sessions retains it for
+legacy Python calls. HTTP and Telegram use durable execution.
 
 `SessionService(..., context_plugin_registry=...)` selects an implementation from the
 session's `context_plugin: {"name": "kapy/summary", "config": {}}`. The name is fixed
@@ -216,7 +247,14 @@ queue. Cancel ends the current run at a boundary and leaves queued inputs intact
 
 `live(id, after_seq=-1)` owns a confirmed Pub/Sub subscription before replaying
 history and following complete messages/deltas in nonempty event lists. Consumers
-apply each batch in order; only complete messages advance the cursor. History
-pagination uses before_seq independently. Use aclosing when
+apply each batch in order and acknowledge only fully applied authoritative messages.
+The connection directly advances through consecutive authoritative broadcasts; a
+gap triggers ordered history backfill. Preview messages and deltas neither advance
+the cursor nor trigger reads. Periodic history reads recover missed commits even
+during continuous preview traffic. History allows numeric gaps and provisional
+replacement, but authority after a provisional row fails the stream. Producers must
+preserve the confirmed prefix, including its membership. Legacy messages are
+non-authoritative and may replay; legacy consumers deduplicate by their own seq.
+History pagination uses before_seq independently. Use aclosing when
 stopping early. See [HTTP adapters](../interfaces/http/README.md) for application wiring,
-background scheduling and WebSocket lifetime.
+direct submission and WebSocket lifetime.

@@ -284,23 +284,33 @@ INSERT payload with no extra SELECT or RETURNING. State-only checkpoints emit
 nothing. A committed message replaces all temporary parts at its sequence; it
 is not a runner-completion event. Output DTOs carry no execution lease token.
 
-`live(after_seq=-1)` starts after the last applied complete history sequence (-1 replays all),
-confirms its subscription before reading history, filters overlaps and backfills
-missing predecessors when later events expose a gap. It also polls history every
-5 seconds, configurable through `SessionService(live_poll_interval=...)`, so lost
-final notifications are recovered without another event or reconnect. Only the
-contiguous prefix advances the cursor; unresolved gaps wait for another read.
-History and each subscription read produce nonempty lists, not individual events.
-The WebSocket controller sends one JSON array per batch. Batch boundaries are not
-transaction boundaries or acknowledgements. Each short transaction ends before
-yielding. Consumer backpressure pauses polling, but not background reception;
-incoming traffic does not postpone it. Each live call owns at most one pending
-subscription read and joins it before closing its subscription. Database and
-subscription errors end the generator; runner completion does not. Reconnect from
-the last complete seq, clearing provisional text first. Missing subscribers lose
-deltas, and temporary append events may occasionally repeat or interleave between
-runner attempts; committed messages replace all provisional content. There is no
-outbox or delta recovery cursor.
+`SessionService.live(after_seq=-1)` resumes after the last fully applied authoritative
+prefix for durable execution (-1 without one). The connection cursor advances when
+authoritative messages enter its ordered output; the client's saved cursor advances
+only after applying them. Producers must commit before publishing and preserve both
+the content and membership of the authoritative prefix, including its numeric gaps.
+The service subscribes before reading history. Authoritative broadcasts at cursor + 1
+advance directly without reading history; a greater seq triggers one ordered backfill
+per batch. Batch authority is sorted before temporary events, so consecutive positions
+can advance together and suppress covered previews. Deltas and non-authoritative
+messages never advance the cursor or trigger backfill, regardless of their seq.
+
+The service also polls the unconfirmed suffix every 5 seconds (configurable via
+live_poll_interval); preview traffic does not postpone this deadline. History can
+prove legitimate sequence gaps, and its provisional suffix can replay or be replaced.
+A snapshot containing authority after a provisional row, or missing an authoritative
+broadcast being backfilled, fails the stream instead of skipping an unconfirmed
+position. Legacy messages are all non-authoritative, so legacy consumers retain their
+own append-only cursor and deduplicate replay by seq.
+
+History and subscription reads produce nonempty lists. WebSocket sends one JSON
+array per batch; batches are not transaction boundaries or acknowledgements.
+Transactions end before yielding. Backpressure pauses polling, not background
+reception. Each live call owns at most one subscription read and joins it before
+closing. Errors end the generator; runner completion does not. Reconnect clears
+previews and resumes from the applied authoritative prefix. Complete messages
+replace only their own seq's preview; later deltas establish a new preview. Missing
+subscribers lose deltas. There is no outbox or durable delta cursor.
 
 `AgentOutputService.publisher(flush_interval=0.5)` buffers at most 64 KiB of encoded
 JSON plus one in-flight batch of the same maximum size. The awaited callback only

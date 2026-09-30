@@ -25,12 +25,17 @@ class RunnerDatabase:
     sessions: async_sessionmaker[AsyncSession]
     session_id: UUID
     outputs: AgentOutputService
+    valkey: Valkey
 
 
 @pytest_asyncio.fixture
 async def runner_database() -> AsyncIterator[RunnerDatabase]:
     settings = CommonSettings.model_validate(
-        {**os.environ, "KAPY_DATABASE_SCHEMA": f"runner_state_test_{uuid4().hex}"}
+        {
+            **os.environ,
+            "KAPY_DATABASE_SCHEMA": f"runner_state_test_{uuid4().hex}",
+            "KAPY_VALKEY_NAMESPACE": f"runner-test-{uuid4().hex}",
+        }
     )
     try:
         await migrate(settings, "upgrade")
@@ -40,9 +45,11 @@ async def runner_database() -> AsyncIterator[RunnerDatabase]:
             async with sessions.begin() as db:
                 db.add(SessionRow(id=session_id, provider_id=uuid4(), model_name="test"))
             async with Valkey.from_url(settings.valkey_url.get_secret_value()) as client:
-                outputs = AgentOutputService(client, channel_prefix=f"runner-test:{uuid4()}")
+                outputs = AgentOutputService(
+                    client, channel_prefix=settings.valkey_namespace + ":agent-output"
+                )
                 with bind_output_service(outputs):
-                    yield RunnerDatabase(settings, sessions, session_id, outputs)
+                    yield RunnerDatabase(settings, sessions, session_id, outputs, client)
     finally:
         async with await psycopg.AsyncConnection.connect(
             settings.database_url.get_secret_value(), autocommit=True

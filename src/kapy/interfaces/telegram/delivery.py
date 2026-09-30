@@ -1,7 +1,8 @@
 """Project SessionService.live into drafts and durable at-least-once messages.
 
-Only a complete message advances after_seq. Persist one pending body before any
-send, then acknowledge character offsets; a lost remote acknowledgement may replay
+Only an authoritative complete message advances after_seq for durable sessions.
+Legacy checkpoints retain their append-only delivery contract. Persist one pending
+body before any send, then acknowledge character offsets; a lost remote acknowledgement may replay
 one chunk. Each live batch is delivered before requesting the next; draft state
 only renders text already consumed from live, which owns output buffering.
 No database transaction spans sending, sleeping or generator iteration.
@@ -154,14 +155,19 @@ class TelegramDelivery:
             await self.send_pending(row)
         if row.blocked_error:
             return
+        legacy = await self.sessions.has_legacy_checkpoint(row.session_id)
         preview = Preview()
         async with aclosing(self.sessions.live(row.session_id, after_seq=row.after_seq)) as batches:
             async for batch in batches:
                 for event in batch:
+                    seq = event.response_seq if isinstance(event, TextDelta) else event.message.seq
+                    if seq <= row.after_seq:
+                        continue
                     if isinstance(event, TextDelta):
                         preview.apply(event)
                     elif isinstance(event, MessageCommitted):
-                        preview = Preview(unavailable=preview.unavailable)
+                        if preview.seq == seq:
+                            preview = Preview(unavailable=preview.unavailable)
                         message = event.message.message
                         text = (
                             "".join(
@@ -170,6 +176,12 @@ class TelegramDelivery:
                             if isinstance(message, ModelResponse)
                             else ""
                         )
+                        if not legacy and not event.message.authoritative:
+                            if text and seq >= preview.seq:
+                                preview.apply(
+                                    TextDelta(row.session_id, seq, 0, "text", "replace", text)
+                                )
+                            continue
                         if text:
                             row.pending = {
                                 "seq": event.message.seq,

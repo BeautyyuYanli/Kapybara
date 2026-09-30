@@ -203,7 +203,7 @@ async function save() {
         >
           {{
             id
-              ? "模型容量未知，运行前需要设置摘要阈值。仍可保存配置。"
+              ? "模型容量未知；摘要阈值仅用于旧 runner，当前执行无需配置。"
               : "模型容量未知，创建时将保存默认摘要阈值 183500。"
           }}
         </p>
@@ -216,7 +216,7 @@ async function save() {
         <FormField
           id="context_plugin_name"
           label="上下文插件"
-          help="创建后不能更换插件；默认摘要使用 kapy/summary。"
+          help="创建后不能更换插件；上下文和分页配置仅用于旧 runner，当前执行不使用。"
           :error="fields.context_plugin_name || fields.context_plugin"
           v-slot="f"
           ><input
@@ -238,7 +238,7 @@ async function save() {
           label="分页阈值（可选）"
           :help="
             id
-              ? '留空在下次启动时采用模型容量的 70%；容量未知时需设置阈值。'
+              ? '旧 runner 留空时采用模型容量的 70%；容量未知时需设置阈值。'
               : '留空采用模型容量的 70%；创建时容量未知则保存默认阈值 183500。'
           "
           :error="fields.compaction_threshold_tokens"

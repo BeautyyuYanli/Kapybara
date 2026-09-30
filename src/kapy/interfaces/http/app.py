@@ -15,7 +15,7 @@ from .settings import HttpSettings
 
 
 class _InflightRequests:
-    """Track full ASGI calls, including BackgroundTasks, until their cleanup completes."""
+    """Track full ASGI calls, including WebSocket cleanup, until their cleanup completes."""
 
     def __init__(self, app: ASGIApp, active: set[asyncio.Task]) -> None:
         self.app, self.active = app, active
@@ -43,8 +43,6 @@ def create_app(settings: HttpSettings) -> FastAPI:
             router = create_router(
                 ModelService(resources.core_session_factory),
                 sessions,
-                realtime_output=settings.common.realtime_output,
-                output_flush_interval=settings.common.output_flush_interval,
             )
             app.include_router(router)
             if settings.frontend_dist is not None:

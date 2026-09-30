@@ -1,7 +1,8 @@
 """Shared session composition for every interface process.
 
-The registry selects per-session context plugins. HTTP and Telegram pass stored
-configuration through the same service; neither owns paging behavior.
+HTTP and Telegram borrow Temporal through the same service. The registry and
+execution factory remain available to legacy Python runners and plugin cleanup;
+durable execution owns its resources in the independent Worker.
 """
 
 from kapy.agent_output import AgentOutputService
@@ -29,6 +30,8 @@ def create_session_service(
         output_service=AgentOutputService(
             resources.valkey, channel_prefix=settings.valkey_namespace + ":agent-output"
         ),
+        temporal_client=resources.temporal_client,
+        temporal_task_queue=settings.temporal_task_queue,
         heartbeat_interval=settings.heartbeat_interval,
         heartbeat_timeout=settings.heartbeat_timeout,
         takeover_grace_period=settings.takeover_grace_period,

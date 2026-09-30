@@ -2,7 +2,7 @@
 
 from kapy.agent_runner.types import HistoryMessage, MessageCommitted, OutputEvent, TextDelta
 
-from .service import SessionService
+from .service import DurableRunnerConflict, SessionService
 from .types import (
     CreateSession,
     InputChannel,
@@ -26,4 +26,5 @@ __all__ = [
     "SubmitInput",
     "SessionInput",
     "SessionService",
+    "DurableRunnerConflict",
 ]

@@ -20,20 +20,26 @@ Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
 
 ```sh
 docker compose build runtime
-docker compose up -d --wait postgres valkey
+docker compose up -d --wait postgres valkey temporal
 # 首次启动：核心和 Telegram 数据库分别升级，serve 不自动迁移。
 docker compose run --rm runtime kapy db upgrade
 docker compose run --rm telegram kapy interface telegram db upgrade
-docker compose up -d runtime telegram
+docker compose up -d runner-worker runtime telegram
 docker compose ps
 ```
 
 | 服务 | 用途 | 宿主机入口 |
 | --- | --- | --- |
-| `postgres` | Runner checkpoint、原始 history、compaction、输入队列及取消状态 | `127.0.0.1:55432` |
+| `postgres` | durable runner_state、history，以及旧 checkpoint、compaction、输入队列和取消状态 | `127.0.0.1:55432` |
 | `valkey` | 按 session 广播临时输出；无离线消息、TTL 或持久化 | `127.0.0.1:56379` |
+| `temporal` | 持久化 Workflow 调度与恢复；数据保存在 PostgreSQL 的独立数据库 | `127.0.0.1:7233` |
+| `runner-worker` | 执行 durable Workflow 和 Activity，持有模型及输出资源 | 无入站端口 |
 | `runtime` | 非 root 的 HTTP 接口和配置前端 | `0.0.0.0:8000`，前端 `/app/` |
 | `telegram` | 独立 Telegram session 接口，通过 Bot API 长轮询 | 无入站端口 |
+
+HTTP 直接启动入口和 Telegram 普通文本均提交到 Temporal，需同时运行
+`runner-worker` 才会执行；接口进程不自带 Worker。详见
+[Temporal durable Runner 与 Worker](src/kapy/runner_duarable/README.md)。
 
 源码、测试和脚本挂载为只读；更新依赖或前端后需要重新构建。
 PostgreSQL、runtime 和 Telegram 状态目录分别保存在 `postgres-data`、
@@ -52,11 +58,12 @@ HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
 聊天/话题的 session 模型并保存 bot 默认选择，后续新会话也使用它；选择重启后保留。
 `/model` 不带参数显示当前默认值。尚未选择模型时 bot 仍可启动，并提示配置命令。
 `KAPY_TELEGRAM_SESSION_TEMPLATE` 可作为没有已保存选择时的初始默认模板。
-可用 `KAPY_HTTP_PORT` / `KAPY_POSTGRES_PORT` / `KAPY_VALKEY_PORT` 更改映射端口。
+可用 `KAPY_HTTP_PORT` / `KAPY_POSTGRES_PORT` / `KAPY_VALKEY_PORT` /
+`KAPY_TEMPORAL_PORT` 更改映射端口。
 
 ## 验证
 
-主实现测试使用真实 PostgreSQL、Valkey、子进程、PTY 和本地 HTTP 服务；
+主实现测试使用真实 PostgreSQL、Valkey、Temporal、子进程、PTY 和本地 HTTP 服务；
 模型行为使用 SDK 的确定性测试模型，不调用外部模型 API。
 进程和文件测试要求在容器中运行，避免在宿主机跳过。
 
@@ -64,13 +71,15 @@ HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
 docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests
 ```
 
-使用 `.env` 的模型端点和凭据运行真实模型验收：
+使用 `.env` 的模型端点和凭据，验收保留的旧 Python runner 入口：
 
 ```sh
 docker compose exec -T runtime python scripts/check_runtime.py
 ```
 
-该脚本使用 OpenAI Responses 协议，会产生数次模型请求。运行前需按上方步骤
+该脚本调用旧 `SessionService.start_runner()`，覆盖工具与上下文压缩；不代表
+HTTP / Telegram 的 durable 执行链路。脚本使用 OpenAI Responses 协议，会产生
+数次模型请求。运行前需按上方步骤
 执行 `kapy db upgrade` 初始化配置的 PostgreSQL schema；脚本保留一个独立
 session 供检查，每次运行使用新的 session ID。
 
@@ -78,8 +87,8 @@ session 供检查，每次运行使用新的 session ID。
 
 - 模型调用工具，通过 ProcessManager 启动进程生成文件；检查输出、文件原子写入，
   并重新打开 ProcessManager 读取保留的进程结果。
-- SessionService 开启实时输出（默认每 0.5 秒批量发送 delta）；消费端先订阅，
-  再读历史。按顺序消费事件批次，检查完整消息 DTO 与数据库一致；临时 delta
+- 旧 Python 入口开启实时输出（默认每 0.5 秒批量发送 delta）；消费端先订阅，
+  再读历史。按顺序消费事件批次并按 seq 去重，检查完整消息 DTO 与数据库一致；临时 delta
   按 part 还原预览，完整消息替换预览。
 - 从指定 history seq 回放；手动压缩保持原始 history 不变；重启后仅用摘要恢复，
   验证模型仍记得先前工具结果，并触发基于 usage 的自动压缩。
@@ -93,18 +102,24 @@ session 供检查，每次运行使用新的 session ID。
 
 - [进程管理 API](src/kapy/processes/README.md)
 - [文件传输](src/kapy/file_transfer.py)
-- [Runner、压缩和实时输出契约](src/kapy/agent_runner/README.md)
+- [旧 Python Runner、压缩和实时输出契约](src/kapy/agent_runner/README.md)
+- [Temporal durable Runner 与 Worker](src/kapy/runner_duarable/README.md)
 - [Valkey 输出服务](src/kapy/agent_output/service.py)
 - [SessionService：生产侧与历史回放](src/kapy/control/sessions/service.py)
 - [独立进程接口](src/kapy/interfaces/README.md)
 - [核心与接口数据库迁移](src/kapy/database/README.md)
 - [控制面 FastAPI HTTP / WebSocket API](src/kapy/interfaces/http/README.md)
 
-调用方负责 engine、数据库 schema、模型 Agent 和 Valkey client 的生命周期。
-`SessionService.start_runner(..., realtime_output=True)` 需要注入
-`AgentOutputService`；默认关闭实时输出。`live(session_id, after_seq=-1)`
-返回从最后已应用完整消息序号之后回放、再继续监听的异步 generator，提前结束时使用 `aclosing`。
-Pub/Sub 是尽力广播，断线后用最后一条完整消息的 `seq` 作为 `after_seq` 续接历史。
+调用方负责 engine、数据库 schema、Valkey / Temporal client 的生命周期。
+保留的旧 Python 入口 `SessionService.start_runner(..., realtime_output=True)`
+还由调用方管理模型 Agent，并需注入 `AgentOutputService`；该入口默认关闭实时输出。
+HTTP / Telegram 的执行使用 `start_durable_runner()`，模型资源由独立 Worker 管理。
+
+`live(session_id, after_seq=-1)` 返回历史回放并继续监听的异步 generator，
+提前结束时使用 `aclosing`。durable 消费者以最后完整应用的 authoritative 前缀末尾
+`seq` 作为 `after_seq`，尚无该位置时使用 -1；delta 和 non-authoritative 消息
+均不能推进游标。Pub/Sub 是尽力广播，断线后清空临时预览并从该 authoritative
+位置续接。旧 Python runner 的历史仍可读取，旧消费者需按 seq 去重以处理重播。
 
 ```sh
 # 停止并保留 PostgreSQL 和 runtime 数据

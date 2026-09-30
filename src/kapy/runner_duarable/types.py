@@ -8,7 +8,7 @@ Settings are final values, not overrides of a Worker-local model catalogue.
 from typing import Self
 from uuid import UUID
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import ConfigDict, Field, SecretStr, model_validator
 
 from kapy.agent_runner.types import HistoryMessage
 from kapy.control.models.runtime import provider_arguments
@@ -68,6 +68,10 @@ class RunnerDeps(DTO):
 
 class MessageBatch(DTO):
     """One atomic batch with explicit positions, authority and complete SDK messages."""
+
+    # SDK usage preserves provider-specific fields. Inherited forbid would reject
+    # those fields while decoding the nested SDK dataclasses.
+    model_config = ConfigDict(extra="ignore")
 
     session_id: UUID
     messages: list[HistoryMessage]

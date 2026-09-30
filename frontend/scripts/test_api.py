@@ -13,7 +13,6 @@ from uuid import uuid4
 import psycopg
 from fastapi import FastAPI
 from psycopg import sql
-from pydantic_ai import Agent
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from kapy.control.database import ControlTable
@@ -46,6 +45,6 @@ async def lifespan(app):
 factory = async_sessionmaker(engine, expire_on_commit=False)
 app = FastAPI(lifespan=lifespan)
 app.include_router(
-    create_router(ModelService(factory), SessionService(factory), agent=Agent("test"))
+    create_router(ModelService(factory), SessionService(factory))
 )
 app.include_router(create_frontend_router(Path(__file__).resolve().parents[1] / "dist"))

@@ -3,7 +3,6 @@
 from pathlib import Path
 
 from fastapi import APIRouter
-from pydantic_ai import Agent
 
 from kapy.control.models import ModelService
 from kapy.control.sessions import SessionService
@@ -19,27 +18,11 @@ __all__ = [
 ]
 
 
-def create_router[DepsT, OutputT](
-    models: ModelService,
-    sessions: SessionService,
-    *,
-    agent: Agent[DepsT, OutputT] | None = None,
-    deps: DepsT = None,
-    realtime_output: bool = True,
-    output_flush_interval: float = 0.5,
-) -> APIRouter:
+def create_router(models: ModelService, sessions: SessionService) -> APIRouter:
     """Compose HTTP and WebSocket routes under /api using the borrowed services."""
     router = APIRouter(prefix="/api")
     router.include_router(create_model_router(models))
-    router.include_router(
-        create_session_router(
-            sessions,
-            agent=agent,
-            deps=deps,
-            realtime_output=realtime_output,
-            output_flush_interval=output_flush_interval,
-        )
-    )
+    router.include_router(create_session_router(sessions))
     return router
 
 

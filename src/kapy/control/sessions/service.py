@@ -1,8 +1,9 @@
 """User-side session configuration, interaction channels and runner composition.
 
-Ordinary methods own short transactions. Consumption borrows the runner's already
-fenced transaction, preserving atomic queue-to-history transfer. This service
-owns no long-lived ORM session, Agent, or engine. Optional output transport
+Ordinary methods own short transactions. Durable admission holds the session row
+lock through bounded Temporal RPCs; model work remains in the Worker. Legacy
+consumption borrows the runner's fenced transaction for atomic queue-to-history
+transfer. This service owns no long-lived ORM session, Agent, or engine. Output transport
 is borrowed from agent_output; each live call owns its subscription/read task and joins
 original history to live events without holding a transaction during iteration.
 """
@@ -12,6 +13,7 @@ import math
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import partial
 from typing import Any, cast
 from uuid import UUID
@@ -21,6 +23,10 @@ from pydantic_ai.models import Model
 from pydantic_ai.providers import Provider
 from pydantic_ai.settings import ModelSettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.agent_output import AgentOutputService
 from kapy.agent_plugins import AgentPluginService, PluginRegistry
@@ -36,6 +42,7 @@ from kapy.agent_runner import (
     UserInput,
 )
 from kapy.agent_runner import start_runner as run_agent_session
+from kapy.agent_runner.models import AgentStateRow
 from kapy.agent_runner.repository import AgentRepository
 from kapy.context_plugins import ContextPluginRegistry, create_default_registry
 from kapy.control.models.repository import ModelRepository
@@ -49,6 +56,7 @@ from kapy.control.models.types import ModelRecord, ProviderConfig
 from kapy.control.types import utc_now
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
+from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow
 from kapy.session_lease import SessionLease, is_session_busy, open_session_lease
 
 from .repository import SessionRepository, lock_session
@@ -61,6 +69,13 @@ from .types import (
     SubmitInput,
     UpdateSession,
 )
+
+
+class DurableRunnerConflict(Exception):
+    """The preceding Workflow did not complete successfully; do not restart old state."""
+
+
+_TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
 
 
 @dataclass(frozen=True)
@@ -87,11 +102,12 @@ type SessionExecutionFactory = Callable[
 
 
 class SessionService:
-    """User-side entry point; configure the same finite heartbeat policy on every worker.
+    """User-side configuration, execution admission and output for both runners.
 
-    The instance stores only borrowed factories/output transport and heartbeat
-    and live polling values, plus plugin/execution factories and a context plugin registry. Model
-    configuration is fixed for each start call. The execution factory owns model
+    The instance borrows factories, output transport and the Temporal Client.
+    Durable admission uses a row lock through bounded RPCs; the Worker owns execution.
+    Legacy execution uses heartbeat policy, factories and context plugin registry.
+    Model configuration is fixed for each start call. The execution factory owns model
     and plugin resources inside each lease. Direct caller-owned Agents use a
     separate adapter with a task-local model/settings override.
     """
@@ -101,6 +117,8 @@ class SessionService:
         session_factory: async_sessionmaker[AsyncSession],
         *,
         output_service: AgentOutputService | None = None,
+        temporal_client: Client | None = None,
+        temporal_task_queue: str | None = None,
         heartbeat_interval: float = 10.0,
         heartbeat_timeout: float = 60.0,
         takeover_grace_period: float = 30.0,
@@ -119,6 +137,8 @@ class SessionService:
             raise ValueError("takeover_grace_period must be finite and positive")
         if not math.isfinite(live_poll_interval) or live_poll_interval <= 0:
             raise ValueError("live_poll_interval must be finite and positive")
+        self._temporal_client = temporal_client
+        self._temporal_task_queue = temporal_task_queue
         self._live_poll_interval = live_poll_interval
         self._session_factory = session_factory
         self._output_service = output_service
@@ -163,7 +183,9 @@ class SessionService:
     async def close_session(self, session_id: UUID) -> SessionRecord:
         """Acquire exclusive ownership before deciding closing; Busy changes no state.
 
-        Close never changes cancellation or pending inputs. Failures retain the
+        With a Temporal Client, check remote activity under the session row lock
+        before changing lifecycle. Query failures propagate; close never stops a
+        Workflow. Close never changes cancellation or pending inputs. Failures retain the
         irreversible closing decision and completed bindings for explicit retry.
         Registered resources are cleaned under the lease, including plugin exit;
         fencing cannot revoke already-issued external requests from a lost owner.
@@ -180,6 +202,10 @@ class SessionService:
                 row = await lock_session(db, session_id)
                 if row.status == LifecycleStatus.CLOSED:
                     return SessionRecord.model_validate(row)
+                if self._temporal_client is not None and await self.is_durable_runner_running(
+                    session_id
+                ):
+                    raise SessionBusy(f"Session {session_id} has an active Workflow")
                 row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
                 bindings = await BindingRepository(db).list(session_id)
             for binding in bindings:
@@ -227,6 +253,93 @@ class SessionService:
         """
         async with self._session_factory.begin() as db:
             return await is_session_busy(db, session_id, heartbeat_timeout=self._heartbeat_timeout)
+
+    async def has_legacy_checkpoint(self, session_id: UUID) -> bool:
+        """Identify legacy history for delivery; durable execution never creates this row."""
+        async with self._session_factory.begin() as db:
+            return await db.get(AgentStateRow, session_id) is not None
+
+    async def _durable_status(self, session_id: UUID) -> WorkflowExecutionStatus | None:
+        if self._temporal_client is None:
+            raise RuntimeError("Durable execution requires a Temporal client")
+        try:
+            description = await self._temporal_client.get_workflow_handle(
+                f"kapy-runner:{session_id}"
+            ).describe(rpc_timeout=_TEMPORAL_RPC_TIMEOUT)
+        except RPCError as error:
+            if error.status == RPCStatusCode.NOT_FOUND:
+                return None
+            raise
+        return description.status
+
+    async def is_durable_runner_running(self, session_id: UUID) -> bool:
+        """Observe Temporal execution; only NOT_FOUND means absent, RPC failures propagate."""
+        return await self._durable_status(session_id) == WorkflowExecutionStatus.RUNNING
+
+    async def start_durable_runner(
+        self, session_id: UUID, *, user_prompt: str
+    ) -> WorkflowHandle[RunnerWorkflow, str]:
+        """Submit one text prompt, returning after Temporal confirms the start.
+
+        Borrow the Client and serialize admission/close with a session row lock,
+        held only through bounded RPCs. No legacy lease, queue or cancel flag is
+        used. A new execution may follow only COMPLETED, preserving authoritative
+        history across replay. A failed/ambiguous RPC never triggers a new attempt
+        here; callers query the fixed Workflow ID to discover accepted execution.
+        The Worker owns model resources and state saving; cancelling this await
+        does not cancel a Workflow. Never mix legacy and durable session writers.
+        """
+        if self._temporal_client is None or not self._temporal_task_queue:
+            raise RuntimeError("Durable execution requires a Temporal client and task queue")
+        if not isinstance(user_prompt, str):
+            raise ValueError("user_prompt must be a string")
+        async with self._session_factory.begin() as db:
+            row = await lock_session(db, session_id)
+            if row.status != LifecycleStatus.READY:
+                raise LifecycleError(f"Session {session_id} is {row.status}")
+            if await BindingRepository(db).list(session_id):
+                raise ValueError("Durable execution does not support business plugins")
+            if await db.get(AgentStateRow, session_id) is not None:
+                raise ValueError("Legacy checkpoints cannot be resumed by durable execution")
+            status = await self._durable_status(session_id)
+            if status == WorkflowExecutionStatus.RUNNING:
+                raise SessionBusy(f"Session {session_id} has an active Workflow")
+            if status is not None and status != WorkflowExecutionStatus.COMPLETED:
+                raise DurableRunnerConflict(f"Previous Workflow ended with {status.name}")
+            repo = ModelRepository(db)
+            model = await repo.get_model(row.provider_id, row.model_name)
+            provider = await repo.get_provider_config(row.provider_id)
+            _, model_class = resolve_classes(provider)
+            settings = validate_settings(model_class, model.settings | row.model_settings)
+            state, version = await SessionRepository(db).read_runner_state(session_id)
+            data = RunnerInput(
+                session_id=session_id,
+                runner_state=state,
+                runner_state_version=version,
+                user_prompt=user_prompt,
+                config=DurableExecutionConfig(
+                    provider_class=provider.provider_class,
+                    model_class=provider.model_class,
+                    model_name=model.model_name,
+                    api_key=provider.api_key.get_secret_value(),
+                    base_url=provider.base_url,
+                    provider_kwargs=provider.provider_kwargs,
+                    model_settings=settings,
+                    context_window=model.context_window,
+                ),
+            )
+            try:
+                return await self._temporal_client.start_workflow(
+                    RunnerWorkflow.run,
+                    data,
+                    id=f"kapy-runner:{session_id}",
+                    task_queue=self._temporal_task_queue,
+                    id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+                    id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                    rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
+                )
+            except WorkflowAlreadyStartedError as error:
+                raise SessionBusy(f"Session {session_id} has an active Workflow") from error
 
     async def enqueue_input(
         self, session_id: UUID, channel: InputChannel, content: UserInput
@@ -447,20 +560,21 @@ class SessionService:
     async def live(
         self, session_id: UUID, *, after_seq: int = -1
     ) -> AsyncGenerator[list[OutputEvent]]:
-        """Yield nonempty batches of original history and live output after the applied seq.
+        """Replay history and follow output after an applied authoritative prefix.
 
-        after_seq must be an integer >= -1, otherwise ValueError is raised.
-        An output_service is required even for history replay, otherwise RuntimeError
-        is raised. Validation, subscription and history reads begin on iteration.
-        Realtime output supplies provisional deltas; complete messages are also polled.
-
-        Subscribe before reading to deduplicate overlapping commits. Only complete
-        messages advance the cursor. Gaps trigger a short read; unresolved gaps wait
-        for later events or the next poll without skipping predecessors. Polling uses
-        live_poll_interval, independent of incoming traffic. No transaction spans a
-        yield. Consumer backpressure pauses polling but not transport reception.
-        Database/subscription errors end the stream; runner completion does not.
-        Use aclosing when stopping early.
+        after_seq is an integer >= -1, acknowledged by the caller after applying
+        the authoritative prefix. The connection cursor advances when authoritative
+        messages enter its ordered output; it is not a client acknowledgement.
+        Producers must commit before publishing and never change the confirmed
+        prefix or insert into its gaps. Consecutive authoritative broadcasts advance
+        directly; only a gap triggers backfill. Previews never advance or read history.
+        Subscribe before replay and poll the unconfirmed suffix for missed commits
+        and provisional replacements. History permits numeric gaps, but authority
+        after a provisional row or an unconfirmed authoritative broadcast raises
+        RuntimeError. Legacy history can replay; legacy consumers deduplicate by seq.
+        Consumer backpressure pauses polling, not transport reception. No transaction
+        spans a yield. Errors end the stream; completion does not. Use aclosing when
+        stopping early; clear temporary previews and resume from the applied prefix.
         """
         if type(after_seq) is not int or after_seq < -1:
             raise ValueError("after_seq must be an integer >= -1")
@@ -474,6 +588,20 @@ class SessionService:
                     session_id, after_seq=last_seq
                 )
 
+        def replay(entries: tuple[HistoryMessage, ...]) -> list[MessageCommitted]:
+            nonlocal last_seq
+            confirmed_seq = last_seq
+            provisional = False
+            for entry in entries:
+                if entry.authoritative:
+                    if provisional:
+                        raise RuntimeError("History authoritative messages must form a prefix")
+                    confirmed_seq = entry.seq
+                else:
+                    provisional = True
+            last_seq = confirmed_seq
+            return [MessageCommitted(entry) for entry in entries]
+
         loop = asyncio.get_running_loop()
         next_poll_at = loop.time()
         pending = None
@@ -483,14 +611,8 @@ class SessionService:
                     if loop.time() >= next_poll_at:
                         entries = await read_history()
                         next_poll_at = loop.time() + self._live_poll_interval
-                        replay: list[OutputEvent] = []
-                        for entry in entries:
-                            if entry.seq != last_seq + 1:
-                                break
-                            last_seq = entry.seq
-                            replay.append(MessageCommitted(entry))
-                        if replay:
-                            yield replay
+                        if entries:
+                            yield list(replay(entries))
 
                     if pending is None:
                         pending = asyncio.ensure_future(anext(events))
@@ -507,32 +629,59 @@ class SessionService:
                         return
                     pending = None
                     result: list[OutputEvent] = []
-                    for event in batch:
-                        seq = (
-                            event.message.seq
-                            if isinstance(event, MessageCommitted)
-                            else event.response_seq
-                        )
-                        if seq > last_seq + 1:
-                            entries = await read_history()
-                            next_poll_at = loop.time() + self._live_poll_interval
-                            for entry in entries:
-                                if entry.seq != last_seq + 1:
-                                    break
-                                last_seq = entry.seq
-                                result.append(MessageCommitted(entry))
-                        if seq != last_seq + 1:
-                            continue
-                        if isinstance(event, MessageCommitted):
+                    authoritative = {
+                        event.message.seq: event
+                        for event in batch
+                        if isinstance(event, MessageCommitted)
+                        and event.message.authoritative
+                        and event.message.seq > last_seq
+                    }
+                    for seq in sorted(authoritative):
+                        if seq == last_seq + 1:
+                            result.append(authoritative[seq])
                             last_seq = seq
-                        result.append(event)
-                    # Commits later in this batch (including backfill) supersede
-                    # previews that have not yet reached the consumer.
-                    result = [
-                        item
-                        for item in result
-                        if isinstance(item, MessageCommitted) or item.response_seq > last_seq
-                    ]
+                            continue
+                        entries = await read_history()
+                        next_poll_at = loop.time() + self._live_poll_interval
+                        # Confirmed snapshots are immutable. Keep full SDK usage
+                        # from the broadcast instead of normalized database fields.
+                        entries = tuple(
+                            authoritative[entry.seq].message
+                            if entry.authoritative and entry.seq in authoritative
+                            else entry
+                            for entry in entries
+                        )
+                        # Keep a provisional broadcast at its original position
+                        # relative to later deltas, without replaying it twice.
+                        snapshots = {
+                            event.message.seq
+                            for event in batch
+                            if isinstance(event, MessageCommitted)
+                            and not event.message.authoritative
+                        }
+                        # This read follows receipt of the entire batch, so every
+                        # remaining authoritative broadcast must occur in history.
+                        confirmed = {entry.seq for entry in entries if entry.authoritative}
+                        if any(seq > last_seq and seq not in confirmed for seq in authoritative):
+                            raise RuntimeError(
+                                "Authoritative broadcast is not confirmed in history"
+                            )
+                        result.extend(
+                            event
+                            for event in replay(entries)
+                            if event.message.authoritative or event.message.seq not in snapshots
+                        )
+                        break
+
+                    # Final messages suppress covered previews even if those
+                    # arrived first. Remaining temporary events keep their order,
+                    # including deltas that follow a same-key provisional snapshot.
+                    for event in batch:
+                        if isinstance(event, MessageCommitted):
+                            if not event.message.authoritative and event.message.seq > last_seq:
+                                result.append(event)
+                        elif event.response_seq > last_seq:
+                            result.append(event)
                     if result:
                         yield result
             finally:

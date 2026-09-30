@@ -230,7 +230,6 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
             ),
         )
         client = AsyncMock(spec=TelegramClient)
-        scheduled = []
         controller = TelegramController(
             client=client,
             sessions=sessions,
@@ -239,7 +238,6 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
             settings=config,
             bot_id=42,
             username="kapy_bot",
-            schedule_runner=scheduled.append,
         )
         await repository.ingest(
             42,
@@ -249,16 +247,21 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
                     "message": {
                         "chat": {"id": 123, "type": "private"},
                         "from": {"id": 1, "is_bot": False},
-                        "text": "Reply with exactly KAPY_INTERFACE_OK and nothing else.",
+                        "text": "/queue Reply with exactly KAPY_INTERFACE_OK and nothing else.",
                     },
                 }
             ],
         )
         await controller.process_once()
-        assert len(scheduled) == 1
-        session_id = scheduled[0]
+        session_id = await repository.route(42, 123, 0)
+        assert session_id is not None
         (row,) = await repository.deliveries(42)
         delivery = TelegramDelivery(client, sessions, repository, 42)
+        # Existing legacy sessions are recognized by their checkpoint.
+        from kapy.agent_runner.repository import AgentRepository
+
+        async with database.sessions.begin() as db:
+            await AgentRepository(db).resume(session_id)
         follower = asyncio.create_task(delivery.consume(row))
         try:
             async with asyncio.timeout(5):
@@ -290,7 +293,7 @@ async def session_round_trip(database, valkey_client, tmp_path, *, live_config=N
 
 
 @pytest.mark.asyncio
-async def test_telegram_core_runner_live_round_trip(
+async def test_telegram_legacy_history_delivery_round_trip(
     database, valkey_client, tmp_path, session_model
 ):
     session_model(TestModel(custom_output_text="KAPY_INTERFACE_OK"))
@@ -322,7 +325,6 @@ async def test_telegram_model_command_updates_only_bound_session_and_new_default
     await migrate_telegram(path, "upgrade")
     async with open_storage(path) as engine:
         repository = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
-        scheduled = []
         controller = TelegramController(
             client=AsyncMock(spec=TelegramClient),
             sessions=sessions,
@@ -342,7 +344,6 @@ async def test_telegram_model_command_updates_only_bound_session_and_new_default
             ),
             bot_id=42,
             username="kapy_bot",
-            schedule_runner=scheduled.append,
         )
 
         async def send(update_id, text, thread=0):
@@ -383,7 +384,6 @@ async def test_telegram_model_command_updates_only_bound_session_and_new_default
         assert (created.provider_id, created.model_name) == (new_provider.id, "new")
         assert created.model_settings == {}
         assert len((await models.list_models()).items) == 2
-        assert not scheduled
 
 
 @pytest.mark.live
@@ -425,7 +425,7 @@ async def test_http_interface_serves_http_without_credentials(database, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_http_shutdown_joins_background_runner_before_resources_close(
+async def test_http_shutdown_joins_start_request_before_resources_close(
     database, seed_session, monkeypatch
 ):
     from contextlib import asynccontextmanager
@@ -453,7 +453,7 @@ async def test_http_shutdown_joins_background_runner_before_resources_close(
             events.append("runner-cleaned")
 
     monkeypatch.setattr(http_app, "open_resources", resources)
-    monkeypatch.setattr(SessionService, "start_runner", runner)
+    monkeypatch.setattr(SessionService, "start_durable_runner", runner)
     app = create_app(
         HttpSettings(
             common=CommonSettings(
@@ -469,8 +469,8 @@ async def test_http_shutdown_joins_background_runner_before_resources_close(
         async with app.router.lifespan_context(app):
             request = asyncio.create_task(
                 client.post(
-                    f"/api/sessions/{session_id}/inputs",
-                    json={"content": "test"},
+                    f"/api/sessions/{session_id}/runner",
+                    json={"user_prompt": "test"},
                 )
             )
             await asyncio.wait_for(started.wait(), 2)
@@ -563,7 +563,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
 
     monkeypatch.setattr(telegram_main, "open_resources", resources)
     monkeypatch.setattr(TelegramClient, "api", api)
-    monkeypatch.setattr(SessionService, "start_runner", runner)
+    monkeypatch.setattr(SessionService, "start_durable_runner", runner)
     task = asyncio.create_task(telegram_main.serve(settings))
     try:
         await asyncio.wait_for(started.wait(), 3)
@@ -626,7 +626,7 @@ async def test_telegram_serve_draft_pacing_uses_publisher_setting(
             yield [TextDelta(target, 0, 0, "text", "replace", str(index))]
             await sent[index].wait()
         yield [
-            MessageCommitted(HistoryMessage(target, 0, False, ModelResponse([TextPart("final")])))
+            MessageCommitted(HistoryMessage(target, 0, True, ModelResponse([TextPart("final")])))
         ]
         settled.set()
         await asyncio.Future()

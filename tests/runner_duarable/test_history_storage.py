@@ -28,7 +28,7 @@ from kapy.runner_duarable.types import MessageBatch
 pytestmark = pytest.mark.asyncio
 
 
-async def test_message_payload_round_trip_uses_sdk_binary_codec():
+async def test_message_payload_round_trip_preserves_sdk_binary_and_usage():
     session_id = uuid4()
     message = ModelRequest(
         parts=[
@@ -36,16 +36,28 @@ async def test_message_payload_round_trip_uses_sdk_binary_codec():
         ],
         metadata={"seq": 4, "authoritative": True, "source": "upload"},
     )
+    response = ModelResponse(
+        parts=[TextPart("done")],
+        usage=RequestUsage(input_tokens=10, output_tokens=2, output_reasoning_tokens=0),
+    )
     data = MessageBatch(
-        session_id=session_id, messages=[HistoryMessage(session_id, 4, True, message)]
+        session_id=session_id,
+        messages=[
+            HistoryMessage(session_id, 4, True, message),
+            HistoryMessage(session_id, 5, True, response),
+        ],
     )
     converter = DataConverter(payload_converter_class=PydanticAIPayloadConverter)
     restored = (await converter.decode(await converter.encode([data]), [MessageBatch]))[0]
     expected = ModelMessagesTypeAdapter.validate_json(
-        ModelMessagesTypeAdapter.dump_json([message])
-    )[0]
-    assert restored.messages == [HistoryMessage(session_id, 4, True, expected)]
+        ModelMessagesTypeAdapter.dump_json([message, response])
+    )
+    assert restored.messages == [
+        HistoryMessage(session_id, 4, True, expected[0]),
+        HistoryMessage(session_id, 5, True, expected[1]),
+    ]
     assert restored.messages[0].message.parts[0].content[1].data == b"\xff\x00\xfe"
+    assert restored.messages[1].message.usage.__dict__["output_reasoning_tokens"] == 0
 
 
 @pytest.mark.integration

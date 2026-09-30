@@ -19,7 +19,6 @@ from kapy.agent_output import AgentOutputService
 from kapy.agent_runner import HistoryMessage, MessageCommitted, OutputEvent, TextDelta
 from kapy.agent_runner.repository import AgentRepository
 from kapy.control.sessions import SessionService
-from kapy.session_lease import open_session_lease
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -60,19 +59,12 @@ def response(text="answer"):
 
 
 async def append(database, session_id, messages, start_seq):
-    async with (
-        open_session_lease(session_id, session_factory=database.sessions) as lease,
-        database.sessions.begin() as db,
-    ):
-        await lease.lock_owned(db)
-        repo = AgentRepository(db)
-        await repo.resume(session_id)
-        entries = await repo.save_checkpoint(
-            session_id,
-            next_step="done",
-            start_seq=start_seq,
-            messages=messages,
-        )
+    entries = tuple(
+        HistoryMessage(session_id, start_seq + index, True, message)
+        for index, message in enumerate(messages)
+    )
+    async with database.sessions.begin() as db:
+        await AgentRepository(db).upsert_history(session_id, entries)
     return entries
 
 
@@ -140,9 +132,9 @@ async def test_subscribe_before_history_deduplicates_overlap(
     assert calls == [-1]
 
 
-@pytest.mark.parametrize("trigger", ["commit", "delta", "covered_delta"])
+@pytest.mark.parametrize("broadcast_prefix", [False, True])
 async def test_missing_notifications_backfill_history_once(
-    database, valkey_client, monkeypatch, trigger, seed_session
+    database, valkey_client, monkeypatch, seed_session, broadcast_prefix
 ):
     session_id = uuid4()
     await seed_session(session_id)
@@ -159,27 +151,91 @@ async def test_missing_notifications_backfill_history_once(
     monkeypatch.setattr(AgentRepository, "read_history_entries", observe)
     async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
-        missing = [response("first"), ModelRequest(parts=[UserPromptPart("next")])]
-        if trigger == "covered_delta":
-            missing.append(response("second"))
+        missing = [
+            response("first"),
+            ModelRequest(parts=[UserPromptPart("next")]),
+            response("second"),
+        ]
         entries = await append(database, session_id, missing, 1)
-        live = TextDelta(session_id, 3, 0, "text", "append", "new")
-        async with direct_publisher(valkey_client, session_id) as callback:
-            await callback(MessageCommitted(entries[-1]) if trigger == "commit" else live)
-            if trigger != "delta":
-                # A sentinel proves that an overlapping commit or covered delta
-                # did not survive the backfill. It is not used as a DB cursor.
-                await callback(
-                    TextDelta(session_id, len(missing) + 1, 0, "text", "append", "sentinel")
-                )
+        live = TextDelta(session_id, 4, 0, "text", "append", "new")
+        batch = [MessageCommitted(entries[-1])]
+        if broadcast_prefix:
+            batch.append(MessageCommitted(entries[0]))
+        # This preview proves the overlapping commit did not survive backfill.
+        await valkey_client.publish(
+            f"kapy:agent-output:{session_id}",
+            TypeAdapter(list[OutputEvent]).dump_json([*batch, live]),
+        )
         async with asyncio.timeout(2):
             assert [(await next_committed(events)).seq for _ in missing] == list(
                 range(1, 1 + len(missing))
             )
-            following = await anext(events)
-            assert isinstance(following, TextDelta)
-            assert following.text == ("new" if trigger == "delta" else "sentinel")
-    assert reads == [-1, 0]
+            assert await anext(events) == live
+    assert reads == [-1, 1 if broadcast_prefix else 0]
+
+
+async def test_previews_and_contiguous_authority_do_not_read_history(
+    database, valkey_client, monkeypatch
+):
+    session_id = uuid4()
+    initial = (await append(database, session_id, [response("initial")], 0))[0]
+    sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
+    original = AgentRepository.read_history_entries
+    reads = []
+
+    async def observe(repo, requested_session, *, after_seq=-1):
+        reads.append(after_seq)
+        return await original(repo, requested_session, after_seq=after_seq)
+
+    monkeypatch.setattr(AgentRepository, "read_history_entries", observe)
+    async with aclosing(sessions.live(session_id)) as batches:
+        assert await anext(batches) == [MessageCommitted(initial)]
+        provisional = MessageCommitted(HistoryMessage(session_id, 5, False, response("temporary")))
+        async with database.sessions.begin() as db:
+            await AgentRepository(db).upsert_history(session_id, [provisional.message])
+        near = TextDelta(session_id, 1, 0, "text", "replace", "near")
+        far = TextDelta(session_id, 8, 0, "text", "append", "far")
+        await valkey_client.publish(
+            f"kapy:agent-output:{session_id}",
+            TypeAdapter(list[OutputEvent]).dump_json([near, provisional, far]),
+        )
+        async with asyncio.timeout(2):
+            assert await anext(batches) == [near, provisional, far]
+        assert reads == [-1]
+
+        final = await append(database, session_id, [response(str(seq)) for seq in (1, 2, 3)], 1)
+        covered = TextDelta(session_id, 2, 0, "text", "append", "obsolete")
+        following = TextDelta(session_id, 5, 0, "text", "append", "after snapshot")
+        await valkey_client.publish(
+            f"kapy:agent-output:{session_id}",
+            TypeAdapter(list[OutputEvent]).dump_json(
+                [
+                    MessageCommitted(initial),
+                    MessageCommitted(final[2]),
+                    MessageCommitted(final[0]),
+                    MessageCommitted(final[1]),
+                    covered,
+                    provisional,
+                    following,
+                ]
+            ),
+        )
+        async with asyncio.timeout(2):
+            assert await anext(batches) == [
+                *[MessageCommitted(entry) for entry in final],
+                provisional,
+                following,
+            ]
+        assert reads == [-1]
+
+    # The connection delivered through 3; a client that applied only through 1
+    # must still recover 2 and 3 from its own acknowledgement on reconnect.
+    async with aclosing(sessions.live(session_id, after_seq=1)) as batches:
+        assert await anext(batches) == [
+            *[MessageCommitted(entry) for entry in final[1:]],
+            provisional,
+        ]
+    assert reads == [-1, 1]
 
 
 async def test_start_cursor_and_reconnect_recover_unpublished_tail(
@@ -283,31 +339,22 @@ async def test_unstarted_session_can_follow_new_execution(
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_unfilled_predecessor_gap_waits_then_polls_contiguous_history(
+async def test_gaps_are_valid_and_later_authoritative_broadcast_backfills(
     database, valkey_client, seed_session
 ):
     session_id = uuid4()
     await seed_session(session_id)
-    sessions = SessionService(
-        database.sessions, output_service=AgentOutputService(valkey_client), live_poll_interval=0.02
-    )
+    sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
     await append(database, session_id, [response()], 0)
     async with individual_events(sessions, session_id) as events:
         assert (await next_committed(events)).seq == 0
+        one = (await append(database, session_id, [response("one")], 2))[0]
+        two = (await append(database, session_id, [response("two")], 5))[0]
         async with direct_publisher(valkey_client, session_id) as callback:
-            await callback(MessageCommitted(HistoryMessage(session_id, 2, False, response())))
-        waiting = asyncio.create_task(anext(events))
-        try:
-            await asyncio.sleep(0.06)
-            assert not waiting.done()
-            entries = await append(database, session_id, [response("one"), response("two")], 1)
-            async with asyncio.timeout(2):
-                assert await waiting == MessageCommitted(entries[0])
-                assert await anext(events) == MessageCommitted(entries[1])
-        finally:
-            waiting.cancel()
-            await asyncio.gather(waiting, return_exceptions=True)
-    assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
+            await callback(MessageCommitted(two))
+        async with asyncio.timeout(2):
+            assert await next_committed(events) == one
+            assert await next_committed(events) == two
 
 
 async def test_poll_recovers_silent_tail_without_cancelling_subscription(database, valkey_client):
@@ -469,13 +516,153 @@ async def test_live_hands_off_whole_history_and_backfilled_batch(database, valke
     async with aclosing(sessions.live(session_id)) as batches:
         assert await anext(batches) == [MessageCommitted(entry) for entry in initial]
         tail = await append(database, session_id, [response("two"), response("three")], 2)
-        # Sub retains the preview because it has not seen the commits. live's gap
-        # backfill must remove that preview from its still-undelivered result list.
+        # Sub retains seq 2's preview because only seq 3 was broadcast. The gap
+        # backfill must remove that preview from live's still-undelivered result.
         preview = TextDelta(session_id, 2, 0, "text", "replace", "temporary")
         future = TextDelta(session_id, 4, 0, "text", "append", "next")
         await valkey_client.publish(
             f"kapy:agent-output:{session_id}",
-            TypeAdapter(list[OutputEvent]).dump_json([preview, future]),
+            TypeAdapter(list[OutputEvent]).dump_json([preview, MessageCommitted(tail[-1]), future]),
         )
         async with asyncio.timeout(2):
             assert await anext(batches) == [*[MessageCommitted(entry) for entry in tail], future]
+
+
+async def test_backfill_keeps_temporary_snapshot_and_delta_order(database, valkey_client):
+    session_id = uuid4()
+    initial = (await append(database, session_id, [response("initial")], 0))[0]
+    sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
+    async with aclosing(sessions.live(session_id)) as batches:
+        assert await anext(batches) == [MessageCommitted(initial)]
+        final = (await append(database, session_id, [response("final")], 2))[0]
+        provisional = MessageCommitted(HistoryMessage(session_id, 3, False, response("snapshot")))
+        async with database.sessions.begin() as db:
+            await AgentRepository(db).upsert_history(session_id, [provisional.message])
+        other = TextDelta(session_id, 4, 0, "text", "replace", "other")
+        following = TextDelta(session_id, 3, 0, "text", "append", "following")
+        await valkey_client.publish(
+            f"kapy:agent-output:{session_id}",
+            TypeAdapter(list[OutputEvent]).dump_json(
+                [other, provisional, MessageCommitted(final), following]
+            ),
+        )
+        async with asyncio.timeout(2):
+            assert await anext(batches) == [MessageCommitted(final), other, provisional, following]
+
+
+@pytest.mark.parametrize("read_boundary", ["initial", "poll", "backfill"])
+async def test_inconsistent_history_prefix_fails_without_confirming_later_messages(
+    database, valkey_client, read_boundary
+):
+    session_id = uuid4()
+    initial = (await append(database, session_id, [response("initial")], 0))[0]
+    sessions = SessionService(
+        database.sessions,
+        output_service=AgentOutputService(valkey_client),
+        live_poll_interval=0.02 if read_boundary == "poll" else 5,
+    )
+    provisional = HistoryMessage(session_id, 1, False, response("not confirmed"))
+    inconsistent = HistoryMessage(session_id, 3, True, response("must not acknowledge"))
+    async with aclosing(sessions.live(session_id)) as batches:
+        if read_boundary != "initial":
+            assert await anext(batches) == [MessageCommitted(initial)]
+        async with database.sessions.begin() as db:
+            await AgentRepository(db).upsert_history(session_id, [provisional, inconsistent])
+        if read_boundary == "backfill":
+            async with direct_publisher(valkey_client, session_id) as publish:
+                await publish(MessageCommitted(inconsistent))
+        async with asyncio.timeout(2):
+            with pytest.raises(RuntimeError, match="authoritative messages must form a prefix"):
+                await anext(batches)
+    assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
+
+
+@pytest.mark.parametrize("later_commit", [False, True])
+async def test_uncommitted_authoritative_gap_broadcast_fails_and_closes_subscription(
+    database, valkey_client, later_commit
+):
+    session_id = uuid4()
+    initial = (await append(database, session_id, [response("initial")], 0))[0]
+    sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
+    async with aclosing(sessions.live(session_id)) as batches:
+        assert await anext(batches) == [MessageCommitted(initial)]
+        invalid = MessageCommitted(HistoryMessage(session_id, 3, True, response("not committed")))
+        batch: list[OutputEvent] = [invalid]
+        if later_commit:
+            # The first gap broadcast exists, but every member of the same batch
+            # must be confirmed before yielding, even with a higher history seq.
+            confirmed = (await append(database, session_id, [response("confirmed")], 2))[0]
+            await append(database, session_id, [response("later")], 4)
+            batch.insert(0, MessageCommitted(confirmed))
+        await valkey_client.publish(
+            f"kapy:agent-output:{session_id}",
+            TypeAdapter(list[OutputEvent]).dump_json(batch),
+        )
+        async with asyncio.timeout(2):
+            with pytest.raises(RuntimeError, match="broadcast is not confirmed in history"):
+                await anext(batches)
+    assert (await valkey_client.pubsub_numsub(f"kapy:agent-output:{session_id}"))[0][1] == 0
+
+
+async def test_provisional_history_and_delta_never_skip_authoritative_replacement(
+    database, valkey_client
+):
+    session_id = uuid4()
+    outputs = AgentOutputService(valkey_client)
+    sessions = SessionService(database.sessions, output_service=outputs, live_poll_interval=0.02)
+    provisional = HistoryMessage(session_id, 0, False, response("provisional"))
+    async with database.sessions.begin() as db:
+        await AgentRepository(db).upsert_history(session_id, [provisional])
+    async with individual_events(sessions, session_id) as events:
+        assert await next_committed(events) == provisional
+        # A silent replacement must be re-read even though this position was sent.
+        final = HistoryMessage(session_id, 0, True, response("final"))
+        async with database.sessions.begin() as db:
+            await AgentRepository(db).upsert_history(session_id, [final])
+        async with asyncio.timeout(2):
+            assert await next_committed(events) == final
+            delta = TextDelta(session_id, 1, 0, "text", "replace", "temporary")
+            async with direct_publisher(valkey_client, session_id) as publish:
+                await publish(delta)
+            assert await anext(events) == delta
+            tail = (await append(database, session_id, [response("complete")], 1))[0]
+            assert await next_committed(events) == tail
+    # Only the applied authority is used for reconnect; the delta was never a cursor.
+    async with individual_events(sessions, session_id, after_seq=0) as events:
+        assert await next_committed(events) == tail
+
+
+async def test_legacy_history_remains_replayable_without_an_authoritative_cursor(
+    database, valkey_client
+):
+    session_id = uuid4()
+    entry = HistoryMessage(session_id, 4, False, response("legacy"))
+    async with database.sessions.begin() as db:
+        await AgentRepository(db).upsert_history(session_id, [entry])
+    sessions = SessionService(
+        database.sessions, output_service=AgentOutputService(valkey_client), live_poll_interval=0.02
+    )
+    async with individual_events(sessions, session_id) as events:
+        async with asyncio.timeout(2):
+            assert await next_committed(events) == entry
+            assert await next_committed(events) == entry
+
+
+@pytest.mark.parametrize("seq", [1, 3])
+async def test_authoritative_live_keeps_broadcast_usage_details(database, valkey_client, seq):
+    from pydantic_ai.usage import RequestUsage
+
+    session_id = uuid4()
+    sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
+    initial = (await append(database, session_id, [response("initial")], 0))[0]
+    async with individual_events(sessions, session_id) as events:
+        assert await next_committed(events) == initial
+        full = ModelResponse(
+            [TextPart("full")],
+            usage=RequestUsage(input_tokens=100, output_tokens=20, details={"extra": 7}),
+        )
+        entry = (await append(database, session_id, [full], seq))[0]
+        async with direct_publisher(valkey_client, session_id) as publish:
+            await publish(MessageCommitted(entry))
+        async with asyncio.timeout(2):
+            assert await next_committed(events) == entry

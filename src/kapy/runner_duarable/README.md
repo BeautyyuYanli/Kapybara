@@ -107,6 +107,8 @@ seq and authority are never extracted from JSON or reconciled with SDK metadata.
 History DTOs take both attributes from columns. Existing SDK payload encoding and
 normalized token columns remain unchanged; full events retain all input SDK fields,
 including usage details, without a database reconstruction.
+`MessageBatch` uses `extra="ignore"` so control DTO strictness does not reject
+provider-specific fields in nested SDK usage; the SDK codec preserves those fields.
 
 Upsert unconditionally replaces `(session_id, seq)`, including authoritative and
 nullable fields, while preserving created_at. Invalid seq/authority, mismatched
@@ -125,12 +127,26 @@ The successful state includes seq/authority metadata, including a non-authoritat
 after-run tail that can be re-numbered in the next run. History is not a mirror of
 the last successful state. `after_seq` queries cannot recover earlier overwrites.
 
-Use `AgentOutputService.subscribe()` for this output path. A full snapshot replaces
-the same key and clears its provisional text; later deltas form a fresh preview,
-never append into the complete message itself. `SessionService.live()` assumes
-contiguous append-only history and is not this runner's consumer; HTTP and Telegram
-execution are not switched to Temporal here. Transport buffering and close behavior
-are described in [the runner output contract](../agent_runner/README.md).
+HTTP and Telegram use `SessionService.start_durable_runner()`, which serializes
+starts with a short session row lock and the fixed `kapy-runner:{session_id}`
+Workflow ID. It admits a new execution only initially or after COMPLETED, so
+terminal failures cannot silently restart from an older state and overwrite an
+already confirmed authoritative prefix. It rejects business plugin bindings and
+legacy checkpoints; queues, cancel flags and compaction settings remain unused.
+
+`SessionService.live(after_seq=-1)` joins history with Pub/Sub and periodic reads.
+Resume from the last fully applied authoritative prefix only: provisional complete
+messages and deltas cannot advance the cursor or trigger backfill. Consecutive
+authoritative broadcasts advance directly; only a jump beyond cursor + 1 triggers
+ordered history backfill. Numeric gaps are valid once confirmed by history, but the
+authoritative prefix's content and membership must remain immutable. An inconsistent
+history prefix fails the stream. Periodic reads recover missed commits independently
+of preview traffic; unconfirmed suffixes can replay. Client acknowledgement may lag
+the connection cursor and must reflect only fully applied messages.
+Complete snapshots replace the same key and clear that key's preview; later deltas
+form a new preview. Clear previews when reconnecting. Direct
+`AgentOutputService.subscribe()` remains available for callers owning their replay
+policy. Transport buffering is described in [the output contract](../agent_runner/README.md).
 
 The module defines its own Agent at module scope. It reuses Provider/Model
 construction helpers, but does not import the legacy application Agent factory.
@@ -181,8 +197,8 @@ The Worker and interface processes share `KAPY_TEMPORAL_ADDRESS` (default
 per `open_resources()` lifespan, available as `resources.temporal_client`; HTTP
 also exposes it through `request.app.state.resources.temporal_client`. Startup
 requires a reachable Temporal service. Client has no explicit close API; process
-owners finish their tasks before releasing resources. Session execution is not
-automatically switched to this Workflow.
+owners finish their tasks before releasing resources. HTTP direct runner submissions and ordinary Telegram text use this Workflow.
+Queue submissions do not start it, and legacy Python start_runner remains available.
 
 The resolver reads configuration from `RunnerDeps.config` and uses the existing
 Provider/Model builders to construct the real SDK
