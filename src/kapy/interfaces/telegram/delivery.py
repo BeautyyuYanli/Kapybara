@@ -61,9 +61,14 @@ class Preview:
             value for (_, kind), value in sorted(self.parts.items()) if kind == "thinking"
         )
         if thinking:
-            # Drop completed 500-character pages, including at an exact boundary.
-            # A nonempty placeholder replaces the old draft while the next page is empty.
-            return thinking[len(thinking) // 500 * 500 :] or "…", False
+            # Recompute from parts so replacements and merged batches use the same pages.
+            # Keep the last completed page until the growing page also ends at a newline.
+            previous, start = 0, 0
+            while (end := thinking.find("\n", start + 601)) != -1:
+                previous, start = start, end + 1
+            if start:
+                return thinking[previous:start] + "---\n" + thinking[start:], False
+            return thinking, False
         return self.progress, False
 
 
