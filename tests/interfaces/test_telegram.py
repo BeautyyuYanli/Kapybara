@@ -466,24 +466,21 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
 
 
 @pytest.mark.asyncio
-async def test_thinking_preview_turns_pages_and_resets_on_replacement(repository):
+async def test_thinking_preview_slides_over_latest_five_hundred_characters(repository):
     row = await delivery_row(repository)
     client = AsyncMock(spec=TelegramClient)
-    first = "思\n" + "考" * 298
-    second = "新" * 301
 
     async def live(session_id, *, after_seq):
         for seq, part, kind, op, content in [
-            (0, 0, "thinking", "replace", first),
+            (0, 0, "thinking", "replace", "思" * 499),
             (0, 0, "thinking", "append", "😀"),
-            (0, 0, "thinking", "append", "\n"),
-            (0, 1, "thinking", "replace", second),
-            (0, 1, "thinking", "append", "\n"),
-            (0, 1, "thinking", "append", "第三页"),
+            (0, 1, "thinking", "replace", "新"),
+            (0, 1, "thinking", "append", "\n\n段落"),
+            (0, 1, "thinking", "append", "续" * 700),
             (0, 1, "thinking", "replace", "重置"),
             (1, 0, "thinking", "replace", "新的回复"),
             (1, 1, "text", "replace", "answer"),
-            (1, 0, "thinking", "append", "思" * 301 + "\n"),
+            (1, 0, "thinking", "append", "更多思考"),
         ]:
             yield [TextDelta(session_id, seq, part, kind, op, content)]
 
@@ -494,51 +491,57 @@ async def test_thinking_preview_turns_pages_and_resets_on_replacement(repository
 
     calls = client.send.call_args_list
     assert [call.args[2] for call in calls] == [
-        first,
-        first + "😀",
-        first + "😀\n\n---\n\n",
-        first + "😀\n\n---\n\n" + second,
-        second + "\n\n---\n\n",
-        second + "\n\n---\n\n第三页",
-        first + "😀\n\n---\n\n重置",
+        "思" * 499,
+        "思" * 499 + "😀",
+        "思" * 498 + "😀新",
+        "思" * 494 + "😀新\n\n段落",
+        "续" * 500,
+        "思" * 497 + "😀重置",
         "新的回复",
         "answer",
     ]
-    assert all(call.kwargs["draft_id"] == calls[0].kwargs["draft_id"] for call in calls[:7])
+    assert all(call.kwargs["draft_id"] == calls[0].kwargs["draft_id"] for call in calls[:6])
     assert all(call.kwargs["rich"] for call in calls)
-    assert calls[-1].kwargs["rich"]
     assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
 
 
 @pytest.mark.asyncio
-async def test_thinking_merged_batch_keeps_latest_completed_and_growing_page(repository):
+@pytest.mark.parametrize("merged", [True, False])
+async def test_thinking_tail_is_independent_of_live_batch_boundaries(repository, merged):
     row = await delivery_row(repository)
     client = AsyncMock(spec=TelegramClient)
+    fragments = [f"{i}:思考\n\n" for i in range(100)]
 
     async def live(session_id, *, after_seq):
-        yield [
-            TextDelta(session_id, 0, 0, "thinking", "replace", "甲" * 301 + "\n"),
-            TextDelta(session_id, 0, 0, "thinking", "append", "乙" * 301 + "\n"),
-            TextDelta(session_id, 0, 1, "thinking", "replace", "丙" * 301 + "\n末页"),
-        ]
+        events = [TextDelta(session_id, 0, 0, "thinking", "append", text) for text in fragments]
+        if merged:
+            yield events
+        else:
+            for event in events:
+                yield [event]
+        for _ in range(51):
+            yield []
 
     sessions = AsyncMock(spec=SessionService)
     sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     await TelegramDelivery(client, sessions, repository, 42).consume(row)
 
-    client.send.assert_awaited_once()
-    assert client.send.call_args.args[2] == "丙" * 301 + "\n\n---\n\n末页"
+    assert client.send.call_args.args[2] == "".join(fragments)[-500:]
 
 
 @pytest.mark.asyncio
-async def test_thinking_paginated_draft_falls_back_to_plain_text(repository):
+async def test_thinking_draft_falls_back_to_plain_text(repository):
     row = await delivery_row(repository)
     client = AsyncMock(spec=TelegramClient)
     client.send.side_effect = [TelegramFailure(400, rich_content_rejected=True), None]
 
     async def live(session_id, *, after_seq):
-        yield [TextDelta(session_id, 0, 0, "thinking", "replace", "思" * 301 + "\n下一页")]
+        yield [
+            TextDelta(
+                session_id, 0, 0, "thinking", "replace", "一\n\n二\n\n三\n\n四\n\n五\n\n六\n\n七"
+            )
+        ]
 
     sessions = AsyncMock(spec=SessionService)
     sessions.has_legacy_checkpoint.return_value = False
@@ -547,7 +550,7 @@ async def test_thinking_paginated_draft_falls_back_to_plain_text(repository):
 
     calls = client.send.call_args_list
     assert [call.kwargs["rich"] for call in calls] == [True, False]
-    assert all(call.args[2] == "思" * 301 + "\n\n---\n\n下一页" for call in calls)
+    assert all(call.args[2] == "一\n\n二\n\n三\n\n四\n\n五\n\n六\n\n七" for call in calls)
     assert calls[0].kwargs["draft_id"] == calls[1].kwargs["draft_id"]
 
 

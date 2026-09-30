@@ -119,11 +119,9 @@ replays locally; no old runner is restarted. Pending sends finish before the nex
 event, and messages without display text can acknowledge an authoritative position.
 
 Private chats (including topics) receive replace/append draft previews rendered once
-per consumed batch. A thinking page ends at the first newline after more than 300
-Unicode characters, using `\n\n---\n\n` as the page separator. The next page starts counting
-from zero; the previous completed page stays visible until the next page completes.
-Large batches show only the latest completed page and the growing page. Without a
-qualifying newline, a page keeps growing (subject to the normal draft send limit).
+per consumed batch. Thinking previews show a sliding tail of the latest 500 Unicode
+characters, without page boundaries or added separators. Replace/append events update
+the response parts before the tail is selected; batch boundaries do not affect it.
 Answer text takes precedence over thinking. Both use Markdown drafts, with plain-text
 fallback on explicit format rejection.
 Delivery awaits that send, including retries and chat pacing,

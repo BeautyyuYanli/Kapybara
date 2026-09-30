@@ -61,14 +61,7 @@ class Preview:
             value for (_, kind), value in sorted(self.parts.items()) if kind == "thinking"
         )
         if thinking:
-            # Recompute from parts so replacements and merged batches use the same pages.
-            # Keep the last completed page until the growing page also ends at a newline.
-            previous, start = 0, 0
-            while (end := thinking.find("\n", start + 301)) != -1:
-                previous, start = start, end + 1
-            if start:
-                return thinking[previous:start] + "\n---\n\n" + thinking[start:], not self.plain
-            return thinking, not self.plain
+            return thinking[-500:], not self.plain
         return self.progress, False
 
 
