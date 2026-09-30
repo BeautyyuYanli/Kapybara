@@ -125,8 +125,7 @@ from zero; the previous completed page stays visible until the next page complet
 Large batches show only the latest completed page and the growing page. Without a
 qualifying newline, a page keeps growing (subject to the normal draft send limit).
 Answer text takes precedence over thinking. Both use Markdown drafts, with plain-text
-fallback on explicit format rejection. Pagination and successful-send logs include
-boundaries, character counts, format and separator position, but no message content.
+fallback on explicit format rejection.
 Delivery awaits that send, including retries and chat pacing,
 before reading the next batch. SessionService/AgentOutput retain incoming output
 and merge pending deltas during this wait; the interface has no read-ahead task,

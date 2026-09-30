@@ -66,14 +66,6 @@ class Preview:
             previous, start = 0, 0
             while (end := thinking.find("\n", start + 301)) != -1:
                 previous, start = start, end + 1
-            logger.info(
-                "Thinking pagination seq=%s draft=%s chars=%s previous_start=%s growing_start=%s",
-                self.seq,
-                self.draft_id,
-                len(thinking),
-                previous,
-                start,
-            )
             if start:
                 return thinking[previous:start] + "\n---\n\n" + thinking[start:], not self.plain
             return thinking, not self.plain
@@ -164,17 +156,6 @@ class TelegramDelivery:
                     await asyncio.sleep(retry_delay(error))
                 continue
             preview.sent, preview.sent_at = (chunk, rich), time.monotonic()
-            logger.info(
-                "Preview sent session=%s seq=%s draft=%s rendered_chars=%s sent_chars=%s "
-                "rich=%s divider_at=%s",
-                row.session_id,
-                preview.seq,
-                preview.draft_id,
-                len(text),
-                len(chunk),
-                rich,
-                chunk.find("\n\n---\n\n"),
-            )
             return
 
     async def consume(self, row: DeliveryRow) -> None:
