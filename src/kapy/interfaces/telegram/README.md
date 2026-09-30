@@ -119,12 +119,14 @@ replays locally; no old runner is restarted. Pending sends finish before the nex
 event, and messages without display text can acknowledge an authoritative position.
 
 Private chats (including topics) receive replace/append draft previews rendered once
-per consumed batch. A thinking page ends at the first newline after more than 400
-Unicode characters, using `\n---\n\n` as the page separator. The next page starts counting
+per consumed batch. A thinking page ends at the first newline after more than 300
+Unicode characters, using `\n\n---\n\n` as the page separator. The next page starts counting
 from zero; the previous completed page stays visible until the next page completes.
 Large batches show only the latest completed page and the growing page. Without a
 qualifying newline, a page keeps growing (subject to the normal draft send limit).
-Answer text takes precedence over thinking.
+Answer text takes precedence over thinking. Both use Markdown drafts, with plain-text
+fallback on explicit format rejection. Pagination and successful-send logs include
+boundaries, character counts, format and separator position, but no message content.
 Delivery awaits that send, including retries and chat pacing,
 before reading the next batch. SessionService/AgentOutput retain incoming output
 and merge pending deltas during this wait; the interface has no read-ahead task,
