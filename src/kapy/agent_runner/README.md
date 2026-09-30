@@ -343,11 +343,19 @@ replaces it with an empty one, without waiting to fill a batch. Previously deliv
 lists are never mutated. No busy polling or additional database task is involved.
 
 The subscriber uses the same merge rules across all undelivered network batches.
-Repeated or smaller-seq snapshots overwrite normally; there is no completion watermark. Pending JSON is
-limited to 1 MiB: overflowing delta updates leave the old buffer intact; commits
-first evict deltas, then raise BufferError if complete messages alone cannot fit.
+Repeated or smaller-seq snapshots overwrite normally; there is no completion watermark.
+After each merge, keep at most 256 pending events by evicting entries from the front.
+Updates move to the end, so eviction removes the least recently updated events,
+regardless of type, seq or authority. Capacity never ends the subscription. This
+counts merged events, not bytes: individual snapshots or merged text can be large.
 The limit excludes decoded network input and batches already handed to consumers.
-Connection/decode/capacity errors release the connection immediately and take priority
+Eviction does not advance a cursor. `SessionService.live` recovers missed snapshots
+through authoritative gap backfill or periodic history reads, including an evicted
+authoritative replacement of a previously delivered provisional snapshot. Polling
+requires the consumer to keep advancing. History returns the current snapshot, not
+every overwritten provisional version; deltas remain lossy previews. Direct
+`subscribe()` consumers are responsible for any history recovery they need.
+Connection/decode/validation errors release the connection immediately and take priority
 over buffered output on the next read; there is no automatic resubscription. Idle
 reads have no timeout. Exiting the context joins the receiver before closing the
 iterator. Shared clients stay open.

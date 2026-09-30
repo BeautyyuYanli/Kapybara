@@ -133,9 +133,11 @@ chunks; other 400/403 errors block that delivery for operator investigation. Lim
 and transport failures back off. Losing the remote send acknowledgement may repeat
 a chunk. Pending sends finish before further live consumption or resuming history.
 
-Live subscription timeouts and subscriber-buffer overflow reconnect from the
-persisted cursor. Temporary SQLite
-discovery errors back off without cancelling existing session followers.
+Live subscription connection failures and timeouts reconnect from the persisted
+cursor. A full subscriber buffer evicts the least recently updated events and keeps
+the subscription open; SessionService.live recovers missed snapshots through history
+reads. Temporary SQLite discovery errors back off without cancelling existing
+session followers.
 
 Switching /new preserves old deliveries. Ordering is per session; replies from
 separate sessions in one topic can interleave. Reconnection drops provisional

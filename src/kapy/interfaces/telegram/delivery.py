@@ -216,7 +216,6 @@ class TelegramDelivery:
                 ValkeyConnectionError,
                 ValkeyTimeoutError,
                 TimeoutError,
-                BufferError,
             ):
                 logger.warning("Telegram live transport/storage unavailable; resuming from cursor")
                 await asyncio.sleep(retry_delay(TelegramFailure(503), failures))

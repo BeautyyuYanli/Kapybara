@@ -437,55 +437,96 @@ async def test_subscriber_receives_and_releases_failed_connection_without_consum
     )
 
 
-async def test_subscriber_capacity_drops_delta_update_but_preserves_complete_messages(
-    valkey_client,
+@pytest.mark.parametrize("event_kind", ["delta", "commit"])
+async def test_subscriber_capacity_evicts_oldest_events_and_keeps_receiving(
+    valkey_client, event_kind
 ):
     session_id = uuid4()
-    outputs = AgentOutputService(valkey_client)
     channel = f"kapy:agent-output:{session_id}"
-    original = delta(session_id, "original", op="replace")
-    async with outputs.subscribe(session_id) as events:
-        # One network batch is processed before consumer handoff. Oversized append
-        # must preserve the accepted replacement rather than partially modifying it.
-        await valkey_client.publish(
-            channel, ADAPTER.dump_json([original, delta(session_id, "x" * (1024 * 1024))])
-        )
-        assert await anext(events) == [original]
-        commit = MessageCommitted(
-            HistoryMessage(session_id, 1, False, ModelResponse(parts=[TextPart("x" * 600_000)]))
-        )
-        future = TextDelta(session_id, 2, 0, "text", "append", "y" * 600_000)
-        await valkey_client.publish(channel, ADAPTER.dump_json([future, commit]))
-        assert await anext(events) == [commit]
-        too_big = MessageCommitted(
+    incoming: list[OutputEvent] = [
+        TextDelta(session_id, seq, 0, "text", "replace", str(seq))
+        if event_kind == "delta"
+        else MessageCommitted(
             HistoryMessage(
-                session_id, 2, False, ModelResponse(parts=[TextPart("x" * (1024 * 1024))])
+                session_id, seq, bool(seq % 2), ModelResponse(parts=[TextPart(str(seq))])
             )
         )
-        await valkey_client.publish(channel, ADAPTER.dump_json([too_big]))
-        with pytest.raises(BufferError):
-            await anext(events)
+        for seq in reversed(range(260))
+    ]
+    async with (
+        asyncio.timeout(2),
+        AgentOutputService(valkey_client).subscribe(session_id) as events,
+    ):
+        # One network batch is processed before consumer handoff. Keep the last
+        # arrivals regardless of sequence, event type or authoritative status.
+        await valkey_client.publish(channel, ADAPTER.dump_json(incoming))
+        assert await anext(events) == incoming[-256:]
+        assert (await valkey_client.pubsub_numsub(channel))[0][1] == 1
+        following = delta(session_id, "still subscribed")
+        await valkey_client.publish(channel, ADAPTER.dump_json([following]))
+        assert await anext(events) == [following]
     assert (await valkey_client.pubsub_numsub(channel))[0][1] == 0
 
 
-async def test_subscriber_accumulated_commits_overflow_without_silent_eviction(valkey_client):
+@pytest.mark.parametrize("update_kind", ["append", "replace", "commit"])
+@pytest.mark.parametrize("overflow", [False, True])
+async def test_subscriber_merges_before_capacity_and_updates_eviction_order(
+    valkey_client, update_kind, overflow
+):
     session_id = uuid4()
     channel = f"kapy:agent-output:{session_id}"
-    commits: list[OutputEvent] = [
-        MessageCommitted(
-            HistoryMessage(session_id, seq, False, ModelResponse(parts=[TextPart("x" * 600_000)]))
-        )
-        for seq in range(2)
+    original: list[OutputEvent] = [
+        TextDelta(session_id, seq, 0, "text", "replace", str(seq)) for seq in range(256)
     ]
-    assert all(len(ADAPTER.dump_json([commit])) < 1024 * 1024 for commit in commits)
-    async with AgentOutputService(valkey_client).subscribe(session_id) as events:
-        # Both commits individually fit; together they cannot remain buffered.
-        # Processing one received batch does not yield to the consumer midway.
-        await valkey_client.publish(channel, ADAPTER.dump_json(commits))
-        async with asyncio.timeout(2):
-            with pytest.raises(BufferError):
-                await anext(events)
-        assert (await valkey_client.pubsub_numsub(channel))[0][1] == 0
+    if update_kind == "commit":
+        update = merged = MessageCommitted(
+            HistoryMessage(session_id, 128, True, ModelResponse(parts=[TextPart("final")]))
+        )
+    else:
+        update = TextDelta(session_id, 128, 0, "text", update_kind, "updated")
+        merged = TextDelta(
+            session_id,
+            128,
+            0,
+            "text",
+            "replace",
+            "128updated" if update_kind == "append" else "updated",
+        )
+    incoming = [*original, update]
+    expected = [*original[:128], *original[129:], merged]
+    if overflow:
+        newest = TextDelta(session_id, 256, 0, "text", "replace", "newest")
+        incoming.append(newest)
+        expected = [*expected[1:], newest]
+    async with (
+        asyncio.timeout(2),
+        AgentOutputService(valkey_client).subscribe(session_id) as events,
+    ):
+        await valkey_client.publish(channel, ADAPTER.dump_json(incoming))
+        assert await anext(events) == expected
+
+
+async def test_subscriber_capacity_counts_merged_events_without_a_byte_limit(valkey_client):
+    session_id = uuid4()
+    channel = f"kapy:agent-output:{session_id}"
+    content = "x" * (1024 * 1024)
+    commit = MessageCommitted(
+        HistoryMessage(session_id, 2, True, ModelResponse(parts=[TextPart(content)]))
+    )
+    incoming: list[OutputEvent] = [
+        delta(session_id, "original", op="replace"),
+        delta(session_id, content),
+        commit,
+    ]
+    async with (
+        asyncio.timeout(2),
+        AgentOutputService(valkey_client).subscribe(session_id) as events,
+    ):
+        await valkey_client.publish(channel, ADAPTER.dump_json(incoming))
+        assert await anext(events) == [
+            delta(session_id, "original" + content, op="replace"),
+            commit,
+        ]
 
 
 async def test_subscriber_setup_failure_propagates_and_joins_receiver():

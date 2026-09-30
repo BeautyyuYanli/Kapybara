@@ -16,6 +16,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from temporalio.client import WorkflowHandle
+from valkey.exceptions import ConnectionError as ValkeyConnectionError
 
 from kapy.agent_plugins import PluginOperationError
 from kapy.agent_runner import HistoryMessage, MessageCommitted, TextDelta
@@ -458,7 +459,7 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
 
 
 @pytest.mark.asyncio
-async def test_buffer_overflow_resumes_after_last_delivered_commit(repository, monkeypatch):
+async def test_connection_failure_resumes_after_last_delivered_commit(repository, monkeypatch):
     row = await delivery_row(repository)
     key = delivery_key(row)
     client = AsyncMock(spec=TelegramClient)
@@ -475,7 +476,7 @@ async def test_buffer_overflow_resumes_after_last_delivered_commit(repository, m
                     )
                 ]
                 assert (await repository.get_delivery(key)).after_seq == 0
-                raise BufferError("Output subscription buffer is full")
+                raise ValkeyConnectionError("Output subscription connection closed")
             yield [
                 MessageCommitted(
                     HistoryMessage(session_id, 1, True, ModelResponse([TextPart("second")]))

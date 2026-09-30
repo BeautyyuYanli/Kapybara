@@ -28,7 +28,7 @@ from kapy.agent_runner.types import MessageCommitted, OutputCallback, OutputEven
 logger = logging.getLogger(__name__)
 _BATCH_ADAPTER = TypeAdapter(list[OutputEvent])
 _MAX_BATCH_BYTES = 64 * 1024
-_MAX_SUBSCRIBER_BYTES = 1024 * 1024
+_MAX_SUBSCRIBER_EVENTS = 256
 
 
 class AgentOutputService:
@@ -88,9 +88,10 @@ class AgentOutputService:
         """Yield whole merged batches after acknowledgement, independently of network reads.
 
         One receiver owns the connection and releases it even while consumers pause.
-        Pending output is bounded to 1 MiB of JSON; overflowing deltas are dropped,
-        but commits that cannot fit without deltas fail with BufferError. Errors
-        precede buffered data on the next read. Idle reads have no timeout or retry.
+        Keep at most 256 merged pending events, evicting the oldest entries after
+        each merge regardless of type or authority. This bounds count, not memory;
+        callers needing complete snapshots must recover missed output from history.
+        Errors precede buffered data on the next read. Idle reads have no timeout or retry.
         The context cancels and joins its receiver even if iteration never starts.
         """
         ready, changed = asyncio.Event(), asyncio.Event()
@@ -127,20 +128,8 @@ class AgentOutputService:
                                 if _session_id(event) != session_id:
                                     raise ValueError("Output event belongs to another session")
                                 candidate = _merge(buffer, event)
-                                if len(_BATCH_ADAPTER.dump_json(candidate)) > _MAX_SUBSCRIBER_BYTES:
-                                    if isinstance(event, TextDelta):
-                                        continue
-                                    commits: list[OutputEvent] = [
-                                        item
-                                        for item in candidate
-                                        if isinstance(item, MessageCommitted)
-                                    ]
-                                    candidate = commits
-                                    if (
-                                        len(_BATCH_ADAPTER.dump_json(candidate))
-                                        > _MAX_SUBSCRIBER_BYTES
-                                    ):
-                                        raise BufferError("Output subscription buffer is full")
+                                if len(candidate) > _MAX_SUBSCRIBER_EVENTS:
+                                    del candidate[:-_MAX_SUBSCRIBER_EVENTS]
                                 buffer = candidate
                             changed.set()
                     finally:

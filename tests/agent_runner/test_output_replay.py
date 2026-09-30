@@ -174,6 +174,62 @@ async def test_missing_notifications_backfill_history_once(
     assert reads == [-1, 1 if broadcast_prefix else 0]
 
 
+async def test_evicted_authoritative_notifications_backfill_on_retained_gap(
+    database, valkey_client
+):
+    session_id = uuid4()
+    sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
+    initial = (await append(database, session_id, [response("initial")], 0))[0]
+    async with aclosing(sessions.live(session_id)) as batches:
+        assert await anext(batches) == [MessageCommitted(initial)]
+        entries = await append(
+            database, session_id, [response(str(seq)) for seq in range(1, 258)], 1
+        )
+        preview = TextDelta(session_id, 258, 0, "text", "replace", "next")
+        # The consumer is paused. The first two notifications are evicted before
+        # any handoff, so the remaining authority must recover the missing prefix.
+        expected: list[OutputEvent] = [*[MessageCommitted(entry) for entry in entries], preview]
+        await valkey_client.publish(
+            f"kapy:agent-output:{session_id}", TypeAdapter(list[OutputEvent]).dump_json(expected)
+        )
+        async with asyncio.timeout(2):  # Before the default five-second poll.
+            assert await anext(batches) == expected
+
+
+@pytest.mark.parametrize("provisional_delivered", [False, True])
+async def test_poll_recovers_evicted_tail_or_same_seq_authoritative_replacement(
+    database, valkey_client, provisional_delivered
+):
+    session_id = uuid4()
+    channel = f"kapy:agent-output:{session_id}"
+    sessions = SessionService(
+        database.sessions, output_service=AgentOutputService(valkey_client), live_poll_interval=0.5
+    )
+    initial = HistoryMessage(session_id, 0, not provisional_delivered, response("initial"))
+    async with database.sessions.begin() as db:
+        await AgentRepository(db).upsert_history(session_id, [initial])
+    async with aclosing(sessions.live(session_id)) as batches:
+        assert await anext(batches) == [MessageCommitted(initial)]
+        final = HistoryMessage(
+            session_id, 0 if provisional_delivered else 1, True, response("final")
+        )
+        async with database.sessions.begin() as db:
+            await AgentRepository(db).upsert_history(session_id, [final])
+        previews: list[OutputEvent] = [
+            TextDelta(session_id, seq, 0, "text", "replace", str(seq)) for seq in range(2, 258)
+        ]
+        # Only previews survive this batch. They cannot advance the authority
+        # cursor or trigger backfill, and no later broadcast will announce final.
+        await valkey_client.publish(
+            channel, TypeAdapter(list[OutputEvent]).dump_json([MessageCommitted(final), *previews])
+        )
+        async with asyncio.timeout(2):
+            received = [await anext(batches), await anext(batches)]
+            assert previews in received
+            assert [MessageCommitted(final)] in received
+        assert (await valkey_client.pubsub_numsub(channel))[0][1] == 1
+
+
 async def test_previews_and_contiguous_authority_do_not_read_history(
     database, valkey_client, monkeypatch
 ):
