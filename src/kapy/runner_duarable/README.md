@@ -233,6 +233,9 @@ docker compose run --rm --no-deps -e KAPY_TEMPORAL_ADDRESS=temporal:7233 \
   runtime python -m pytest -q -p no:cacheprovider tests/runner_duarable
 ```
 
-Temporal owns model Activity timeout/retry behavior through SDK defaults. External
-requests can repeat after an unrecorded completion; no exactly-once guarantee is
-added. Workflow failures propagate to callers.
+Model Activities have a five-minute start-to-close timeout and allow at most one
+retry (two attempts total). The SDK's default heartbeat timeout and non-retryable
+error classification still apply; no schedule-to-close timeout is set. History
+recording and state saving retain their separate timeout and retry policies.
+External requests can repeat after an unrecorded completion; no exactly-once
+guarantee is added. Workflow failures propagate to callers.

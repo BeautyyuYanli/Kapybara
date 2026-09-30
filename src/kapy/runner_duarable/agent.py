@@ -9,12 +9,15 @@ the Activity. Constructors must perform no external I/O, as with the SDK's own
 Workflow-side model inference. HTTP requests only execute inside Activities.
 """
 
+from datetime import timedelta
+
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import CapabilityOrdering, Hooks, ResolveModelId
 from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model, ModelResolutionContext
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
 
@@ -68,7 +71,13 @@ agent = Agent(
             ),
         ),
         TemporalDurability(
-            run_context_type=RunnerActivityContext, event_stream_handler=handle_deltas
+            run_context_type=RunnerActivityContext,
+            event_stream_handler=handle_deltas,
+            model_activity_config={
+                "start_to_close_timeout": timedelta(minutes=5),
+                # Temporal counts the initial attempt, so two attempts allow one retry.
+                "retry_policy": RetryPolicy(maximum_attempts=2),
+            },
         ),
     ],
 )
