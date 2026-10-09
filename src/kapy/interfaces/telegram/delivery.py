@@ -1,9 +1,11 @@
 """Project SessionService.live into drafts and durable at-least-once messages.
 
 Only an authoritative complete message advances after_seq for durable sessions.
-Legacy checkpoints retain their append-only delivery contract. Persist one pending
-body before any send, then acknowledge character offsets; a lost remote acknowledgement may replay
-one chunk. Each live batch is delivered before requesting the next; draft state
+Complete responses are sent immediately; provisional replies retain message ids
+for edits and replay deduplication until authority covers them. Legacy checkpoints
+retain their append-only delivery contract. Persist one pending body before sending,
+then acknowledge chunk ids and character offsets; a lost send acknowledgement may
+replay one chunk. Each live batch is delivered before requesting the next; draft state
 only renders text already consumed from live, which owns output buffering.
 No database transaction spans sending, sleeping or generator iteration.
 """
@@ -28,6 +30,13 @@ from .models import DeliveryRow
 from .repository import DeliveryKey, TelegramRepository, delivery_key
 
 logger = logging.getLogger(__name__)
+
+
+def _acknowledge_authority(row: DeliveryRow, seq: int) -> None:
+    row.after_seq = seq
+    row.sent_responses = {
+        position: sent for position, sent in row.sent_responses.items() if int(position) > seq
+    }
 
 
 @dataclass
@@ -81,13 +90,19 @@ class TelegramDelivery:
         )
 
     async def send_pending(self, row: DeliveryRow) -> None:
-        """Attempt one persisted chunk; save retry/fallback/progress before returning."""
+        """Send/edit one chunk or delete one surplus chunk, saving progress each time.
+
+        Old pending bodies without an authority flag retain their cursor semantics.
+        Provisional replies keep ids and text separately from the recovery cursor.
+        """
         pending = row.pending
         if pending is None or row.blocked_error:
             return
         if delay := max(0, row.next_attempt_at - time.time()):
             await asyncio.sleep(delay)
         remaining = pending["text"][row.item_offset :]
+        message_ids = list(pending.get("message_ids", []))
+        item_index = pending.get("item_index", 0)
         rich = pending["format"] == "rich"
         chunk, remainder = rich_chunk(remaining) if rich else text_chunk(remaining)
         if rich and not chunk and remaining:
@@ -97,7 +112,18 @@ class TelegramDelivery:
             chunk, remainder = text_chunk(remaining)
         try:
             if chunk:
-                await self.client.send(row.chat_id, row.thread_id, chunk, rich=rich)
+                if item_index < len(message_ids):
+                    await self.client.edit(row.chat_id, message_ids[item_index], chunk, rich=rich)
+                else:
+                    message_id = await self.client.send(
+                        row.chat_id, row.thread_id, chunk, rich=rich
+                    )
+                    assert message_id is not None
+                    message_ids.append(message_id)
+                item_index += 1
+            elif item_index < len(message_ids):
+                await self.client.delete(row.chat_id, message_ids[-1])
+                message_ids.pop()
         except TelegramFailure as error:
             if error.code == 401:
                 raise
@@ -110,10 +136,17 @@ class TelegramDelivery:
             await self.repository.save_delivery(row)
             return
         row.next_attempt_at = 0
-        if remainder:
+        if remainder or item_index < len(message_ids):
             row.item_offset += len(chunk)
+            row.pending = pending | {"message_ids": message_ids, "item_index": item_index}
         else:
-            row.after_seq = int(pending["seq"])
+            seq = int(pending["seq"])
+            if pending.get("authoritative", True):
+                _acknowledge_authority(row, seq)
+            else:
+                row.sent_responses = row.sent_responses | {
+                    str(seq): {"text": pending["text"], "message_ids": message_ids}
+                }
             row.pending, row.item_offset = None, 0
         await self.repository.save_delivery(row)
 
@@ -166,7 +199,8 @@ class TelegramDelivery:
                     if seq <= row.after_seq:
                         continue
                     if isinstance(event, TextDelta):
-                        preview.apply(event)
+                        if str(seq) not in row.sent_responses:
+                            preview.apply(event)
                     elif isinstance(event, MessageCommitted):
                         if preview.seq == seq:
                             preview = Preview(unavailable=preview.unavailable)
@@ -178,17 +212,16 @@ class TelegramDelivery:
                             if isinstance(message, ModelResponse)
                             else ""
                         )
-                        if not legacy and not event.message.authoritative:
-                            if text and seq >= preview.seq:
-                                preview.apply(
-                                    TextDelta(row.session_id, seq, 0, "text", "replace", text)
-                                )
-                            continue
-                        if text:
+                        authoritative = legacy or event.message.authoritative
+                        sent = row.sent_responses.get(str(seq))
+                        if (text or sent is not None) and (sent is None or sent["text"] != text):
                             row.pending = {
                                 "seq": event.message.seq,
                                 "text": text,
                                 "format": "rich",
+                                "authoritative": authoritative,
+                                "message_ids": sent["message_ids"] if sent is not None else [],
+                                "item_index": 0,
                             }
                             row.item_offset = 0
                             await self.repository.save_delivery(row)
@@ -196,14 +229,14 @@ class TelegramDelivery:
                                 await self.send_pending(row)
                             if row.blocked_error:
                                 return
-                        else:
-                            row.after_seq = event.message.seq
+                        elif authoritative:
+                            _acknowledge_authority(row, seq)
                             await self.repository.save_delivery(row)
                         # Authority may seal a gap by deleting older provisional rows.
                         # Clear those previews only after delivery acknowledges the prefix.
                         if not legacy and preview.seq <= row.after_seq:
                             preview = Preview(unavailable=preview.unavailable)
-                        if not text:
+                        if not text and authoritative:
                             for part in message.parts:
                                 if isinstance(part, ToolCallPart):
                                     preview.progress = f"Calling tool: {part.tool_name}"

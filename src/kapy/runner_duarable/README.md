@@ -183,9 +183,10 @@ without a separate deletion event. Later positions retain their previews. Clear
 previews when reconnecting. Direct
 `AgentOutputService.subscribe()` remains available for callers owning their replay
 policy. Transport buffering is described in [the output contract](../agent_runner/README.md).
-Under Telegram's existing delivery rules, the final provisional response remains
-a temporary preview until a later model request confirms it. This runner does not
-emit a separate completion event that promotes it to a formal Telegram message.
+Telegram sends complete responses as formal replies regardless of authority, so
+the final provisional response needs no later model request or run-completion
+event for delivery. Its own persisted message ids deduplicate replay and permit
+edits before confirmation; the recovery cursor still follows authority alone.
 
 The module defines its own Agent at module scope. It reuses Provider/Model
 construction helpers, but does not import the legacy application Agent factory.

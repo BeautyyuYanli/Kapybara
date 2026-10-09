@@ -3,7 +3,7 @@
 from typing import Any, ClassVar
 from uuid import UUID
 
-from sqlalchemy import JSON, Column, MetaData, Text
+from sqlalchemy import JSON, Column, MetaData, Text, text
 from sqlmodel import Field, SQLModel
 
 
@@ -47,6 +47,12 @@ class RouteRow(TelegramTable, table=True):
 
 
 class DeliveryRow(TelegramTable, table=True):
+    """Delivery cursor and editable replies beyond the confirmed history prefix.
+
+    sent_responses retains text and Telegram message ids until authority covers
+    their seq. Sending a provisional reply never advances after_seq.
+    """
+
     __tablename__ = "plugin_telegram_delivery"  # pyrefly: ignore[bad-override]
     bot_id: int = Field(primary_key=True)
     chat_id: int = Field(primary_key=True)
@@ -54,6 +60,10 @@ class DeliveryRow(TelegramTable, table=True):
     session_id: UUID = Field(primary_key=True)
     chat_type: str = Field(sa_type=Text)
     after_seq: int = -1
+    sent_responses: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False, server_default=text("'{}'")),
+    )
     pending: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     item_offset: int = 0
     next_attempt_at: float = 0
