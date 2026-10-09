@@ -1002,6 +1002,7 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
     ):
         repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
         telegram = AsyncMock(spec=TelegramClient)
+        telegram.send.return_value = 123
         controller = TelegramController(
             client=telegram,
             sessions=sessions,
@@ -1034,23 +1035,6 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         assert session_id is not None
         first = temporal.get_workflow_handle(f"kapy-runner:{session_id}")
         assert await asyncio.wait_for(first.result(), 30) == "done"
-        second = await sessions.start_durable_runner(session_id, user_prompt="second prompt")
-        assert await asyncio.wait_for(second.result(), 30) == "done"
-        assert len(requests) == 2
-        assert requests[0]["headers"]["authorization"] == "Bearer local-test"
-        assert requests[0]["body"]["temperature"] == 0.5
-        assert requests[0]["body"]["max_completion_tokens"] == 20
-        assert [message["content"] for message in requests[1]["body"]["messages"]] == [
-            "first prompt",
-            "done",
-            "second prompt",
-        ]
-        async with runner_database.sessions.begin() as db:
-            state, version = await SessionRepository(db).read_runner_state(session_id)
-        assert state is not None and version == 2
-        assert not await sessions.has_legacy_checkpoint(session_id)
-        assert not await sessions.is_durable_runner_running(session_id)
-        assert not await sessions.read_inputs(session_id, "queued")
         (row,) = await repository.deliveries(42)
         follower = asyncio.create_task(
             TelegramDelivery(telegram, sessions, repository, 42).consume(row)
@@ -1058,17 +1042,48 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         try:
             async with asyncio.timeout(5):
                 while (  # noqa: ASYNC110
+                    (await repository.get_delivery(delivery_key(row))).sent_responses.get("1")
+                    != {"text": "done", "message_ids": [123]}
+                ):
+                    await asyncio.sleep(0.01)
+            saved = await repository.get_delivery(delivery_key(row))
+            assert saved.after_seq == 0
+            assert saved.sent_responses == {"1": {"text": "done", "message_ids": [123]}}
+            # The first final reply is delivered without waiting for another prompt.
+            second = await sessions.start_durable_runner(session_id, user_prompt="second prompt")
+            assert await asyncio.wait_for(second.result(), 30) == "done"
+            assert len(requests) == 2
+            assert requests[0]["headers"]["authorization"] == "Bearer local-test"
+            assert requests[0]["body"]["temperature"] == 0.5
+            assert requests[0]["body"]["max_completion_tokens"] == 20
+            assert [message["content"] for message in requests[1]["body"]["messages"]] == [
+                "first prompt",
+                "done",
+                "second prompt",
+            ]
+            async with runner_database.sessions.begin() as db:
+                state, version = await SessionRepository(db).read_runner_state(session_id)
+            assert state is not None and version == 2
+            assert not await sessions.has_legacy_checkpoint(session_id)
+            assert not await sessions.is_durable_runner_running(session_id)
+            assert not await sessions.read_inputs(session_id, "queued")
+            async with asyncio.timeout(5):
+                while (  # noqa: ASYNC110
                     (await repository.get_delivery(delivery_key(row))).after_seq < 2
-                    or not any("draft_id" in call.kwargs for call in telegram.send.call_args_list)
+                    or (await repository.get_delivery(delivery_key(row))).sent_responses.get("3")
+                    != {"text": "done", "message_ids": [123]}
                 ):
                     await asyncio.sleep(0.01)
             assert [
                 call.args[2]
                 for call in telegram.send.call_args_list
                 if "draft_id" not in call.kwargs
-            ] == ["done"]
+            ] == ["done", "done"]
             assert telegram.send.call_args.args[2] == "done"
-            assert "draft_id" in telegram.send.call_args.kwargs
+            assert "draft_id" not in telegram.send.call_args.kwargs
+            telegram.edit.assert_not_awaited()
+            saved = await repository.get_delivery(delivery_key(row))
+            assert saved.sent_responses == {"3": {"text": "done", "message_ids": [123]}}
             async with runner_database.sessions.begin() as db:
                 from kapy.agent_runner.repository import AgentRepository
 
