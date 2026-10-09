@@ -1,7 +1,7 @@
 """Execution position, messages and context pages, without physical FKs.
 
-Legacy checkpoints append history; the Temporal runner may replace provisional
-rows while preserving a confirmed prefix. Do not mix these writers for one session.
+Legacy checkpoints and the Temporal runner append immutable history using separate
+ownership protocols. Do not mix these writers for one session.
 """
 
 from datetime import datetime
@@ -10,14 +10,11 @@ from uuid import UUID
 
 from sqlalchemy import (
     JSON,
-    Boolean,
     CheckConstraint,
     Column,
     DateTime,
-    Index,
     MetaData,
     Text,
-    false,
     func,
 )
 from sqlmodel import Field, SQLModel
@@ -47,14 +44,10 @@ class AgentHistoryRow(SQLModel, table=True):
         CheckConstraint("kind IN ('request', 'response')"),
         CheckConstraint("input_tokens IS NULL OR input_tokens >= 0"),
         CheckConstraint("output_tokens IS NULL OR output_tokens >= 0"),
-        Index("ix_agent_history_session_authoritative_seq", "session_id", "authoritative", "seq"),
     )
 
     session_id: UUID = Field(primary_key=True)
     seq: int = Field(primary_key=True)
-    authoritative: bool = Field(
-        default=False, sa_column=Column(Boolean, nullable=False, server_default=false())
-    )
     kind: str = Field(sa_type=Text)
     created_at: datetime = Field(
         sa_column=Column(

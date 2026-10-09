@@ -12,7 +12,7 @@ from temporalio import workflow
 # reuse those modules instead of reinitializing their types in each sandbox.
 with workflow.unsafe.imports_passed_through():
     from .agent import agent
-    from .recording import MessageRecordCapability
+    from .recording import MessageRecordCapability, Recorder
     from .types import DurableExecutionConfig, MessageBatch, RunnerDeps, RunnerInput
 from .workflow import RunnerWorkflow
 
@@ -20,6 +20,7 @@ __all__ = [
     "DurableExecutionConfig",
     "MessageRecordCapability",
     "MessageBatch",
+    "Recorder",
     "RunnerDeps",
     "RunnerInput",
     "RunnerWorkflow",

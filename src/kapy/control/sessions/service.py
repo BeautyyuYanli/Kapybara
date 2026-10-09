@@ -38,6 +38,7 @@ from kapy.agent_runner import (
     OutputEvent,
     RunnerExecution,
     SessionBusy,
+    TextDelta,
     TurnResult,
     UserInput,
 )
@@ -254,11 +255,6 @@ class SessionService:
         async with self._session_factory.begin() as db:
             return await is_session_busy(db, session_id, heartbeat_timeout=self._heartbeat_timeout)
 
-    async def has_legacy_checkpoint(self, session_id: UUID) -> bool:
-        """Identify legacy history for delivery; durable execution never creates this row."""
-        async with self._session_factory.begin() as db:
-            return await db.get(AgentStateRow, session_id) is not None
-
     async def _durable_status(self, session_id: UUID) -> WorkflowExecutionStatus | None:
         if self._temporal_client is None:
             raise RuntimeError("Durable execution requires a Temporal client")
@@ -283,7 +279,7 @@ class SessionService:
 
         Borrow the Client and serialize admission/close with a session row lock,
         held only through bounded RPCs. No legacy lease, queue or cancel flag is
-        used. A new execution may follow only COMPLETED, preserving authoritative
+        used. A new execution may follow only COMPLETED, preserving recorded
         history across replay. A failed/ambiguous RPC never triggers a new attempt
         here; callers query the fixed Workflow ID to discover accepted execution.
         The Worker owns model resources and state saving; cancelling this await
@@ -560,21 +556,18 @@ class SessionService:
     async def live(
         self, session_id: UUID, *, after_seq: int = -1
     ) -> AsyncGenerator[list[OutputEvent]]:
-        """Replay history and follow output after an applied authoritative prefix.
+        """Replay immutable history and follow output after an applied message.
 
         after_seq is an integer >= -1, acknowledged by the caller after applying
-        the authoritative prefix. The connection cursor advances when authoritative
-        messages enter its ordered output; it is not a client acknowledgement.
-        Producers must commit before publishing and never change the confirmed
-        prefix or insert into its gaps. Consecutive authoritative broadcasts advance
-        directly; only a gap triggers backfill. Previews never advance or read history.
-        Subscribe before replay and poll the unconfirmed suffix for missed commits
-        and provisional replacements. History permits numeric gaps, but authority
-        after a provisional row or an unconfirmed authoritative broadcast raises
-        RuntimeError. Legacy history can replay; legacy consumers deduplicate by seq.
+        complete messages. The connection cursor advances when complete messages
+        enter its ordered output; it is not a client acknowledgement. Producers
+        commit before publishing and never change old positions or fill their gaps.
+        Consecutive broadcasts advance directly; a numeric jump triggers backfill.
+        Subscribe before replay and periodically read history for missed commits.
+        Previews never advance either cursor or trigger reads. Stored gaps are valid.
         Consumer backpressure pauses polling, not transport reception. No transaction
         spans a yield. Errors end the stream; completion does not. Use aclosing when
-        stopping early; clear temporary previews and resume from the applied prefix.
+        stopping early; clear temporary previews and resume from the applied position.
         """
         if type(after_seq) is not int or after_seq < -1:
             raise ValueError("after_seq must be an integer >= -1")
@@ -590,16 +583,8 @@ class SessionService:
 
         def replay(entries: tuple[HistoryMessage, ...]) -> list[MessageCommitted]:
             nonlocal last_seq
-            confirmed_seq = last_seq
-            provisional = False
-            for entry in entries:
-                if entry.authoritative:
-                    if provisional:
-                        raise RuntimeError("History authoritative messages must form a prefix")
-                    confirmed_seq = entry.seq
-                else:
-                    provisional = True
-            last_seq = confirmed_seq
+            if entries:
+                last_seq = entries[-1].seq
             return [MessageCommitted(entry) for entry in entries]
 
         loop = asyncio.get_running_loop()
@@ -629,58 +614,31 @@ class SessionService:
                         return
                     pending = None
                     result: list[OutputEvent] = []
-                    authoritative = {
+                    complete = {
                         event.message.seq: event
                         for event in batch
-                        if isinstance(event, MessageCommitted)
-                        and event.message.authoritative
-                        and event.message.seq > last_seq
+                        if isinstance(event, MessageCommitted) and event.message.seq > last_seq
                     }
-                    for seq in sorted(authoritative):
+                    for seq in sorted(complete):
                         if seq == last_seq + 1:
-                            result.append(authoritative[seq])
+                            result.append(complete[seq])
                             last_seq = seq
                             continue
                         entries = await read_history()
                         next_poll_at = loop.time() + self._live_poll_interval
-                        # Confirmed snapshots are immutable. Keep full SDK usage
+                        # Complete messages are immutable. Keep full SDK usage
                         # from the broadcast instead of normalized database fields.
                         entries = tuple(
-                            authoritative[entry.seq].message
-                            if entry.authoritative and entry.seq in authoritative
-                            else entry
+                            complete[entry.seq].message if entry.seq in complete else entry
                             for entry in entries
                         )
-                        # Keep a provisional broadcast at its original position
-                        # relative to later deltas, without replaying it twice.
-                        snapshots = {
-                            event.message.seq
-                            for event in batch
-                            if isinstance(event, MessageCommitted)
-                            and not event.message.authoritative
-                        }
-                        # This read follows receipt of the entire batch, so every
-                        # remaining authoritative broadcast must occur in history.
-                        confirmed = {entry.seq for entry in entries if entry.authoritative}
-                        if any(seq > last_seq and seq not in confirmed for seq in authoritative):
-                            raise RuntimeError(
-                                "Authoritative broadcast is not confirmed in history"
-                            )
-                        result.extend(
-                            event
-                            for event in replay(entries)
-                            if event.message.authoritative or event.message.seq not in snapshots
-                        )
+                        result.extend(replay(entries))
                         break
 
-                    # Final messages suppress covered previews even if those
-                    # arrived first. Remaining temporary events keep their order,
-                    # including deltas that follow a same-key provisional snapshot.
+                    # Complete messages suppress covered previews even if those
+                    # arrived first. Remaining temporary events keep their order.
                     for event in batch:
-                        if isinstance(event, MessageCommitted):
-                            if not event.message.authoritative and event.message.seq > last_seq:
-                                result.append(event)
-                        elif event.response_seq > last_seq:
+                        if isinstance(event, TextDelta) and event.response_seq > last_seq:
                             result.append(event)
                     if result:
                         yield result

@@ -105,23 +105,14 @@ remote Workflow. `/queue`, `/steer` and `/cancel` keep their storage behavior an
 help entries, but the durable Worker consumes none of these fields. No local runner
 task, queue consumer or recovery scan is installed.
 
-Each delivery consumes SessionService.live batches in order, with its persisted
-after_seq. Only fully delivered authoritative messages advance this cursor for
-durable sessions. The durable runner confirms model inputs before dispatch.
-Complete ModelResponse text is sent as a formal reply immediately, including the
-final non-authoritative response.
-Delta events remain temporary previews. Provisional replies retain their text and
-Telegram message ids in sent_responses, independently of after_seq: replaying the
-same text does not resend it, and changed text edits the existing messages. A later
-authoritative confirmation advances the cursor and discards covered receipts.
-Complete snapshots replace previews at their own seq. Once authority is fully
-delivered or a non-text message is applied, delivery discards previews at/below the
-new cursor, including positions deleted when storage seals a numeric gap. Previews
-at larger seq remain; tool progress from the applied message is then displayed.
-Existing legacy sessions are
-identified by their old checkpoint and retain append-only delivery, deduplicating
-replays locally; no old runner is restarted. Pending sends finish before the next
-event, and messages without display text can acknowledge an authoritative position.
+Each delivery consumes SessionService.live batches in order with its persisted
+`after_seq`. Every fully applied complete message advances this cursor, for both
+durable and legacy sessions. Complete ModelResponse text becomes a fixed formal
+reply; complete messages without display text advance directly. Delta events
+remain temporary previews. A complete message clears its own preview, and after
+application all previews at/below the new cursor are discarded. Larger preview
+positions remain, and non-text tool messages can display progress. Complete
+requests are not echoed and complete messages do not signal run completion.
 
 Private chats (including topics) receive replace/append draft previews rendered once
 per consumed batch. Thinking previews show a sliding tail of the latest 500 Unicode
@@ -139,17 +130,15 @@ complete messages retain one-second spacing. Unchanged drafts are suppressed for
 20 seconds and may refresh on a subsequent batch; there is no idle refresh task.
 Network latency and Telegram rate-limit backoff can slow delivery, including a
 complete message arriving while a draft is still being sent. Groups only
-receive complete text responses, including non-authoritative replies. Thinking/tools
-are provisional. Complete requests
-are not echoed and complete messages are not interpreted as run-finished signals.
-One pending response is persisted before sending, with rich/plain mode and confirmed
-character offsets and message ids. Edits reuse existing chunks, append new chunks
-when a reply grows, and delete surplus chunks when it shrinks. Each operation saves
-progress, including across restarts. Explicit rich-content rejection falls back to
-UTF-16-safe plain chunks; other 400/403 errors block that delivery for operator investigation. Limit
-and transport failures back off. Losing the remote send acknowledgement may repeat
-a chunk. Repeating an already-applied edit or deletion succeeds. Pending operations
-finish before further live consumption or resuming history.
+receive complete text responses; thinking and tool progress remain drafts.
+One pending response is persisted before sending, with rich/plain format and its
+acknowledged character offset. Successful chunks save progress, including across
+restarts; completion clears pending and advances after_seq. There are no per-seq
+reply receipts, edits or surplus-chunk deletions. Explicit rich-content rejection
+falls back to UTF-16-safe plain chunks; other 400/403 errors block delivery for
+operator investigation. Limit and transport failures back off. Losing a remote
+send acknowledgment may repeat the unacknowledged chunk. Pending sends finish
+before further live consumption or history replay.
 
 Live subscription connection failures and timeouts reconnect from the persisted
 cursor. A full subscriber buffer evicts the least recently updated events and keeps

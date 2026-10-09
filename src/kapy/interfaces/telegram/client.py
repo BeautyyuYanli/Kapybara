@@ -112,23 +112,10 @@ class TelegramClient:
                 rejected = False
                 if response.status_code == code == 400 and body.get("ok") is False:
                     description = body.get("description")
-                    if isinstance(description, str):
-                        description = description.lower().removeprefix("bad request: ")
-                        # A retry can follow a remotely successful edit or deletion.
-                        if method == "editMessageText" and description.startswith(
-                            "message is not modified"
-                        ):
-                            return True
-                        if (
-                            method == "deleteMessage"
-                            and description == "message to delete not found"
-                        ):
-                            return True
-                    rejected = (
-                        method in {"sendRichMessage", "sendRichMessageDraft"}
-                        or method == "editMessageText"
-                        and "rich_message" in params
-                    ) and rich_rejection(description)
+                    rejected = method in {
+                        "sendRichMessage",
+                        "sendRichMessageDraft",
+                    } and rich_rejection(description)
                 retry_after = float((body.get("parameters") or {}).get("retry_after", 1))
                 raise TelegramFailure(code, retry_after, rejected)
             return body["result"]
@@ -143,8 +130,8 @@ class TelegramClient:
         *,
         rich: bool = False,
         draft_id: int | None = None,
-    ) -> int | None:
-        """Return the persisted message id; drafts have no message id."""
+    ) -> None:
+        """Send a complete reply or temporary draft with per-chat pacing."""
         method = "sendRichMessage" if rich else "sendMessage"
         params: dict[str, Any] = {"chat_id": chat}
         params.update({"rich_message": {"markdown": text}} if rich else {"text": text})
@@ -153,27 +140,11 @@ class TelegramClient:
             params["draft_id"] = draft_id
         if thread:
             params["message_thread_id"] = thread
-        result = await self._paced_api(chat, method, params, draft=draft_id is not None)
-        if draft_id is not None:
-            return None
-        message_id = result.get("message_id") if isinstance(result, dict) else None
-        if type(message_id) is not int:
-            raise TelegramFailure(503)
-        return message_id
-
-    async def edit(self, chat: int, message_id: int, text: str, *, rich: bool = False) -> None:
-        """Replace a sent reply, treating an already-applied retry as success."""
-        params: dict[str, Any] = {"chat_id": chat, "message_id": message_id}
-        params.update({"rich_message": {"markdown": text}} if rich else {"text": text})
-        await self._paced_api(chat, "editMessageText", params)
-
-    async def delete(self, chat: int, message_id: int) -> None:
-        """Remove a superseded chunk; an already-deleted retry succeeds."""
-        await self._paced_api(chat, "deleteMessage", {"chat_id": chat, "message_id": message_id})
+        await self._paced_api(chat, method, params, draft=draft_id is not None)
 
     async def _paced_api(
         self, chat: int, method: str, params: dict[str, Any], *, draft: bool = False
-    ) -> Any:
+    ) -> None:
         async with self._chat_locks.setdefault(chat, asyncio.Lock()):
             delay = self._chat_ready.get(chat, 0) - time.monotonic()
             if delay > 0:
@@ -181,7 +152,7 @@ class TelegramClient:
             started = time.monotonic()
             interval = self.draft_interval if draft else 1
             try:
-                result = await self.api(method, params)
+                await self.api(method, params)
             except TelegramFailure as error:
                 self._chat_ready[chat] = time.monotonic() + retry_delay(error)
                 raise
@@ -191,4 +162,3 @@ class TelegramClient:
                 self._chat_ready[chat] = started + interval
                 raise
             self._chat_ready[chat] = started + interval
-            return result

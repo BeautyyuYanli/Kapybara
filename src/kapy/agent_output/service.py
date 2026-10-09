@@ -89,7 +89,7 @@ class AgentOutputService:
 
         One receiver owns the connection and releases it even while consumers pause.
         Keep at most 256 merged pending events, evicting the oldest entries after
-        each merge regardless of type or authority. This bounds count, not memory;
+        each merge regardless of type or seq. This bounds count, not memory;
         callers needing complete snapshots must recover missed output from history.
         Errors precede buffered data on the next read. Idle reads have no timeout or retry.
         The context cancels and joins its receiver even if iteration never starts.
@@ -185,7 +185,7 @@ def _merge(buffer: list[OutputEvent], event: OutputEvent) -> list[OutputEvent]:
     """Build a candidate without mutating a buffer that may reject it for capacity.
 
     Only undelivered parts merge; replacing with empty text remains meaningful.
-    Full snapshots replace only their own key, regardless of seq or authority.
+    Full snapshots replace only their own buffered key, regardless of seq.
     Later deltas form a new preview and never merge across a same-key snapshot.
     A merged event moves to the latest arrival position. No delivery cursor lives here.
     """

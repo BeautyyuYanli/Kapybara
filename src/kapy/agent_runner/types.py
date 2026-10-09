@@ -20,14 +20,13 @@ type ConsumeCancel = Callable[[AsyncSession], Awaitable[bool]]
 
 @dataclass(frozen=True, slots=True)
 class HistoryMessage:
-    """SDK message value at a session position, with explicit recording authority.
+    """Immutable, successfully stored SDK message at a session position.
 
     Storage reads these attributes from columns, never from message metadata.
     """
 
     session_id: UUID
     seq: Annotated[int, Field(strict=True, ge=0)]
-    authoritative: Annotated[bool, Field(strict=True)]
     message: ModelMessage
 
 

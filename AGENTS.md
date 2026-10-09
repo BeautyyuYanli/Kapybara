@@ -134,10 +134,12 @@ session 供检查，每次运行使用新的 session ID。
 HTTP / Telegram 的执行使用 `start_durable_runner()`，模型资源由独立 Worker 管理。
 
 `live(session_id, after_seq=-1)` 返回历史回放并继续监听的异步 generator，
-提前结束时使用 `aclosing`。durable 消费者以最后完整应用的 authoritative 前缀末尾
-`seq` 作为 `after_seq`，尚无该位置时使用 -1；delta 和 non-authoritative 消息
-均不能推进游标。Pub/Sub 是尽力广播，断线后清空临时预览并从该 authoritative
-位置续接。旧 Python runner 的历史仍可读取，旧消费者需按 seq 去重以处理重播。
+提前结束时使用 `aclosing`。消费者以最后完整应用消息的 `seq` 作为 `after_seq`，尚无该位置时使用 -1；
+delta 不推进游标。完整消息写入后内容和位置固定，数据库中的数值缺口也保持封闭。
+Pub/Sub 是尽力广播，断线后清空临时预览并从该位置续接；旧 Python runner 使用同一
+完整消息游标契约。durable 仅在模型节点结束后记录消息，最终输出工具回执及 after-run
+追加内容先保存在 runner_state，后续模型节点才记录。核心与 Telegram 的固定消息迁移
+需离线执行，不兼容旧 Workflow 回放。
 
 ```sh
 # 停止并保留 PostgreSQL 和 runtime 数据

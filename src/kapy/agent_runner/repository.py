@@ -1,7 +1,7 @@
 """Runner history and checkpoints, borrowing one caller-owned transaction.
 
 Legacy checkpoint mutations follow SessionLease.lock_owned in the same
-transaction. Temporal upsert_history protects the confirmed prefix: its caller
+transaction. Temporal append_history seals all stored positions: its caller
 locks the session row in the same transaction, without using legacy leases.
 No method acquires a lease, commits, or manages session lifetime. Usage is
 normalized outside message JSON; message parts retain the SDK's official codec.
@@ -12,7 +12,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse
-from sqlalchemy import delete, func, insert, update
+from sqlalchemy import func, insert, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
@@ -48,7 +48,6 @@ def _encode_history(messages: Sequence[HistoryMessage]) -> list[dict[str, Any]]:
             dict(
                 session_id=entry.session_id,
                 seq=entry.seq,
-                authoritative=entry.authoritative,
                 kind=kind,
                 message={"parts": parts},
                 message_metadata=payload,
@@ -73,7 +72,7 @@ def _decode_history(rows: Sequence[AgentHistoryRow]) -> tuple[HistoryMessage, ..
         payloads.append(payload)
     messages = ModelMessagesTypeAdapter.validate_python(payloads)
     return tuple(
-        HistoryMessage(row.session_id, row.seq, row.authoritative, message)
+        HistoryMessage(row.session_id, row.seq, message)
         for row, message in zip(rows, messages, strict=True)
     )
 
@@ -131,7 +130,7 @@ class AgentRepository:
     async def read_history_entries(
         self, session_id: UUID, *, after_seq: int = -1
     ) -> tuple[HistoryMessage, ...]:
-        """Read after a seq cursor; overwrites at/before that cursor are not returned."""
+        """Read immutable complete messages strictly after the seq cursor, in ascending order."""
         if isinstance(after_seq, bool) or not isinstance(after_seq, int) or after_seq < -1:
             raise ValueError("after_seq must be an integer >= -1")
         statement = (
@@ -238,7 +237,7 @@ class AgentRepository:
         """
         rows = _encode_history(
             [
-                HistoryMessage(session_id, start_seq + offset, False, message)
+                HistoryMessage(session_id, start_seq + offset, message)
                 for offset, message in enumerate(messages)
             ]
         )
@@ -251,26 +250,22 @@ class AgentRepository:
             await self._db.execute(insert(AgentHistoryRow), rows)
         return _decode_history([AgentHistoryRow(**row) for row in rows])
 
-    async def upsert_history(
+    async def append_history(
         self, session_id: UUID, messages: Sequence[HistoryMessage]
     ) -> tuple[HistoryMessage, ...]:
-        """Protect the confirmed prefix and return accepted input DTOs in input order.
+        """Append above the stored maximum and return new DTOs in input order.
 
-        The caller holds the session row lock through commit. All new authoritative
-        positions are judged against the same stored boundary; provisional inputs
-        at/below the resulting boundary are silently discarded. Older provisional
-        rows in that range are removed, sealing numeric gaps as well as messages.
-        JSON metadata never determines authority. Invalid or duplicate positions
-        reject the whole batch; an empty batch does nothing. Accepted overwrites
-        preserve created_at. Only publish returned DTOs after committing.
+        The caller holds the session row lock through commit. All positions in one
+        batch use the same pre-write maximum; old positions and their numeric gaps
+        are permanently sealed. JSON metadata never determines stored positions.
+        Invalid, duplicate or cross-session positions reject the whole batch; an
+        empty batch does nothing. Only publish returned DTOs after committing.
         """
         seen: set[int] = set()
         for message in messages:
             seq = message.seq
             if type(seq) is not int or seq < 0:
                 raise ValueError("History seq must be a nonnegative integer")
-            if type(message.authoritative) is not bool:
-                raise ValueError("History authoritative must be a boolean")
             if message.session_id != session_id:
                 raise ValueError("History message belongs to another session")
             if seq in seen:
@@ -278,55 +273,19 @@ class AgentRepository:
             seen.add(seq)
         if not messages:
             return ()
-        last_authoritative = (
+        last_seq = (
             await self._db.execute(
                 select(AgentHistoryRow.seq)
                 .where(
                     col(AgentHistoryRow.session_id) == session_id,
-                    col(AgentHistoryRow.authoritative).is_(True),
                 )
                 .order_by(col(AgentHistoryRow.seq).desc())
                 .limit(1)
             )
         ).scalar_one_or_none()
-        old_boundary = -1 if last_authoritative is None else last_authoritative
-        new_boundary = max(
-            (message.seq for message in messages if message.authoritative),
-            default=old_boundary,
-        )
-        new_boundary = max(old_boundary, new_boundary)
-        accepted = tuple(
-            message
-            for message in messages
-            if message.seq > (old_boundary if message.authoritative else new_boundary)
-        )
+        old_boundary = -1 if last_seq is None else last_seq
+        accepted = tuple(message for message in messages if message.seq > old_boundary)
         rows = _encode_history(accepted)
         if rows:
-            statement = pg_insert(AgentHistoryRow).values(rows)
-            await self._db.execute(
-                statement.on_conflict_do_update(
-                    index_elements=["session_id", "seq"],
-                    set_={
-                        name: statement.excluded[name]
-                        for name in (
-                            "authoritative",
-                            "kind",
-                            "message",
-                            "message_metadata",
-                            "finish_reason",
-                            "input_tokens",
-                            "output_tokens",
-                        )
-                    },
-                )
-            )
-        # Promote same-position N rows first so they keep their original created_at.
-        # Even an entirely discarded batch repairs pre-existing N rows below the boundary.
-        await self._db.execute(
-            delete(AgentHistoryRow).where(
-                col(AgentHistoryRow.session_id) == session_id,
-                col(AgentHistoryRow.authoritative).is_(False),
-                col(AgentHistoryRow.seq) <= new_boundary,
-            )
-        )
+            await self._db.execute(insert(AgentHistoryRow), rows)
         return accepted

@@ -23,7 +23,7 @@ from kapy.control.models.runtime import build_model, build_provider, resolve_cla
 
 from .context import RunnerActivityContext
 from .output import handle_deltas
-from .recording import MessageRecordCapability, record_before_model_request
+from .recording import MessageRecordCapability, Recorder
 from .types import RunnerDeps
 
 MODEL_ID = "kapy-configured"
@@ -55,19 +55,18 @@ async def resolve_model(ctx: ModelResolutionContext[RunnerDeps], model_id: str) 
         raise UserError("Invalid model execution configuration") from exc
 
 
+recorder = Recorder()
 agent = Agent(
     name="runner_duarable",
     model=MODEL_ID,
     deps_type=RunnerDeps,
     capabilities=[
-        MessageRecordCapability(),
+        MessageRecordCapability(recorder),
         ResolveModelId(resolve_model),
         Hooks(
-            model_request=record_before_model_request,
+            before_model_request=recorder.predict_response_seq,
             ordering=CapabilityOrdering(
                 position="innermost",
-                # Temporal first installs its dispatch model; the recorder wraps it.
-                wrapped_by=[TemporalDurability],
                 requires=[MessageRecordCapability],
             ),
         ),

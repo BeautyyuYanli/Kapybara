@@ -32,15 +32,34 @@ to NULL/0, without deriving state from legacy history. The runner owns encoding;
 the session repository owns versioned, idempotent replacement. These columns are
 internal storage and are absent from ordinary session configuration DTOs.
 
-`agent_history.authoritative` is a non-null boolean column beside seq, defaulting
-to False for existing rows and legacy checkpoints. Temporal recording supplies it
-explicitly. Under the session row lock, history writes preserve the existing
-authoritative prefix, including numeric gaps: stale inputs are silently discarded
-and advancing authority deletes provisional rows at/below the new boundary. The
-`(session_id, authoritative, seq)` index serves boundary lookup and provisional
-cleanup; the generated index revision leaves existing data unchanged.
-Storage decisions use columns, never JSON metadata. The SDK retains its separate
-seq/authority metadata for run restoration and numbering.
+`agent_history` stores fixed complete messages keyed by `(session_id, seq)`.
+Under the session row lock, durable writes insert only above the batch's pre-write
+maximum seq; old rows and their numeric gaps remain sealed. SDK `metadata.seq`
+marks successful recording for restoration and numbering, while storage uses
+columns rather than JSON payload to decide positions.
+
+The offline immutable-history revision removes the old authority column/index.
+It preserves every response and confirmed request, and all history belonging to
+legacy checkpoint sessions. Unconfirmed durable requests are removed; matching
+runner_state messages retain their content but lose seq. Retained positions,
+content, timestamps and runner-state versions stay unchanged, and obsolete
+metadata authority flags are removed. Telegram's separate revision folds sent
+reply receipts into after_seq, clears covered pending sends, retains unfinished
+body/format/character offsets, and drops receipt/edit state. Run these migrations
+with runners and interfaces stopped. They have no online compatibility or old
+Workflow replay adapter. Both data conversions reject downgrade because discarded
+provisional records and receipt state cannot be reconstructed.
+
+Generate each revision against a development database at its preceding revision:
+
+```sh
+kapy db revision --message 'Make complete history immutable' --plan immutable-history
+kapy interface telegram db revision --message 'Use complete message delivery cursors' --plan immutable-history
+```
+
+The explicit plans reject unrelated schema differences and emit fixed SQL before
+the generated column/index removal; generated revisions import no current models
+or conversion plans.
 
 ControlTable includes `plugin_agent_bindings` and the shared session/binding lifecycle
 columns. Agent plugins store small JSON state in this core-owned table; data_version

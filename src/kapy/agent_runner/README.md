@@ -277,45 +277,35 @@ ordinary node hooks and a native graph retained across successive run calls.
 `text` or `thinking`. `replace` initializes/clears a part, `append` adds text without
 trimming. `response_seq` is the next absolute history sequence captured before the
 model request. `MessageCommitted.message` is a `HistoryMessage(session_id, seq,
-authoritative, message)`. Legacy checkpoints set authoritative=False and use the
-same normalized usage and official SDK codec as history reads. The
-[Temporal runner](../runner_duarable/README.md) uses the same DTO with explicit
-authority and complete SDK input snapshots, including all usage fields.
-Both input and response/tool-result checkpoints publish after commit, reusing the
-INSERT payload with no extra SELECT or RETURNING. State-only checkpoints emit
-nothing. A committed message replaces all temporary parts at its sequence; it
-is not a runner-completion event. Output DTOs carry no execution lease token.
+message)`. Legacy checkpoints and the [Temporal runner](../runner_duarable/README.md)
+use the same immutable complete-message DTO and official SDK codec. Legacy usage
+is normalized for history; Temporal broadcasts retain the complete SDK input
+usage. Both input and response/tool-result checkpoints publish after commit,
+reusing the INSERT payload with no extra SELECT or RETURNING. State-only
+checkpoints emit nothing. A committed message replaces temporary parts at its
+seq; it is not a runner-completion event. Output DTOs carry no execution lease token.
 
-`SessionService.live(after_seq=-1)` resumes after the last fully applied authoritative
-prefix for durable execution (-1 without one). The connection cursor advances when
-authoritative messages enter its ordered output; the client's saved cursor advances
-only after applying them. Producers must commit before publishing and preserve both
-the content and membership of the authoritative prefix, including its numeric gaps.
-The service subscribes before reading history. Authoritative broadcasts at cursor + 1
-advance directly without reading history; a greater seq triggers one ordered backfill
-per batch. Batch authority is sorted before temporary events, so consecutive positions
-can advance together and suppress covered previews. Deltas and non-authoritative
-messages never advance the cursor or trigger backfill, regardless of their seq.
+`SessionService.live(after_seq=-1)` resumes after the last fully applied complete
+message (-1 without one). The connection cursor advances when complete messages
+enter ordered output; the client's saved cursor advances only after applying them.
+Producers commit before publishing and preserve old messages and their numeric
+gaps. The service subscribes before reading history. Consecutive complete
+broadcasts advance without reads; a numeric jump triggers ordered database
+backfill. Each batch orders complete messages before remaining previews, so it can
+advance several positions and suppress covered deltas. Deltas never advance either
+cursor or trigger history reads.
 
-The service also polls the unconfirmed suffix every 5 seconds (configurable via
-live_poll_interval); preview traffic does not postpone this deadline. History can
-prove legitimate sequence gaps, and its provisional suffix can replay or be replaced.
-A snapshot containing authority after a provisional row, or missing an authoritative
-broadcast being backfilled, fails the stream instead of skipping an unconfirmed
-position. Legacy messages are all non-authoritative, so legacy consumers retain their
-own append-only cursor and deduplicate replay by seq.
-
-History and subscription reads produce nonempty lists. WebSocket sends one JSON
-array per batch; batches are not transaction boundaries or acknowledgements.
-Transactions end before yielding. Backpressure pauses polling, not background
-reception. Each live call owns at most one subscription read and joins it before
-closing. Errors end the generator; runner completion does not. Reconnect clears
-previews and resumes from the applied authoritative prefix. Complete messages
-replace their own seq's preview; after fully applying authoritative messages,
-consumers also discard provisional snapshots and previews at/below the confirmed
-cursor. Durable storage may delete those rows when authority seals numeric gaps,
-without emitting deletion events. Later positions keep their previews. Missing
-subscribers lose deltas. There is no outbox or durable delta cursor.
+History polling every 5 seconds (configurable with live_poll_interval) recovers
+missed commits; preview traffic does not postpone its deadline. History permits
+numeric gaps. Both runner implementations use the same cursor and deduplication
+contract. History/subscription reads produce nonempty lists. WebSocket sends one
+JSON array per batch, without transaction or completion semantics. Transactions
+end before yielding; backpressure pauses polling, not transport reception.
+Each call joins its pending subscription read before closing. Errors end the
+generator; runner completion does not. Use aclosing on early exit. Reconnection
+clears previews and resumes from the applied seq. After applying a complete
+message, clear previews at/below its seq and keep those at later positions.
+Missing subscribers lose deltas; there is no outbox or durable delta cursor.
 
 `AgentOutputService.publisher(flush_interval=0.5)` buffers at most 64 KiB of encoded
 JSON plus one in-flight batch of the same maximum size. The awaited callback only
@@ -329,7 +319,7 @@ replacement. A full snapshot removes only its same-key buffered snapshots and
 deltas, moving the new snapshot to the latest arrival position. Other keys are
 unchanged. Later same-key deltas form a new preview; they never merge across a
 complete snapshot or append into complete message content. Only undelivered data
-participates; seq order and authority impose no permanent filter.
+participates; seq order imposes no permanent filter.
 One task sends and recovers connections, including with zero interval.
 Each network attempt has a one-second deadline. Failed batches are discarded;
 recoverable failures trigger a one-second delay and a bounded PING probe until
@@ -351,15 +341,13 @@ The subscriber uses the same merge rules across all undelivered network batches.
 Repeated or smaller-seq snapshots overwrite normally; there is no completion watermark.
 After each merge, keep at most 256 pending events by evicting entries from the front.
 Updates move to the end, so eviction removes the least recently updated events,
-regardless of type, seq or authority. Capacity never ends the subscription. This
+regardless of type or seq. Capacity never ends the subscription. This
 counts merged events, not bytes: individual snapshots or merged text can be large.
 The limit excludes decoded network input and batches already handed to consumers.
-Eviction does not advance a cursor. `SessionService.live` recovers missed snapshots
-through authoritative gap backfill or periodic history reads, including an evicted
-authoritative replacement of a previously delivered provisional snapshot. Polling
-requires the consumer to keep advancing. History returns the current snapshot, not
-every overwritten provisional version; deltas remain lossy previews. Direct
-`subscribe()` consumers are responsible for any history recovery they need.
+Eviction does not advance a cursor. `SessionService.live` recovers missed complete
+messages through gap backfill or periodic history reads. Polling requires the
+consumer to keep advancing. History contains fixed complete messages; deltas remain
+lossy previews. Direct `subscribe()` consumers own their history recovery policy.
 Connection/decode/validation errors release the connection immediately and take priority
 over buffered output on the next read; there is no automatic resubscription. Idle
 reads have no timeout. Exiting the context joins the receiver before closing the

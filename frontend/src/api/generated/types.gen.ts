@@ -468,9 +468,8 @@ export type HttpValidationError = {
 /**
  * HistoryMessage
  *
- * SDK message value at a session position, with explicit recording authority.
+ * Immutable, successfully stored SDK message at a session position.
  *
- * Authority is a producer contract, not a restriction on same-key replacement.
  * Storage reads these attributes from columns, never from message metadata.
  */
 export type HistoryMessage = {
@@ -482,10 +481,6 @@ export type HistoryMessage = {
      * Seq
      */
     seq: number;
-    /**
-     * Authoritative
-     */
-    authoritative: boolean;
     /**
      * Message
      */
@@ -828,6 +823,7 @@ export type ModelResponse = {
     metadata?: {
         [key: string]: unknown;
     } | null;
+    workspace_ref?: WorkspaceRef | null;
     /**
      * State
      */
@@ -1224,6 +1220,10 @@ export type RequestUsage = {
      */
     output_audio_tokens?: number;
     /**
+     * Audio Seconds
+     */
+    audio_seconds?: number;
+    /**
      * Details
      */
     details?: {
@@ -1576,9 +1576,21 @@ export type ToolCallPart = {
     part_kind?: 'tool-call';
 };
 
-export type ToolReturnContent = unknown | {
+export type ToolReturnContent = string | ({
+    kind: 'image-url';
+} & ImageUrlOutput) | ({
+    kind: 'audio-url';
+} & AudioUrlOutput) | ({
+    kind: 'document-url';
+} & DocumentUrlOutput) | ({
+    kind: 'video-url';
+} & VideoUrlOutput) | ({
+    kind: 'binary';
+} & BinaryContentOutput) | ({
+    kind: 'uploaded-file';
+} & UploadedFileOutput) | {
     [key: string]: ToolReturnContent;
-} | Array<ToolReturnContent>;
+} | Array<ToolReturnContent> | unknown;
 
 /**
  * ToolReturnPart
@@ -2115,6 +2127,24 @@ export type VideoUrlOutput = {
 };
 
 /**
+ * WorkspaceRef
+ *
+ * Serializable identity of a [workspace](../workspace.md) environment, without credentials.
+ *
+ * Pass it to a later run as `workspace=` to continue in that environment.
+ */
+export type WorkspaceRef = {
+    /**
+     * Provider
+     */
+    provider: string;
+    /**
+     * Id
+     */
+    id: string;
+};
+
+/**
  * AudioUrl
  *
  * A URL to an audio file.
@@ -2246,9 +2276,8 @@ export type FilePartWritable = {
 /**
  * HistoryMessage
  *
- * SDK message value at a session position, with explicit recording authority.
+ * Immutable, successfully stored SDK message at a session position.
  *
- * Authority is a producer contract, not a restriction on same-key replacement.
  * Storage reads these attributes from columns, never from message metadata.
  */
 export type HistoryMessageWritable = {
@@ -2260,10 +2289,6 @@ export type HistoryMessageWritable = {
      * Seq
      */
     seq: number;
-    /**
-     * Authoritative
-     */
-    authoritative: boolean;
     /**
      * Message
      */
@@ -2313,7 +2338,7 @@ export type ModelRequestWritable = {
     /**
      * Parts
      */
-    parts: Array<SystemPromptPart | UserPromptPartWritable | SpeechPartWritable | ToolSearchReturnPart | LoadCapabilityReturnPart | ToolReturnPart | RetryPromptPart | ToolAvailabilityDeltaPart>;
+    parts: Array<SystemPromptPart | UserPromptPartWritable | SpeechPartWritable | ToolSearchReturnPart | LoadCapabilityReturnPart | ToolReturnPartWritable | RetryPromptPart | ToolAvailabilityDeltaPart>;
     /**
      * Timestamp
      */
@@ -2355,7 +2380,7 @@ export type ModelResponseWritable = {
     /**
      * Parts
      */
-    parts: Array<TextPart | ToolSearchCallPart | LoadCapabilityCallPart | ToolCallPart | NativeToolSearchCallPart | NativeToolCallPart | NativeToolSearchReturnPart | NativeToolReturnPart | ThinkingPart | CompactionPart | FilePartWritable | SpeechPartWritable>;
+    parts: Array<TextPart | ToolSearchCallPart | LoadCapabilityCallPart | ToolCallPart | NativeToolSearchCallPart | NativeToolCallPart | NativeToolSearchReturnPart | NativeToolReturnPartWritable | ThinkingPart | CompactionPart | FilePartWritable | SpeechPartWritable>;
     usage?: RequestUsage;
     /**
      * Model Name
@@ -2405,10 +2430,63 @@ export type ModelResponseWritable = {
     metadata?: {
         [key: string]: unknown;
     } | null;
+    workspace_ref?: WorkspaceRef | null;
     /**
      * State
      */
     state?: 'complete' | 'incomplete' | 'suspended' | 'interrupted';
+};
+
+/**
+ * NativeToolReturnPart
+ *
+ * A tool return message from a native tool.
+ *
+ * For native tools with a stable cross-provider shape (currently `tool_search`), a
+ * `NativeToolReturnPart` may be promoted to a typed subclass like
+ * [`NativeToolSearchReturnPart`][pydantic_ai.messages.NativeToolSearchReturnPart]
+ * with a narrowed `content` `TypedDict`. See `NativeToolCallPart` for the pattern.
+ */
+export type NativeToolReturnPartWritable = {
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    content: ToolReturnContentWritable;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id?: string;
+    /**
+     * Tool Kind
+     */
+    tool_kind?: 'tool-search' | 'capability-load' | null;
+    /**
+     * Metadata
+     */
+    metadata?: unknown;
+    /**
+     * Timestamp
+     */
+    timestamp?: string;
+    /**
+     * Outcome
+     */
+    outcome?: 'success' | 'failed' | 'denied' | 'interrupted';
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+    /**
+     * Provider Details
+     */
+    provider_details?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Part Kind
+     */
+    part_kind?: 'builtin-tool-return';
 };
 
 /**
@@ -2485,9 +2563,58 @@ export type SpeechPartWritable = {
     part_kind?: 'speech';
 };
 
-export type ToolReturnContentWritable = unknown | {
+export type ToolReturnContentWritable = string | ({
+    kind: 'image-url';
+} & ImageUrlOutputWritable) | ({
+    kind: 'audio-url';
+} & AudioUrlOutputWritable) | ({
+    kind: 'document-url';
+} & DocumentUrlOutputWritable) | ({
+    kind: 'video-url';
+} & VideoUrlOutputWritable) | ({
+    kind: 'binary';
+} & BinaryContentOutputWritable) | ({
+    kind: 'uploaded-file';
+} & UploadedFileOutputWritable) | {
     [key: string]: ToolReturnContentWritable;
-} | Array<ToolReturnContentWritable>;
+} | Array<ToolReturnContentWritable> | unknown;
+
+/**
+ * ToolReturnPart
+ *
+ * A tool return message, this encodes the result of running a tool.
+ */
+export type ToolReturnPartWritable = {
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    content: ToolReturnContentWritable;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id?: string;
+    /**
+     * Tool Kind
+     */
+    tool_kind?: 'tool-search' | 'capability-load' | null;
+    /**
+     * Metadata
+     */
+    metadata?: unknown;
+    /**
+     * Timestamp
+     */
+    timestamp?: string;
+    /**
+     * Outcome
+     */
+    outcome?: 'success' | 'failed' | 'denied' | 'interrupted';
+    /**
+     * Part Kind
+     */
+    part_kind?: 'tool-return';
+};
 
 /**
  * UpdateProvider

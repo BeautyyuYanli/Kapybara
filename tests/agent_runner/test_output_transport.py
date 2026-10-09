@@ -31,7 +31,7 @@ async def test_ready_subscription_broadcast_batch_order_and_cleanup(valkey_clien
     first = delta(session_id, "hello", op="replace")
     second = delta(session_id, " world")
     committed = MessageCommitted(
-        HistoryMessage(session_id, 1, False, ModelResponse(parts=[TextPart("hello world")]))
+        HistoryMessage(session_id, 1, ModelResponse(parts=[TextPart("hello world")]))
     )
     channel = f"kapy:agent-output:{session_id}"
     async with outputs.subscribe(session_id) as left, outputs.subscribe(session_id) as right:
@@ -294,9 +294,7 @@ async def test_blocked_network_never_blocks_callback_and_buffers_are_bounded(
             for _ in range(100):
                 await callback(delta(session_id, "界" * 12_000))
             await callback(delta(session_id, "界" * 30_000))
-            await callback(
-                MessageCommitted(HistoryMessage(session_id, 1, False, ModelResponse(parts=[])))
-            )
+            await callback(MessageCommitted(HistoryMessage(session_id, 1, ModelResponse(parts=[]))))
         release.set()
         await sent.wait()
     assert all(len(payload) <= 64 * 1024 for payload in batches)
@@ -375,7 +373,7 @@ async def test_unrecoverable_publish_error_disables_without_reaching_producer(
 @pytest.mark.parametrize("transport", ["publisher", "subscriber"])
 async def test_merge_replace_append_parts_and_complete_coverage(valkey_client, transport):
     session_id = uuid4()
-    commit = MessageCommitted(HistoryMessage(session_id, 1, False, ModelResponse(parts=[])))
+    commit = MessageCommitted(HistoryMessage(session_id, 1, ModelResponse(parts=[])))
     empty = TextDelta(session_id, 2, 0, "text", "replace", "")
     thinking = TextDelta(session_id, 2, 0, "thinking", "append", "thought")
     text = TextDelta(session_id, 2, 1, "text", "append", "ab")
@@ -447,9 +445,7 @@ async def test_subscriber_capacity_evicts_oldest_events_and_keeps_receiving(
         TextDelta(session_id, seq, 0, "text", "replace", str(seq))
         if event_kind == "delta"
         else MessageCommitted(
-            HistoryMessage(
-                session_id, seq, bool(seq % 2), ModelResponse(parts=[TextPart(str(seq))])
-            )
+            HistoryMessage(session_id, seq, ModelResponse(parts=[TextPart(str(seq))]))
         )
         for seq in reversed(range(260))
     ]
@@ -458,7 +454,7 @@ async def test_subscriber_capacity_evicts_oldest_events_and_keeps_receiving(
         AgentOutputService(valkey_client).subscribe(session_id) as events,
     ):
         # One network batch is processed before consumer handoff. Keep the last
-        # arrivals regardless of sequence, event type or authoritative status.
+        # arrivals regardless of sequence or event type.
         await valkey_client.publish(channel, ADAPTER.dump_json(incoming))
         assert await anext(events) == incoming[-256:]
         assert (await valkey_client.pubsub_numsub(channel))[0][1] == 1
@@ -480,7 +476,7 @@ async def test_subscriber_merges_before_capacity_and_updates_eviction_order(
     ]
     if update_kind == "commit":
         update = merged = MessageCommitted(
-            HistoryMessage(session_id, 128, True, ModelResponse(parts=[TextPart("final")]))
+            HistoryMessage(session_id, 128, ModelResponse(parts=[TextPart("final")]))
         )
     else:
         update = TextDelta(session_id, 128, 0, "text", update_kind, "updated")
@@ -511,7 +507,7 @@ async def test_subscriber_capacity_counts_merged_events_without_a_byte_limit(val
     channel = f"kapy:agent-output:{session_id}"
     content = "x" * (1024 * 1024)
     commit = MessageCommitted(
-        HistoryMessage(session_id, 2, True, ModelResponse(parts=[TextPart(content)]))
+        HistoryMessage(session_id, 2, ModelResponse(parts=[TextPart(content)]))
     )
     incoming: list[OutputEvent] = [
         delta(session_id, "original", op="replace"),
@@ -621,29 +617,26 @@ async def test_cancellation_during_subscription_confirmation_joins_receiver(valk
 
 
 @pytest.mark.parametrize("transport", ["publisher", "subscriber"])
-async def test_full_snapshots_overwrite_only_their_key_without_authority_gating(
-    valkey_client, transport
-):
+async def test_complete_message_duplicates_collapse_their_key_and_preview(valkey_client, transport):
     session_id = uuid4()
     outputs = AgentOutputService(valkey_client)
-    provisional = MessageCommitted(HistoryMessage(session_id, 42, False, ModelResponse(parts=[])))
-    authoritative = MessageCommitted(
-        HistoryMessage(session_id, 42, True, ModelResponse(parts=[TextPart("final")]))
+    complete = MessageCommitted(
+        HistoryMessage(session_id, 42, ModelResponse(parts=[TextPart("final")]))
     )
-    other = MessageCommitted(HistoryMessage(session_id, 43, False, ModelResponse(parts=[])))
+    other = MessageCommitted(HistoryMessage(session_id, 43, ModelResponse(parts=[])))
     other_preview = TextDelta(session_id, 40, 0, "text", "replace", "unrelated")
     same_preview = TextDelta(session_id, 42, 0, "text", "append", "covered")
     following = TextDelta(session_id, 42, 0, "text", "append", "new attempt")
     batch = [
-        provisional,
+        complete,
         other,
         other_preview,
         same_preview,
-        authoritative,
-        authoritative,
+        complete,
+        complete,
         following,
     ]
-    expected = [other, other_preview, authoritative, following]
+    expected = [other, other_preview, complete, following]
     async with asyncio.timeout(3):
         if transport == "publisher":
             async with valkey_client.pubsub() as raw:
@@ -661,9 +654,8 @@ async def test_full_snapshots_overwrite_only_their_key_without_authority_gating(
                     f"kapy:agent-output:{session_id}", ADAPTER.dump_json(batch)
                 )
                 assert await anext(events) == expected
-                # Delivered authority creates no permanent filter; duplicate and
-                # non-authoritative replacements remain ordinary same-key snapshots.
-                for event in (authoritative, provisional):
+                # The raw transport keeps no delivered cursor; consumers deduplicate.
+                for event in (complete, complete):
                     await valkey_client.publish(
                         f"kapy:agent-output:{session_id}", ADAPTER.dump_json([event])
                     )

@@ -6,6 +6,9 @@ Revises: ${down_revision | comma,n}
 
 from collections.abc import Sequence
 
+# Alembic renders SQL statements as indivisible string literals.
+# ruff: noqa: E501
+
 from alembic import op
 import sqlalchemy as sa
 ${imports if imports else ""}
@@ -21,4 +24,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+% if config.attributes.get("irreversible_reason"):
+    raise NotImplementedError(${repr(config.attributes["irreversible_reason"])})
+% else:
     ${downgrades if downgrades else "pass"}
+% endif

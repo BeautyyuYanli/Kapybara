@@ -27,7 +27,7 @@ class RunnerActivities:
     async def record_messages(self, data: MessageBatch) -> None:
         """Serialize session writes and publish accepted snapshots only after commit.
 
-        Confirmed retries are discarded; missed broadcasts are recovered from history.
+        Stored retries are discarded; missed broadcasts are recovered from history.
         Lock only the session id, avoiding a read of the potentially large runner state.
         """
         try:
@@ -41,7 +41,7 @@ class RunnerActivities:
                 ).scalar_one_or_none()
                 if session_id is None:
                     raise LookupError(f"Session {data.session_id} does not exist")
-                accepted = await AgentRepository(db).upsert_history(session_id, data.messages)
+                accepted = await AgentRepository(db).append_history(session_id, data.messages)
         except LookupError as exc:
             raise ApplicationError(str(exc), type="SessionNotFound", non_retryable=True) from exc
         except ValueError as exc:

@@ -12,13 +12,14 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import import_module
 from threading import Thread
 from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import CapabilityOrdering, Hooks
 from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
 from pydantic_ai.messages import (
@@ -34,8 +35,8 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings
-from sqlalchemy import func
 from sqlmodel import col, select
 from temporalio import activity
 from temporalio.client import Client
@@ -56,7 +57,7 @@ from kapy.runner_duarable import (
     agent,
 )
 from kapy.runner_duarable.activities import RunnerActivities
-from kapy.runner_duarable.recording import record_before_model_request
+from kapy.runner_duarable.recording import Recorder
 from kapy.runner_duarable.types import MessageBatch, SaveRunnerStateInput
 from kapy.runner_duarable.worker import serve
 
@@ -240,14 +241,14 @@ def make_config(base_url: str, protocol: str = "OpenAIChatModel") -> DurableExec
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_class", [OpenAIChatModel, OpenAIResponsesModel, GoogleModel])
 @pytest.mark.parametrize("with_tools", [False, True], ids=["new-session", "tool-history"])
-async def test_authoritative_database_history_reproduces_model_input(
+async def test_database_history_reproduces_model_input(
     endpoint, runner_database, monkeypatch, model_class, with_tools
 ):
     """Compare complete HTTP bodies after real storage, codec and SDK normalization.
 
     Only the Temporal Activity scheduler is replaced; recording uses the real
-    database Activity. The restored input is selected with authority in SQL, while
-    the newly generated response is present in storage and deliberately excluded.
+    database Activity. The restored input is selected in sequence order, then
+    the newly generated response is excluded from the replay input.
     """
     base_url, requests = endpoint
     config = make_config(base_url, model_class.__name__)
@@ -266,6 +267,8 @@ async def test_authoritative_database_history_reproduces_model_input(
     def work(path: str, rows: int) -> dict[str, Any]:
         """Read a report and return its row count."""
         return {"path": path, "rows": rows}
+
+    instructions = "Keep all historical tool arguments and results."
 
     history: list[ModelMessage] = []
     if with_tools:
@@ -299,16 +302,17 @@ async def test_authoritative_database_history_reproduces_model_input(
             profile={"context_window": config.context_window},
         ) as model,
     ):
+        recorder = Recorder()
         recording_agent = Agent(
             model,
             deps_type=RunnerDeps,
             system_prompt="You are a file assistant.",
-            instructions="Keep all historical tool arguments and results.",
+            instructions=instructions,
             tools=[work],
             capabilities=[
-                MessageRecordCapability(),
+                MessageRecordCapability(recorder),
                 Hooks(
-                    model_request=record_before_model_request,
+                    before_model_request=recorder.predict_response_seq,
                     ordering=CapabilityOrdering(
                         position="innermost", requires=[MessageRecordCapability]
                     ),
@@ -340,7 +344,6 @@ async def test_authoritative_database_history_reproduces_model_input(
                         select(AgentHistoryRow)
                         .where(
                             col(AgentHistoryRow.session_id) == runner_database.session_id,
-                            col(AgentHistoryRow.authoritative).is_(True),
                         )
                         .order_by(col(AgentHistoryRow.seq))
                     )
@@ -348,18 +351,10 @@ async def test_authoritative_database_history_reproduces_model_input(
                 .scalars()
                 .all()
             )
-            provisional_count = (
-                await db.execute(
-                    select(func.count())
-                    .select_from(AgentHistoryRow)
-                    .where(
-                        col(AgentHistoryRow.session_id) == runner_database.session_id,
-                        col(AgentHistoryRow.authoritative).is_(False),
-                    )
-                )
-            ).scalar_one()
-        assert rows and provisional_count == 1
+        assert rows
         assert [row.seq for row in rows] == list(range(len(rows)))
+        assert rows[-1].kind == "response"
+        rows = rows[:-1]
         restored = ModelMessagesTypeAdapter.validate_python(
             [
                 {
@@ -372,12 +367,11 @@ async def test_authoritative_database_history_reproduces_model_input(
             ]
         )
         assert isinstance(restored[-1], ModelRequest)
-        assert all((message.metadata or {})["authoritative"] for message in restored)
-        # No prompt is added: the trailing authoritative request is sent again.
+        # Excluding the response leaves the recorded request to send again.
         reproduction_agent = Agent(
             model,
             system_prompt="You are a file assistant.",
-            instructions="Keep all historical tool arguments and results.",
+            instructions=instructions,
             tools=[work],
         )
         replayed = await reproduction_agent.run(
@@ -498,18 +492,14 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
     async with runner_database.sessions.begin() as db:
         stored = await AgentRepository(db).read_history_entries(runner_database.session_id)
     assert [entry.seq for entry in stored] == [0, 1]
-    assert [
-        (e.message.seq, e.message.authoritative)
-        for e in broadcasts
-        if isinstance(e, MessageCommitted)
-    ] == [(0, True), (1, False), (1, False)]
+    assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == [0, 1]
     assert [(e.response_seq, e.text) for e in broadcasts if isinstance(e, TextDelta)] == [
         (1, "done")
     ]
     published_before_replay = list(broadcasts)
     assert [entry.message.metadata for entry in stored] == [
-        {"seq": 0, "authoritative": True},
-        {"seq": 1, "authoritative": False},
+        {"seq": 0},
+        {"seq": 1},
     ]
     messages = ModelMessagesTypeAdapter.validate_json(state)
     assert any(
@@ -557,8 +547,7 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_databa
     async def fail_request(self, *args, **kwargs):
         assert activity.in_activity()
         async with runner_database.sessions.begin() as db:
-            (entry,) = await AgentRepository(db).read_history_entries(runner_database.session_id)
-        assert entry.seq == 0 and entry.authoritative
+            assert await AgentRepository(db).read_history_entries(runner_database.session_id) == ()
         models.append(self)
         raise UserError("invalid model request")
         yield  # pragma: no cover - retain the SDK async context manager contract
@@ -739,7 +728,7 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
     cause = exc_info.value.cause.cause
     assert isinstance(cause, ApplicationError) and cause.non_retryable
     assert cause.type == ("SessionNotFound" if missing else "RunnerStateConflict")
-    assert len(requests) == (0 if missing else 1)
+    assert len(requests) == 1  # Persistence validates the session after model dispatch.
     async with runner_database.sessions.begin() as db:
         assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
             "previous",
@@ -749,10 +738,37 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_workflow_restores_state_and_continues_marks(endpoint, runner_database):
+async def test_workflow_restores_state_and_records_after_run_tail_once(
+    endpoint, runner_database, monkeypatch
+):
     from kapy.agent_runner.repository import AgentRepository
 
     base_url, requests = endpoint
+    broadcasts: list[OutputEvent] = []
+    publish = runner_database.outputs._publish
+
+    async def observe_publish(session_id, payload):
+        await publish(session_id, payload)
+        broadcasts.extend(TypeAdapter(list[OutputEvent]).validate_json(payload))
+
+    async def append_tail(
+        ctx: RunContext[RunnerDeps], *, result: AgentRunResult[str]
+    ) -> AgentRunResult[str]:
+        if ctx.prompt == "first":
+            result.all_messages().append(
+                ModelRequest([UserPromptPart("after-run tail")], metadata={"source": "after_run"})
+            )
+        return result
+
+    tail_agent = Agent(
+        name=agent.name,
+        model=agent.model,
+        deps_type=RunnerDeps,
+        capabilities=[*agent.root_capability.capabilities, Hooks(after_run=append_tail)],
+    )
+    monkeypatch.setattr(import_module("kapy.runner_duarable.agent"), "agent", tail_agent)
+    monkeypatch.setattr(import_module("kapy.runner_duarable.workflow"), "agent", tail_agent)
+    monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
     saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-restore-{uuid4()}"
@@ -761,7 +777,7 @@ async def test_workflow_restores_state_and_continues_marks(endpoint, runner_data
         task_queue=queue,
         workflows=[RunnerWorkflow],
         activities=[saver.record_messages, saver.save_runner_state],
-        plugins=[AgentPlugin(agent)],
+        plugins=[AgentPlugin(tail_agent)],
     ):
         for prompt in ("first", "follow-up"):
             async with runner_database.sessions.begin() as db:
@@ -784,10 +800,31 @@ async def test_workflow_restores_state_and_continues_marks(endpoint, runner_data
                 )
                 == "done"
             )
+            if prompt == "first":
+                async with runner_database.sessions.begin() as db:
+                    first_state, first_version = await SessionRepository(db).read_runner_state(
+                        runner_database.session_id
+                    )
+                    first_entries = await AgentRepository(db).read_history_entries(
+                        runner_database.session_id
+                    )
+                assert first_state is not None and first_version == 1
+                first_messages = ModelMessagesTypeAdapter.validate_json(first_state)
+                tail = first_messages[-1]
+                assert isinstance(tail, ModelRequest) and len(tail.parts) == 1
+                part = tail.parts[0]
+                assert isinstance(part, UserPromptPart) and part.content == "after-run tail"
+                assert first_messages[-1].metadata == {"source": "after_run"}
+                assert [entry.seq for entry in first_entries] == [0, 1]
+                assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == [
+                    0,
+                    1,
+                ]
     assert len(requests) == 2
     assert [(m["role"], m["content"]) for m in requests[1]["body"]["messages"]] == [
         ("user", "first"),
         ("assistant", "done"),
+        ("user", "after-run tail"),
         ("user", "follow-up"),
     ]
     async with runner_database.sessions.begin() as db:
@@ -796,10 +833,14 @@ async def test_workflow_restores_state_and_continues_marks(endpoint, runner_data
     assert state is not None and version == 2
     messages = ModelMessagesTypeAdapter.validate_json(state)
     assert [m.metadata for m in messages] == [
-        {"seq": seq, "authoritative": seq < 3} for seq in range(4)
+        {"seq": 0},
+        {"seq": 1},
+        {"source": "after_run", "seq": 2},
+        {"seq": 3},
+        {"seq": 4},
     ]
-    assert [entry.authoritative for entry in entries] == [True, True, True, False]
-    assert [entry.seq for entry in entries] == list(range(4))
+    assert [entry.seq for entry in entries] == list(range(5))
+    assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == list(range(5))
     # History normalizes usage into token columns; runner_state retains SDK usage.
     assert ModelMessagesTypeAdapter.dump_python(
         [entry.message for entry in entries], exclude={"__all__": {"usage"}}
@@ -904,30 +945,23 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(
         assert await handle.result() == "done"
         history = await handle.fetch_history()
     assert len(requests) == 1
-    assert len(inputs) == 6
-    assert all(inputs[index] == inputs[index + 1] for index in (0, 2, 4))
-    assert [(m.seq, m.authoritative) for m in inputs[0].messages] == [(0, True)]
-    assert [(m.seq, m.authoritative) for m in inputs[2].messages] == [(1, False)]
-    assert inputs[2] == inputs[4]
+    assert len(inputs) == 2 and inputs[0] == inputs[1]
+    assert [m.seq for m in inputs[0].messages] == [0, 1]
     async with runner_database.sessions.begin() as db:
         entries = await AgentRepository(db).read_history_entries(runner_database.session_id)
         state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
     assert [entry.seq for entry in entries] == [0, 1]
     assert state is not None and version == 1
     assert [m.metadata for m in ModelMessagesTypeAdapter.validate_json(state)] == [
-        {"seq": 0, "authoritative": True},
-        {"seq": 1, "authoritative": False},
+        {"seq": 0},
+        {"seq": 1},
     ]
-    assert [
-        (e.message.seq, e.message.authoritative)
-        for e in broadcasts
-        if isinstance(e, MessageCommitted)
-    ] == [(0, True), (1, False), (1, False), (1, False), (1, False)]
+    assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == [0, 1]
     published_before_replay = list(broadcasts)
     await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
         history
     )
-    assert len(inputs) == 6 and len(requests) == 1
+    assert len(inputs) == 2 and len(requests) == 1
     assert broadcasts == published_before_replay
 
 
@@ -1042,13 +1076,11 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         try:
             async with asyncio.timeout(5):
                 while (  # noqa: ASYNC110
-                    (await repository.get_delivery(delivery_key(row))).sent_responses.get("1")
-                    != {"text": "done", "message_ids": [123]}
+                    (await repository.get_delivery(delivery_key(row))).after_seq < 1
                 ):
                     await asyncio.sleep(0.01)
             saved = await repository.get_delivery(delivery_key(row))
-            assert saved.after_seq == 0
-            assert saved.sent_responses == {"1": {"text": "done", "message_ids": [123]}}
+            assert saved.after_seq == 1
             # The first final reply is delivered without waiting for another prompt.
             second = await sessions.start_durable_runner(session_id, user_prompt="second prompt")
             assert await asyncio.wait_for(second.result(), 30) == "done"
@@ -1064,14 +1096,11 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
             async with runner_database.sessions.begin() as db:
                 state, version = await SessionRepository(db).read_runner_state(session_id)
             assert state is not None and version == 2
-            assert not await sessions.has_legacy_checkpoint(session_id)
             assert not await sessions.is_durable_runner_running(session_id)
             assert not await sessions.read_inputs(session_id, "queued")
             async with asyncio.timeout(5):
                 while (  # noqa: ASYNC110
-                    (await repository.get_delivery(delivery_key(row))).after_seq < 2
-                    or (await repository.get_delivery(delivery_key(row))).sent_responses.get("3")
-                    != {"text": "done", "message_ids": [123]}
+                    (await repository.get_delivery(delivery_key(row))).after_seq < 3
                 ):
                     await asyncio.sleep(0.01)
             assert [
@@ -1081,19 +1110,13 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
             ] == ["done", "done"]
             assert telegram.send.call_args.args[2] == "done"
             assert "draft_id" not in telegram.send.call_args.kwargs
-            telegram.edit.assert_not_awaited()
             saved = await repository.get_delivery(delivery_key(row))
-            assert saved.sent_responses == {"3": {"text": "done", "message_ids": [123]}}
+            assert saved.after_seq == 3
             async with runner_database.sessions.begin() as db:
                 from kapy.agent_runner.repository import AgentRepository
 
                 entries = await AgentRepository(db).read_history_entries(session_id)
-            assert [(entry.seq, entry.authoritative) for entry in entries] == [
-                (0, True),
-                (1, True),
-                (2, True),
-                (3, False),
-            ]
+            assert [entry.seq for entry in entries] == [0, 1, 2, 3]
         finally:
             follower.cancel()
             await asyncio.gather(follower, return_exceptions=True)

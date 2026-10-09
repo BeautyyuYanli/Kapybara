@@ -24,4 +24,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+% if config.attributes.get("irreversible_reason"):
+    raise NotImplementedError(${repr(config.attributes["irreversible_reason"])})
+% else:
     ${downgrades if downgrades else "pass"}
+% endif

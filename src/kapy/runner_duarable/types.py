@@ -67,7 +67,7 @@ class RunnerDeps(DTO):
 
 
 class MessageBatch(DTO):
-    """One atomic batch with explicit positions, authority and complete SDK messages."""
+    """One atomic batch with explicit positions and immutable complete SDK messages."""
 
     # SDK usage preserves provider-specific fields. Inherited forbid would reject
     # those fields while decoding the nested SDK dataclasses.

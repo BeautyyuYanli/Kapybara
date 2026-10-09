@@ -100,12 +100,15 @@ def main(argv: list[str]) -> int:
     db_parser.add_argument("operation", choices=["upgrade", "current", "revision"])
     db_parser.add_argument("--database-path", type=Path)
     db_parser.add_argument("--message")
+    db_parser.add_argument("--plan", choices=["immutable-history"])
     args = parser.parse_args(argv)
     try:
         values = {} if args.database_path is None else {"database_path": args.database_path}
         if args.command == "db":
             storage = StorageSettings(**values)
-            asyncio.run(migrate(storage.database_path, args.operation, args.message))
+            asyncio.run(
+                migrate(storage.database_path, args.operation, args.message, plan=args.plan)
+            )
         else:
             settings = TelegramSettings(**values)
             logging.basicConfig(level=settings.common.log_level)

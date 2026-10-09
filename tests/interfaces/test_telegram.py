@@ -86,7 +86,6 @@ def update(update_id, text="hello", *, chat=123, thread=0, **message):
 
 def controller(repository, tmp_path):
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.create_session.return_value = SimpleNamespace(id=uuid4())
     sessions.get_session.return_value = SimpleNamespace(status=LifecycleStatus.READY)
     sessions.submit_input.return_value = InputSubmission(
@@ -158,7 +157,7 @@ async def test_sqlite_upgrade_is_idempotent_and_transactions_rollback(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_upgrade_preserves_pending_delivery_and_initializes_reply_receipts(tmp_path):
+async def test_upgrade_preserves_pending_delivery_from_before_reply_receipts(tmp_path):
     from alembic import command
 
     from kapy.database.migration import migration_config
@@ -195,7 +194,74 @@ async def test_upgrade_preserves_pending_delivery_and_initializes_reply_receipts
         restored = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
         row = await restored.get_delivery((42, 123, 9, session_id))
     assert row.after_seq == 2 and row.item_offset == 3 and row.pending == pending
-    assert row.sent_responses == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_seq", [3, 8])
+async def test_offline_reply_migration_advances_receipts_and_preserves_unfinished_offset(
+    tmp_path, pending_seq
+):
+    from alembic import command
+
+    from kapy.database.migration import migration_config
+    from kapy.interfaces.telegram.models import TelegramTable
+
+    path, session_id = tmp_path / "telegram.sqlite3", uuid4()
+    pending = {
+        "seq": pending_seq,
+        "text": "unfinished reply",
+        "format": "plain",
+        "authoritative": False,
+        "message_ids": [123],
+        "item_index": 1,
+    }
+    async with open_storage(path, create=True) as engine:
+        async with engine.begin() as db:
+
+            def config(connection):
+                return migration_config(
+                    connection,
+                    directory=Path(__file__).parents[2] / "src/kapy/interfaces/telegram/migrations",
+                    metadata=TelegramTable.metadata,
+                    version_table="plugin_telegram_schema_version",
+                    owns_table=lambda name: name.startswith("plugin_telegram_"),
+                )
+
+            await db.run_sync(
+                lambda connection: command.upgrade(config(connection), "18474f847e76")
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO plugin_telegram_delivery "
+                    "(bot_id, chat_id, thread_id, session_id, chat_type, after_seq, "
+                    "sent_responses, "
+                    "pending, item_offset, next_attempt_at, blocked_error) "
+                    "VALUES (42, 123, 9, :session, 'private', 2, :receipts, :pending, 4, 10, '400')"
+                ),
+                {
+                    "session": session_id.hex,
+                    "receipts": json.dumps({"5": {"text": "sent", "message_ids": [90]}}),
+                    "pending": json.dumps(pending),
+                },
+            )
+            await db.run_sync(lambda connection: command.upgrade(config(connection), "head"))
+            await db.run_sync(lambda connection: command.check(config(connection)))
+            row = (await db.execute(text("SELECT * FROM plugin_telegram_delivery"))).one()
+            assert row.after_seq == 5
+            if pending_seq <= 5:
+                assert row.pending is None
+                assert (row.item_offset, row.next_attempt_at, row.blocked_error) == (0, 0, None)
+            else:
+                assert json.loads(row.pending) == {
+                    "seq": pending_seq,
+                    "text": "unfinished reply",
+                    "format": "plain",
+                }
+                assert (row.item_offset, row.next_attempt_at, row.blocked_error) == (4, 10, "400")
+            with pytest.raises(NotImplementedError, match="irreversible"):
+                await db.run_sync(
+                    lambda connection: command.downgrade(config(connection), "18474f847e76")
+                )
 
 
 @pytest.mark.asyncio
@@ -410,25 +476,62 @@ async def delivery_row(repository, *, text="", chat_type="private", chat_id=123)
 
 
 @pytest.mark.asyncio
-async def test_delivery_fallback_and_resume_offsets_survive_restart(repository):
+async def test_delivery_fallback_and_consume_resume_offsets_survive_restart(repository, tmp_path):
     body = "😀" * 5000
-    row = await delivery_row(repository, text=body)
+    row = await delivery_row(repository)
     client = telegram_client()
-    client.send.side_effect = TelegramFailure(400, rich_content_rejected=True)
-    delivery = TelegramDelivery(client, AsyncMock(spec=SessionService), repository, 42)
-    await delivery.send_pending(row)
+    sessions = AsyncMock(spec=SessionService)
+    sent, cursors = [], []
+
+    async def live(session_id, *, after_seq):
+        cursors.append(after_seq)
+        yield [MessageCommitted(HistoryMessage(session_id, 4, ModelResponse([TextPart(body)])))]
+
+    async def interrupted_send(chat, thread, content, *, rich):
+        if rich:
+            raise TelegramFailure(400, rich_content_rejected=True)
+        if sent:
+            saved = await repository.get_delivery(delivery_key(row))
+            assert saved.item_offset == 2000 and saved.after_seq == -1
+            raise asyncio.CancelledError()
+        sent.append(content)
+
+    sessions.live = live
+    client.send.side_effect = interrupted_send
+    with pytest.raises(asyncio.CancelledError):
+        await TelegramDelivery(client, sessions, repository, 42).consume(row)
     saved = await repository.get_delivery(delivery_key(row))
-    assert saved.pending is not None and saved.pending["format"] == "plain"
-    client.send.side_effect = None
-    await delivery.send_pending(saved)
+    assert saved.pending == {"seq": 4, "text": body, "format": "plain"}
     assert saved.item_offset == 2000 and saved.after_seq == -1
-    saved = await repository.get_delivery(delivery_key(row))
-    while saved.pending:
-        await delivery.send_pending(saved)
-    assert saved.after_seq == 4 and saved.item_offset == 0
-    plain = [call.args[2] for call in client.send.call_args_list if not call.kwargs.get("rich")]
-    assert "".join(plain) == body
-    assert all(len(chunk.encode("utf-16-le")) <= 8000 for chunk in plain)
+
+    async with open_storage(tmp_path / "telegram.sqlite3") as engine:
+        restarted = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
+
+        async def resumed_send(chat, thread, content, *, rich):
+            assert not rich
+            assert (await restarted.get_delivery(delivery_key(row))).after_seq == -1
+            sent.append(content)
+
+        async def resumed_live(session_id, *, after_seq):
+            cursors.append(after_seq)
+            assert after_seq == 4 and "".join(sent) == body
+            saved = await restarted.get_delivery(delivery_key(row))
+            assert saved.pending is None and saved.item_offset == 0
+            yield [
+                MessageCommitted(
+                    HistoryMessage(session_id, 5, ModelRequest([UserPromptPart("next")]))
+                )
+            ]
+
+        client.send.side_effect = resumed_send
+        sessions.live = resumed_live
+        await TelegramDelivery(client, sessions, restarted, 42).consume(
+            await restarted.get_delivery(delivery_key(row))
+        )
+        assert (await restarted.get_delivery(delivery_key(row))).after_seq == 5
+    assert cursors == [-1, 4]
+    assert "".join(sent) == body and [len(chunk) for chunk in sent] == [2000, 2000, 1000]
+    assert all(len(chunk.encode("utf-16-le")) <= 8000 for chunk in sent)
 
 
 @pytest.mark.asyncio
@@ -465,7 +568,7 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
         try:
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 0, True, ModelRequest([UserPromptPart("input")]))
+                    HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("input")]))
                 ),
                 TextDelta(session_id, 1, 0, "text", "replace", "old"),
             ]
@@ -476,13 +579,13 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
             await preview_sent.wait()
             yield [
                 MessageCommitted(
-                    HistoryMessage(session_id, 1, True, ModelResponse([TextPart("complete")]))
+                    HistoryMessage(session_id, 1, ModelResponse([TextPart("complete")]))
                 ),
                 MessageCommitted(
-                    HistoryMessage(session_id, 2, True, ModelRequest([UserPromptPart("next")]))
+                    HistoryMessage(session_id, 2, ModelRequest([UserPromptPart("next")]))
                 ),
                 MessageCommitted(
-                    HistoryMessage(session_id, 3, True, ModelResponse([TextPart("second")]))
+                    HistoryMessage(session_id, 3, ModelResponse([TextPart("second")]))
                 ),
             ]
             replayed.set()
@@ -491,7 +594,6 @@ async def test_live_deltas_are_temporary_commits_delivered_once_and_close(reposi
             closed.set()
 
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     delivery = TelegramDelivery(client, sessions, repository, 42)
     task = asyncio.create_task(delivery.consume(row))
@@ -534,7 +636,6 @@ async def test_thinking_preview_slides_over_latest_five_hundred_characters(repos
             yield [event]
 
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     await TelegramDelivery(client, sessions, repository, 42).consume(row)
 
@@ -572,7 +673,6 @@ async def test_thinking_tail_is_independent_of_live_batch_boundaries(repository,
             yield []
 
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     await TelegramDelivery(client, sessions, repository, 42).consume(row)
 
@@ -593,7 +693,6 @@ async def test_thinking_draft_falls_back_to_plain_text(repository):
         ]
 
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     await TelegramDelivery(client, sessions, repository, 42).consume(row)
 
@@ -617,15 +716,13 @@ async def test_connection_failure_resumes_after_last_delivered_commit(repository
             if len(cursors) == 1:
                 yield [
                     MessageCommitted(
-                        HistoryMessage(session_id, 0, True, ModelResponse([TextPart("first")]))
+                        HistoryMessage(session_id, 0, ModelResponse([TextPart("first")]))
                     )
                 ]
                 assert (await repository.get_delivery(key)).after_seq == 0
                 raise ValkeyConnectionError("Output subscription connection closed")
             yield [
-                MessageCommitted(
-                    HistoryMessage(session_id, 1, True, ModelResponse([TextPart("second")]))
-                )
+                MessageCommitted(HistoryMessage(session_id, 1, ModelResponse([TextPart("second")])))
             ]
             recovered.set()
             await asyncio.Future()
@@ -634,7 +731,6 @@ async def test_connection_failure_resumes_after_last_delivered_commit(repository
 
     monkeypatch.setattr("kapy.interfaces.telegram.delivery.retry_delay", lambda *args: 0)
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     task = asyncio.create_task(TelegramDelivery(client, sessions, repository, 42).follow(key))
     try:
@@ -677,64 +773,7 @@ async def test_draft_rate_limit_delays_following_complete_message():
 
 
 @pytest.mark.asyncio
-async def test_sent_message_id_is_used_for_rich_and_plain_edits_and_deletion():
-    calls = []
-
-    def response(request):
-        calls.append((request.url.path.rsplit("/", 1)[-1], json.loads(request.content)))
-        return httpx2.Response(200, json={"ok": True, "result": {"message_id": 321}})
-
-    async with httpx2.AsyncClient(transport=httpx2.MockTransport(response)) as http:
-        client = TelegramClient(http, "unused", "https://telegram.invalid")
-        message_id = await client.send(123, 9, "first", rich=True)
-        assert message_id == 321
-        await client.edit(123, message_id, "revised", rich=True)
-        await client.edit(123, message_id, "plain")
-        await client.delete(123, message_id)
-    assert calls == [
-        (
-            "sendRichMessage",
-            {"chat_id": 123, "message_thread_id": 9, "rich_message": {"markdown": "first"}},
-        ),
-        (
-            "editMessageText",
-            {"chat_id": 123, "message_id": 321, "rich_message": {"markdown": "revised"}},
-        ),
-        ("editMessageText", {"chat_id": 123, "message_id": 321, "text": "plain"}),
-        ("deleteMessage", {"chat_id": 123, "message_id": 321}),
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("method", "description"),
-    [
-        ("editMessageText", "Bad Request: message is not modified: specified new message content"),
-        ("deleteMessage", "Bad Request: message to delete not found"),
-    ],
-)
-async def test_already_applied_edit_and_delete_retries_succeed(method, description):
-    calls = 0
-
-    def response(request):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise httpx2.ReadError("acknowledgment lost", request=request)
-        return httpx2.Response(
-            400, json={"ok": False, "error_code": 400, "description": description}
-        )
-
-    async with httpx2.AsyncClient(transport=httpx2.MockTransport(response)) as http:
-        client = TelegramClient(http, "unused", "https://telegram.invalid")
-        with pytest.raises(TelegramFailure) as error:
-            await client.api(method, {"chat_id": 123, "message_id": 321})
-        assert error.value.code == 503
-        assert await client.api(method, {"chat_id": 123, "message_id": 321}) is True
-
-
-@pytest.mark.asyncio
-async def test_rich_edit_rejection_preserves_plain_fallback():
+async def test_rich_send_rejection_preserves_plain_fallback():
     def response(request):
         return httpx2.Response(
             400,
@@ -744,7 +783,7 @@ async def test_rich_edit_rejection_preserves_plain_fallback():
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(response)) as http:
         client = TelegramClient(http, "unused", "https://telegram.invalid")
         with pytest.raises(TelegramFailure) as error:
-            await client.edit(123, 321, "revised", rich=True)
+            await client.send(123, 0, "reply", rich=True)
     assert error.value.code == 400 and error.value.rich_content_rejected
 
 
@@ -770,15 +809,12 @@ async def test_delivery_waits_for_draft_before_reading_and_closes_on_cancel(repo
             yield [TextDelta(session_id, 0, 0, "text", "replace", "preview")]
             reads.append("final")
             yield [
-                MessageCommitted(
-                    HistoryMessage(session_id, 0, True, ModelResponse([TextPart("final")]))
-                )
+                MessageCommitted(HistoryMessage(session_id, 0, ModelResponse([TextPart("final")])))
             ]
         finally:
             closed.set()
 
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     task = asyncio.create_task(TelegramDelivery(client, sessions, repository, 42).consume(row))
     try:
@@ -818,7 +854,6 @@ async def test_draft_retry_and_plain_fallback_finish_before_next_read(repository
         assert (await repository.get_delivery(delivery_key(row))).after_seq == -1
 
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     await TelegramDelivery(client, sessions, repository, 42).consume(row)
     assert [call.kwargs["rich"] for call in client.send.call_args_list] == [True, True, False]
@@ -860,7 +895,6 @@ async def test_discovery_retry_preserves_existing_followers(repository, monkeypa
 
     monkeypatch.setattr(module, "retry_delay", lambda *args: 0)
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     task = asyncio.create_task(TelegramDelivery(telegram_client(), sessions, repository, 42).run())
     try:
@@ -974,14 +1008,12 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
                 HistoryMessage(
                     session_id,
                     0,
-                    True,
                     ModelResponse([TextPart(name + " final")]),
                 )
             )
         ]
 
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     sessions.live = live
     delivery = TelegramDelivery(client, sessions, repository, 42)
     tasks = [asyncio.create_task(delivery.consume(group))]
@@ -1059,25 +1091,23 @@ async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("chat_type", ["private", "supergroup"])
-async def test_durable_reply_is_sent_before_authority_and_edited_after_restart(
+async def test_complete_reply_advances_cursor_and_restart_deduplicates(
     repository, tmp_path, chat_type
 ):
     row = await delivery_row(repository, chat_type=chat_type)
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     client = telegram_client()
 
     async def live(session_id, *, after_seq):
-        request = ModelRequest([UserPromptPart("input")])
-        yield [MessageCommitted(HistoryMessage(session_id, 0, True, request))]
+        yield [
+            MessageCommitted(HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("input")])))
+        ]
         yield [TextDelta(session_id, 1, 0, "text", "replace", "preview")]
         complete = MessageCommitted(
-            HistoryMessage(session_id, 1, False, ModelResponse([TextPart("complete")]))
+            HistoryMessage(session_id, 1, ModelResponse([TextPart("complete")]))
         )
         yield [complete]
-        saved = await repository.get_delivery(delivery_key(row))
-        assert saved.after_seq == 0
-        assert saved.sent_responses == {"1": {"text": "complete", "message_ids": [123]}}
+        assert (await repository.get_delivery(delivery_key(row))).after_seq == 1
         yield [complete, TextDelta(session_id, 1, 0, "text", "append", "stale")]
 
     sessions.live = live
@@ -1087,24 +1117,10 @@ async def test_durable_reply_is_sent_before_authority_and_edited_after_restart(
     )
 
     async def replay(session_id, *, after_seq):
-        assert after_seq == 0
+        assert after_seq == 1
         yield [
-            MessageCommitted(
-                HistoryMessage(session_id, 1, False, ModelResponse([TextPart("complete")]))
-            )
-        ]
-        yield [
-            MessageCommitted(
-                HistoryMessage(session_id, 1, False, ModelResponse([TextPart("revised")]))
-            )
-        ]
-        yield [
-            MessageCommitted(
-                HistoryMessage(session_id, 1, True, ModelResponse([TextPart("revised")]))
-            ),
-            MessageCommitted(
-                HistoryMessage(session_id, 2, True, ModelRequest([UserPromptPart("next")]))
-            ),
+            MessageCommitted(HistoryMessage(session_id, 2, ModelRequest([UserPromptPart("next")]))),
+            MessageCommitted(HistoryMessage(session_id, 3, ModelResponse([TextPart("second")]))),
         ]
 
     async with open_storage(tmp_path / "telegram.sqlite3") as engine:
@@ -1114,79 +1130,10 @@ async def test_durable_reply_is_sent_before_authority_and_edited_after_restart(
             await restarted.get_delivery(delivery_key(row))
         )
         saved = await restarted.get_delivery(delivery_key(row))
-    assert saved.after_seq == 2 and saved.sent_responses == {}
+    assert saved.after_seq == 3 and saved.pending is None
     assert [
         call.args[2] for call in client.send.call_args_list if "draft_id" not in call.kwargs
-    ] == ["complete"]
-    client.edit.assert_awaited_once_with(123, 123, "revised", rich=True)
-
-
-@pytest.mark.asyncio
-async def test_provisional_reply_chunk_growth_and_interrupted_shrink_survive_restart(
-    repository, tmp_path
-):
-    row = await delivery_row(repository)
-    sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
-    client = telegram_client()
-    client.send.side_effect = [201, 202, 203]
-    body = "a" * 20000 + "\n\n" + "b" * 20000 + "\n\n" + "c" * 20000
-
-    async def live(session_id, *, after_seq):
-        assert after_seq == -1
-        for content in ("first", body):
-            yield [
-                MessageCommitted(
-                    HistoryMessage(session_id, 0, False, ModelResponse([TextPart(content)]))
-                )
-            ]
-
-    sessions.live = live
-    await TelegramDelivery(client, sessions, repository, 42).consume(row)
-    saved = await repository.get_delivery(delivery_key(row))
-    assert saved.after_seq == -1
-    assert saved.sent_responses == {"0": {"text": body, "message_ids": [201, 202, 203]}}
-    assert client.edit.call_args.args[1] == 201
-
-    async def shrink(session_id, *, after_seq):
-        yield [
-            MessageCommitted(
-                HistoryMessage(session_id, 0, False, ModelResponse([TextPart("short")]))
-            )
-        ]
-
-    sessions.live = shrink
-    client.delete.side_effect = [asyncio.CancelledError(), None, None]
-    with pytest.raises(asyncio.CancelledError):
-        await TelegramDelivery(client, sessions, repository, 42).consume(saved)
-    saved = await repository.get_delivery(delivery_key(row))
-    assert saved.pending is not None and saved.pending["item_index"] == 1
-    assert saved.item_offset == len("short") and saved.after_seq == -1
-
-    async def replay(session_id, *, after_seq):
-        assert after_seq == -1
-        yield [
-            MessageCommitted(
-                HistoryMessage(session_id, 0, False, ModelResponse([TextPart("short")]))
-            )
-        ]
-        yield [
-            MessageCommitted(
-                HistoryMessage(session_id, 0, True, ModelResponse([TextPart("final")]))
-            )
-        ]
-
-    async with open_storage(tmp_path / "telegram.sqlite3") as engine:
-        restarted = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
-        sessions.live = replay
-        await TelegramDelivery(client, sessions, restarted, 42).consume(
-            await restarted.get_delivery(delivery_key(row))
-        )
-        saved = await restarted.get_delivery(delivery_key(row))
-    assert saved.after_seq == 0 and saved.pending is None and saved.sent_responses == {}
-    assert client.send.await_count == 3
-    assert [call.args[1] for call in client.edit.await_args_list] == [201, 201, 201]
-    assert [call.args[1] for call in client.delete.await_args_list] == [203, 203, 202]
+    ] == ["complete", "second"]
 
 
 @pytest.mark.asyncio
@@ -1217,12 +1164,11 @@ async def test_durable_busy_and_ambiguous_start_are_not_retried_as_queued_input(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preview_seq", [1, 4])
 @pytest.mark.parametrize("complete_kind", ["text", "request", "tool_call", "tool_return"])
-async def test_durable_confirmation_clears_covered_previews_and_keeps_future(
+async def test_complete_message_clears_covered_previews_and_keeps_future(
     repository, preview_seq, complete_kind
 ):
     row = await delivery_row(repository)
     sessions = AsyncMock(spec=SessionService)
-    sessions.has_legacy_checkpoint.return_value = False
     client = telegram_client()
     messages = {
         "text": ModelResponse([TextPart("final")]),
@@ -1248,7 +1194,7 @@ async def test_durable_confirmation_clears_covered_previews_and_keeps_future(
         from unittest.mock import patch
 
         with patch("kapy.interfaces.telegram.delivery.time.monotonic", return_value=future_time):
-            yield [MessageCommitted(HistoryMessage(session_id, 3, True, messages[complete_kind]))]
+            yield [MessageCommitted(HistoryMessage(session_id, 3, messages[complete_kind]))]
         assert (await repository.get_delivery(delivery_key(row))).after_seq == 3
 
     sessions.live = live

@@ -245,16 +245,14 @@ Execution/cleanup failures are not retried.
 This closes the final queue-check/release handoff window without a persistent job
 queue. Cancel ends the current run at a boundary and leaves queued inputs intact.
 
-`live(id, after_seq=-1)` owns a confirmed Pub/Sub subscription before replaying
-history and following complete messages/deltas in nonempty event lists. Consumers
-apply each batch in order and acknowledge only fully applied authoritative messages.
-The connection directly advances through consecutive authoritative broadcasts; a
-gap triggers ordered history backfill. Preview messages and deltas neither advance
-the cursor nor trigger reads. Periodic history reads recover missed commits even
-during continuous preview traffic. History allows numeric gaps and provisional
-replacement, but authority after a provisional row fails the stream. Producers must
-preserve the confirmed prefix, including its membership. Legacy messages are
-non-authoritative and may replay; legacy consumers deduplicate by their own seq.
+`live(id, after_seq=-1)` subscribes before replaying history and following complete
+messages/deltas in nonempty event lists. Consumers apply each batch in order and
+persist the seq of their last fully applied complete message. Consecutive complete
+broadcasts advance the connection cursor directly; numeric jumps trigger ordered
+history backfill. Deltas neither advance cursors nor trigger reads. Periodic reads
+recover missed commits even during preview traffic. History allows numeric gaps;
+old complete messages and gaps remain fixed. Legacy and durable history share this
+cursor contract.
 History pagination uses before_seq independently. Use aclosing when
 stopping early. See [HTTP adapters](../interfaces/http/README.md) for application wiring,
 direct submission and WebSocket lifetime.

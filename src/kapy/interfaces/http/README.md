@@ -84,14 +84,12 @@ List providers/models/sessions with offset=0 and limit=100. Page contains only
 items and has_more; limit is 1..200. Fetch history without before_seq for the latest
 page, then use its earliest seq as exclusive before_seq to load older messages.
 Each page's items are ascending, and has_more describes older history. Connect live
-with the last fully applied authoritative prefix's seq, or -1 without one. after_seq is
-required on WebSocket; it is an exclusive cursor, unchanged by upward pagination.
-The service subscribes before replay. Consecutive authoritative broadcasts advance
-directly; a larger jump triggers ordered history backfill. Preview events do not
-advance or trigger reads. Periodic reads recover missed commits even during preview
-traffic. Sequence gaps proven by history are valid; provisional messages may repeat
-or be overwritten. An authoritative message after a provisional history row is a
-contract error and ends the stream instead of skipping that row.
+with the last fully applied complete message's seq, or -1 without one. after_seq
+is required on WebSocket; it is an exclusive cursor, unchanged by upward pagination.
+The service subscribes before replay. Consecutive complete broadcasts advance
+directly; a numeric jump triggers ordered history backfill. Deltas do not advance
+the cursor or trigger reads. Periodic reads recover missed commits during preview
+traffic. History may contain numeric gaps; recorded messages and old gaps stay fixed.
 
 WebSocket sends each live batch as a JSON array of existing delta and message DTOs
 using the SDK message codec. Apply items in order; frames are neither transactions
@@ -101,12 +99,10 @@ It does not poll history or signal execution completion. Client business frames
 close it with 1003; accepted-connection failures close it with 1011. Disconnect
 closes the generator and subscription even when idle, without cancelling the runner.
 A connection can span multiple runs. Temporary deltas have no replay guarantee:
-clear them on reconnect and resume from the last fully applied authoritative prefix. Delta and provisional
-message positions never advance that cursor. After fully applying an authoritative
-message, discard all provisional snapshots and previews at/below the new cursor,
-including numeric gaps; storage may delete them without a deletion event. Keep
-previews at later positions. Legacy append-only consumers may
-continue using their applied seq but must deduplicate repeated provisional history.
+clear them on reconnect and resume from the last fully applied complete message.
+Only complete messages advance that cursor. After application, discard previews
+at/below its seq, including numeric gaps, and keep those at later positions.
+Legacy and durable history use the same complete-message cursor contract.
 
 Frontends may replace their pending-input list from read_inputs after submissions,
 deletions and committed input messages, while merging history by seq. No separate

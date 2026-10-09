@@ -70,3 +70,65 @@ END IF; END $$"""),
             ops.ExecuteSQLOp("ALTER TABLE agent_context_pages RENAME TO agent_compactions"),
         ]
     )
+
+
+def immutable_history(context, revision, directives) -> None:
+    """Convert offline history/state before dropping the obsolete authority schema.
+
+    Only unconfirmed durable request rows are removed. Their positions are also
+    unmarked in runner_state while their SDK content remains available. The data
+    conversion cannot be reversed, so the generated downgrade rejects execution.
+    """
+    script = directives[0]
+    if len(script.upgrade_ops.ops) != 1 or not isinstance(
+        table := script.upgrade_ops.ops[0], ops.ModifyTableOps
+    ):
+        raise ValueError("immutable-history plan requires only the history authority removal")
+    detected = {
+        (
+            type(operation),
+            getattr(operation, "column_name", None),
+            getattr(operation, "index_name", None),
+        )
+        for operation in table.ops
+    }
+    expected = {
+        (ops.DropColumnOp, "authoritative", None),
+        (ops.DropIndexOp, None, "ix_agent_history_session_authoritative_seq"),
+    }
+    if table.table_name != "agent_history" or detected != expected:
+        raise ValueError("immutable-history plan requires only the history authority removal")
+    script.upgrade_ops.ops[:0] = [
+        ops.ExecuteSQLOp("""UPDATE sessions AS s
+SET runner_state = (
+    SELECT COALESCE(jsonb_agg(
+        CASE WHEN jsonb_typeof(m.value->'metadata') = 'object' THEN
+            jsonb_set(m.value, '{metadata}',
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM agent_history h
+                    WHERE h.session_id = s.id AND NOT h.authoritative
+                        AND h.kind = 'request'
+                        AND m.value->'metadata'->>'seq' = h.seq::text
+                        AND NOT EXISTS (
+                            SELECT 1 FROM agent_states a WHERE a.session_id = h.session_id
+                        )
+                ) THEN (m.value->'metadata') - 'seq' - 'authoritative'
+                ELSE (m.value->'metadata') - 'authoritative' END)
+        ELSE m.value END ORDER BY m.ordinality
+    ), '[]'::jsonb)::text
+    FROM jsonb_array_elements(s.runner_state::jsonb) WITH ORDINALITY AS m
+)
+WHERE runner_state IS NOT NULL"""),
+        ops.ExecuteSQLOp("""DELETE FROM agent_history h
+WHERE NOT h.authoritative AND h.kind = 'request'
+    AND NOT EXISTS (SELECT 1 FROM agent_states a WHERE a.session_id = h.session_id)"""),
+        ops.ExecuteSQLOp("""UPDATE agent_history
+SET message_metadata = jsonb_set(message_metadata::jsonb, '{metadata}',
+    (message_metadata::jsonb->'metadata') - 'authoritative')::json
+WHERE jsonb_typeof(message_metadata::jsonb->'metadata') = 'object'
+    AND message_metadata::jsonb->'metadata' ? 'authoritative'"""),
+    ]
+    script.downgrade_ops = ops.DowngradeOps([])
+    context.config.attributes["irreversible_reason"] = (
+        "Immutable history conversion is irreversible"
+    )

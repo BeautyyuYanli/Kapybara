@@ -19,12 +19,17 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models import ModelRequestContext
+from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.run import AgentRunResult
+from pydantic_ai.usage import RunUsage
 
-from kapy.runner_duarable import DurableExecutionConfig, MessageRecordCapability, RunnerDeps
-from kapy.runner_duarable.recording import record_before_model_request
+from kapy.runner_duarable import (
+    DurableExecutionConfig,
+    MessageRecordCapability,
+    Recorder,
+    RunnerDeps,
+)
 from kapy.runner_duarable.types import MessageBatch
 
 pytestmark = pytest.mark.asyncio
@@ -61,15 +66,15 @@ def metadata(message: ModelMessage) -> dict[str, Any]:
     return message.metadata
 
 
-def request_hook() -> Hooks:
+def request_hook(recorder: Recorder) -> Hooks:
     return Hooks(
-        model_request=record_before_model_request,
+        before_model_request=recorder.predict_response_seq,
         ordering=CapabilityOrdering(position="innermost", requires=[MessageRecordCapability]),
     )
 
 
 class FinishMessages(AbstractCapability[RunnerDeps]):
-    """Prepare inputs before dispatch and edit provisional output after the node."""
+    """Prepare inputs and finalize output before post-node recording."""
 
     def get_ordering(self) -> CapabilityOrdering:
         return CapabilityOrdering(position="outermost")
@@ -107,50 +112,73 @@ class FinishMessages(AbstractCapability[RunnerDeps]):
         return result
 
 
-async def test_three_boundaries_confirm_input_then_save_provisional_output(recorded):
+async def test_prediction_then_node_recording_leaves_after_run_tail_unrecorded(recorded):
     from pydantic_ai.models.function import FunctionModel
 
     predicted = []
 
     async def respond(messages, info):
         predicted.append(deps.response_seq)
-        assert messages[-1].metadata == {"prepared": True, "seq": 0, "authoritative": True}
+        assert messages[-1].metadata == {"prepared": True}
         assert [part.content for part in messages[-1].parts] == ["go", "late input"]
         assert messages[-1].instructions == "confirmed instructions"
-        assert recorded[-1].messages[0].message == messages[-1]
+        assert recorded == []
         return ModelResponse(parts=[TextPart("done")])
 
     deps = make_deps()
+    recorder = Recorder()
     agent = Agent(
         FunctionModel(respond),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(), FinishMessages(), request_hook()],
+        capabilities=[MessageRecordCapability(recorder), FinishMessages(), request_hook(recorder)],
     )
     result = await agent.run("go", deps=deps)
-    assert [[(m.seq, m.authoritative) for m in b.messages] for b in recorded] == [
-        [(0, True)],
-        [(1, False)],
-        [(1, False), (2, False)],
-    ]
+    assert [[m.seq for m in b.messages] for b in recorded] == [[0, 1]]
     assert recorded[0].messages[0].message.metadata == {
         "prepared": True,
         "seq": 0,
-        "authoritative": True,
     }
-    assert recorded[1].messages[0].message.parts == [TextPart("finished")]
+    assert recorded[0].messages[0].message.instructions == "confirmed instructions"
+    assert recorded[0].messages[1].message.parts == [TextPart("finished")]
     assert [m.metadata for m in result.all_messages()][-2:] == [
-        {"seq": 1, "authoritative": False},
-        {"seq": 2, "authoritative": False},
+        {"seq": 1},
+        None,
     ]
-    assert predicted == [1] and deps.response_seq is None
+    assert predicted == [1]
+
+
+async def test_prediction_preserves_working_history_and_request_context(recorded):
+    messages: list[ModelMessage] = [
+        ModelResponse([TextPart("anchor")], metadata={"seq": 5}),
+        ModelRequest([UserPromptPart("second")]),
+        ModelRequest([UserPromptPart("third")]),
+    ]
+    outgoing: list[ModelMessage] = [ModelRequest([UserPromptPart("model-only view")])]
+    model = TestModel()
+    ctx = RunContext(deps=make_deps(), model=model, usage=RunUsage(), messages=messages)
+    request_context = ModelRequestContext(
+        model=model,
+        messages=outgoing,
+        model_settings=None,
+        model_request_parameters=ModelRequestParameters(),
+    )
+    original_history, original_outgoing = deepcopy(messages), deepcopy(outgoing)
+
+    assert await Recorder().predict_response_seq(ctx, request_context) is request_context
+
+    assert ctx.deps.response_seq == 8
+    assert ctx.messages is messages and ctx.messages == original_history
+    assert request_context.messages is outgoing and outgoing == original_outgoing
+    assert recorded == []
 
 
 async def test_tools_and_output_tool_tail_use_same_recording_boundaries(recorded):
+    recorder = Recorder()
     agent = Agent(
         TestModel(custom_output_args=["one"]),
         output_type=list[str],
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(), request_hook()],
+        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
     )
 
     @agent.tool_plain
@@ -159,61 +187,55 @@ async def test_tools_and_output_tool_tail_use_same_recording_boundaries(recorded
 
     result = await agent.run("go", deps=make_deps())
     assert result.output == ["one"]
-    assert [[(m.seq, m.authoritative) for m in b.messages] for b in recorded] == [
-        [(0, True)],
-        [(1, False)],
-        [(1, True), (2, True)],
-        [(3, False)],
-        [(3, False), (4, False)],
-    ]
-    assert isinstance(recorded[-1].messages[-1].message.parts[0], ToolReturnPart)
+    assert [[m.seq for m in b.messages] for b in recorded] == [[0, 1], [2, 3]]
+    tail = result.all_messages()[-1]
+    assert isinstance(tail.parts[0], ToolReturnPart) and tail.metadata is None
+
+    restored = await agent.run("again", deps=make_deps(), message_history=result.all_messages())
+    assert [m.seq for m in recorded[2].messages][:2] == [4, 5]
+    assert isinstance(recorded[2].messages[0].message.parts[0], ToolReturnPart)
+    assert restored.output == ["one"]
 
 
-async def test_restore_merged_non_authoritative_tail_restarts_after_authority(recorded):
+async def test_restore_tail_starts_after_last_recorded_position(recorded):
+    recorder = Recorder()
     agent = Agent(
         TestModel(),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(), request_hook()],
+        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
     )
     history = [
-        ModelRequest(parts=[UserPromptPart("first")], metadata={"seq": 5, "authoritative": True}),
-        ModelResponse(parts=[TextPart("reply")], metadata={"seq": 10, "authoritative": True}),
-        ModelRequest(
-            parts=[UserPromptPart("second")], metadata={"seq": 90, "authoritative": False}
-        ),
-        ModelRequest(parts=[UserPromptPart("third")], metadata={"seq": 90}),
+        ModelRequest(parts=[UserPromptPart("first")], metadata={"seq": 5}),
+        ModelResponse(parts=[TextPart("reply")], metadata={"seq": 10}),
+        ModelRequest(parts=[UserPromptPart("second")]),
+        ModelRequest(parts=[UserPromptPart("third")]),
     ]
     result = await agent.run("new", deps=make_deps(), message_history=history)
-    assert [[m.seq for m in b.messages] for b in recorded] == [[11], [12], [12]]
+    assert [[m.seq for m in b.messages] for b in recorded] == [[11, 12, 13]]
     assert [part.content for part in recorded[0].messages[0].message.parts] == [
         "second",
         "third",
-        "new",
     ]
-    assert [metadata(m)["seq"] for m in result.all_messages()] == [5, 10, 11, 12]
-    assert [metadata(m)["authoritative"] for m in result.all_messages()] == [
-        True,
-        True,
-        True,
-        False,
-    ]
+    request = recorded[0].messages[1].message
+    assert isinstance(request, ModelRequest)
+    part = request.parts[0]
+    assert isinstance(part, UserPromptPart) and part.content == "new"
+    assert [metadata(m)["seq"] for m in result.all_messages()] == [5, 10, 11, 12, 13]
 
 
-async def test_non_authoritative_positions_never_advance_anchor(recorded):
+async def test_recorded_positions_skip_retries_and_preserve_gaps(recorded):
     messages = [
-        ModelResponse(parts=[TextPart("old")], metadata={"seq": 90}),
-        ModelRequest(parts=[UserPromptPart("tail")], metadata={"seq": 90, "authoritative": False}),
+        ModelResponse(parts=[TextPart("old")], metadata={"seq": 5}),
+        ModelRequest(parts=[UserPromptPart("tail")], metadata={"source": "business"}),
     ]
-    recorder, deps = MessageRecordCapability(), make_deps()
-    assert await recorder.record_messages(deps, messages, authoritative=False) == 2
+    recorder, deps = Recorder(), make_deps()
+    await recorder.record_messages(deps, messages)
     assert [m.metadata for m in messages] == [
-        {"seq": 0, "authoritative": False},
-        {"seq": 1, "authoritative": False},
+        {"seq": 5},
+        {"source": "business", "seq": 6},
     ]
-    assert await recorder.record_messages(deps, messages, authoritative=True) == 2
-    assert [[m.seq for m in b.messages] for b in recorded] == [[0, 1], [0, 1]]
-    assert await recorder.record_messages(deps, messages, authoritative=False) == 2
-    assert len(recorded) == 2
+    await recorder.record_messages(deps, messages)
+    assert [[m.seq for m in b.messages] for b in recorded] == [[6]]
 
 
 @pytest.mark.parametrize(
@@ -223,26 +245,21 @@ async def test_non_authoritative_positions_never_advance_anchor(recorded):
         ({"seq": -1}, "nonnegative integer"),
         ({"seq": "1"}, "nonnegative integer"),
         ({"seq": None}, "nonnegative integer"),
-        ({"authoritative": "true"}, "boolean"),
-        ({"authoritative": True}, "requires metadata.seq"),
     ],
 )
 async def test_invalid_metadata_rejected(recorded, metadata, error):
     with pytest.raises(UserError, match=error):
-        await MessageRecordCapability().record_messages(
-            make_deps(), [ModelResponse(parts=[], metadata=metadata)], authoritative=False
-        )
+        await Recorder().record_messages(make_deps(), [ModelResponse(parts=[], metadata=metadata)])
     assert recorded == []
 
 
 @pytest.mark.parametrize("seq", [5, 4])
-async def test_authoritative_marks_must_increase(recorded, seq):
+async def test_recorded_positions_must_increase(recorded, seq):
     messages: list[ModelMessage] = [
-        ModelResponse(parts=[], metadata={"seq": value, "authoritative": True})
-        for value in (5, seq)
+        ModelResponse(parts=[], metadata={"seq": value}) for value in (5, seq)
     ]
     with pytest.raises(UserError, match="strictly increasing"):
-        await MessageRecordCapability().record_messages(make_deps(), messages, authoritative=True)
+        await Recorder().record_messages(make_deps(), messages)
     assert recorded == []
 
 
@@ -250,21 +267,22 @@ async def test_failed_recording_keeps_live_metadata_and_independent_copy(monkeyp
     message = ModelRequest(parts=[UserPromptPart("original")], metadata={"source": "business"})
 
     async def fail(name, data, **kwargs):
-        assert data.messages[0].seq == 0 and data.messages[0].authoritative
+        assert data.messages[0].seq == 0
         data.messages[0].message.parts.clear()
         assert message.metadata == {"source": "business"} and message.parts
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr("kapy.runner_duarable.recording.workflow.execute_activity", fail)
     with pytest.raises(RuntimeError, match="database unavailable"):
-        await MessageRecordCapability().record_messages(make_deps(), [message], authoritative=True)
+        await Recorder().record_messages(make_deps(), [message])
     assert message.metadata == {"source": "business"} and message.parts
 
 
-async def test_model_failure_clears_prediction_and_retains_authoritative_input(recorded):
+async def test_model_failure_records_no_history(recorded):
     from pydantic_ai.models.function import FunctionModel
 
     deps = make_deps()
+    recorder = Recorder()
 
     async def fail(messages, info):
         assert deps.response_seq == 1
@@ -273,22 +291,22 @@ async def test_model_failure_clears_prediction_and_retains_authoritative_input(r
     agent = Agent(
         FunctionModel(fail),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(), request_hook()],
+        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
     )
     with pytest.raises(RuntimeError, match="model failed"):
         await agent.run("go", deps=deps)
-    assert deps.response_seq is None
-    assert [[(m.seq, m.authoritative) for m in b.messages] for b in recorded] == [[(0, True)]]
+    assert recorded == []
 
 
-async def test_confirmation_failure_prevents_model_dispatch(monkeypatch):
+async def test_recording_failure_occurs_after_model_dispatch(monkeypatch):
     from pydantic_ai.models.function import FunctionModel
 
     deps = make_deps()
+    recorder = Recorder()
     dispatched = []
 
     async def fail(name, data, **kwargs):
-        assert [(m.seq, m.authoritative) for m in data.messages] == [(0, True)]
+        assert [m.seq for m in data.messages] == [0, 1]
         raise RuntimeError("database unavailable")
 
     async def respond(messages, info):
@@ -299,53 +317,23 @@ async def test_confirmation_failure_prevents_model_dispatch(monkeypatch):
     agent = Agent(
         FunctionModel(respond),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(), request_hook()],
+        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
     )
     with pytest.raises(RuntimeError, match="database unavailable"):
         await agent.run("go", deps=deps)
-    assert dispatched == [] and deps.response_seq is None
+    assert len(dispatched) == 1
+    assert all("seq" not in (message.metadata or {}) for message in dispatched[0])
 
 
 async def test_shared_agent_runs_keep_independent_positions(recorded):
+    recorder = Recorder()
     agent = Agent(
-        TestModel(), deps_type=RunnerDeps, capabilities=[MessageRecordCapability(), request_hook()]
+        TestModel(),
+        deps_type=RunnerDeps,
+        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
     )
     results = await asyncio.gather(
         agent.run("first", deps=make_deps()), agent.run("second", deps=make_deps())
     )
     assert [[metadata(m)["seq"] for m in r.all_messages()] for r in results] == [[0, 1], [0, 1]]
     assert len({batch.session_id for batch in recorded}) == 2
-
-
-@pytest.mark.parametrize("leading_authority", [False, True])
-@pytest.mark.parametrize("with_tail", [False, True])
-async def test_recorder_ignores_provisional_messages_before_last_anchor(
-    recorded, leading_authority, with_tail
-):
-    messages: list[ModelMessage] = []
-    if leading_authority:
-        messages.append(
-            ModelResponse([TextPart("first")], metadata={"seq": 1, "authoritative": True})
-        )
-    ignored = ModelRequest(
-        [UserPromptPart("ignored")], metadata={"seq": 90, "authoritative": False}
-    )
-    messages.extend(
-        [ignored, ModelResponse([TextPart("anchor")], metadata={"seq": 5, "authoritative": True})]
-    )
-    original = deepcopy(messages)
-    if with_tail:
-        messages.append(
-            ModelRequest([UserPromptPart("tail")], metadata={"seq": 2, "authoritative": False})
-        )
-    next_seq = await MessageRecordCapability().record_messages(
-        make_deps(), messages, authoritative=True
-    )
-    assert next_seq == (7 if with_tail else 6)
-    assert messages[: len(original)] == original
-    if with_tail:
-        assert len(recorded) == 1
-        assert [(m.seq, m.authoritative) for m in recorded[0].messages] == [(6, True)]
-        assert metadata(messages[-1]) == {"seq": 6, "authoritative": True}
-    else:
-        assert recorded == []

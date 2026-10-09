@@ -8,7 +8,11 @@ from .models import TelegramTable
 from .storage import open_storage
 
 
-async def migrate(path: Path, operation: str, message: str | None = None) -> None:
+async def migrate(
+    path: Path, operation: str, message: str | None = None, *, plan: str | None = None
+) -> None:
+    if plan is not None and (operation != "revision" or plan != "immutable-history"):
+        raise ValueError("immutable-history is a revision generation plan")
     async with open_storage(path, create=operation in {"upgrade", "revision"}) as engine:
         async with engine.begin() as connection:
 
@@ -20,6 +24,10 @@ async def migrate(path: Path, operation: str, message: str | None = None) -> Non
                     version_table="plugin_telegram_schema_version",
                     owns_table=lambda name: name.startswith("plugin_telegram_"),
                 )
+                if plan is not None:
+                    from .revision_plans import immutable_history
+
+                    config.attributes["process_revision_directives"] = immutable_history
                 execute(config, operation, message=message)
 
             await connection.run_sync(run)
