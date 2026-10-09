@@ -113,7 +113,7 @@ one complete model/tool batch without automatic paging; `run()` checks host pagi
 paging and input acceptance. A page action never replaces the business turn result.
 
 `SessionExecutionCapability` owns SDK initialization recovery, input acceptance and
-node checkpoints through Pydantic AI 2.40.0's public hooks. It is injected into each
+node checkpoints through Pydantic AI 2.54.0's public hooks. It is injected into each
 business `Agent.iter()` alongside `OutputCapability`, without changing shared Agent
 configuration or caller deps. Its outermost node ordering checkpoints after ordinary
 business after-node hooks. Protocol/transaction failures are latched independently
@@ -134,8 +134,10 @@ queued runs and auxiliary paging calls.
 The handle keeps a committed working context and a separate SDK graph. Absolute
 history sequences never derive from SDK message indices or virtual context length.
 A new graph receives the assembled view as `message_history`; an existing graph
-applies rebuilt context through `before_model_request`, preserving the SDK's freshly
-resolved pending content, instructions and metadata. Ordinary turns append their
+applies rebuilt context through `before_model_request`, explicitly updating both
+public `RunContext.messages` and the independent request messages list. The
+historical prefix changes while the SDK's freshly resolved pending request keeps
+its content, instructions, metadata and identity. Ordinary turns append their
 committed messages without rereading all history.
 
 `open_runner(..., context_plugin=...)` and the lower-level `start_runner` borrow

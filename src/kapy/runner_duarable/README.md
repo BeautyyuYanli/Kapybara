@@ -70,8 +70,10 @@ boundaries record the entire suffix after the last authoritative SDK message:
 
 The recorder wraps all capabilities so reverse post-hook execution makes it last.
 Register business wrappers, including other innermost peers, before the request
-hook. This hook is later than SDK `before_model_request`: instructions and business
-request preparation have finished before it records and predicts the response.
+hook. It records the history prepared by those wrappers and predicts the response
+immediately before Temporal dispatch. The SDK executes `before_model_request`
+inside the wrap handler, so the provisional snapshot precedes that chain; the
+authoritative node boundary records the final history after it completes.
 
 Only messages with `metadata.authoritative=True` anchor numbering. Their
 `metadata.seq` values must be nonnegative strict integers and strictly increasing;

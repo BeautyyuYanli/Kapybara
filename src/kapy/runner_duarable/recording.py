@@ -109,7 +109,7 @@ async def record_before_model_request(
     request_context: ModelRequestContext,
     handler: WrapModelRequestHandler,
 ) -> ModelResponse:
-    """Run after business request preparation, immediately outside Temporal dispatch."""
+    """Record wrap-prepared history immediately outside Temporal dispatch."""
     recorder = next(
         capability
         for capability in ctx.capabilities.values()
