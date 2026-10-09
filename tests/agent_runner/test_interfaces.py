@@ -615,10 +615,10 @@ async def test_telegram_serve_draft_pacing_uses_publisher_setting(
             # Network work consumes part of the period rather than extending it.
             await asyncio.sleep(0.15)
             sent[int(content)].set()
-        else:
-            assert method == "sendRichMessage"
-            messages.append(content)
-        return {}
+            return True
+        assert method == "sendRichMessage"
+        messages.append(content)
+        return {"message_id": 123}
 
     async def live(self, target, *, after_seq):
         times.append(time.monotonic())
