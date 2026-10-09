@@ -48,7 +48,7 @@ settings、native tools 和 toolsets 使用原生契约。SDK 自动调用子项
 语义，不增加 priority 或依赖解析器。插件组与宿主静态 capability 作为整体组合，
 排序声明不能假定组内插件与宿主可以任意交错。
 
-项目锁定的 SDK 2.40.0 给 `CombinedCapability` 的子工具包装时会读取 live
+项目锁定的 SDK 2.54.0 给 `CombinedCapability` 的子工具包装时会读取 live
 `ctx.capabilities`，而 Temporal 的 Activity 上下文不携带这些实例。模块仅在
 `TemporalRunContext` 的 Activity 重建路径替换该工具归属包装：保留已有
 `capability_id`，缺失时使用插件声明的稳定 ID，并合并 `defer_loading`；其余
@@ -57,7 +57,7 @@ settings、native tools 和 toolsets 使用原生契约。SDK 自动调用子项
 延迟加载器对 Toolset instructions 的收集；其余组合和资源生命周期由 SDK 负责。
 模块不序列化 capability 对象，也不构造临时 context registry。
 
-SDK 2.40.0 的 `DynamicCapability` 外层工具集不向嵌套工具集转发逐步解析，因此
+SDK 2.54.0 的 `DynamicCapability` 外层工具集不向嵌套工具集转发逐步解析，因此
 插件内部的 `DynamicToolset` 或 `Capability(toolsets=[callable])` 不会自动逐步重建。
 本模块实现的是每次 `agent.run` 的插件选择和配置；插件工厂应直接构造具体 Toolset，
 不依赖内部 callable toolset 的步骤调度。
@@ -70,7 +70,7 @@ Activities；每个插件无需单独包装 `DynamicCapability`。Workflow 中�
 不在 `agent.run` 临时传入 `capabilities=` 或执行型 `toolsets=`。
 
 Temporal 聚合入口可以加载延迟 capability 的 instructions 并启用、调用其工具，但
-`load_capability` 返回不包含组内 Toolset instructions：SDK 2.40.0 的 Workflow
+`load_capability` 返回不包含组内 Toolset instructions：SDK 2.54.0 的 Workflow
 工具树不解析动态聚合内部的归属包装，延迟加载器无法收集这部分指令。普通运行保持
 完整的 capability 与 Toolset instructions；单个原生 `DynamicCapability` 没有此
 缺失。原生 `DynamicCapability` 返回 `CombinedCapability` 时又会在 Activity 访问
@@ -114,6 +114,6 @@ Toolset 在 `__aenter__` 获取资源，在 `__aexit__` 释放；进入失败也
 两个使用端均可通过 `python -m kapy.capability_plugins.examples.<in_process|temporal>`
 执行。Temporal 样例需要 `localhost:7233` 的服务。
 
-契约基于项目锁定的 Pydantic AI 2.40.0，参见 SDK 的
+契约基于项目锁定的 Pydantic AI 2.54.0，参见 SDK 的
 [DynamicCapability](https://pydantic.dev/docs/ai/capabilities/custom/#dynamically-building-a-capability)
 和 [Temporal Toolset](https://pydantic.dev/docs/ai/capabilities/durable_execution/temporal/#agent-names-and-toolset-ids)。

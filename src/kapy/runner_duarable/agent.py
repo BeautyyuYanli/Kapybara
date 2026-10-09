@@ -66,7 +66,8 @@ agent = Agent(
             model_request=record_before_model_request,
             ordering=CapabilityOrdering(
                 position="innermost",
-                wraps=[TemporalDurability],
+                # Temporal first installs its dispatch model; the recorder wraps it.
+                wrapped_by=[TemporalDurability],
                 requires=[MessageRecordCapability],
             ),
         ),

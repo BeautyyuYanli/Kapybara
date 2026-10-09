@@ -64,14 +64,17 @@ boundaries record the entire suffix after the last authoritative SDK message:
 
 | Boundary | authoritative | Ordering |
 | --- | --- | --- |
-| Before the model request | True | Innermost `Hooks(model_request=...)`, directly outside Temporal dispatch |
+| Before the model request | True | After SDK preparation, directly before model/Temporal Activity dispatch |
 | After each ModelRequestNode | False | Last `after_node_run`, after business hooks finalize the provisional response |
 | After the run | False | Last `after_run`, including any output-tool return tail |
 
 The recorder wraps all capabilities so reverse post-hook execution makes it last.
 Register business wrappers, including other innermost peers, before the request
-hook. This hook is later than SDK `before_model_request`: instructions and business
-request preparation have finished before it records and predicts the response.
+hook. SDK 2.54 runs `before_model_request` and message normalization inside the
+wrap handler. Temporal's wrap hook first installs its durable dispatch model;
+the recording hook runs inside it and installs a request-local model adapter that confirms the
+final prepared messages at `request`/`request_stream`, after those steps and
+immediately before the underlying model or Temporal model Activity is invoked.
 The acknowledged input prefix is frozen before the model handler runs. Authority
 does not establish provider receipt, prefix-cache creation or run success. The
 new response becomes authoritative only when a later model request includes it
@@ -94,13 +97,13 @@ from the same values. One `kapy.record_history` Activity commits the entire batc
 then broadcasts `MessageCommitted` snapshots from the accepted input DTOs. Only
 after acknowledgment does the recorder mark live SDK messages. Failure never
 prematurely marks them. Database filtering does not restore stored payloads into
-SDK messages or runner state. The request hook records `request_context.messages`,
+SDK messages or runner state. The model adapter records its final `messages` argument,
 the SDK's normalized, provider-prepared input, and after acknowledgment uses that
 same list in SDK working history. This preserves the confirmed message boundaries:
 leaving adjacent requests in working history would let the next SDK normalization
 merge them and discard their numbering metadata. Empty suffixes do not schedule an
-Activity. The request hook sets `RunnerDeps.response_seq` to the next position while invoking the model
-handler, then clears it in `finally`. Model Activities inherit that prediction;
+Activity. The adapter sets `RunnerDeps.response_seq` to the next position while invoking the underlying
+model, then clears it in `finally`. Model Activities inherit that prediction;
 retries reuse it.
 
 Business hooks preserve authoritative message content and numbering. Once the

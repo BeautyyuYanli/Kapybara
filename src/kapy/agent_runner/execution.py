@@ -430,7 +430,11 @@ class SessionExecutionCapability(AbstractCapability[Any]):
                 # The SDK has already resolved this request's dynamic instructions,
                 # metadata and pending content. Replace only its historical prefix.
                 prefix = state.require_context()[: -self.pending_history_count]
-                request_context = replace(request_context, messages=[*deepcopy(prefix), pending])
+                messages = [*deepcopy(prefix), pending]
+                # Request messages are an independent list. A rebuilt context also
+                # intentionally replaces persistent history for later checkpoints.
+                ctx.messages[:] = messages
+                request_context = replace(request_context, messages=messages)
                 state.context_changed = False
             self._request_prefix = deepcopy(request_context.messages[:-1])
             return request_context

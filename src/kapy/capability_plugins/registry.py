@@ -30,7 +30,7 @@ from .types import PluginDeps
 class _PluginToolset[DepsT: PluginDeps](WrapperToolset[DepsT]):
     """Keep ownership on tool definitions without requiring live run capabilities.
 
-    SDK 2.40's CombinedCapability ownership wrapper looks up ``ctx.capabilities``.
+    SDK 2.54's CombinedCapability ownership wrapper looks up ``ctx.capabilities``.
     Temporal intentionally excludes those live objects from Activity contexts.
     Plugins instead declare stable capability IDs that survive serialization.
     Lifecycle and calls still delegate to the original SDK toolset.

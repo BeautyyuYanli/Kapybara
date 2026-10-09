@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ from pydantic_ai import Agent, ModelRequestNode, RunContext
 from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering, Hooks
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
+    InstructionPart,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -17,6 +19,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.run import AgentRunResult
 
@@ -76,6 +79,20 @@ class FinishMessages(AbstractCapability[RunnerDeps]):
         request.metadata = {**(request.metadata or {}), "prepared": True}
         return await handler(request_context)
 
+    async def before_model_request(
+        self, ctx: RunContext[RunnerDeps], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        request = request_context.messages[-1]
+        assert isinstance(request, ModelRequest)
+        request.parts = [*request.parts, UserPromptPart("late input")]
+        return replace(
+            request_context,
+            model_request_parameters=replace(
+                request_context.model_request_parameters,
+                instruction_parts=[InstructionPart("confirmed instructions")],
+            ),
+        )
+
     async def after_node_run(self, ctx, *, node, result):
         if isinstance(node, ModelRequestNode):
             response = ctx.messages[-1]
@@ -98,6 +115,8 @@ async def test_three_boundaries_confirm_input_then_save_provisional_output(recor
     async def respond(messages, info):
         predicted.append(deps.response_seq)
         assert messages[-1].metadata == {"prepared": True, "seq": 0, "authoritative": True}
+        assert [part.content for part in messages[-1].parts] == ["go", "late input"]
+        assert messages[-1].instructions == "confirmed instructions"
         assert recorded[-1].messages[0].message == messages[-1]
         return ModelResponse(parts=[TextPart("done")])
 

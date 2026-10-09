@@ -5,7 +5,10 @@ before the last anchor are silently ignored. Storage independently protects the
 confirmed database prefix; discarded input is not restored into SDK history.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from copy import deepcopy
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -19,8 +22,10 @@ from pydantic_ai.capabilities import (
 )
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse
-from pydantic_ai.models import ModelRequestContext
+from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters, StreamedResponse
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.run import AgentRunResult
+from pydantic_ai.settings import ModelSettings
 from temporalio import workflow
 
 from kapy.agent_runner.types import HistoryMessage
@@ -103,13 +108,66 @@ class MessageRecordCapability(AbstractCapability[RunnerDeps]):
         return last_seq + 1 + len(pending)
 
 
+class _RecordingModel(WrapperModel):
+    """One request's adapter; confirm the SDK's final input before dispatch.
+
+    SDK 2.54 runs before hooks and message normalization inside the wrap handler.
+    The model boundary receives their final result in both streaming modes.
+    This adapter borrows the model and run context; neither is retained across runs.
+    """
+
+    def __init__(
+        self, wrapped: Model, ctx: RunContext[RunnerDeps], recorder: MessageRecordCapability
+    ) -> None:
+        super().__init__(wrapped)
+        self.ctx = ctx
+        self.recorder = recorder
+
+    @asynccontextmanager
+    async def confirmed_input(self, messages: list[ModelMessage]) -> AsyncIterator[None]:
+        response_seq = await self.recorder.record_messages(
+            self.ctx.deps, messages, authoritative=True
+        )
+        # Retain prepared boundaries so later SDK normalization cannot discard
+        # numbering metadata by merging adjacent confirmed requests.
+        self.ctx.messages[:] = messages
+        self.ctx.deps.response_seq = response_seq
+        try:
+            yield
+        finally:
+            self.ctx.deps.response_seq = None
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        async with self.confirmed_input(messages):
+            return await self.wrapped.request(messages, model_settings, model_request_parameters)
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        async with self.confirmed_input(messages):
+            async with self.wrapped.request_stream(
+                messages, model_settings, model_request_parameters, run_context
+            ) as response:
+                yield response
+
+
 async def record_before_model_request(
     ctx: RunContext[RunnerDeps],
     *,
     request_context: ModelRequestContext,
     handler: WrapModelRequestHandler,
 ) -> ModelResponse:
-    """Persist the frozen input after business preparation, before Temporal dispatch.
+    """Install confirmation at the prepared model boundary before Temporal dispatch.
 
     Authority records the input's commitment, not provider receipt or cache use.
     The new response remains provisional until a later request includes it.
@@ -119,14 +177,6 @@ async def record_before_model_request(
         for capability in ctx.capabilities.values()
         if isinstance(capability, MessageRecordCapability)
     )
-    response_seq = await recorder.record_messages(
-        ctx.deps, request_context.messages, authoritative=True
+    return await handler(
+        replace(request_context, model=_RecordingModel(request_context.model, ctx, recorder))
     )
-    # Keep the prepared boundaries in state: merging adjacent confirmed requests
-    # on the next run would otherwise discard their seq/authority anchors.
-    ctx.messages[:] = request_context.messages
-    ctx.deps.response_seq = response_seq
-    try:
-        return await handler(request_context)
-    finally:
-        ctx.deps.response_seq = None
