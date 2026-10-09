@@ -64,14 +64,19 @@ boundaries record the entire suffix after the last authoritative SDK message:
 
 | Boundary | authoritative | Ordering |
 | --- | --- | --- |
-| Before the model request | False | Innermost `Hooks(model_request=...)`, directly outside Temporal dispatch |
-| After each ModelRequestNode | True | Last `after_node_run`, after business hooks finalize messages |
+| Before the model request | True | Innermost `Hooks(model_request=...)`, directly outside Temporal dispatch |
+| After each ModelRequestNode | False | Last `after_node_run`, after business hooks finalize the provisional response |
 | After the run | False | Last `after_run`, including any output-tool return tail |
 
 The recorder wraps all capabilities so reverse post-hook execution makes it last.
 Register business wrappers, including other innermost peers, before the request
 hook. This hook is later than SDK `before_model_request`: instructions and business
 request preparation have finished before it records and predicts the response.
+The acknowledged input prefix is frozen before the model handler runs. Authority
+does not establish provider receipt, prefix-cache creation or run success. The
+new response becomes authoritative only when a later model request includes it
+as input. A final response and output-tool return tail remain stored provisionally
+when no later request follows.
 
 Only messages with `metadata.authoritative=True` anchor numbering. Their
 `metadata.seq` values must be nonnegative strict integers and strictly increasing;
@@ -89,18 +94,25 @@ from the same values. One `kapy.record_history` Activity commits the entire batc
 then broadcasts `MessageCommitted` snapshots from the accepted input DTOs. Only
 after acknowledgment does the recorder mark live SDK messages. Failure never
 prematurely marks them. Database filtering does not restore stored payloads into
-SDK messages or runner state. Empty suffixes do not schedule an Activity. The request
-hook sets `RunnerDeps.response_seq` to the next position while invoking the model
+SDK messages or runner state. The request hook records `request_context.messages`,
+the SDK's normalized, provider-prepared input, and after acknowledgment uses that
+same list in SDK working history. This preserves the confirmed message boundaries:
+leaving adjacent requests in working history would let the next SDK normalization
+merge them and discard their numbering metadata. Empty suffixes do not schedule an
+Activity. The request hook sets `RunnerDeps.response_seq` to the next position while invoking the model
 handler, then clears it in `finally`. Model Activities inherit that prediction;
 retries reuse it.
 
 Business hooks preserve authoritative message content and numbering. Once the
-node's messages are authoritative, later hooks may change provisional messages or
+input messages are authoritative, later hooks may change provisional messages or
 append new messages; the recorder only processes the suffix after the last anchor.
 There is no final Request rewrite. During a model request, do not
 insert or reorder messages before the response: that would invalidate the predicted
-seq used by provisional deltas. Content changes are allowed. Node-after recording
-always uses actual SDK history; no cross-seq preview migration is provided.
+seq used by provisional deltas. Only provisional content can change. Node-after
+recording always uses actual SDK history; no cross-seq preview migration is provided.
+To reproduce the last dispatched input, restore only authoritative entries in seq
+order with the SDK codec, then use the same instructions, tools and settings and
+let the SDK normalize them again. No new user prompt is added for this reproduction.
 
 `RunnerActivities.record_messages(MessageBatch)` retains the registered Activity
 name `kapy.record_history` and a 30-second timeout. Its transaction locks the
@@ -171,6 +183,9 @@ without a separate deletion event. Later positions retain their previews. Clear
 previews when reconnecting. Direct
 `AgentOutputService.subscribe()` remains available for callers owning their replay
 policy. Transport buffering is described in [the output contract](../agent_runner/README.md).
+Under Telegram's existing delivery rules, the final provisional response remains
+a temporary preview until a later model request confirms it. This runner does not
+emit a separate completion event that promotes it to a formal Telegram message.
 
 The module defines its own Agent at module scope. It reuses Provider/Model
 construction helpers, but does not import the legacy application Agent factory.

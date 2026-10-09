@@ -1,4 +1,4 @@
-"""Record the non-authoritative suffix at request, node and run boundaries.
+"""Confirm model inputs before dispatch and save provisional responses afterwards.
 
 Only authoritative SDK metadata anchors numbering. Non-authoritative messages
 before the last anchor are silently ignored. Storage independently protects the
@@ -42,7 +42,7 @@ class MessageRecordCapability(AbstractCapability[RunnerDeps]):
         result: NodeResult[RunnerDeps],
     ) -> NodeResult[RunnerDeps]:
         if isinstance(node, ModelRequestNode):
-            await self.record_messages(ctx.deps, ctx.messages, authoritative=True)
+            await self.record_messages(ctx.deps, ctx.messages, authoritative=False)
         return result
 
     async def after_run(
@@ -109,13 +109,22 @@ async def record_before_model_request(
     request_context: ModelRequestContext,
     handler: WrapModelRequestHandler,
 ) -> ModelResponse:
-    """Run after business request preparation, immediately outside Temporal dispatch."""
+    """Persist the frozen input after business preparation, before Temporal dispatch.
+
+    Authority records the input's commitment, not provider receipt or cache use.
+    The new response remains provisional until a later request includes it.
+    """
     recorder = next(
         capability
         for capability in ctx.capabilities.values()
         if isinstance(capability, MessageRecordCapability)
     )
-    response_seq = await recorder.record_messages(ctx.deps, ctx.messages, authoritative=False)
+    response_seq = await recorder.record_messages(
+        ctx.deps, request_context.messages, authoritative=True
+    )
+    # Keep the prepared boundaries in state: merging adjacent confirmed requests
+    # on the next run would otherwise discard their seq/authority anchors.
+    ctx.messages[:] = request_context.messages
     ctx.deps.response_seq = response_seq
     try:
         return await handler(request_context)

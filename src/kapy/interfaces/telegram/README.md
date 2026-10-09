@@ -108,7 +108,9 @@ task, queue consumer or recovery scan is installed.
 Each delivery consumes SessionService.live batches in order, with its persisted
 after_seq. Only fully delivered authoritative messages advance this cursor for
 durable sessions. Delta and non-authoritative complete messages update temporary
-previews; authoritative ModelResponse text becomes a formal message. Provisional
+previews; authoritative ModelResponse text becomes a formal message. The durable
+runner confirms model inputs before dispatch, so the final response remains a
+preview until a later model request includes and confirms it. Provisional
 messages replace previews at their own seq. Once authority is fully
 delivered or a non-text message is applied, delivery discards previews at/below the
 new cursor, including positions deleted when storage seals a numeric gap. Previews
