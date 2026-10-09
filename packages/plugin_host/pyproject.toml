@@ -1,0 +1,37 @@
+[project]
+name = "kapy-plugin-host"
+version = "0.1.0"
+description = "Durable RPC plugin instructions and hooks for Pydantic AI"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "jsonschema>=4.18,<5",
+    "pydantic>=2.13.5,<3",
+    "pydantic-ai-slim>=2.40.0,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pydantic-ai-slim[temporal]>=2.40.0,<3",
+    "pyrefly>=1.2.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.6",
+    "types-jsonschema>=4.26.0.20261006",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "plugin_host"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pyrefly]
+project-includes = ["src", "tests"]
+search-path = ["src", "tests"]
+python-version = "3.14"
