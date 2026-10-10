@@ -74,7 +74,8 @@ HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
 创建模型后在 Telegram 发送 `/model <provider UUID> <model name>`，同时更新当前
 聊天/话题的 session 模型并保存 bot 默认选择，后续新会话也使用它；选择重启后保留。
 `/model` 不带参数显示当前默认值。尚未选择模型时 bot 仍可启动，并提示配置命令。
-`KAPY_TELEGRAM_SESSION_TEMPLATE` 可作为没有已保存选择时的初始默认模板。
+`KAPY_TELEGRAM_SESSION_TEMPLATE` 配置新会话模板，可包含固定的 `layers` 配置；
+已保存的模型选择仅覆盖模板中的 provider/model，其余会话选项继续保留。
 可用 `KAPY_HTTP_PORT` / `KAPY_POSTGRES_PORT` / `KAPY_VALKEY_PORT` /
 `KAPY_TEMPORAL_PORT` / `KAPY_DRIZZLE_PORT` / `KAPY_TEMPORAL_UI_PORT`
 更改映射端口。

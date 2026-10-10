@@ -331,6 +331,32 @@ async def test_model_command_updates_session_and_persists_default_after_restart(
 
 
 @pytest.mark.asyncio
+async def test_saved_model_preserves_session_template_when_creating_after_restart(
+    repository, tmp_path
+):
+    template = CreateSession(
+        provider_id=uuid4(),
+        model_name="fallback-model",
+        layers={"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}},
+        model_settings={"temperature": 0.2},
+        compaction_threshold_tokens=5000,
+        compaction_replay_turns=3,
+    )
+    provider_id, model_name = uuid4(), "selected-model"
+    await repository.set_default_model(42, provider_id, model_name)
+    async with open_storage(tmp_path / "telegram.sqlite3") as engine:
+        restored = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
+        app, sessions, _ = controller(restored, tmp_path)
+        app.settings = app.settings.model_copy(update={"session_template": template})
+        await restored.ingest(42, [update(1, "/new")])
+        await app.process_once()
+        sessions.create_session.assert_awaited_once_with(
+            template.model_copy(update={"provider_id": provider_id, "model_name": model_name})
+        )
+        assert template.model_name == "fallback-model" and template.provider_id != provider_id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["malformed", "unknown", "unauthorized", "session-update"])
 async def test_failed_model_choice_preserves_previous_default(repository, tmp_path, failure):
     app, sessions, _ = controller(repository, tmp_path)

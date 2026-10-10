@@ -91,11 +91,15 @@ class TelegramController:
                 failures += 1
 
     async def session_template(self) -> CreateSession | None:
-        """Saved selection overrides the environment template using normal session defaults."""
+        """Saved selection replaces the model pair, preserving configured session options."""
         default = await self.repository.default_model(self.bot_id)
-        if default is not None:
+        if default is None:
+            return self.settings.session_template
+        if self.settings.session_template is None:
             return CreateSession(provider_id=default.provider_id, model_name=default.model_name)
-        return self.settings.session_template
+        return self.settings.session_template.model_copy(
+            update={"provider_id": default.provider_id, "model_name": default.model_name}
+        )
 
     async def resolve_model(self, text: str, session_id: UUID | None) -> dict[str, Any]:
         """Validate a complete model identity before recording a repeatable selection action."""
