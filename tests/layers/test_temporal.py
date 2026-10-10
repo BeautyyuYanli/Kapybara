@@ -16,12 +16,14 @@ from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.worker import Replayer, Worker
 
-from capability_plugins.temporal_agent import agent as resource_agent
-from capability_plugins.temporal_agent import approval_agent, events
-from capability_plugins.temporal_workflow import ApprovalWorkflow, ResourceWorkflow
-from kapy.capability_plugins import PluginDeps, PluginSpec
-from kapy.capability_plugins.examples.temporal_agent import agent as example_agent
-from kapy.capability_plugins.examples.temporal_workflow import PluginExampleWorkflow
+from kapy.layers import LayerDeps, load_layers
+from kapy.layers.examples.temporal_agent import agent as example_agent
+from kapy.layers.examples.temporal_agent import registry as example_registry
+from kapy.layers.examples.temporal_workflow import LayerExampleWorkflow
+from layers import tool_definitions
+from layers.temporal_agent import agent as resource_agent
+from layers.temporal_agent import approval_agent, events, registry, wrapped_agent
+from layers.temporal_workflow import ApprovalWorkflow, ResourceWorkflow
 
 
 async def connect() -> Client:
@@ -33,30 +35,32 @@ async def connect() -> Client:
 
 
 @pytest.mark.asyncio
-async def test_temporal_dynamic_toolsets_rebuild_resources_and_replay_without_effects() -> None:
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_temporal_dynamic_toolsets_rebuild_resources_and_replay_without_effects(
+    wrapped: bool,
+) -> None:
     events.clear()
     client = await connect()
-    queue = f"capability-plugins-resource-{uuid4()}"
+    queue = f"layers-resource-{uuid4()}"
     inputs = [
-        PluginDeps(
-            plugins=(
-                PluginSpec(plugin_name="echo", config={"prefix": f"{label}:"}),
-                PluginSpec(plugin_name="resource", config={"label": label}),
+        LayerDeps(
+            layers=load_layers(
+                {"echo": {"prefix": f"{label}:"}, "resource": {"label": label}}, {}, registry
             )
         )
         for label in ("A", "B")
-    ] + [PluginDeps()]
+    ] + [LayerDeps()]
     async with Worker(
         client,
         task_queue=queue,
         workflows=[ResourceWorkflow],
-        plugins=[AgentPlugin(resource_agent)],
+        plugins=[AgentPlugin(wrapped_agent if wrapped else resource_agent)],
     ):
         handles = await asyncio.gather(
             *(
                 client.start_workflow(
                     ResourceWorkflow.run,
-                    deps,
+                    args=[deps, wrapped],
                     id=f"{queue}-{index}",
                     task_queue=queue,
                     execution_timeout=timedelta(seconds=45),
@@ -82,10 +86,8 @@ async def test_temporal_dynamic_toolsets_rebuild_resources_and_replay_without_ef
         if event.HasField("activity_task_scheduled_event_attributes")
     }
     for operation in ("get_tools", "validate_args", "call_tool"):
-        assert (
-            f"agent__capability_plugins_test__dynamic_toolset__plugins__{operation}"
-            in activity_names
-        )
+        agent_name = "layers_wrapped_test" if wrapped else "layers_test"
+        assert f"agent__{agent_name}__dynamic_toolset__layers__{operation}" in activity_names
 
     effects = list(events)
     replayer = Replayer(workflows=[ResourceWorkflow], plugins=[PydanticAIPlugin()])
@@ -97,32 +99,29 @@ async def test_temporal_dynamic_toolsets_rebuild_resources_and_replay_without_ef
 @pytest.mark.asyncio
 async def test_temporal_consumer_example_and_invalid_input() -> None:
     client = await connect()
-    queue = f"capability-plugins-example-{uuid4()}"
+    queue = f"layers-example-{uuid4()}"
     async with Worker(
         client,
         task_queue=queue,
-        workflows=[PluginExampleWorkflow],
+        workflows=[LayerExampleWorkflow],
         plugins=[AgentPlugin(example_agent)],
     ):
-        deps = PluginDeps(plugins=(PluginSpec(plugin_name="echo", config={"prefix": "Temporal:"}),))
+        deps = LayerDeps(
+            layers=load_layers({"echo": {"prefix": "Temporal:"}}, {}, example_registry)
+        )
         output = await client.execute_workflow(
-            PluginExampleWorkflow.run,
+            LayerExampleWorkflow.run,
             args=["echo", deps],
             id=f"{queue}-valid",
             task_queue=queue,
             execution_timeout=timedelta(seconds=45),
         )
         assert json.loads(output) == {"example_echo": "Temporal:a"}
-        for index, spec in enumerate(
-            (
-                PluginSpec(plugin_name="unknown"),
-                PluginSpec(plugin_name="echo", config={"extra": True}),
-            )
-        ):
+        for index, (name, config) in enumerate((("unknown", {}), ("echo", {"extra": True}))):
             with pytest.raises(WorkflowFailureError) as caught:
                 await client.execute_workflow(
-                    PluginExampleWorkflow.run,
-                    args=["echo", PluginDeps(plugins=(spec,))],
+                    LayerExampleWorkflow.run,
+                    args=["echo", LayerDeps(layers={name: {"config": config, "state": {}}})],
                     id=f"{queue}-invalid-{index}",
                     task_queue=queue,
                     execution_timeout=timedelta(seconds=45),
@@ -133,8 +132,8 @@ async def test_temporal_consumer_example_and_invalid_input() -> None:
 @pytest.mark.asyncio
 async def test_temporal_preserves_nondefault_tool_definition_after_discovery_activity() -> None:
     client = await connect()
-    queue = f"capability-plugins-approval-{uuid4()}"
-    deps = PluginDeps(plugins=(PluginSpec(plugin_name="approval"),))
+    queue = f"layers-approval-{uuid4()}"
+    deps = LayerDeps(layers=load_layers({"approval": {}}, {}, {"approval": tool_definitions}))
     async with Worker(
         client,
         task_queue=queue,
@@ -160,6 +159,6 @@ async def test_temporal_preserves_nondefault_tool_definition_after_discovery_act
     assert any(
         event.HasField("activity_task_scheduled_event_attributes")
         and event.activity_task_scheduled_event_attributes.activity_type.name
-        == "agent__capability_plugins_approval__dynamic_toolset__plugins__get_tools"
+        == "agent__layers_approval__dynamic_toolset__layers__get_tools"
         for event in history.events
     )

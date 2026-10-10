@@ -1,4 +1,8 @@
-"""Session configuration, fixed plugin specs, lifecycle results and user inputs."""
+"""Public fixed layer Config, legacy plugin specs, lifecycle and user inputs.
+
+Execution State stays internal. Layer names/configuration cannot change through
+UpdateSession, and nonempty layers/plugins select mutually exclusive runners.
+"""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +40,7 @@ class InputSubmission(DTO):
 
 class CreateSession(DTO):
     plugins: list[PluginSpec] = Field(default_factory=list)
+    layers: dict[str, JsonObject] = Field(default_factory=dict)
     context_plugin: ContextPluginSpec = Field(default_factory=ContextPluginSpec)
     provider_id: UUID
     model_name: Name
@@ -43,6 +48,12 @@ class CreateSession(DTO):
     model_settings: JsonObject = Field(default_factory=dict)
     compaction_threshold_tokens: int | None = Field(default=None, gt=0, strict=True)
     compaction_replay_turns: int = Field(default=10, ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def choose_runner_components(self) -> Self:
+        if self.layers and self.plugins:
+            raise ValueError("layers and legacy plugins cannot be configured together")
+        return self
 
 
 class UpdateSession(UpdateDTO):
@@ -63,6 +74,7 @@ class UpdateSession(UpdateDTO):
 
 
 class SessionRecord(DTO):
+    layers: dict[str, JsonObject] = Field(default_factory=dict)
     context_plugin: ContextPluginSpec
     status: LifecycleStatus
     id: UUID

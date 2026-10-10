@@ -1,8 +1,11 @@
 """Session configuration, FIFO inputs and a coalescing cancellation bit.
 
 Sessions store the latest opaque runner snapshot and its submission version; the
-runner owns the encoding. Model references may dangle; services use no physical
-FKs; input and agent rows use the same session identifier.
+runner owns the encoding. Fixed native layer Config and mutable internal State
+live in separate JSON columns. Tools return State to the Workflow; its final
+snapshot saves all States and messages together. CLOSING cleanup saves individual
+layer progress. Model references may dangle; services use no physical FKs; input
+and agent rows use the same session identifier.
 """
 
 from datetime import datetime
@@ -51,6 +54,14 @@ class SessionRow(ControlTable, table=True):
     model_name: str = Field(sa_type=Text)
     model_settings: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSON(none_as_null=True), nullable=False)
+    )
+    layers: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON(none_as_null=True), nullable=False, server_default="{}"),
+    )
+    layer_states: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON(none_as_null=True), nullable=False, server_default="{}"),
     )
     context_plugin: dict[str, Any] = Field(
         default_factory=lambda: {"name": "kapy/summary", "config": {}},

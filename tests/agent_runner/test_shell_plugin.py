@@ -7,21 +7,18 @@ application's native Pydantic AI capability wiring inside a disposable container
 import asyncio
 import json
 import os
-import socket
-import subprocess
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import anyio
 import httpx2
 import pytest
-import pytest_asyncio
 from pydantic import ValidationError
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.tools import Tool
 from shellctl import ShellctlClient, ShellctlClientError
+from shellctl_fixture import shell_server as shell_server
 
 from kapy.agent_plugins import AgentPluginService, PluginSpec, StateConflict
 from kapy.agent_plugins.builtin.shell import ShellPlugin, ShellPluginConfig, ShellPluginState
@@ -422,57 +419,6 @@ async def test_close_retains_partial_progress_and_not_found_is_idempotent(shell_
         "/v1/jobs/b",
         "/v1/jobs/c",
     ]
-
-
-@pytest_asyncio.fixture
-async def shell_server(tmp_path):
-    """A private server, SQLite directory and tmux socket; never the deployment."""
-    binaries = Path(os.environ["KAPY_SHELLCTL_TEST_BIN_DIR"])
-    assert (binaries / "shellctl").is_file(), "Run make -C packages/shellctl build-server"
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
-    environment = {key: os.environ[key] for key in ("HOME", "USER", "LANG") if key in os.environ}
-    # The application image intentionally uses nologin; tmux needs a real shell.
-    environment.update(
-        PATH=f"{binaries}:/usr/bin:/bin", XDG_DATA_HOME=str(tmp_path), SHELL="/bin/bash"
-    )
-    tmux_socket = tmp_path / "shellctl/runtime/tmux.sock"
-    with (tmp_path / "server.log").open("wb") as log:
-        process = await asyncio.create_subprocess_exec(
-            str(binaries / "shellctl"),
-            "serve",
-            "--listen",
-            f"127.0.0.1:{port}",
-            env=environment,
-            stdout=log,
-            stderr=log,
-        )
-        try:
-            async with ShellctlClient(f"http://127.0.0.1:{port}", token="") as client:
-                with anyio.fail_after(10):
-                    while True:
-                        assert process.returncode is None
-                        try:
-                            await client.health()
-                            break
-                        except httpx2.TransportError:
-                            await anyio.sleep(0.05)
-                yield client, tmp_path
-        finally:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), 5)
-            except TimeoutError:
-                process.kill()
-                await asyncio.wait_for(process.wait(), 5)
-            await anyio.run_process(
-                ["tmux", "-S", str(tmux_socket), "kill-server"],
-                env=environment,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
 
 
 @pytest.mark.asyncio

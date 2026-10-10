@@ -278,6 +278,12 @@ export type CreateSessionAndSchedule = {
      * Plugins
      */
     plugins?: Array<PluginSpec>;
+    /**
+     * Layers
+     */
+    layers?: {
+        [key: string]: JsonObject;
+    };
     context_plugin?: ContextPluginSpec;
     /**
      * Provider Id
@@ -1289,6 +1295,12 @@ export type SessionInput = {
  * SessionRecord
  */
 export type SessionRecord = {
+    /**
+     * Layers
+     */
+    layers?: {
+        [key: string]: JsonObject;
+    };
     context_plugin: ContextPluginSpec;
     status: LifecycleStatus;
     /**

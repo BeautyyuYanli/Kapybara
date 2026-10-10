@@ -32,6 +32,18 @@ to NULL/0, without deriving state from legacy history. The runner owns encoding;
 the session repository owns versioned, idempotent replacement. These columns are
 internal storage and are absent from ordinary session configuration DTOs.
 
+Sessions store native layer configuration in `layers` JSON and internal execution
+State in `layer_states` JSON. The generated column revision gives both independent
+`{}` defaults and backfills existing rows with empty selections. Configuration
+names are fixed on creation. Successful tool calls return State to the Workflow
+without accessing these columns. The final successful snapshot saves all States
+and the opaque messages together using the existing version. Single-layer database
+updates are reserved for CLOSING session cleanup progress. Retry identity includes
+both snapshot contents. Generate this schema change with
+`kapy db revision --message 'Add session layer configuration and state'` against a
+disposable schema at the preceding revision. Layer State introduces no separate
+database, StateStore, or plugin-owned tables.
+
 `agent_history` stores fixed complete messages keyed by `(session_id, seq)`.
 Under the session row lock, durable writes insert only above the batch's pre-write
 maximum seq; old rows and their numeric gaps remain sealed. SDK `metadata.seq`

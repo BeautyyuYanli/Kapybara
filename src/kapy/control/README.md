@@ -78,7 +78,11 @@ continue the same Workflow. An ambiguous start error never retries automatically
 
 Provider values and merged model/session settings become DurableExecutionConfig;
 the interface validates protocol settings without constructing SDK resources.
-The Worker owns resources, output and saving. Business plugin bindings and legacy
+The Worker owns resources, output and saving. Native layers are selected through
+`CreateSession.layers`, a name-to-Config JSON dictionary. Creation validates the
+registered modules and default States; the choices remain fixed. Admission reads
+their configuration and latest State in the same locked session row as the message
+snapshot. Business plugin bindings and legacy
 checkpoints are rejected; context/compaction configuration, pending inputs and
 cancel flags remain stored but unused. Do not mix legacy/durable writers in one
 session or bypass this admission boundary. Closing checks durable status under
@@ -118,9 +122,11 @@ deletes its local models without blocking on or rewriting session references.
 No remote resources are deleted.
 
 Sessions have UUID identities, title, model identity, JSON model_settings and two
-paging columns, context_plugin JSON and a ready/closing/closed lifecycle status. create/get/list/update
+paging columns, context_plugin JSON, fixed `layers` configuration JSON and a
+ready/closing/closed lifecycle status. create/get/list/update
 and close APIs retain records; there is no physical deletion. Fixed plugin bindings
-are supplied in CreateSession.plugins. The shared application factory collects
+are supplied in CreateSession.plugins; a nonempty layers selection cannot coexist
+with these legacy bindings. The shared legacy application factory collects
 business capabilities and creates a fully configured base Agent per execution;
 direct Agent calls remain available for sessions without plugins. DTOs reject
 unknown fields. Updates preserve omitted fields and replace supplied JSON
@@ -137,18 +143,31 @@ version, initially NULL/0. The runner owns the encoding; these fields are absent
 from session configuration DTOs. Internal read/save methods expose an atomic
 state/version pair and versioned replacement, including idempotent retries. See
 the [Temporal runner](../runner_duarable/README.md) for its save contract.
+`SessionRecord.layers` exposes validated configuration only. Internal
+`sessions.layer_states` stores per-layer State; HTTP/PATCH cannot read or replace
+it. Successful tools return State to the Workflow without a database round trip.
+Only the final versioned save replaces all layer States and messages together;
+an execution that never commits that save retains the preceding snapshot.
 
 
-Session creation validates plugin config before saving ready session/binding records
+Session creation validates layer and plugin config before saving ready session/binding records
 in one transaction; it does not allocate external resources. `close_session(id)`
 first acquires the shared session lease. SessionBusy leaves all business state,
 inputs and cancel flags unchanged. After admission it checks durable Workflow status under the session row lock;
 active execution is busy and query failures propagate. It then records closing, cleans fixed
-bindings sequentially, and records each completed binding and then the session as
-closed. Failure preserves progress; explicit retry skips completed bindings. Close
+bindings sequentially, deletes known shell layer jobs, and records each completed
+binding/deletion and then the session as
+closed. Failure preserves CLOSING and unfinished bindings/jobs; an explicit retry
+continues from saved progress. Close
 never changes cancellation flags. Registered cleanup is confirmed; lost-owner
 external requests and orphan resources still require plugin reconciliation. See
 [Agent plugins](../agent_plugins/README.md) for StateStore and resource contracts.
+The native [shell layer](../layers/README.md) shares shell behavior with the legacy
+plugin and closes its own per-call clients. Its jobs remain alive after a run until
+session cleanup or shellctl retention removes them. Failed/cancelled execution
+can leave remote jobs outside the saved inventory; close cannot discover them.
+The legacy `start_runner()`
+entry rejects a session configured with layers before opening resources.
 
 Input intake and execution admission require ready. Admission is fenced by the
 acquired lease; no normal closer can change lifecycle until execution cleanup ends.

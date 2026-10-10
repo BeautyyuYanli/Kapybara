@@ -19,6 +19,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.providers import Provider
 from pydantic_ai.settings import ModelSettings
@@ -55,6 +56,10 @@ from kapy.control.models.runtime import (
 )
 from kapy.control.models.types import ModelRecord, ProviderConfig
 from kapy.control.types import utc_now
+from kapy.layers import load_layers
+from kapy.layers.registry import REGISTRY
+from kapy.layers.shell import layer as shell_layer
+from kapy.layers.types import JsonObject
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow
@@ -157,6 +162,13 @@ class SessionService:
         creation stores 70% of 256 Ki tokens, rounded down. Updates do not default it.
         """
         prepared = self.plugins.prepare_bindings(data.plugins)
+        try:
+            layers = load_layers(data.layers, {}, REGISTRY)
+        except UserError as exc:
+            raise ValueError(str(exc)) from exc
+        data = data.model_copy(
+            update={"layers": {name: entry["config"] for name, entry in layers.items()}}
+        )
         async with self._session_factory.begin() as db:
             try:
                 model = await ModelRepository(db).get_model(data.provider_id, data.model_name)
@@ -166,7 +178,8 @@ class SessionService:
             if threshold is None and (model is None or model.context_window is None):
                 threshold = 256 * 1024 * 7 // 10
             record = await SessionRepository(db).create_session(
-                data.model_copy(update={"compaction_threshold_tokens": threshold})
+                data.model_copy(update={"compaction_threshold_tokens": threshold}),
+                layer_states={name: entry["state"] for name, entry in layers.items()},
             )
             self.plugins.create_bindings(db, record.id, prepared)
         return record
@@ -209,9 +222,21 @@ class SessionService:
                     raise SessionBusy(f"Session {session_id} has an active Workflow")
                 row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
                 bindings = await BindingRepository(db).list(session_id)
+                layers = load_layers(row.layers, row.layer_states, REGISTRY)
             for binding in bindings:
                 if binding.status != LifecycleStatus.CLOSED:
                     await self.plugins.close_binding(binding, lease=lease)
+            for name, entry in layers.items():
+                if REGISTRY[name] is shell_layer:
+
+                    async def save_state(state: JsonObject, layer_name: str = name) -> None:
+                        async with self._session_factory.begin() as db:
+                            await lease.lock_owned(db)
+                            await SessionRepository(db).save_layer_cleanup(
+                                session_id, layer_name, state
+                            )
+
+                    await shell_layer.close_session(entry["config"], entry["state"], save_state)
             async with self._session_factory.begin() as db:
                 await lease.lock_owned(db)
                 row = await lock_session(db, session_id)
@@ -312,6 +337,7 @@ class SessionService:
                 session_id=session_id,
                 runner_state=state,
                 runner_state_version=version,
+                layers=load_layers(row.layers, row.layer_states, REGISTRY),
                 user_prompt=user_prompt,
                 config=DurableExecutionConfig(
                     provider_class=provider.provider_class,
@@ -438,6 +464,8 @@ class SessionService:
 
         async with self._session_factory.begin() as db:
             session = await SessionRepository(db).get_session(session_id)
+            if session.layers:
+                raise ValueError("Layer sessions require durable execution")
             repo = ModelRepository(db)
             model = await repo.get_model(session.provider_id, session.model_name)
             config = await repo.get_provider_config(session.provider_id)

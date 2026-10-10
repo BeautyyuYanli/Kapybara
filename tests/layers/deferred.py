@@ -2,16 +2,18 @@
 
 import json
 
-from pydantic_ai.capabilities import AbstractCapability, Capability
+from pydantic_ai.capabilities import Capability as NativeCapability
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo
 from pydantic_ai.toolsets import FunctionToolset
 
-from kapy.capability_plugins import PluginDeps
-from kapy.capability_plugins.examples.echo import EchoConfig
+from kapy.layers import LayerDeps
+from kapy.layers.examples.echo import Config, State
+
+__all__ = ["Config", "State", "Capability"]
 
 
-class LazyToolset(FunctionToolset[PluginDeps]):
+class LazyToolset(FunctionToolset[LayerDeps]):
     def __init__(self) -> None:
         def lazy_tool() -> str:
             return "lazy-result"
@@ -19,13 +21,15 @@ class LazyToolset(FunctionToolset[PluginDeps]):
         super().__init__(id="lazy-tools", tools=[lazy_tool], instructions="TOOLSET_RULE")
 
 
-def build_lazy(config: EchoConfig) -> AbstractCapability[PluginDeps]:
-    return Capability(
-        id="lazy",
-        defer_loading=True,
-        instructions="CAPABILITY_RULE",
-        toolsets=[LazyToolset()],
-    )
+class Capability(NativeCapability[LayerDeps]):
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(
+            id=name,
+            defer_loading=True,
+            instructions="CAPABILITY_RULE",
+            toolsets=[LazyToolset()],
+        )
 
 
 async def lazy_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:

@@ -16,12 +16,17 @@ from pydantic_ai.capabilities import CapabilityOrdering, Hooks, ResolveModelId
 from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model, ModelResolutionContext
+from shellctl.shared.constants import SHELL_TOOL_HARD_TIMEOUT_SECONDS
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.workflow import ActivityCancellationType
 
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
+from kapy.layers import layers_capability
+from kapy.layers.registry import REGISTRY
 
 from .context import RunnerActivityContext
+from .layers import LayerStateCapability, return_layer_state
 from .output import handle_deltas
 from .recording import MessageRecordCapability, Recorder
 from .types import RunnerDeps
@@ -63,6 +68,8 @@ agent = Agent(
     capabilities=[
         MessageRecordCapability(recorder),
         ResolveModelId(resolve_model),
+        layers_capability(REGISTRY, wrap_toolset=return_layer_state),
+        LayerStateCapability(),
         Hooks(
             before_model_request=recorder.predict_response_seq,
             ordering=CapabilityOrdering(
@@ -77,6 +84,16 @@ agent = Agent(
                 "start_to_close_timeout": timedelta(minutes=5),
                 # Temporal counts the initial attempt, so two attempts allow one retry.
                 "retry_policy": RetryPolicy(maximum_attempts=2),
+            },
+            toolset_activity_config={
+                "layers": {
+                    "start_to_close_timeout": timedelta(
+                        seconds=SHELL_TOOL_HARD_TIMEOUT_SECONDS + 60
+                    ),
+                    "retry_policy": RetryPolicy(maximum_attempts=1),
+                    "heartbeat_timeout": timedelta(seconds=10),
+                    "cancellation_type": ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+                }
             },
         ),
     ],

@@ -14,6 +14,7 @@ from kapy.agent_runner.types import HistoryMessage
 from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
 from kapy.control.types import DTO, JsonObject, Name
+from kapy.layers.types import LayerData
 
 
 class DurableExecutionConfig(DTO):
@@ -56,6 +57,7 @@ class RunnerInput(DTO):
     runner_state: str | None
     user_prompt: str
     config: DurableExecutionConfig
+    layers: dict[str, LayerData] = Field(default_factory=dict)
 
 
 class RunnerDeps(DTO):
@@ -64,6 +66,7 @@ class RunnerDeps(DTO):
     config: DurableExecutionConfig
     session_id: UUID
     response_seq: int | None = Field(default=None, ge=0, strict=True)
+    layers: dict[str, LayerData] = Field(default_factory=dict)
 
 
 class MessageBatch(DTO):
@@ -83,3 +86,4 @@ class SaveRunnerStateInput(DTO):
     session_id: UUID
     expected_version: int = Field(ge=0, strict=True)
     runner_state: str
+    layer_states: dict[str, JsonObject] = Field(default_factory=dict)

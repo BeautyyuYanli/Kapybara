@@ -10,6 +10,7 @@ from kapy.agent_runner.repository import AgentRepository
 from kapy.agent_runner.types import MessageCommitted
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
+from kapy.lifecycle import LifecycleError
 
 from .types import MessageBatch, SaveRunnerStateInput
 
@@ -61,6 +62,7 @@ class RunnerActivities:
                     data.session_id,
                     expected_version=data.expected_version,
                     runner_state=data.runner_state,
+                    layer_states=data.layer_states,
                 )
         except LookupError as exc:
             raise ApplicationError(str(exc), type="SessionNotFound", non_retryable=True) from exc
@@ -68,3 +70,5 @@ class RunnerActivities:
             raise ApplicationError(
                 str(exc), type="RunnerStateConflict", non_retryable=True
             ) from exc
+        except LifecycleError as exc:
+            raise ApplicationError(str(exc), type="SessionLifecycle", non_retryable=True) from exc

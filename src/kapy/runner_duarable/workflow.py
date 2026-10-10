@@ -9,6 +9,9 @@ from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.settings import ModelSettings
 from temporalio import workflow
 
+from kapy.layers import load_layers, snapshot_layers
+from kapy.layers.registry import REGISTRY
+
 from .agent import MODEL_ID, agent
 from .types import RunnerDeps, RunnerInput, SaveRunnerStateInput
 
@@ -27,19 +30,33 @@ class RunnerWorkflow:
             # UserError fails the execution under PydanticAIPlugin instead of
             # indefinitely retrying a Workflow Task with the same bad input.
             raise UserError("Invalid runner_state message history") from exc
+        try:
+            layers = load_layers(
+                {name: entry["config"] for name, entry in data.layers.items()},
+                {name: entry["state"] for name, entry in data.layers.items()},
+                REGISTRY,
+            )
+        except ValueError as exc:
+            raise UserError("Invalid layer configuration or state") from exc
+        deps = RunnerDeps(config=data.config, session_id=data.session_id, layers=layers)
         result = await agent.run(
             data.user_prompt,
             model=MODEL_ID,
             model_settings=cast(ModelSettings, data.config.model_settings),
-            deps=RunnerDeps(config=data.config, session_id=data.session_id),
+            deps=deps,
             message_history=history,
         )
+        try:
+            layer_states = snapshot_layers(deps, REGISTRY)
+        except ValueError as exc:
+            raise UserError("Invalid final layer state") from exc
         await workflow.execute_activity(
             "kapy.save_runner_state",
             SaveRunnerStateInput(
                 session_id=data.session_id,
                 expected_version=data.runner_state_version,
                 runner_state=result.all_messages_json().decode("utf-8"),
+                layer_states=layer_states,
             ),
             start_to_close_timeout=timedelta(seconds=30),
         )

@@ -128,3 +128,11 @@ configuration changes remain available after close. Model references may dangle;
 SDK settings/model availability are checked before direct execution starts. Business
 plugin bindings and legacy checkpoints cannot start durable execution. Context and
 compaction settings retain their CRUD behavior but are unused by the durable Worker.
+
+CreateSession also accepts native `layers` as registered name-to-Config JSON,
+for example `{"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}`.
+Unknown names, invalid Config, or combining nonempty layers with legacy plugins
+return 422. GET/list/create responses include normalized layer configuration;
+internal State is absent. PATCH cannot change layers or State. Durable starts
+restore the internal saved State, and close cleans up the shell inventory with
+the same retryable CLOSING lifecycle. See [Layers](../../layers/README.md).

@@ -23,7 +23,11 @@ and takes effect immediately without restarting the interface process.
 
 The optional `KAPY_TELEGRAM_SESSION_TEMPLATE` supplies the initial fallback, for example
 `{"provider_id":"00000000-0000-0000-0000-000000000001","model_name":"your-model"}`.
-The template accepts the existing CreateSession fields, including host paging values and context_plugin selection. Existing templates
+The template accepts the existing CreateSession fields, including host paging values,
+context_plugin selection and fixed native `layers` configuration. For example,
+add `"layers":{"shell":{"cwd":"/workspace","base_url":"http://shellctl:8765"}}`
+to enable the shell Toolset in newly created durable sessions. State is initialized
+and saved by SessionService/Worker. Existing templates
 without that field default to kapy/summary; the interface has no context logic.
 An omitted template or JSON `null` requires selecting a model before creating a
 session. A saved choice takes precedence over the entire environment template and
@@ -152,7 +156,7 @@ preview state. Cancellation unwinds the current read or send and closes the live
 Bot API, SQLite, Valkey and core PostgreSQL resources; exit does not set a user
 cancel flag. Existing legacy Telegram state is not imported.
 
-`/close` first acquires the session lease, then awaits sequential plugin cleanup
+`/close` first acquires the session lease, then awaits sequential plugin and shell-layer cleanup
 and keeps the route/history for inspection. A busy lease or active durable Workflow replies that close has
 not started and completes the inbox command; it is never automatically retried
 as a future close. Retry `/close` after execution exits; `/cancel` only stores the legacy flag.

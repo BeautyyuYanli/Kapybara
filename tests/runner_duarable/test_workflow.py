@@ -849,8 +849,20 @@ async def test_workflow_restores_state_and_records_after_run_tail_once(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["not-json", '{"history": []}', '[{"kind": "invalid"}]'])
-async def test_invalid_state_fails_workflow_before_model_call(endpoint, runner_database, state):
+@pytest.mark.parametrize(
+    ("state", "layers"),
+    [
+        ("not-json", {}),
+        ('{"history": []}', {}),
+        ('[{"kind": "invalid"}]', {}),
+        (None, {"shell": {"config": {"cwd": "relative"}, "state": {}}}),
+        (None, {"shell": {"config": {"cwd": "/tmp"}, "state": {"jobs": {"job": -1}}}}),
+        (None, {"unknown": {"config": {}, "state": {}}}),
+    ],
+)
+async def test_invalid_state_fails_workflow_before_model_call(
+    endpoint, runner_database, state, layers
+):
     from temporalio.client import WorkflowFailureError
     from temporalio.exceptions import ApplicationError
 
@@ -874,6 +886,7 @@ async def test_invalid_state_fails_workflow_before_model_call(endpoint, runner_d
                     session_id=runner_database.session_id,
                     runner_state_version=0,
                     runner_state=state,
+                    layers=layers,
                     user_prompt="hello",
                     config=make_config(base_url),
                 ),

@@ -35,27 +35,78 @@ including metadata seq marks and the unrecorded final tail. State remains a bare
 message-array JSON string, without a wrapper or cumulative run usage. The session
 layer stores it opaquely and does not expose it through session DTOs/HTTP.
 
-`SessionRepository.save_runner_state(id, expected_version=..., runner_state=...)`
+`SessionRepository.save_runner_state(id, expected_version=..., runner_state=..., layer_states=...)`
 borrows a transaction and locks the session row. Matching the current version
-replaces the state, increments the version once, and updates `updated_at`. If the
-current version is already `expected_version + 1` and the string matches exactly,
-the save succeeds without changes. Any other version/string mismatch raises
+replaces the message snapshot and all layer States together, increments the
+version once, and updates `updated_at`. The session must be READY and the State
+names must match its configured layers. If the current version is already
+`expected_version + 1` and both messages and States match exactly, the save
+succeeds without changes. Any other version/content mismatch raises
 `ValueError`. Two concurrent distinct results from the same base version cannot
-both commit. The same base version and string count as one submission, regardless
+both commit. The same base version, messages and States count as one submission, regardless
 of Workflow identity; retrying never refreshes the base version. Configuration
 updates and lifecycle changes do not increment this version.
 
 The save Activity owns and commits its database transaction before returning. It
 has a 30-second start-to-close timeout and uses Temporal's default retry policy
 for transient failures. Missing sessions and state conflicts become non-retryable
-`ApplicationError`s with types `SessionNotFound` and `RunnerStateConflict`. Save
+`ApplicationError`s with types `SessionNotFound`, `RunnerStateConflict`, and
+`SessionLifecycle`. Save
 failure propagates to the Workflow. Replay uses Temporal's recorded completion;
 if a commit succeeded but its acknowledgment was lost, repository idempotency
-handles the repeated Activity. Agent failure leaves the previous snapshot intact.
+handles the repeated Activity. Agent failure leaves the previous message snapshot intact.
 Cancellation or timeout during saving cannot undo an already committed transaction,
 so an unsuccessful Workflow may still have saved state. Saving never changes the
-session's lifecycle status. Partial failure/cancel snapshots are outside this
-runner's contract.
+session's lifecycle status. Until the final save commits, failure/cancellation
+leaves both messages and layer States at the preceding successful snapshot.
+
+## Layer configuration and State
+
+`CreateSession.layers` accepts registered names and configuration objects, such as
+`{"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}`. Creation
+validates Config and initializes State from `{}` without allocating resources.
+Names/configuration stay fixed for the session. The public session DTO returns
+configuration; internal PostgreSQL `sessions.layer_states` holds execution State.
+`SessionService.start_durable_runner()` reads both JSON columns with the message
+snapshot/version under its admission lock and fixes `RunnerInput.layers`.
+
+The [layer module contract](../layers/README.md) uses fixed Config/State exports
+and native Capability/Toolset classes. The Agent installs one dynamic `layers`
+capability. Components read `ctx.deps.layers[name]` and explicitly replace their
+own State JSON. SDK tool Activities reconstruct the selected modules from the
+Workflow's serialized deps; State transport performs no session database I/O.
+
+On ordinary tool success, an inner native Toolset wrapper validates the called
+layer's State and carries it in SDK `ToolReturn.metadata`. The outer Workflow
+wrapper applies only that layer's State before business hooks, then restores the
+original ordinary value or native ToolReturn, including its content, metadata
+and tools. Transport metadata never reaches model messages. Other layers'
+pending Workflow changes survive. Temporal records the successful result and
+State together, so replay needs neither database nor shell I/O for this boundary.
+
+Activity errors, cancellation and native `ModelRetry` follow the SDK's existing
+protocol and return no local State. Remote shell operations already performed are
+not rolled back or compensated. Even successful tool States stay only in the
+running Workflow until `snapshot_layers()` joins the final message transaction;
+a later run failure leaves the previous database inventory intact. Session close
+can clean only jobs in that saved inventory.
+
+All layer tools execute sequentially, so the next Activity receives the preceding
+call's returned State. The dynamic layer Activities have a finite shell hard
+timeout plus 60 seconds, a 10-second heartbeat timeout, at most one attempt, and
+wait for cancellation cleanup. Non-idempotent shell operations are not retried
+by Temporal. SDK `ModelRetry` still asks the model for a new call through its
+normal protocol. A lost remote acknowledgement can mean an operation executed.
+
+Shell jobs survive a completed run. Exclusive session close reads the latest
+saved inventory, deletes each known job, and saves progress after each confirmed
+deletion. Cleanup failure retains CLOSING and remaining jobs for a close retry.
+New layer sessions reject legacy `plugins` and the old Python runner entry;
+existing legacy plugin sessions retain their original execution and StateStore.
+
+Drain old Workflows before deploying this Agent definition. The successful tool
+payload and State transport changed; replay compatibility with previous Workflow
+code is not provided.
 
 ## Message recording and realtime output
 
@@ -164,14 +215,15 @@ receive up to 15 seconds to finish before cancellation.
 The Worker owns PostgreSQL and Valkey clients through `open_resources()`. It
 creates one `AgentOutputService` with prefix `settings.valkey_namespace +
 ":agent-output"`, injects it into `RunnerActivities`, and binds it with
-`bind_output_service()` before starting Worker tasks. Register both
-`record_messages` and `save_runner_state` alongside `AgentPlugin(agent)`; custom
+`bind_output_service(outputs)` before starting Worker tasks.
+Register `record_messages` and `save_runner_state` alongside
+`AgentPlugin(agent)`; custom
 Workers must also establish the binding around their entire Worker lifetime.
 
 `RunnerActivityContext` borrows this service in its constructor. SDK default
 context deserialization and `dataclasses.replace()` copies both call this
 constructor, so all asynchronous Activities on the Worker loop share the resource.
-The service is excluded from SDK serialization and is never placed in deps, state,
+The service is excluded from SDK serialization and never placed in deps, state,
 or Workflow inputs. Module passthrough keeps the context binding's identity shared;
 Workflow code never reads the binding or uses network clients. The same module-level
 Agent registers the context type and `handle_deltas` for Workflow and AgentPlugin.
