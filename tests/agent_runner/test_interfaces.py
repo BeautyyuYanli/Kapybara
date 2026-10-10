@@ -92,6 +92,69 @@ async def test_core_migrations_own_only_core_tables(database):
 
 
 @pytest.mark.asyncio
+async def test_creating_revision_preserves_legacy_status_and_json(database):
+    schema = "tmpv2_creating_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    session_id = uuid4()
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def upgrade(connection, target):
+                    connection.dialect.default_schema_name = schema
+                    config = migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, agent_metadata, lease_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+                    command.upgrade(config, target)
+
+                await db.run_sync(lambda connection: upgrade(connection, "0618cbf51930"))
+                await db.execute(
+                    text(
+                        "INSERT INTO sessions (id, title, provider_id, model_name, model_settings, "
+                        "status, layers, layer_states, compaction_replay_turns, "
+                        "created_at, updated_at) "
+                        "VALUES (:id, 'retained', :provider, 'test', '{}', 'closing', "
+                        '\'{"shell": {"cwd": "/tmp"}}\', '
+                        '\'{"shell": {"jobs": {"known": 8}}}\', 10, now(), now())'
+                    ),
+                    {"id": session_id, "provider": uuid4()},
+                )
+                await db.execute(
+                    text(
+                        "INSERT INTO plugin_agent_bindings (session_id, "
+                        "plugin_provider, plugin_name, "
+                        "data_version, config, state, revision, status, created_at, updated_at) "
+                        "VALUES (:id, 'builtin', 'example', 1, '{\"kept\": true}', "
+                        "'{\"progress\": 1}', :revision, 'closed', now(), now())"
+                    ),
+                    {"id": session_id, "revision": uuid4()},
+                )
+                session = (await db.execute(text("SELECT * FROM sessions"))).one()
+                binding = (await db.execute(text("SELECT * FROM plugin_agent_bindings"))).one()
+                await db.run_sync(lambda connection: upgrade(connection, "head"))
+                assert (await db.execute(text("SELECT * FROM sessions"))).one() == session
+                assert (
+                    await db.execute(text("SELECT * FROM plugin_agent_bindings"))
+                ).one() == binding
+                await db.execute(
+                    text("UPDATE sessions SET status='creating' WHERE id=:id"), {"id": session_id}
+                )
+                assert (
+                    await db.execute(text("SELECT status FROM sessions"))
+                ).scalar_one() == "creating"
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
 async def test_core_migrations_preserve_pages_and_execution(database):
     schema = "tmpv2_page_migration_" + uuid4().hex
     settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)

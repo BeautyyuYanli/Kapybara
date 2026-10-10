@@ -68,6 +68,12 @@ query and withdrawal semantics, including multimodal UserInput. Enqueueing never
 starts a runner. Existing operation IDs retain their names for client compatibility.
 Cancel endpoints store/read the legacy flag; durable execution does not consume it.
 
+Creation accepts an optional UUID `id`; retain it across lost responses. Duplicate
+IDs return 409 with `session_id` and do not replay scope enter or optional initial
+input. Errors after reservation begins include that ID in the safe error response,
+without upstream payloads. Query GET by this ID before deciding whether to close or
+create another session. The host never automatically repeats creation.
+
 `POST /sessions/{id}/runner` accepts `{user_prompt: string}`. It waits for Temporal
 start confirmation, then returns Workflow ID and actual run ID; 202 does not mean
 model completion. An active execution returns 409. Non-successful terminal execution
@@ -122,9 +128,10 @@ The host supplies the explicit Vite build directory and shares its existing reso
 lifespan. Missing index.html fails setup. See the root frontend/README.md.
 
 CreateSession accepts fixed `plugins` (provider/name/config); SessionRecord returns
-`status`. Close transitions ready -> closing -> closed and retains records. Intake
-and direct runner submission require ready; read/history/live and ordinary
-configuration changes remain available after close. Model references may dangle;
+`status`. Creation first commits creating and only publishes ready with complete
+State. Close transitions creating or ready -> closing -> closed and retains records.
+Intake, direct runner submission and execution configuration changes require ready;
+title metadata and read/history/live remain available in every phase. Model references may dangle;
 SDK settings/model availability are checked before direct execution starts. Business
 plugin bindings and legacy checkpoints cannot start durable execution. Context and
 compaction settings retain their CRUD behavior but are unused by the durable Worker.
@@ -135,7 +142,13 @@ Unknown names, invalid Config, or combining nonempty layers with legacy plugins
 return 422. GET/list/create responses include normalized layer configuration;
 internal State is absent. PATCH cannot change layers or State. Durable starts
 restore the internal saved State. Optional layer `enter_scope`/`exit_scope` hooks
-initialize business State and release registered resources. Close retains CLOSING
+initialize business State and release registered resources. Enter runs after durable
+identity/Config registration under the same lease as ready publication. Lost ready
+COMMIT responses are resolved from the authoritative row after the transaction ends;
+unconfirmed outcomes never trigger blind resource deletion. Abandoned creating exits
+all layers in reverse with None, including partial/uncalled enters, using ID/Config
+for recovery. Close retains CLOSING
 and validated cleanup progress on failure. Explicit `RetryableScopeError` gets
 three bounded hook attempts and returns 503 if exhausted; ordinary hook errors do
-not automatically retry. See [Layers](../../layers/README.md).
+not automatically retry. Enter only promises safe replay when explicitly raising
+this error; exit must always be idempotent. See [Layers](../../layers/README.md).

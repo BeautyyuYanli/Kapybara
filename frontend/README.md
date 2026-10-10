@@ -55,7 +55,9 @@ creation API and returned by session DTOs; State remains internal. The session f
 accepts a registered name on creation and JSON config; edits keep the name fixed.
 The host reference-round setting is separate from plugin config. Context and
 compaction settings remain editable for legacy consumers; durable execution does
-not use them. No provisional schema or handwritten API DTOs are
+not use them. Existing sessions permit execution configuration edits only while
+ready; creating, closing and closed sessions permit title-only saves. No provisional
+schema or handwritten API DTOs are
 retained. Only TypeScript, SDK and Fetch plugins are enabled.
 
 ```sh

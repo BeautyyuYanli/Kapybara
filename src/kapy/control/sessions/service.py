@@ -64,7 +64,7 @@ from kapy.layers import load_layers
 from kapy.layers.modules import dump_object, layer_types, prepare_layer_configs
 from kapy.layers.registry import REGISTRY
 from kapy.layers.scopes import retry_scope
-from kapy.layers.types import JsonObject, LayerData
+from kapy.layers.types import JsonObject
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow
@@ -75,6 +75,8 @@ from .types import (
     CreateSession,
     InputChannel,
     InputSubmission,
+    SessionAlreadyExists,
+    SessionCreationError,
     SessionInput,
     SessionRecord,
     SubmitInput,
@@ -162,14 +164,17 @@ class SessionService:
         self._execution_factory = execution_factory
 
     async def create_session(self, data: CreateSession) -> SessionRecord:
-        """Enter business scopes, then atomically save configuration and initial State.
+        """Reserve identity/Config, enter under its lease, then publish complete State.
 
         An omitted/None threshold stays None for a known model capacity; otherwise
         creation stores 70% of 256 Ki tokens, rounded down. Updates do not default it.
-        Hook I/O is outside transactions. Definite failures compensate successful
-        enters in reverse order; a started COMMIT has an uncertain outcome and
-        must never trigger resource deletion. Hooks own incomplete allocation and
-        process-crash recovery; there is no cross-system creation transaction.
+        Hook I/O is outside transactions. Failed initialization closes all configured
+        scopes with None, including partial and uncalled enters. A cancelled cleanup
+        hook leaves closing and does not prevent the other scopes' compensation.
+        A ready COMMIT error is resolved only after that transaction ends:
+        confirmed ready is kept;
+        creating is closed. An unavailable database leaves an unconfirmed outcome.
+        Restarted hosts never replay enter. Callers retain the fixed ID to query/close.
         """
         prepared = self.plugins.prepare_bindings(data.plugins)
         try:
@@ -179,68 +184,108 @@ class SessionService:
         data = data.model_copy(
             update={"layers": {name: dump_object(config) for name, config in configs.items()}}
         )
-        session_id = uuid4()
+        session_id = data.id or uuid4()
+        registered = False
         states: dict[str, JsonObject] = {}
-        entered: list[tuple[str, BaseModel, BaseModel]] = []
-        commit_started = False
+        # Validate default States before reservation; enter-backed States may have
+        # required fields and need not be constructible until the hook returns.
+        for name in configs:
+            if getattr(REGISTRY[name], "enter_scope", None) is None:
+                states[name] = dump_object(layer_types(name, REGISTRY)[1].model_validate({}))
         try:
-            for name, config in configs.items():
-                _, state_type, _ = layer_types(name, REGISTRY)
-                enter = getattr(REGISTRY[name], "enter_scope", None)
-                if enter is None:
-                    state = state_type.model_validate({})
-                else:
-                    returned = await retry_scope(
-                        lambda enter=enter, config=config: enter(
-                            session_id, config.model_copy(deep=True)
+            async with self._lease(session_id) as lease:
+                # Never call enter unless registration COMMIT was acknowledged.
+                async with self._scope_transaction(lease) as db:
+                    try:
+                        model = await ModelRepository(db).get_model(
+                            data.provider_id, data.model_name
                         )
+                    except LookupError:
+                        model = None
+                    threshold = data.compaction_threshold_tokens
+                    if threshold is None and (model is None or model.context_window is None):
+                        threshold = 256 * 1024 * 7 // 10
+                    await SessionRepository(db).register_creating(
+                        data.model_copy(update={"compaction_threshold_tokens": threshold}),
+                        session_id=session_id,
                     )
-                    if not isinstance(returned, state_type):
-                        raise TypeError(f"Layer {name!r} enter_scope must return its State")
-                    state = state_type.model_validate(dump_object(returned))
-                    entered.append((name, config, state))
-                states[name] = dump_object(state)
-            # Flush all writes before the commit boundary, including legacy bindings.
-            # A commit error/cancellation can follow a successful server-side commit.
-            async with self._session_factory() as db:
+                    self.plugins.create_bindings(db, session_id, prepared)
+                    await db.flush()
+                registered = True
                 try:
-                    model = await ModelRepository(db).get_model(data.provider_id, data.model_name)
-                except LookupError:
-                    model = None
-                threshold = data.compaction_threshold_tokens
-                if threshold is None and (model is None or model.context_window is None):
-                    threshold = 256 * 1024 * 7 // 10
-                record = await SessionRepository(db).create_session(
-                    data.model_copy(update={"compaction_threshold_tokens": threshold}),
-                    session_id=session_id,
-                    layer_states=states,
-                )
-                self.plugins.create_bindings(db, session_id, prepared)
-                await db.flush()
-                commit_started = True
-                await db.commit()
-            return record
-        except BaseException:
-            if not commit_started:
-                # Shield compensation from the cancellation that caused creation
-                # to fail. Each hook remains responsible for bounded remote I/O.
-                with anyio.CancelScope(shield=True):
-                    for name, config, state in reversed(entered):
-                        exit_hook = getattr(REGISTRY[name], "exit_scope", None)
-                        if exit_hook is not None:
-                            try:
-                                await retry_scope(
-                                    lambda hook=exit_hook, cfg=config, value=state: hook(
-                                        session_id, cfg.model_copy(deep=True), value
-                                    )
-                                )
-                            except BaseException:
-                                _logger.exception(
-                                    "Scope compensation failed for session %s layer %s",
-                                    session_id,
-                                    name,
-                                )
+                    for name, config in configs.items():
+                        enter = getattr(REGISTRY[name], "enter_scope", None)
+                        if enter is None:
+                            continue
+
+                        async def attempt(enter=enter, config=config):
+                            lease.check()
+                            return await enter(session_id, config.model_copy(deep=True))
+
+                        returned = await retry_scope(attempt)
+                        state_type = layer_types(name, REGISTRY)[1]
+                        if not isinstance(returned, state_type):
+                            raise TypeError(f"Layer {name!r} enter_scope must return its State")
+                        states[name] = dump_object(state_type.model_validate(dump_object(returned)))
+                    async with self._scope_transaction(lease) as db:
+                        record = await SessionRepository(db).publish_ready(session_id, states)
+                    return record
+                except BaseException as error:
+                    # The previous transaction's close has finished before probing
+                    # the authoritative row. Cancellation remains a cancellation,
+                    # even when this probe confirms successful creation.
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            resolved = await self._close_owned(
+                                session_id, lease, failed_creation=True
+                            )
+                        except BaseException:
+                            _logger.exception(
+                                "Creation outcome/compensation failed for session %s", session_id
+                            )
+                        else:
+                            if resolved.status == LifecycleStatus.READY and isinstance(
+                                error, Exception
+                            ):
+                                return resolved
+                    raise
+        except SessionAlreadyExists as error:
+            if not registered and error.session_id == session_id:
+                raise
+            raise SessionCreationError(session_id) from error
+        except SessionBusy as error:
+            if registered:
+                raise SessionCreationError(session_id) from error
+            raise SessionAlreadyExists(session_id) from error
+        except Exception as error:
+            raise SessionCreationError(session_id) from error
+        except BaseException as error:
+            error.add_note(f"Session creation identity: {session_id}")
             raise
+
+    def _lease(self, session_id: UUID) -> AbstractAsyncContextManager[SessionLease]:
+        return open_session_lease(
+            session_id,
+            session_factory=self._session_factory,
+            heartbeat_interval=self._heartbeat_interval,
+            heartbeat_timeout=self._heartbeat_timeout,
+            takeover_grace_period=self._takeover_grace_period,
+        )
+
+    @asynccontextmanager
+    async def _scope_transaction(
+        self, lease: SessionLease, *, budget: float = 5
+    ) -> AsyncIterator[AsyncSession]:
+        """Fence, commit and close in the owner task before its lease can be released."""
+        db = self._session_factory()
+        try:
+            with anyio.fail_after(budget):
+                await lease.lock_owned(db)
+                yield db
+                await db.commit()
+        finally:
+            with anyio.fail_after(5, shield=True):
+                await db.close()
 
     async def require_ready(self, session_id: UUID, *, db: AsyncSession | None = None) -> None:
         """Lock the session for intake or lease admission in the caller's transaction."""
@@ -255,56 +300,97 @@ class SessionService:
     async def close_session(self, session_id: UUID) -> SessionRecord:
         """Acquire exclusive ownership before deciding closing; Busy changes no state.
 
-        With a Temporal Client, check remote activity under the session row lock
-        before changing lifecycle. Query failures propagate; close never stops a
-        Workflow. Close never changes cancellation or pending inputs. Failures retain the
-        irreversible closing decision and completed cleanup progress for explicit retry.
+        With a Temporal Client, ready/closing sessions check remote activity under
+        the row lock before changing lifecycle. Creating skips the query so abandoned
+        scopes can be cleaned independently of Temporal; closed returns directly.
+        Query failures propagate; close never stops a Workflow. Close never changes
+        cancellation or pending inputs. Failures retain the irreversible closing
+        decision and completed cleanup progress for explicit retry.
         Registered resources are cleaned under the lease, including plugin exit;
         fencing cannot revoke already-issued external requests from a lost owner.
         Optional layer exits save mutated State after every attempt, even on
         error/cancellation. Only RetryableScopeError permits an automatic retry;
         a later close can repeat earlier successful exits, which must be idempotent.
+        Abandoned creating scopes have no saved State and exit with None. Ordinary
+        exit failures are recorded while the remaining configured exits are tried.
         """
-        async with open_session_lease(
-            session_id,
-            session_factory=self._session_factory,
-            heartbeat_interval=self._heartbeat_interval,
-            heartbeat_timeout=self._heartbeat_timeout,
-            takeover_grace_period=self._takeover_grace_period,
-        ) as lease:
-            async with self._session_factory.begin() as db:
-                await lease.lock_owned(db)
-                row = await lock_session(db, session_id)
-                if row.status == LifecycleStatus.CLOSED:
-                    return SessionRecord.model_validate(row)
-                if self._temporal_client is not None and await self.is_durable_runner_running(
-                    session_id
-                ):
-                    raise SessionBusy(f"Session {session_id} has an active Workflow")
-                row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
-                bindings = await BindingRepository(db).list(session_id)
-                layers = load_layers(row.layers, row.layer_states, REGISTRY)
-            for binding in bindings:
-                if binding.status != LifecycleStatus.CLOSED:
-                    await self.plugins.close_binding(binding, lease=lease)
-            for name, entry in layers.items():
-                await self._exit_layer_scope(session_id, name, entry, lease)
-            async with self._session_factory.begin() as db:
-                await lease.lock_owned(db)
-                row = await lock_session(db, session_id)
-                row.status, row.updated_at = LifecycleStatus.CLOSED, utc_now()
+        async with self._lease(session_id) as lease:
+            return await self._close_owned(session_id, lease)
+
+    async def _close_owned(
+        self, session_id: UUID, lease: SessionLease, *, failed_creation: bool = False
+    ) -> SessionRecord:
+        """Resolve abandoned creation or perform close while retaining the same lease."""
+        # Admission includes the existing ten-second Workflow query; preserve that
+        # RPC budget rather than timing it out at the shorter DB-only deadline.
+        async with self._scope_transaction(
+            lease, budget=_TEMPORAL_RPC_TIMEOUT.total_seconds() + 5
+        ) as db:
+            row = await lock_session(db, session_id)
+            if row.status == LifecycleStatus.CLOSED or (
+                failed_creation and row.status == LifecycleStatus.READY
+            ):
                 return SessionRecord.model_validate(row)
+            if (
+                not failed_creation
+                and row.status != LifecycleStatus.CREATING
+                and self._temporal_client is not None
+                and await self.is_durable_runner_running(session_id)
+            ):
+                raise SessionBusy(f"Session {session_id} has an active Workflow")
+            configs = prepare_layer_configs(row.layers, REGISTRY)
+            # READY always has a complete validated snapshot. An abandoned creating
+            # record stores no States at all; do not fabricate defaults for it.
+            states = deepcopy(row.layer_states)
+            if row.status == LifecycleStatus.READY or states:
+                if states.keys() != row.layers.keys():
+                    raise ValueError("Saved layer states must match the configured layer names")
+                states = {
+                    name: dump_object(layer_types(name, REGISTRY)[1].model_validate(value))
+                    for name, value in states.items()
+                }
+            row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
+            bindings = await BindingRepository(db).list(session_id)
+        error: Exception | asyncio.CancelledError | None = None
+        for binding in bindings:
+            if binding.status != LifecycleStatus.CLOSED:
+                await self.plugins.close_binding(binding, lease=lease)
+        for name, config in reversed(configs.items()):
+            try:
+                await self._exit_layer_scope(session_id, name, config, states.get(name), lease)
+            except asyncio.CancelledError as caught:
+                if not failed_creation:
+                    raise
+                _logger.exception(
+                    "Scope compensation cancelled for session %s layer %s", session_id, name
+                )
+                error = error or caught
+            except Exception as caught:
+                _logger.exception("Scope cleanup failed for session %s layer %s", session_id, name)
+                error = error or caught
+        if error is not None:
+            raise error
+        async with self._scope_transaction(lease) as db:
+            row = await lock_session(db, session_id)
+            if row.status != LifecycleStatus.CLOSING:
+                raise LifecycleError(f"Session {session_id} is {row.status}")
+            row.status, row.updated_at = LifecycleStatus.CLOSED, utc_now()
+            return SessionRecord.model_validate(row)
 
     async def _exit_layer_scope(
-        self, session_id: UUID, name: str, entry: LayerData, lease: SessionLease
+        self,
+        session_id: UUID,
+        name: str,
+        config: BaseModel,
+        saved_state: JsonObject | None,
+        lease: SessionLease,
     ) -> None:
         """Persist valid exit progress under ownership before propagating or retrying."""
         exit_hook = getattr(REGISTRY[name], "exit_scope", None)
         if exit_hook is None:
             return
-        config_type, state_type, _ = layer_types(name, REGISTRY)
-        config = config_type.model_validate(deepcopy(entry["config"]))
-        state = state_type.model_validate(deepcopy(entry["state"]))
+        _, state_type, _ = layer_types(name, REGISTRY)
+        state = None if saved_state is None else state_type.model_validate(deepcopy(saved_state))
 
         async def attempt() -> None:
             lease.check()
@@ -312,23 +398,15 @@ class SessionService:
 
         async def save_progress() -> None:
             nonlocal state
+            if state is None:
+                return
             # Model instances do not revalidate mutations by default. Round-trip
             # through JSON so persisted progress and the next attempt are validated.
             state = state_type.model_validate(dump_object(state))
             saved = dump_object(state)
-            # Keep commit/rollback in this task: the maker's begin context
-            # shields a separate commit task that can outlive our deadline/lease.
-            db = self._session_factory()
-            try:
-                with anyio.fail_after(5, shield=True):
-                    await lease.lock_owned(db)
+            with anyio.CancelScope(shield=True):
+                async with self._scope_transaction(lease) as db:
                     await SessionRepository(db).save_layer_cleanup(session_id, name, saved)
-                    await db.commit()
-            finally:
-                # Closing performs rollback on an aborted transaction. Give it
-                # its own bounded shield after the operation's deadline expires.
-                with anyio.fail_after(5, shield=True):
-                    await db.close()
 
         await retry_scope(attempt, after_attempt=save_progress)
 
@@ -411,6 +489,8 @@ class SessionService:
                 raise ValueError("Durable execution does not support business plugins")
             if await db.get(AgentStateRow, session_id) is not None:
                 raise ValueError("Legacy checkpoints cannot be resumed by durable execution")
+            if row.layer_states.keys() != row.layers.keys():
+                raise ValueError("Saved layer states must match the configured layer names")
             status = await self._durable_status(session_id)
             if status == WorkflowExecutionStatus.RUNNING:
                 raise SessionBusy(f"Session {session_id} has an active Workflow")

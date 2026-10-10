@@ -45,6 +45,8 @@ async def test_enter_allocates_nothing_and_exit_forgets_only_confirmed_deletions
     scope_id, config = uuid4(), layer.Config(cwd="/remote/work")
     state = await layer.enter_scope(scope_id, config)
     assert state == layer.State() and not requests and not closed
+    await layer.exit_scope(scope_id, config, None)
+    assert not requests and not closed
     state.jobs = {"a": 2, "b": 3, "c": 4}
     responses.extend(
         [

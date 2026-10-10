@@ -16,7 +16,7 @@ from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import Page, paginate
 
 from .models import SessionCancelRow, SessionInputRow, SessionRow
-from .types import CreateSession, InputChannel, SessionInput, SessionRecord
+from .types import CreateSession, InputChannel, SessionAlreadyExists, SessionInput, SessionRecord
 
 _input_adapter = TypeAdapter(UserInput)
 
@@ -46,18 +46,31 @@ class SessionRepository:
             raise LookupError(f"Session {session_id} does not exist")
         return row
 
-    async def create_session(
+    async def register_creating(
         self,
         data: CreateSession,
         *,
-        session_id: UUID | None = None,
-        layer_states: dict[str, JsonObject] | None = None,
-    ) -> SessionRecord:
-        values = data.model_dump(exclude={"plugins"})
-        if session_id is not None:
-            values["id"] = session_id
-        row = SessionRow(**values, layer_states=layer_states or {})
+        session_id: UUID,
+    ) -> None:
+        """Reserve fixed Config before any enter; caller holds the identity's lease."""
+        if await self._db.get(SessionRow, session_id) is not None:
+            raise SessionAlreadyExists(session_id)
+        values = data.model_dump(exclude={"plugins", "id"})
+        row = SessionRow(**values, id=session_id, status=LifecycleStatus.CREATING)
         self._db.add(row)
+        await self._db.flush()
+
+    async def publish_ready(
+        self, session_id: UUID, layer_states: dict[str, JsonObject]
+    ) -> SessionRecord:
+        """Publish complete State atomically under the caller's ownership transaction."""
+        row = await lock_session(self._db, session_id)
+        if row.status != LifecycleStatus.CREATING:
+            raise LifecycleError(f"Session {session_id} is {row.status}")
+        if layer_states.keys() != row.layers.keys():
+            raise ValueError("Initial layer states must match the configured layer names")
+        row.layer_states = layer_states
+        row.status, row.updated_at = LifecycleStatus.READY, utc_now()
         await self._db.flush()
         return SessionRecord.model_validate(row)
 
@@ -152,7 +165,10 @@ class SessionRepository:
         )
 
     async def update_session(self, session_id: UUID, values: dict[str, Any]) -> SessionRecord:
-        row = await self._session(session_id)
+        """Only READY can edit execution configuration; title stays editable in all phases."""
+        row = await lock_session(self._db, session_id)
+        if row.status != LifecycleStatus.READY and values.keys() - {"title"}:
+            raise LifecycleError(f"Session {session_id} is {row.status}")
         if "context_plugin" in values:
             if values["context_plugin"]["name"] != row.context_plugin["name"]:
                 raise ValueError("context_plugin.name cannot change after session creation")

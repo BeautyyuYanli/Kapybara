@@ -7,6 +7,8 @@ from .types import (
     CreateSession,
     InputChannel,
     InputSubmission,
+    SessionAlreadyExists,
+    SessionCreationError,
     SessionInput,
     SessionRecord,
     SubmitInput,
@@ -26,5 +28,7 @@ __all__ = [
     "SubmitInput",
     "SessionInput",
     "SessionService",
+    "SessionAlreadyExists",
+    "SessionCreationError",
     "DurableRunnerConflict",
 ]

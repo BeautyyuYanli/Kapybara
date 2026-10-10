@@ -1,6 +1,7 @@
 """Session-only Telegram input adapter with durable, at-least-once business calls.
 
-The inbox consumer is serial. Resolved targets and templates survive retries;
+The inbox consumer is serial. Resolved targets, templates and preallocated Session
+IDs survive retries; recovery queries that ID rather than repeating scope enter.
 core commits and private SQLite progress deliberately remain separate transactions.
 Polling and recovery never hold a transaction during a network or runner call.
 The model catalog is read only: /model changes the bound session's model pair and
@@ -13,7 +14,7 @@ import asyncio
 import logging
 import time
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
 from temporalio.service import RPCError
@@ -23,12 +24,14 @@ from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
     DurableRunnerConflict,
+    SessionAlreadyExists,
+    SessionCreationError,
     SessionService,
     SubmitInput,
     UpdateSession,
 )
 from kapy.layers import RetryableScopeError
-from kapy.lifecycle import LifecycleError
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.session_lease import SessionBusy
 
 from .client import TelegramClient, TelegramFailure, retry_delay
@@ -216,9 +219,39 @@ class TelegramController:
             await self.repository.save_action(item, action)
         if command not in {"ignore", "reply"} and not action.get("completed"):
             if action["session_id"] is None:
-                session = await self.sessions.create_session(
-                    CreateSession.model_validate(action["template"])
-                )
+                # Save the identity before the cross-database call. A core COMMIT
+                # can succeed without SQLite observing its response.
+                if not action.get("creating_session_id"):
+                    action["creating_session_id"] = str(uuid4())
+                    await self.repository.save_action(item, action)
+                candidate = UUID(action["creating_session_id"])
+                try:
+                    session = await self.sessions.get_session(candidate)
+                except LookupError:
+                    try:
+                        session = await self.sessions.create_session(
+                            CreateSession.model_validate(action["template"]).model_copy(
+                                update={"id": candidate}
+                            )
+                        )
+                    except SessionAlreadyExists:
+                        # Another owner may still be registering this identity;
+                        # never choose a fresh ID or repeat enter automatically.
+                        action["completed"] = True
+                        action["reply"] = (
+                            f"Session: {candidate}\nCreation is already reserved; "
+                            "query or close this ID explicitly."
+                        )
+                        await self.repository.save_action(item, action)
+                        return
+                if session.status != LifecycleStatus.READY:
+                    action["completed"] = True
+                    action["reply"] = (
+                        f"Session: {candidate}\nStatus: {session.status}\n"
+                        "Creation was not repeated. Query or close this ID explicitly."
+                    )
+                    await self.repository.save_action(item, action)
+                    return
                 await self.repository.bind(item, action, session.id)
                 action = dict(item.resolved_action or {})
             session_id = UUID(action["session_id"])
@@ -299,6 +332,17 @@ class TelegramController:
             await self.repository.save_action(
                 item,
                 {"command": "reply", "reply": "Unable to confirm Workflow state. Use /status."},
+            )
+        except SessionCreationError as error:
+            await self.repository.save_action(
+                item,
+                {
+                    "command": "reply",
+                    "reply": (
+                        f"Session: {error.session_id}\nUnable to confirm successful creation. "
+                        "Query or close this ID explicitly."
+                    ),
+                },
             )
         except PluginOperationError:
             await self.repository.save_action(

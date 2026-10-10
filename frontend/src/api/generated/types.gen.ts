@@ -275,6 +275,10 @@ export type CreateProvider = {
  */
 export type CreateSessionAndSchedule = {
     /**
+     * Id
+     */
+    id?: string | null;
+    /**
      * Plugins
      */
     plugins?: Array<PluginSpec>;
@@ -590,7 +594,7 @@ export type JsonValue = unknown;
 /**
  * LifecycleStatus
  */
-export type LifecycleStatus = 'ready' | 'closing' | 'closed';
+export type LifecycleStatus = 'creating' | 'ready' | 'closing' | 'closed';
 
 /**
  * LoadCapabilityArgs

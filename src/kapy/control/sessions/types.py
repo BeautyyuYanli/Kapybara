@@ -39,6 +39,13 @@ class InputSubmission(DTO):
 
 
 class CreateSession(DTO):
+    """Fixed execution configuration; optional id lets callers resolve lost responses.
+
+    Reusing an existing/reserved identity conflicts instead of replaying enter or
+    initial input. The caller queries or closes that same identity explicitly.
+    """
+
+    id: UUID | None = None
     plugins: list[PluginSpec] = Field(default_factory=list)
     layers: dict[str, JsonObject] = Field(default_factory=dict)
     context_plugin: ContextPluginSpec = Field(default_factory=ContextPluginSpec)
@@ -86,3 +93,23 @@ class SessionRecord(DTO):
     compaction_replay_turns: int
     created_at: datetime
     updated_at: datetime
+
+
+class SessionAlreadyExists(RuntimeError):
+    """A fixed identity is already registered or owned; never replay creation."""
+
+    def __init__(self, session_id: UUID) -> None:
+        self.session_id = session_id
+        super().__init__(f"Session {session_id} already exists or is being created")
+
+
+class SessionCreationError(RuntimeError):
+    """Creation failed after reservation began; query/close this identity explicitly.
+
+    The original error remains the cause for internal diagnostics. Resource or
+    commit outcomes may be unconfirmed, so this exception does not imply rollback.
+    """
+
+    def __init__(self, session_id: UUID) -> None:
+        self.session_id = session_id
+        super().__init__(f"Unable to complete creation of session {session_id}")

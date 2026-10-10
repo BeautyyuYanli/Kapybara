@@ -22,6 +22,7 @@ const model: ModelRecord = {
 };
 const session: SessionRecord = {
   context_plugin: { name: "kapy/summary", config: {} },
+  status: "ready",
   id,
   title: "Demo Session",
   provider_id: id,

@@ -46,30 +46,37 @@ Modules may independently export either of these async functions:
 
 ```python
 async def enter_scope(scope_id: UUID, config: Config) -> State: ...
-async def exit_scope(scope_id: UUID, config: Config, state: State) -> None: ...
+async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> None: ...
 ```
 
 The layer's scope ID is the host session UUID, stable across runs and process
-restarts. Session creation validates all exports/Config, then calls enters in
-configured order before opening its storage transaction. A valid returned State
+restarts. Session creation validates all exports/Config and default States, then
+acquires the session lease and commits `creating` with its identity and fixed Config.
+Only acknowledged registration permits enters, in configured order outside database
+transactions. A valid returned State
 is the initial State; its fields need not have defaults. Without enter, the host
 initializes State from `{}`. Hook parameters are validated model copies; persisted
 Config and State remain JSON objects. SDK component construction and client close
 are separate lifetimes and do not enter or exit the business scope.
 
-The host compensates successful enters in reverse order if later initialization
-or storage fails before COMMIT starts. It logs individual compensation failures,
-continues other exits, and preserves the original error. An unsuccessful enter
-has no valid returned State: the hook owns its partial allocations, using scope
-identity to recover them. Once COMMIT starts, its result may be uncertain, so no
-compensation runs. This is not an atomic transaction across the database and tool
-service; the service still needs crash/orphan recovery where appropriate.
+Complete State is saved atomically with `ready` under that same lease; partial
+initialization State is never saved. Failed/cancelled initialization first persists
+`closing`, then calls every configured exit in reverse order with None, including
+failed and uncalled enters. Exit must clean by scope ID and Config without State;
+None does not mean no resources. It must safely handle absent resources and repeated
+calls. One failed exit does not prevent other exits. Cleanup failure leaves durable
+`closing` for explicit close, while the original creation error remains the cause.
+After a ready COMMIT error, the original transaction ends before a new protected
+transaction resolves the authoritative row: ready is retained, creating is closed.
+Unavailable storage leaves the outcome unconfirmed and does not trigger blind exit.
 
-Session close obtains the existing exclusive lease, checks active Workflows, and
-persists `closing` before calling exits outside database transactions. An exit may
+Session close obtains the existing exclusive lease, checks active Workflows for
+initialized sessions, and persists `closing` before calling exits outside database
+transactions. An exit may
 mutate State to record confirmed cleanup. The host validates and saves that State
 under the lease after every attempt, including error or cancellation. Storage or
-validation failures stop the operation. All cleanup must succeed before `closed`;
+validation failures stop retrying that layer; remaining layers are still attempted.
+All cleanup must succeed before `closed`;
 failure keeps `closing` and any saved progress. A repeated close can call an earlier
 successful exit again; an already closed session returns without calling hooks.
 
@@ -78,13 +85,21 @@ at most three attempts separated by 0.5 seconds. Use exception chaining to retai
 the underlying cause. Ordinary errors, invalid State and cancellation are not
 retried; nested causes and exception groups do not imply retryability. Every retry
 uses the same scope ID and Config. Normal close exits retain revalidated, persisted
-cleanup State; creation-failure compensation retains only in-memory State. Hooks
-must be idempotent after partial effects, lost acknowledgements and repeated close.
+cleanup State; creation-failure compensation uniformly uses None. Enter need not
+be globally idempotent: throwing RetryableScopeError explicitly promises safe
+repetition of that call. Exit is always idempotent, including partial effects,
+lost acknowledgements and repeated close. A restarted host closes abandoned creating
+records rather than replaying enter. If remote creates can complete late, the service
+must terminally close scopes or the layer must reclaim late resources. The lease
+fences local writes and cannot revoke an already-issued external request.
 The host supplies no generic resource manager or background scope workflow.
 
-HTTP reports exhausted retryable scope errors as 503. Telegram records a reply
-requesting explicit `/close` or `/new`; neither interface adds an automatic retry
-after the hook's bounded attempts.
+CreateSession accepts an optional fixed UUID. Duplicate creation reports that
+identity without replaying enter or initial input; callers query or close the same
+ID. HTTP creation errors after reservation begins include the ID, hide upstream
+details and report exhausted retryable errors as 503. Telegram saves the ID before
+creation and queries it on inbox recovery. Neither interface automatically repeats
+creation after the hook's bounded attempts.
 
 `layers_capability(registry)` captures the module mapping at Agent construction
 and installs one stable `DynamicCapability(id="layers")`. Empty deps enables no
@@ -147,4 +162,7 @@ not. Failed cleanup leaves CLOSING and remaining jobs for an explicit close retr
 Each exit attempt has a 60-second budget; client close remains bounded. It owns
 neither the shellctl server nor its directories and files. Ambiguous remote acknowledgements
 can leave an unrecorded job or an already applied input; there is no remote
-exactly-once protocol.
+exactly-once protocol. For abandoned initialization, shell exit accepts None and
+makes no request because enter allocated no resources and tools could not run before
+ready. Ready close requires its valid saved jobs inventory. shellctl's jobs listing
+has no scope ownership field; cleanup cannot discover jobs missing from the snapshot.

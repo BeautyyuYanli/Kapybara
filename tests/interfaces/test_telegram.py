@@ -32,6 +32,7 @@ from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
     InputSubmission,
+    SessionCreationError,
     SessionInput,
     SessionService,
     SubmitInput,
@@ -87,8 +88,21 @@ def update(update_id, text="hello", *, chat=123, thread=0, **message):
 
 def controller(repository, tmp_path):
     sessions = AsyncMock(spec=SessionService)
-    sessions.create_session.return_value = SimpleNamespace(id=uuid4())
-    sessions.get_session.return_value = SimpleNamespace(status=LifecycleStatus.READY)
+    existing = {}
+
+    async def create(data):
+        record = SimpleNamespace(id=data.id, status=LifecycleStatus.READY)
+        existing[record.id] = record
+        sessions.create_session.return_value = record
+        return record
+
+    async def get(session_id):
+        if session_id not in existing:
+            raise LookupError("Session does not exist")
+        return existing[session_id]
+
+    sessions.create_session.side_effect = create
+    sessions.get_session.side_effect = get
     sessions.submit_input.return_value = InputSubmission(
         input=SessionInput(1, "hello"),
         should_start_runner=True,
@@ -295,7 +309,11 @@ async def test_model_command_without_session_only_saves_default(repository, tmp_
     await repository.ingest(42, [update(2, "/new")])
     await app.process_once()
     sessions.create_session.assert_awaited_once_with(
-        CreateSession(provider_id=provider_id, model_name="new-model")
+        CreateSession(
+            id=sessions.create_session.await_args.args[0].id,
+            provider_id=provider_id,
+            model_name="new-model",
+        )
     )
 
 
@@ -325,7 +343,11 @@ async def test_model_command_updates_session_and_persists_default_after_restart(
         assert model_name in new_client.send.call_args.args[2]
         await restarted.process_once()
         new_sessions.create_session.assert_awaited_once_with(
-            CreateSession(provider_id=provider_id, model_name=model_name)
+            CreateSession(
+                id=new_sessions.create_session.await_args.args[0].id,
+                provider_id=provider_id,
+                model_name=model_name,
+            )
         )
         new_sessions.update_session.assert_not_awaited()
         assert await restored.default_model(99) is None
@@ -352,7 +374,13 @@ async def test_saved_model_preserves_session_template_when_creating_after_restar
         await restored.ingest(42, [update(1, "/new")])
         await app.process_once()
         sessions.create_session.assert_awaited_once_with(
-            template.model_copy(update={"provider_id": provider_id, "model_name": model_name})
+            template.model_copy(
+                update={
+                    "id": sessions.create_session.await_args.args[0].id,
+                    "provider_id": provider_id,
+                    "model_name": model_name,
+                }
+            )
         )
         assert template.model_name == "fallback-model" and template.provider_id != provider_id
 
@@ -465,6 +493,74 @@ async def test_retry_after_confirmation_does_not_resubmit_or_recreate(repository
     sessions.start_durable_runner.assert_awaited_once()
     sessions.submit_input.assert_not_awaited()
     assert await repository.next_inbox(42) is None
+
+
+@pytest.mark.asyncio
+async def test_bind_failure_after_creation_recovers_saved_identity(
+    repository, tmp_path, monkeypatch
+):
+    app, sessions, _ = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/new first")])
+    original = repository.bind
+    original_create = sessions.create_session.side_effect
+
+    async def create_after_saved_identity(data):
+        # Read a fresh SQLite transaction before the first core-side effect.
+        item = await repository.next_inbox(42)
+        assert item is not None and item.resolved_action is not None
+        assert item.resolved_action["creating_session_id"] == str(data.id)
+        return await original_create(data)
+
+    sessions.create_session.side_effect = create_after_saved_identity
+
+    async def fail_bind(*args, **kwargs):
+        raise OperationalError("SQLite temporarily unavailable", {}, Exception())
+
+    monkeypatch.setattr(repository, "bind", fail_bind)
+    with pytest.raises(OperationalError):
+        await app.process_once()
+    item = await repository.next_inbox(42)
+    assert item is not None and item.resolved_action is not None
+    created_id = sessions.create_session.await_args.args[0].id
+    assert item.resolved_action["creating_session_id"] == str(created_id)
+    assert item.resolved_action["session_id"] is None
+    assert await repository.route(42, 123, 0) is None
+    sessions.start_durable_runner.assert_not_awaited()
+    monkeypatch.setattr(repository, "bind", original)
+    restarted, _, client = controller(repository, tmp_path)
+    restarted.sessions = sessions
+    await restarted.process_once()
+    assert await repository.route(42, 123, 0) == created_id
+    sessions.create_session.assert_awaited_once()
+    sessions.start_durable_runner.assert_awaited_once_with(created_id, user_prompt="first")
+    assert client.send.await_args.args[-1] == "New session created."
+    assert await repository.next_inbox(42) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase", [LifecycleStatus.CREATING, LifecycleStatus.CLOSING, LifecycleStatus.CLOSED]
+)
+async def test_inbox_recovery_reports_unfinished_scope_without_replaying_enter(
+    repository, tmp_path, phase
+):
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/new first")])
+    item = await repository.next_inbox(42)
+    assert item is not None
+    identity = uuid4()
+    action = await app.resolve(item)
+    action["creating_session_id"] = str(identity)
+    await repository.save_action(item, action)
+    sessions.get_session.side_effect = None
+    sessions.get_session.return_value = SimpleNamespace(id=identity, status=phase)
+    await app.process_once()
+    await app.process_once()
+    sessions.create_session.assert_not_awaited()
+    sessions.start_durable_runner.assert_not_awaited()
+    assert await repository.route(42, 123, 0) is None
+    assert str(identity) in client.send.await_args.args[-1]
+    assert f"Status: {phase}" in client.send.await_args.args[-1]
 
 
 @pytest.mark.asyncio
@@ -1122,7 +1218,11 @@ async def test_scope_retry_exhaustion_becomes_explicit_retry_reply(repository, t
     app, sessions, client = controller(repository, tmp_path)
     failure = RetryableScopeError("secret upstream information")
     if operation == "enter":
-        sessions.create_session.side_effect = failure
+
+        async def fail(data):
+            raise SessionCreationError(data.id) from failure
+
+        sessions.create_session.side_effect = fail
         await repository.ingest(42, [update(1, "/new")])
     else:
         await repository.ingest(42, [update(1, "/new")])
@@ -1132,8 +1232,14 @@ async def test_scope_retry_exhaustion_becomes_explicit_retry_reply(repository, t
     assert await app.process_once()
     assert await app.process_once()
     assert await repository.next_inbox(42) is None
-    retry = "/new" if operation == "enter" else "/close"
-    assert client.send.await_args.args[-1] == f"Layer scope operation failed. Use {retry} to retry."
+    if operation == "enter":
+        identity = sessions.create_session.await_args.args[0].id
+        assert str(identity) in client.send.await_args.args[-1]
+        assert "Query or close this ID" in client.send.await_args.args[-1]
+    else:
+        assert (
+            client.send.await_args.args[-1] == "Layer scope operation failed. Use /close to retry."
+        )
     assert "secret" not in str(client.send.await_args_list)
     if operation == "enter":
         sessions.create_session.assert_awaited_once()

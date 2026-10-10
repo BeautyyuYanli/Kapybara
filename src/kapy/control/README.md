@@ -123,7 +123,7 @@ No remote resources are deleted.
 
 Sessions have UUID identities, title, model identity, JSON model_settings and two
 paging columns, context_plugin JSON, fixed `layers` configuration JSON and a
-ready/closing/closed lifecycle status. create/get/list/update
+creating/ready/closing/closed lifecycle status. create/get/list/update
 and close APIs retain records; there is no physical deletion. Fixed plugin bindings
 are supplied in CreateSession.plugins; a nonempty layers selection cannot coexist
 with these legacy bindings. The shared legacy application factory collects
@@ -150,19 +150,32 @@ Only the final versioned save replaces all layer States and messages together;
 an execution that never commits that save retains the preceding snapshot.
 
 
-Session creation validates layer exports/Config and legacy plugin config, then calls
-each configured module's optional `enter_scope`. The hook may allocate business resources
-and returns the initial State, including required fields; without enter, State
-initializes from `{}`. Ready session/binding records are then saved in one transaction.
+Session creation validates layer exports/Config, default States and legacy plugin
+config, acquires the existing lease, and commits a creating Session plus fixed Config
+and legacy bindings before calling optional enters outside transactions. Enter may
+allocate business resources and return required State fields; without enter, State
+initializes from `{}`. Complete State and ready are then published atomically under
+the same ownership. Failed initialization first persists closing, then exits all
+configured layers in reverse with None, including partial or uncalled enters.
+No partial State is saved. Exit must clean by scope ID/Config without State and be
+idempotent; enter only promises safe repetition when raising RetryableScopeError.
+Creation compensation continues through hook cancellation, preserves the original
+creation error and leaves closing for explicit retry; normal close propagates
+cancellation after saving that hook's progress.
 See the [layer scope contract](../layers/README.md#business-scopes). `close_session(id)`
 first acquires the shared session lease. SessionBusy leaves all business state,
-inputs and cancel flags unchanged. After admission it checks durable Workflow status under the session row lock;
-active execution is busy and query failures propagate. It then records closing, closes
-fixed plugin bindings sequentially, and calls each configured module's optional
+inputs and cancel flags unchanged. For normal close of ready/closing sessions with an
+injected Temporal Client, it checks durable Workflow status under the session row
+lock; active execution is busy and query failures propagate. Creating skips this
+query so abandoned scopes can be cleaned independently of Temporal; closed returns
+directly. Cleanup then records closing, closes fixed plugin bindings sequentially,
+and calls each configured module's optional
 `exit_scope`. Completed bindings are saved individually; normal session close
 validates and saves layer State after every hook attempt. The session becomes closed
 after all cleanup succeeds. Failure preserves CLOSING, unfinished bindings and saved
-layer progress; an explicit retry continues from that progress. Close
+layer progress; an explicit retry continues from that progress. Abandoned creating
+sessions use None rather than fabricated default State. Only all successful exits
+allow closed; one failed layer does not prevent the remaining exits. Close
 never changes cancellation flags. Registered cleanup is confirmed; lost-owner
 external requests and orphan resources still require layer/plugin reconciliation. See
 [Agent plugins](../agent_plugins/README.md) for StateStore and resource contracts.
@@ -173,10 +186,21 @@ can leave remote jobs outside the saved inventory; close cannot discover them.
 The legacy `start_runner()`
 entry rejects a session configured with layers before opening resources.
 
-Input intake and execution admission require ready. Admission is fenced by the
+Creation accepts an optional fixed `id`; duplicate IDs raise SessionAlreadyExists
+without replaying enter. Errors after reservation begins raise SessionCreationError
+with that ID and the original cause; cancellation still propagates.
+Hook errors carrying another Session ID are wrapped with this creation's ID.
+After an uncertain ready COMMIT, its transaction finishes before a new owned
+transaction locks the main
+database row: ready confirms success, creating permits closing/compensation. If the
+database is unreachable, the outcome remains unconfirmed. Callers query or explicitly
+close the same ID. There is no enter replay, creating Workflow or background sweeper.
+
+Input intake, execution configuration updates and execution admission require ready.
+Title metadata remains editable in every phase. Admission is fenced by the
 acquired lease; no normal closer can change lifecycle until execution cleanup ends.
-Queries/history/live, cancellation, input withdrawal and ordinary configuration
-updates remain usable in closing/closed. SDK-dependent model settings are validated
+Queries/history/live, cancellation and input withdrawal remain usable in every phase.
+SDK-dependent model settings are validated
 at execution startup, leaving inputs untouched on failure. Plugin choices and
 lifecycle fields cannot be patched through UpdateSession.
 

@@ -666,7 +666,9 @@ async def test_service_uses_configured_timeout_and_renews_while_model_waits(
         CreateSession(provider_id=provider.id, model_name="custom")
     )
     async with database.sessions.begin() as db:
-        db.add(SessionLeaseRow(session_id=session.id, lock_token=uuid4()))
+        owned = await db.get(SessionLeaseRow, session.id)
+        assert owned is not None
+        owned.lock_token = uuid4()
         await db.flush()
         await db.execute(
             text(

@@ -81,7 +81,10 @@ ownership loss aborts its fenced save without retry. Custom validators and
 migration functions must perform no I/O or external mutations; they run outside
 transactions, without a plugin instance or SessionContext.
 
-Session status advances ready -> closing -> closed. Ready permits execution; it
+Session creation reserves creating before publishing ready; a failed reservation
+never opens legacy plugin resources. Session status then advances ready -> closing
+-> closed, or creating -> closing -> closed when abandoned. Legacy binding status
+retains ready/closing/closed only. Ready permits execution; it
 never promises resources already exist. Close first acquires the same lease as
 execution. A live owner raises SessionBusy without changing session, bindings,
 cancel or inputs. After admission, close locks the lease and session rows to record

@@ -1,9 +1,13 @@
-"""Shared session/binding progress; closed confirms registered-resource cleanup only."""
+"""Shared progress; creating is Session-only, while legacy bindings start ready.
+
+Closed confirms configured cleanup, not discovery/revocation of external requests.
+"""
 
 from enum import StrEnum
 
 
 class LifecycleStatus(StrEnum):
+    CREATING = "creating"
     READY = "ready"
     CLOSING = "closing"
     CLOSED = "closed"

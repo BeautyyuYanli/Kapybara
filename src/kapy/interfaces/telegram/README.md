@@ -94,10 +94,17 @@ session update, following the inbox's existing at-least-once contract.
 
 Polling persists every batch and offset together before the next poll. Inbox
 processing records the resolved target/template and creation/submission progress.
-Core service commits and SQLite acknowledgements remain separate: a crash between
-them may repeat creation or input. This is at-least-once business delivery, not an
-idempotent request-ID protocol. Completed submission is saved before confirmation
-messages, so a Telegram confirmation retry does not re-submit that input.
+Before core creation it saves a fixed UUID in resolved_action. For unfinished
+creation actions, recovery queries that ID: ready binds the existing Session,
+creating/closing/closed reports the phase and queryable/closable ID without
+replaying enter, and only a missing record attempts creation with the same UUID.
+Lease and registration reject concurrent duplicate
+creation. The former route is preserved until ready is bound. A SessionCreationError
+saves a terminal reply action; subsequent attempts only retry delivering that reply.
+Its text retains the UUID for explicit queries or close requests. Core service
+commits and SQLite acknowledgements remain separate; input can still repeat after
+a crash between them. Completed submission is saved before confirmation messages,
+so a Telegram confirmation retry does not re-submit that input.
 
 Ordinary text and `/new <text>` directly await durable start confirmation, without
 waiting for model completion. Busy submission replies explicitly and is not queued.
@@ -165,7 +172,12 @@ not started and completes the inbox command; it is never automatically retried
 as a future close. Retry `/close` after execution exits; `/cancel` only stores the legacy flag.
 Cleanup failure preserves closing and any saved progress. The interface records a
 retry reply for `PluginOperationError` and exhausted `RetryableScopeError`; uncaught
-errors propagate without guaranteeing a reply. Input to a closing/closed session is
+errors propagate without guaranteeing a reply. Creation failure replies with its
+saved UUID for explicit query/close, hiding the original error; no fresh scope is
+automatically created. Failed creating scopes exit all configured layers with None
+in reverse order, including partial/uncalled enters. Exit must recover by ID/Config
+and be idempotent; enter permits retry only by throwing RetryableScopeError.
+Input and execution configuration updates to a creating/closing/closed session are
 rejected without enqueueing; `/new` creates another one.
 `/status` includes the lifecycle status. HTTP and Telegram share SessionService and the independent durable Worker. Business
 plugin bindings and old checkpoints cannot start durable execution. Context plugin

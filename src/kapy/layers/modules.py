@@ -11,14 +11,19 @@ dynamic business information belongs in State and tool results.
 
 Optional async module hooks own the longer business scope:
 enter_scope(scope_id: UUID, config: Config) -> State initializes a new session;
-exit_scope(scope_id: UUID, config: Config, state: State) -> None releases it.
+exit_scope(scope_id: UUID, config: Config, state: State | None) -> None releases it.
 The scope ID is the session UUID, unrelated to individual SDK runs or clients.
-Hooks may raise RetryableScopeError for bounded retries and must be idempotent.
-Enter owns partial allocation until it returns valid State. Exit mutates State to
-record confirmed cleanup. During normal Session close, the host revalidates and
-saves it after success, failure or cancellation. Creation-failure compensation
-retains only the current in-memory State; there is no saved Session.
-Repeated close can invoke a previously successful exit again. Constructors,
+Exit must be idempotent and clean partial/unacknowledged enter allocations by scope
+ID and Config when State is None, including enters that were never called. None
+does not mean no resources. Enter need not be generally idempotent: a top-level
+RetryableScopeError explicitly promises that this particular call can safely be
+repeated. Restarted hosts abandon creating rather than replaying enter.
+The host persists identity/Config before enter, and saves complete State only with
+ready. Normal exit may mutate State to record confirmed progress; the host saves
+valid progress after success, failure or cancellation. Abandoned creation passes
+None uniformly, and repeated close may invoke a successful exit again. Late remote
+allocations require service-side terminal scope closure or layer reconciliation;
+the host lease fences database writes, not external requests. Constructors,
 validators and instructions must never allocate scope resources.
 """
 

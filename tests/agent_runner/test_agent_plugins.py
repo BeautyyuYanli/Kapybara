@@ -1091,12 +1091,13 @@ async def test_close_waits_through_takeover_grace_without_deciding_closing(
     async with database.sessions.begin() as db:
         await db.execute(
             text(
-                "INSERT INTO session_leases (session_id, lock_token, heartbeat_at) "
-                "VALUES (:id, :token, clock_timestamp() - interval '1 hour')"
+                "UPDATE session_leases SET lock_token=:token, "
+                "heartbeat_at=clock_timestamp() - interval '1 hour' WHERE session_id=:id"
             ),
             {"id": session.id, "token": uuid4()},
         )
     _, renewed = heartbeat_observation
+    renewed.clear()
     closing = asyncio.create_task(service.close_session(session.id))
     try:
         await asyncio.wait_for(renewed.wait(), 5)

@@ -8,7 +8,9 @@ import anyio
 class RetryableScopeError(RuntimeError):
     """A scope hook explicitly permits another attempt with the same scope ID.
 
-    Hooks must be idempotent after partial effects and uncertain acknowledgements.
+    Raising this error promises safe repetition after partial effects and uncertain
+    acknowledgements. Enter need not support retries otherwise. Exit is always
+    idempotent because explicit close/recovery may call it again with None.
     Only this outer exception opts into retry; causes, groups and cancellation do
     not. Use ``raise RetryableScopeError(...) from error`` to retain diagnostics.
     """

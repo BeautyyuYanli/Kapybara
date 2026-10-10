@@ -18,6 +18,7 @@ from kapy.agent_runner import HistoryMessage, OutputEvent
 from kapy.control.sessions import (
     CreateSession,
     InputChannel,
+    SessionCreationError,
     SessionInput,
     SessionRecord,
     SessionService,
@@ -43,7 +44,10 @@ def create_session_router(sessions: SessionService) -> APIRouter:
             CreateSession.model_validate(data.model_dump(exclude={"input"}))
         )
         if data.input is not None:
-            await sessions.submit_input(session.id, data.input)
+            try:
+                await sessions.submit_input(session.id, data.input)
+            except Exception as error:
+                raise SessionCreationError(session.id) from error
         return session
 
     @router.get("/sessions", operation_id="list_sessions")

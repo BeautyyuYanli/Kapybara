@@ -15,7 +15,7 @@ from kapy.control.models.types import (
     ModelAlreadyExists,
     ModelDiscoveryError,
 )
-from kapy.control.sessions import DurableRunnerConflict
+from kapy.control.sessions import DurableRunnerConflict, SessionAlreadyExists, SessionCreationError
 from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleError
 from kapy.session_lease import SessionBusy
@@ -32,6 +32,22 @@ class ControlRoute(APIRoute):
                 return await handler(request)
             except HTTPException:
                 raise
+            except SessionAlreadyExists as error:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "detail": "Session identity conflict",
+                        "session_id": str(error.session_id),
+                    },
+                )
+            except SessionCreationError as error:
+                return JSONResponse(
+                    status_code=503 if isinstance(error.__cause__, RetryableScopeError) else 500,
+                    content={
+                        "detail": "Session creation failed; query or close this identity",
+                        "session_id": str(error.session_id),
+                    },
+                )
             except (RequestValidationError, ValidationError) as error:
                 detail = [
                     {key: item[key] for key in ("loc", "msg", "type")} for item in error.errors()

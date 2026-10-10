@@ -136,7 +136,7 @@ async def enter_scope(scope_id: UUID, config: Config) -> State:
     return State()
 
 
-async def exit_scope(scope_id: UUID, config: Config, state: State) -> None:
+async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> None:
     """Delete known jobs, removing only acknowledged or already absent IDs.
 
     The host supplies exclusive scope ownership and persists the mutated State
@@ -144,8 +144,12 @@ async def exit_scope(scope_id: UUID, config: Config, state: State) -> None:
     Connection failures, timeouts, interrupted remote protocols and temporary
     HTTP availability errors opt into retry. Local configuration/protocol and
     authentication errors propagate unchanged.
+
+    None denotes abandoned initialization. Enter allocates nothing, and tools
+    cannot run before ready, so that case has no jobs to release. Ready cleanup
+    must receive its saved inventory; shellctl cannot discover jobs by scope.
     """
-    if not state.jobs:
+    if state is None or not state.jobs:
         return
     try:
         with anyio.fail_after(60):
