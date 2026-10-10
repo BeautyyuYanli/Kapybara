@@ -1,11 +1,11 @@
 """One stable DynamicCapability for ordinary and Temporal layer composition.
 
-SDK 2.54's CombinedCapability ownership wrapper needs live ctx.capabilities,
-which Temporal Activity contexts deliberately omit. Activity resolution uses a
-small ownership wrapper while ordinary runs retain the native deferred loader.
+Layer capabilities with toolsets declare stable IDs. Resolve ownership from
+those IDs rather than the live registry omitted by Temporal Activity contexts.
+The ownership wrapper remains SDK-native for deferred instruction collection.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from types import ModuleType
 
@@ -17,9 +17,7 @@ from pydantic_ai.capabilities import (
     DynamicCapability,
     WrapperCapability,
 )
-from pydantic_ai.durable_exec.temporal import TemporalRunContext
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import InstructionPart
 from pydantic_ai.toolsets import (
     AbstractToolset,
     CombinedToolset,
@@ -33,20 +31,29 @@ from .modules import create_layers, load_layers
 from .types import HasLayers
 
 
-@dataclass
-class _OwnedToolset[DepsT: HasLayers](WrapperToolset[DepsT]):
-    capability: AbstractCapability[DepsT]
+class _OwnedToolset[DepsT: HasLayers](CapabilityOwnedToolset[DepsT]):
+    """Use the declared owner ID; inherit native deferral and visitor behavior.
+
+    get_tools copies SDK definition processing because ownership resolution has
+    no override hook. tests/layers/test_sdk_contract.py guards that copied method
+    and compares the patch with the installed SDK; upgrades require review.
+    """
 
     async def get_tools(self, ctx: RunContext[DepsT]) -> dict[str, ToolsetTool[DepsT]]:
+        capability_id = self.capability.id
+        if not capability_id:
+            raise UserError("Layer capabilities with toolsets must declare a nonempty stable id")
         tools = await self.wrapped.get_tools(ctx)
-        if tools and self.capability.id is None:
-            raise UserError("Layer capabilities with tools must declare a stable id")
         return {
             name: replace(
                 tool,
                 tool_def=replace(
                     tool.tool_def,
-                    capability_id=tool.tool_def.capability_id or self.capability.id,
+                    capability_id=(
+                        tool.tool_def.capability_id
+                        if tool.tool_def.capability_id is not None
+                        else capability_id
+                    ),
                     defer_loading=self.capability.defer_loading is True
                     or tool.tool_def.defer_loading,
                 ),
@@ -54,35 +61,28 @@ class _OwnedToolset[DepsT: HasLayers](WrapperToolset[DepsT]):
             for name, tool in tools.items()
         }
 
-    async def get_instructions(
-        self, ctx: RunContext[DepsT]
-    ) -> str | InstructionPart | Sequence[str | InstructionPart] | None:
-        if self.capability.defer_loading is True:
-            return None
-        return await super().get_instructions(ctx)
 
-
-def _activity_ownership[DepsT: HasLayers](
+def _patch_ownership[DepsT: HasLayers](
     toolset: AbstractToolset[DepsT],
 ) -> AbstractToolset[DepsT]:
     # A layer wrapper can hide a CombinedCapability from SDK flattening. Rewrite
     # every native ownership node, retaining its surrounding state/resource
     # wrappers and the original capability objects used by instructions/hooks.
     if isinstance(toolset, CapabilityOwnedToolset):
-        return _OwnedToolset(_activity_ownership(toolset.wrapped), capability=toolset.capability)
+        return _OwnedToolset(_patch_ownership(toolset.wrapped), capability=toolset.capability)
     if isinstance(toolset, WrapperToolset):
-        return replace(toolset, wrapped=_activity_ownership(toolset.wrapped))
+        return replace(toolset, wrapped=_patch_ownership(toolset.wrapped))
     if isinstance(toolset, CombinedToolset):
-        return replace(toolset, toolsets=[_activity_ownership(child) for child in toolset.toolsets])
+        return replace(toolset, toolsets=[_patch_ownership(child) for child in toolset.toolsets])
     return toolset
 
 
-class _ActivityCapabilities[DepsT: HasLayers](CombinedCapability[DepsT]):
+class _LayerCapabilities[DepsT: HasLayers](CombinedCapability[DepsT]):
     def get_toolset(self) -> AbstractToolset[DepsT] | None:
         toolset = super().get_toolset()
         if toolset is None:
             return None
-        return _activity_ownership(
+        return _patch_ownership(
             toolset if isinstance(toolset, AbstractToolset) else DynamicToolset(toolset)
         )
 
@@ -136,8 +136,6 @@ def layers_capability[DepsT: HasLayers](
             capabilities.append(capability)
         if not capabilities:
             return None
-        if isinstance(ctx, TemporalRunContext):
-            return _ActivityCapabilities(capabilities=capabilities)
-        return CombinedCapability(capabilities=capabilities)
+        return _LayerCapabilities(capabilities=capabilities)
 
     return DynamicCapability(resolve, id="layers")

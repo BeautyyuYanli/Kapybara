@@ -7,12 +7,14 @@ from types import ModuleType
 import pytest
 from pydantic import BaseModel, RootModel, ValidationError, model_validator
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import Capability as NativeCapability
+from pydantic_ai.capabilities import CombinedCapability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets import FunctionToolset, WrapperToolset
 
 from kapy.layers import LayerDeps, create_layers, layers_capability, load_layers, snapshot_layers
 from kapy.layers.examples import echo, new_layer
@@ -200,17 +202,52 @@ async def test_tool_definitions_preserve_native_flags_and_declared_ownership():
 
 
 @pytest.mark.asyncio
-async def test_deferred_loading_preserves_native_capability_and_toolset_instructions():
-    registry = {"lazy": deferred}
+@pytest.mark.parametrize("nested", [False, True])
+async def test_deferred_loading_preserves_native_capability_and_toolset_instructions(nested):
+    class Capability(CombinedCapability[LayerDeps]):
+        def __init__(self, name: str):
+            self.name = name
+            super().__init__(id=name, capabilities=[deferred.Capability("lazy")])
+
+    name = "container" if nested else "lazy"
+    registry = {name: module(Capability=Capability) if nested else deferred}
     agent = Agent(
         FunctionModel(deferred.lazy_model),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(registry)],
+        capabilities=[
+            layers_capability(
+                registry,
+                wrap_toolset=(lambda _, toolset: WrapperToolset(toolset)) if nested else None,
+            )
+        ],
     )
     result = await agent.run(
-        "load lazy", deps=LayerDeps(layers=load_layers({"lazy": {}}, {}, registry))
+        "load lazy", deps=LayerDeps(layers=load_layers({name: {}}, {}, registry))
     )
     assert json.loads(result.output) == {
         "instructions": {"instructions": "CAPABILITY_RULE\n\nTOOLSET_RULE"},
         "tool_result": "lazy-result",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capability_id", [None, ""])
+async def test_nested_tool_owners_require_nonempty_declared_ids(capability_id):
+    class Capability(CombinedCapability[LayerDeps]):
+        def __init__(self, name: str):
+            self.name = name
+
+            def tool() -> str:
+                return "result"
+
+            super().__init__(
+                id=name,
+                capabilities=[NativeCapability(id=capability_id, tools=[tool])],
+            )
+
+    registry = {"invalid": module(Capability=Capability)}
+    agent = Agent(TestModel(), deps_type=LayerDeps, capabilities=[layers_capability(registry)])
+    with pytest.raises(UserError, match="nonempty stable id"):
+        await agent.run(
+            "call tool", deps=LayerDeps(layers=load_layers({"invalid": {}}, {}, registry))
+        )

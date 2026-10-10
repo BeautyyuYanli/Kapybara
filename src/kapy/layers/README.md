@@ -108,11 +108,17 @@ instructions, tool flags and resource lifecycles remain SDK-owned. Layer
 instructions have no application ordering contract. SDK hook ordering, including
 the durable message recorder, still applies.
 
-The small Activity ownership adapter preserves `capability_id` when SDK 2.54.0
-rebuilds a dynamic capability in a `TemporalRunContext` without live capabilities.
-Ordinary runs use the native combined capability. Deferred capability instructions
-retain native behavior; deferred Toolset instructions depend on the SDK's loader.
-Capabilities should declare such instructions on the capability itself.
+Layer composition uses one patched combined capability in ordinary runs and
+Temporal Activities. Every capability that contributes a Toolset, including
+nested owners, must declare a nonempty stable ID. Ownership uses that declared ID,
+so it does not need the live registry omitted by `TemporalRunContext`. The patch
+inherits the SDK's ownership wrapper and retains its deferred instruction
+collection: both capability and Toolset instructions remain available when loaded.
+The patch copies the SDK's `get_tools` definition processing because owner-ID
+resolution has no override hook. [SDK contract tests](../../../tests/layers/test_sdk_contract.py)
+compare it with the installed native implementation and require review when the
+copied method or ownership fields change. A guard failure requires reviewing the
+upstream change before updating its fingerprint.
 
 These examples use deterministic SDK models and show fixed exports, explicit
 State writes, enabling/disabling selections, and resource cleanup:
