@@ -5,11 +5,17 @@ called layer's validated State on success; the outer Workflow wrapper applies it
 before business hooks and restores the original tool result. SDK retry/failure
 signals bypass this success path. Temporal history records the transport, while
 messages and models see no transport metadata. Database snapshots remain run-owned.
+Both directions use the same injected
+writable deps mapping; the inner wrapper captures identity and model type from
+the selected static Layer, without a global registry lookup.
 """
 
+from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
 
+from pydantic import BaseModel
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.durable_exec.temporal import TemporalRunContext
@@ -17,25 +23,25 @@ from pydantic_ai.messages import ToolReturn
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
 from temporalio import workflow
 
-from kapy.layers.modules import dump_object, layer_types
-from kapy.layers.registry import REGISTRY
-
-from .types import RunnerDeps
+from kapy.layers.modules import dump_object
+from kapy.layers.types import Layer, LayerData
 
 _OWNER = "kapy_layer"
 
 
 @dataclass
-class _ReturnLayerStateToolset(WrapperToolset[RunnerDeps]):
-    name: str
+class _ReturnLayerStateToolset[D](WrapperToolset[D]):
+    layer_id: str
+    state_type: type[BaseModel]
+    get_layers: Callable[[D], dict[str, LayerData]]
 
-    async def get_tools(self, ctx: RunContext[RunnerDeps]) -> dict[str, ToolsetTool[RunnerDeps]]:
+    async def get_tools(self, ctx: RunContext[D]) -> dict[str, ToolsetTool[D]]:
         return {
             name: replace(
                 tool,
                 tool_def=replace(
                     tool.tool_def,
-                    metadata=(tool.tool_def.metadata or {}) | {_OWNER: self.name},
+                    metadata=(tool.tool_def.metadata or {}) | {_OWNER: self.layer_id},
                     # Each tool can mutate the same JSON inventory. Sequential
                     # dispatch applies returned State before serializing the next call.
                     sequential=True,
@@ -48,14 +54,16 @@ class _ReturnLayerStateToolset(WrapperToolset[RunnerDeps]):
         self,
         name: str,
         tool_args: dict[str, Any],
-        ctx: RunContext[RunnerDeps],
-        tool: ToolsetTool[RunnerDeps],
+        ctx: RunContext[D],
+        tool: ToolsetTool[D],
     ) -> Any:
         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
         if not isinstance(ctx, TemporalRunContext):
             return result
         state = dump_object(
-            layer_types(self.name, REGISTRY)[1].model_validate(ctx.deps.layers[self.name]["state"])
+            self.state_type.model_validate(
+                deepcopy(self.get_layers(ctx.deps)[self.layer_id]["state"])
+            )
         )
         native_return = isinstance(result, ToolReturn)
         metadata = {
@@ -70,19 +78,28 @@ class _ReturnLayerStateToolset(WrapperToolset[RunnerDeps]):
         return ToolReturn(result, metadata=metadata)
 
 
-def return_layer_state(
-    name: str, toolset: AbstractToolset[RunnerDeps]
-) -> AbstractToolset[RunnerDeps]:
-    return _ReturnLayerStateToolset(toolset, name=name)
+def return_layer_state[D](
+    layer: Layer[D, Any, Any],
+    toolset: AbstractToolset[D],
+    *,
+    get_layers: Callable[[D], dict[str, LayerData]],
+) -> AbstractToolset[D]:
+    """Capture this static layer's identity/models and the same writable deps rule."""
+    return _ReturnLayerStateToolset(
+        toolset, layer_id=layer.id, state_type=layer.state_type, get_layers=get_layers
+    )
 
 
-class _ApplyLayerStateToolset(WrapperToolset[RunnerDeps]):
+@dataclass
+class _ApplyLayerStateToolset[D](WrapperToolset[D]):
+    get_layers: Callable[[D], dict[str, LayerData]]
+
     async def call_tool(
         self,
         name: str,
         tool_args: dict[str, Any],
-        ctx: RunContext[RunnerDeps],
-        tool: ToolsetTool[RunnerDeps],
+        ctx: RunContext[D],
+        tool: ToolsetTool[D],
     ) -> Any:
         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
         owner = (tool.tool_def.metadata or {}).get(_OWNER)
@@ -90,16 +107,17 @@ class _ApplyLayerStateToolset(WrapperToolset[RunnerDeps]):
             return result
         assert isinstance(result, ToolReturn)
         transport = result.metadata
-        ctx.deps.layers[owner]["state"] = transport["state"]
+        self.get_layers(ctx.deps)[owner]["state"] = transport["state"]
         if transport["native_return"]:
             return replace(result, metadata=transport["metadata"])
         return result.return_value
 
 
-class LayerStateCapability(AbstractCapability[RunnerDeps]):
+@dataclass
+class LayerStateCapability[D](AbstractCapability[D]):
     """Apply successful State before native business hooks see the original result."""
 
-    def get_wrapper_toolset(
-        self, toolset: AbstractToolset[RunnerDeps]
-    ) -> AbstractToolset[RunnerDeps]:
-        return _ApplyLayerStateToolset(toolset)
+    get_layers: Callable[[D], dict[str, LayerData]]
+
+    def get_wrapper_toolset(self, toolset: AbstractToolset[D]) -> AbstractToolset[D]:
+        return _ApplyLayerStateToolset(toolset, get_layers=self.get_layers)

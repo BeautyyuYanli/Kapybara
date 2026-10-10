@@ -18,11 +18,10 @@ from temporalio.worker import Replayer, Worker
 
 from kapy.layers import LayerDeps, load_layers
 from kapy.layers.examples.temporal_agent import agent as example_agent
-from kapy.layers.examples.temporal_agent import registry as example_registry
+from kapy.layers.examples.temporal_agent import layers as example_layers
 from kapy.layers.examples.temporal_workflow import LayerExampleWorkflow
-from layers import tool_definitions
 from layers.temporal_agent import agent as resource_agent
-from layers.temporal_agent import approval_agent, events, registry, wrapped_agent
+from layers.temporal_agent import approval_agent, approval_layers, events, layers, wrapped_agent
 from layers.temporal_workflow import ApprovalWorkflow, ResourceWorkflow
 
 
@@ -45,7 +44,7 @@ async def test_temporal_dynamic_toolsets_rebuild_resources_and_replay_without_ef
     inputs = [
         LayerDeps(
             layers=load_layers(
-                {"echo": {"prefix": f"{label}:"}, "resource": {"label": label}}, {}, registry
+                {"echo": {"prefix": f"{label}:"}, "resource": {"label": label}}, {}, layers
             )
         )
         for label in ("A", "B")
@@ -106,9 +105,7 @@ async def test_temporal_consumer_example_and_invalid_input() -> None:
         workflows=[LayerExampleWorkflow],
         plugins=[AgentPlugin(example_agent)],
     ):
-        deps = LayerDeps(
-            layers=load_layers({"echo": {"prefix": "Temporal:"}}, {}, example_registry)
-        )
+        deps = LayerDeps(layers=load_layers({"echo": {"prefix": "Temporal:"}}, {}, example_layers))
         output = await client.execute_workflow(
             LayerExampleWorkflow.run,
             args=["echo", deps],
@@ -133,7 +130,7 @@ async def test_temporal_consumer_example_and_invalid_input() -> None:
 async def test_temporal_preserves_nondefault_tool_definition_after_discovery_activity() -> None:
     client = await connect()
     queue = f"layers-approval-{uuid4()}"
-    deps = LayerDeps(layers=load_layers({"approval": {}}, {}, {"approval": tool_definitions}))
+    deps = LayerDeps(layers=load_layers({"approval": {}}, {}, approval_layers))
     async with Worker(
         client,
         task_queue=queue,

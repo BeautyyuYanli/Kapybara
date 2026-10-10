@@ -1,6 +1,6 @@
 """Native shell layer; only explicit JSON writes retain job IDs and byte cursors.
 
-Config validation and Toolset construction are pure. Each tool call owns one
+Config validation and factory assembly are pure. Each tool call owns one
 HTTP client. Remote tasks survive runs; exit_scope releases the known jobs while
 SessionService saves cleanup progress. State owns neither the shellctl service
 nor the remote cwd/artifacts.
@@ -14,67 +14,54 @@ from uuid import UUID
 import anyio
 import httpx2
 from pydantic_ai import RunContext, Tool
-from pydantic_ai.messages import InstructionPart
+from pydantic_ai.capabilities import Capability
 from pydantic_ai.toolsets import FunctionToolset
 from shellctl import ShellctlClientError
 from shellctl.shared.constants import DEFAULT_TERMINATE_GRACE_SECONDS, DEFAULT_TIMEOUT_SECONDS
 
+from kapy.layers.modules import dump_object
 from kapy.layers.scopes import RetryableScopeError
-from kapy.layers.types import HasLayers
+from kapy.layers.types import Layer, LayerAccess
 
 from . import runtime
 from .models import Config, NonEmpty, RunTimeout, State, WaitTimeout
 from .output import Redactor
 
 
-class ShellDeps(HasLayers, Protocol):
+class ShellDeps(Protocol):
     session_id: UUID
 
 
-class Toolset(FunctionToolset[ShellDeps]):
-    """Sequential native tools sharing only the current deps.layers[name] JSON."""
+def make[DepsT: ShellDeps](
+    layer_id: str, access: LayerAccess[DepsT]
+) -> Layer[DepsT, Config, State]:
+    """Build fixed native tools; each call reads and writes its current deps entry."""
 
-    def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(
-            id=name,
-            tools=[
-                Tool(self.run, name="builtin_shell_run", sequential=True),
-                Tool(self.wait, name="builtin_shell_wait", sequential=True),
-                Tool(self.input, name="builtin_shell_input", sequential=True),
-                Tool(self.interrupt, name="builtin_shell_interrupt", sequential=True),
-            ],
-        )
+    def read(deps: DepsT) -> tuple[Config, State]:
+        entry = access(deps)
+        return Config.model_validate(entry["config"]), State.model_validate(entry["state"])
 
-    async def get_instructions(self, ctx: RunContext[ShellDeps]) -> list[InstructionPart]:
-        config = Config.model_validate(ctx.deps.layers[self.name]["config"])
-        return [
-            InstructionPart(
-                runtime.instructions(config, "builtin_shell", Redactor(config.redact_patterns, ""))
-            )
-        ]
+    def instructions(ctx: RunContext[DepsT]) -> str:
+        config = Config.model_validate(access(ctx.deps)["config"])
+        return runtime.instructions(config, "builtin_shell", Redactor(config.redact_patterns, ""))
 
     @asynccontextmanager
-    async def _operations(
-        self, ctx: RunContext[ShellDeps]
-    ) -> AsyncIterator[runtime.ShellOperations]:
-        entry = ctx.deps.layers[self.name]
-        config = Config.model_validate(entry["config"])
-        state = State.model_validate(entry["state"])
+    async def operations(ctx: RunContext[DepsT]) -> AsyncIterator[runtime.ShellOperations]:
+        config, state = read(ctx.deps)
 
         async def known(job_id: str) -> int | None:
             return state.jobs.get(job_id)
 
         async def register(job_id: str) -> None:
             state.jobs.setdefault(job_id, 0)
-            entry["state"] = state.model_dump(mode="json")
+            access(ctx.deps)["state"] = dump_object(state)
 
         async def change(job_id: str, offset: int | None) -> None:
             if offset is None:
                 state.jobs.pop(job_id, None)
             elif job_id in state.jobs:
                 state.jobs[job_id] = max(state.jobs[job_id], offset)
-            entry["state"] = state.model_dump(mode="json")
+            access(ctx.deps)["state"] = dump_object(state)
 
         async with runtime.open_client(config) as (client, redact):
             yield runtime.ShellOperations(
@@ -90,45 +77,63 @@ class Toolset(FunctionToolset[ShellDeps]):
             )
 
     async def run(
-        self,
-        ctx: RunContext[ShellDeps],
+        ctx: RunContext[DepsT],
         script: NonEmpty,
         timeout: RunTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
         """Run a shell script in a new PTY job."""
-        async with self._operations(ctx) as tools:
+        async with operations(ctx) as tools:
             return await tools.run(script, timeout)
 
     async def wait(
-        self,
-        ctx: RunContext[ShellDeps],
+        ctx: RunContext[DepsT],
         job_id: NonEmpty,
         timeout: WaitTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
         """Read more output from a session job."""
-        async with self._operations(ctx) as tools:
+        async with operations(ctx) as tools:
             return await tools.wait(job_id, timeout)
 
     async def input(
-        self,
-        ctx: RunContext[ShellDeps],
+        ctx: RunContext[DepsT],
         job_id: NonEmpty,
         text: str,
         timeout: RunTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
         """Send PTY input and read resulting output."""
-        async with self._operations(ctx) as tools:
+        async with operations(ctx) as tools:
             return await tools.input(job_id, text, timeout)
 
     async def interrupt(
-        self,
-        ctx: RunContext[ShellDeps],
+        ctx: RunContext[DepsT],
         job_id: NonEmpty,
         grace_seconds: WaitTimeout = DEFAULT_TERMINATE_GRACE_SECONDS,
     ) -> str:
         """Interrupt a session job, retaining its log."""
-        async with self._operations(ctx) as tools:
+        async with operations(ctx) as tools:
             return await tools.interrupt(job_id, grace_seconds)
+
+    return Layer(
+        config_type=Config,
+        state_type=State,
+        capability=Capability(
+            id=layer_id,
+            toolsets=[
+                FunctionToolset[DepsT](
+                    id=layer_id,
+                    instructions=instructions,
+                    tools=[
+                        Tool(run, name="builtin_shell_run", sequential=True),
+                        Tool(wait, name="builtin_shell_wait", sequential=True),
+                        Tool(input, name="builtin_shell_input", sequential=True),
+                        Tool(interrupt, name="builtin_shell_interrupt", sequential=True),
+                    ],
+                )
+            ],
+        ),
+        enter_scope=enter_scope,
+        exit_scope=exit_scope,
+    )
 
 
 async def enter_scope(scope_id: UUID, config: Config) -> State:
@@ -168,6 +173,3 @@ async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> Non
         if error.status_code in {429, 502, 503, 504}:
             raise RetryableScopeError("shellctl scope cleanup temporarily unavailable") from error
         raise
-
-
-__all__ = ["Config", "State", "Toolset", "enter_scope", "exit_scope"]

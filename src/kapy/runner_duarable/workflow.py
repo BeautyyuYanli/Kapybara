@@ -10,7 +10,7 @@ from pydantic_ai.settings import ModelSettings
 from temporalio import workflow
 
 from kapy.layers import load_layers, snapshot_layers
-from kapy.layers.registry import REGISTRY
+from kapy.layers.registry import LAYERS, get_layers
 
 from .agent import MODEL_ID, agent
 from .types import RunnerDeps, RunnerInput, SaveRunnerStateInput
@@ -34,7 +34,7 @@ class RunnerWorkflow:
             layers = load_layers(
                 {name: entry["config"] for name, entry in data.layers.items()},
                 {name: entry["state"] for name, entry in data.layers.items()},
-                REGISTRY,
+                LAYERS,
             )
         except ValueError as exc:
             raise UserError("Invalid layer configuration or state") from exc
@@ -47,7 +47,7 @@ class RunnerWorkflow:
             message_history=history,
         )
         try:
-            layer_states = snapshot_layers(deps, REGISTRY)
+            layer_states = snapshot_layers(deps, LAYERS, get_layers)
         except ValueError as exc:
             raise UserError("Invalid final layer state") from exc
         await workflow.execute_activity(

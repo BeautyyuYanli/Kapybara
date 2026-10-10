@@ -1,16 +1,18 @@
-"""Native SDK modules with explicit JSON Config/State and a name registry."""
+"""Static typed layers with native capabilities and injected JSON access."""
 
 from .composition import layers_capability
-from .modules import create_layers, load_layers, snapshot_layers
+from .modules import load_layers, make_layers, snapshot_layers
 from .scopes import RetryableScopeError
-from .types import HasLayers, LayerData, LayerDeps
+from .types import Layer, LayerAccess, LayerData, LayerDeps, LayerFactory
 
 __all__ = [
-    "HasLayers",
+    "Layer",
+    "LayerAccess",
     "LayerData",
     "LayerDeps",
+    "LayerFactory",
     "RetryableScopeError",
-    "create_layers",
+    "make_layers",
     "layers_capability",
     "load_layers",
     "snapshot_layers",

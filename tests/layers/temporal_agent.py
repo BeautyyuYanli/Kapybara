@@ -3,7 +3,6 @@
 import json
 from dataclasses import replace
 from datetime import timedelta
-from types import ModuleType
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict
@@ -18,7 +17,7 @@ from pydantic_ai.toolsets import FunctionToolset, WrapperToolset
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 
-from kapy.layers import LayerDeps, layers_capability
+from kapy.layers import Layer, LayerAccess, LayerData, LayerDeps, layers_capability, make_layers
 from kapy.layers.examples import echo
 from kapy.layers.examples.echo import State
 from layers import tool_definitions
@@ -33,13 +32,13 @@ class Config(BaseModel):
 
 
 class ResourceToolset(FunctionToolset[LayerDeps]):
-    def __init__(self, name: str) -> None:
-        self.layer_name = name
+    def __init__(self, access: LayerAccess[LayerDeps]) -> None:
+        self.access = access
         self.resource_label = ""
         self.entered = False
 
         async def resource_echo(ctx: RunContext[LayerDeps], text: str) -> str:
-            label = Config.model_validate(ctx.deps.layers[name]["config"]).label
+            label = Config.model_validate(access(ctx.deps)["config"]).label
             assert activity.in_activity() and self.entered
             events.append(("call", label))
             return f"resource:{label}:{text}"
@@ -47,19 +46,17 @@ class ResourceToolset(FunctionToolset[LayerDeps]):
         async def validate(ctx: RunContext[LayerDeps], text: str) -> None:
             assert activity.in_activity() and self.entered
             assert text == "hello"
-            events.append(
-                ("validate", Config.model_validate(ctx.deps.layers[name]["config"]).label)
-            )
+            events.append(("validate", Config.model_validate(access(ctx.deps)["config"]).label))
 
         resource_tool = Tool[LayerDeps](resource_echo, takes_ctx=True)
         resource_tool.args_validator = validate
         super().__init__(id="resource_tools", tools=[resource_tool])
 
     async def for_run(self, ctx: RunContext[LayerDeps]):
-        self.resource_label = Config.model_validate(
-            ctx.deps.layers[self.layer_name]["config"]
-        ).label
-        return await super().for_run(ctx)
+        # This definition is shared; each SDK binding owns its client/resource flags.
+        toolset = ResourceToolset(self.access)
+        toolset.resource_label = Config.model_validate(self.access(ctx.deps)["config"]).label
+        return toolset
 
     async def __aenter__(self) -> Self:
         assert activity.in_activity(), "Resource opened in Workflow"
@@ -81,16 +78,16 @@ class ResourceToolset(FunctionToolset[LayerDeps]):
 
 
 class ResourceCapability(Capability[LayerDeps]):
-    def __init__(self, name: str) -> None:
-        self.name = name
+    def __init__(self, layer_id: str, access: LayerAccess[LayerDeps]) -> None:
+        self.access = access
         super().__init__(
-            id=name,
+            id=layer_id,
             instructions=self.layer_instructions,
-            toolsets=[ResourceToolset(name)],
+            toolsets=[ResourceToolset(access)],
         )
 
     def label(self, ctx: RunContext[LayerDeps]) -> str:
-        return Config.model_validate(ctx.deps.layers[self.name]["config"]).label
+        return Config.model_validate(self.access(ctx.deps)["config"]).label
 
     def layer_instructions(self, ctx: RunContext[LayerDeps]) -> str:
         return f"resource={self.label(ctx)}"
@@ -128,22 +125,25 @@ class ResourceCapability(Capability[LayerDeps]):
         return f"{result}|tool-hook:{self.label(ctx)}"
 
 
-resource = ModuleType("resource")
-for field, value in {"Config": Config, "State": State, "Capability": ResourceCapability}.items():
-    setattr(resource, field, value)
+def resource(layer_id: str, access: LayerAccess[LayerDeps]) -> Layer[LayerDeps, Config, State]:
+    return Layer(
+        config_type=Config,
+        state_type=State,
+        capability=ResourceCapability(layer_id, access),
+    )
 
 
-class NestedEcho(CombinedCapability[LayerDeps]):
-    def __init__(self, name: str) -> None:
-        self.name = name
-        child = echo.Capability(name)
-        child.id = f"{name}.tool"
-        super().__init__(id=name, capabilities=[CombinedCapability(capabilities=[child])])
-
-
-nested_echo = ModuleType("nested_echo")
-for field, value in {"Config": echo.Config, "State": echo.State, "Capability": NestedEcho}.items():
-    setattr(nested_echo, field, value)
+def nested_echo(
+    layer_id: str, access: LayerAccess[LayerDeps]
+) -> Layer[LayerDeps, echo.Config, echo.State]:
+    child = echo.make(f"{layer_id}.tool", access).capability
+    return Layer(
+        config_type=echo.Config,
+        state_type=echo.State,
+        capability=CombinedCapability(
+            id=layer_id, capabilities=[CombinedCapability(capabilities=[child])]
+        ),
+    )
 
 
 async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -161,12 +161,19 @@ async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
 
 
 registry = {"echo": nested_echo, "resource": resource}
+
+
+def get_layers(deps: LayerDeps) -> dict[str, LayerData]:
+    return deps.layers
+
+
+layers = make_layers(registry, get_layers)
 agent = Agent(
     FunctionModel(model),
     name="layers_test",
     deps_type=LayerDeps,
     capabilities=[
-        layers_capability(registry),
+        layers_capability(layers, get_layers=get_layers),
         TemporalDurability(
             activity_config={
                 "start_to_close_timeout": timedelta(seconds=15),
@@ -181,7 +188,11 @@ wrapped_agent = Agent(
     name="layers_wrapped_test",
     deps_type=LayerDeps,
     capabilities=[
-        layers_capability(registry, wrap_toolset=lambda name, toolset: WrapperToolset(toolset)),
+        layers_capability(
+            layers,
+            get_layers=get_layers,
+            wrap_toolset=lambda name, toolset: WrapperToolset(toolset),
+        ),
         TemporalDurability(
             activity_config={
                 "start_to_close_timeout": timedelta(seconds=15),
@@ -214,14 +225,14 @@ async def approval_model(messages: list[ModelMessage], info: AgentInfo) -> Model
     )
 
 
-approval_registry = {"approval": tool_definitions}
+approval_layers = make_layers({"approval": tool_definitions.make}, get_layers)
 approval_agent = Agent(
     FunctionModel(approval_model),
     name="layers_approval",
     deps_type=LayerDeps,
     output_type=str | DeferredToolRequests,
     capabilities=[
-        layers_capability(approval_registry),
+        layers_capability(approval_layers, get_layers=get_layers),
         TemporalDurability(
             activity_config={
                 "start_to_close_timeout": timedelta(seconds=15),

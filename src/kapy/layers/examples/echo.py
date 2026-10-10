@@ -2,9 +2,10 @@
 
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai import RunContext, Tool
-from pydantic_ai.capabilities import Capability as NativeCapability
+from pydantic_ai.capabilities import Capability
 
-from kapy.layers.types import LayerDeps
+from kapy.layers.modules import dump_object
+from kapy.layers.types import Layer, LayerAccess
 
 
 class Config(BaseModel):
@@ -18,20 +19,24 @@ class State(BaseModel):
     calls: int = 0
 
 
-class Capability(NativeCapability[LayerDeps]):
-    def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(
-            id=name,
-            instructions="需要回显文本时调用 example_echo 工具。",
-            tools=[Tool(self.echo, name="example_echo")],
-        )
+def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State]:
+    """Build once; injected access reads the actual entry in each current deps."""
 
-    def echo(self, ctx: RunContext[LayerDeps], text: str) -> str:
+    def echo(ctx: RunContext[DepsT], text: str) -> str:
         """Return text formatted with this run's config and retain a call count."""
-        entry = ctx.deps.layers[self.name]
+        entry = access(ctx.deps)
         config, state = Config.model_validate(entry["config"]), State.model_validate(entry["state"])
         value = text.upper() if config.uppercase else text
         state.calls += 1
-        entry["state"] = state.model_dump(mode="json")
+        access(ctx.deps)["state"] = dump_object(state)
         return f"{config.prefix}{value}"
+
+    return Layer(
+        config_type=Config,
+        state_type=State,
+        capability=Capability(
+            id=layer_id,
+            instructions="需要回显文本时调用 example_echo 工具。",
+            tools=[Tool(echo, name="example_echo")],
+        ),
+    )

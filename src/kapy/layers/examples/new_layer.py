@@ -1,10 +1,10 @@
-"""Minimal fixed module exports; register this module by an installed name."""
+"""Minimal typed factory; model types may also be defined inside make."""
 
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import Capability
 
-from kapy.layers.types import LayerDeps
+from kapy.layers.types import Layer, LayerAccess
 
 
 class Config(BaseModel):
@@ -16,12 +16,12 @@ class State(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class Capability(AbstractCapability[LayerDeps]):
-    def __init__(self, name: str) -> None:
-        self.id = self.name = name
+def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State]:
+    def instructions(ctx: RunContext[DepsT]) -> str:
+        return Config.model_validate(access(ctx.deps)["config"]).instructions
 
-    def get_instructions(self):
-        return self.instructions
-
-    def instructions(self, ctx: RunContext[LayerDeps]) -> str:
-        return Config.model_validate(ctx.deps.layers[self.name]["config"]).instructions
+    return Layer(
+        config_type=Config,
+        state_type=State,
+        capability=Capability(id=layer_id, instructions=instructions),
+    )

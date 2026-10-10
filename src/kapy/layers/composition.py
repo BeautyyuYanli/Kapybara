@@ -3,16 +3,17 @@
 Layer capabilities with toolsets declare stable IDs. Resolve ownership from
 those IDs rather than the live registry omitted by Temporal Activity contexts.
 The ownership wrapper remains SDK-native for deferred instruction collection.
+Each resolution creates its own composition and binds selected static capabilities
+and their toolsets; definitions never retain run data or business-scope resources.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
-from types import ModuleType
+from typing import Any
 
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import (
     AbstractCapability,
-    Capability,
     CombinedCapability,
     DynamicCapability,
     WrapperCapability,
@@ -27,11 +28,11 @@ from pydantic_ai.toolsets import (
 )
 from pydantic_ai.toolsets._capability_owned import CapabilityOwnedToolset
 
-from .modules import create_layers, load_layers
-from .types import HasLayers
+from .modules import load_layers
+from .types import Layer, LayerData
 
 
-class _OwnedToolset[DepsT: HasLayers](CapabilityOwnedToolset[DepsT]):
+class _OwnedToolset[DepsT](CapabilityOwnedToolset[DepsT]):
     """Use the declared owner ID; inherit native deferral and visitor behavior.
 
     get_tools copies SDK definition processing because ownership resolution has
@@ -62,7 +63,7 @@ class _OwnedToolset[DepsT: HasLayers](CapabilityOwnedToolset[DepsT]):
         }
 
 
-def _patch_ownership[DepsT: HasLayers](
+def _patch_ownership[DepsT](
     toolset: AbstractToolset[DepsT],
 ) -> AbstractToolset[DepsT]:
     # A layer wrapper can hide a CombinedCapability from SDK flattening. Rewrite
@@ -77,62 +78,75 @@ def _patch_ownership[DepsT: HasLayers](
     return toolset
 
 
-class _LayerCapabilities[DepsT: HasLayers](CombinedCapability[DepsT]):
-    def get_toolset(self) -> AbstractToolset[DepsT] | None:
+class _LayerCapabilities[DepsT](CombinedCapability[DepsT]):
+    def get_toolset(
+        self,
+    ) -> Callable[[RunContext[DepsT]], Awaitable[AbstractToolset[DepsT]]] | None:
         toolset = super().get_toolset()
         if toolset is None:
             return None
-        return _patch_ownership(
-            toolset if isinstance(toolset, AbstractToolset) else DynamicToolset(toolset)
-        )
+        if not isinstance(toolset, AbstractToolset):
+            toolset = DynamicToolset[DepsT](toolset)
+        owned = _patch_ownership(toolset)
+
+        async def bind(ctx: RunContext[DepsT]) -> AbstractToolset[DepsT]:
+            # SDK DynamicCapability binds capabilities before ctx.capabilities is
+            # complete, and its DynamicToolset does not bind inner contributions.
+            # This native callable contribution runs at tool resolution, where
+            # ordinary runs have the finalized context, once per resolution. Each
+            # reconstructed Activity binds its own copy through the same path.
+            return await owned.for_run(ctx)
+
+        return bind
 
 
 @dataclass
-class _WrappedLayer[DepsT: HasLayers](WrapperCapability[DepsT]):
-    name: str
-    wrap_toolset: Callable[[str, AbstractToolset[DepsT]], AbstractToolset[DepsT]]
+class _WrappedLayer[DepsT](WrapperCapability[DepsT]):
+    layer: Layer[DepsT, Any, Any]
+    wrap_toolset: Callable[[Layer[DepsT, Any, Any], AbstractToolset[DepsT]], AbstractToolset[DepsT]]
 
     def get_toolset(self) -> AbstractToolset[DepsT] | None:
         toolset = self.wrapped.get_toolset()
         if toolset is None:
             return None
         return self.wrap_toolset(
-            self.name,
+            self.layer,
             toolset if isinstance(toolset, AbstractToolset) else DynamicToolset(toolset),
         )
 
 
-def layers_capability[DepsT: HasLayers](
-    registry: Mapping[str, ModuleType],
+def layers_capability[DepsT](
+    layers: Mapping[str, Layer[DepsT, Any, Any]],
     *,
-    wrap_toolset: Callable[[str, AbstractToolset[DepsT]], AbstractToolset[DepsT]] | None = None,
+    get_layers: Callable[[DepsT], dict[str, LayerData]],
+    wrap_toolset: Callable[[Layer[DepsT, Any, Any], AbstractToolset[DepsT]], AbstractToolset[DepsT]]
+    | None = None,
 ) -> DynamicCapability[DepsT]:
-    """Capture modules at Agent construction; a run selects through deps.layers.
+    """Capture static definitions; select from current writable deps on resolution.
 
     The optional wrapper is for a consumer's Activity/state boundary. Native
-    hooks, instructions and Toolset resource lifecycle remain SDK-owned.
+    hooks, for_agent/for_run binding, instructions and resource lifecycle remain
+    SDK-owned. Assembly and selection never call business-scope hooks.
     """
-    modules = dict(registry)
+    installed = dict(layers)
 
     def resolve(ctx: RunContext[DepsT]) -> AbstractCapability[DepsT] | None:
         # Validate serialized direct runner inputs as well as session-created data.
+        selected = get_layers(ctx.deps)
         try:
             load_layers(
-                {name: data["config"] for name, data in ctx.deps.layers.items()},
-                {name: data["state"] for name, data in ctx.deps.layers.items()},
-                modules,
+                {name: data["config"] for name, data in selected.items()},
+                {name: data["state"] for name, data in selected.items()},
+                installed,
             )
         except ValueError as exc:
             raise UserError("Invalid layer configuration or state") from exc
         capabilities = []
-        for name, component in create_layers(ctx.deps, modules).items():
-            capability = (
-                Capability(toolsets=[component], id=name)
-                if isinstance(component, AbstractToolset)
-                else component
-            )
+        for name in selected:
+            layer = installed[name]
+            capability = layer.capability
             if wrap_toolset is not None:
-                capability = _WrappedLayer(capability, name=name, wrap_toolset=wrap_toolset)
+                capability = _WrappedLayer(capability, layer=layer, wrap_toolset=wrap_toolset)
             capabilities.append(capability)
         if not capabilities:
             return None

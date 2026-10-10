@@ -1,48 +1,85 @@
 # Layers
 
-A layer is an installed Python module selected by a plain `name -> module`
-registry. It exports Pydantic `Config` and `State` classes and exactly one native
-Pydantic AI `Capability` or `Toolset` class. The component constructor takes its
-registered name, retains that name, and uses it as its stable SDK ID. There is no
-configuration factory or instance stored in the registry.
+A `Layer[D, Config, State]` is a static definition containing Pydantic model
+classes, one native `AbstractCapability[D]` instance and two independently
+optional business-scope hooks. An installed factory has the signature
+`make(layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]`.
+The concrete return annotation links the hook parameters and asynchronous return
+values to the models; exit must accept `State | None`.
 
-Tools (their collection, names and argument schemas) and instructions are static
-declarations, stable for fixed Config. Do not generate them through State-driven
-factories: changing the model prefix defeats prefix caching. SDK callbacks can
-render those fixed declarations; dynamic business information belongs in State
-and tool results.
+`make_layers(registry, get_layers)` assembles every installed factory once,
+without execution deps. It checks the returned Layer, model classes, native
+capability, async hooks and root capability ID. The root ID must equal the
+registered nonempty string; the framework never rewrites it. Function tools inherit
+the Capability ID during SDK construction. Nested owners and internal Toolsets
+may use independent or derived stable IDs; every Toolset-contributing capability
+owner must have one. IDs stay fixed after construction.
 
-`deps.layers` is a JSON dictionary. Each name has a `config` object and a `state`
-object. Validators, constructors and instructions must be deterministic and
-perform no external I/O, because Temporal reconstructs components in both
-Workflows and Activities. Config stays fixed during execution. State is a
-validated copy and requires explicit JSON writeback:
+The caller supplies `get_layers(deps) -> dict[str, LayerData]`. Its mapping is the
+current enabled selection, separate from the installed factory allowlist. Each
+injected `access(deps)` returns the actual writable entry for its own ID, without
+copying it or creating missing entries. Kapy's `registry.REGISTRY` installs
+`"shell": shell.make`, and its process-local `LAYERS` uses the `RunnerDeps.layers`
+adapter. SessionService, Workflow and Activity use that same static configuration;
+independent consumers assemble their own definitions and may store data elsewhere.
+Changing the installation set requires reassembly.
+
+Each entry is a JSON `config` object and `state` object. Config stays fixed for
+the session. Models read from current data are disposable copies; mutation requires
+an explicit writeback, which updates deps but does not itself save to a database:
 
 ```python
-class Toolset(FunctionToolset[LayerDeps]):
-    def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(id=name)
-        self.add_function(self.count, name="example_count", sequential=True)
+from pydantic import BaseModel
+from pydantic_ai import RunContext
+from pydantic_ai.capabilities import Capability
+from kapy.layers import Layer, LayerAccess, LayerData, make_layers
+from kapy.layers.modules import dump_object
 
-    async def count(self, ctx: RunContext[LayerDeps]) -> int:
-        entry = ctx.deps.layers[self.name]
+class Deps(BaseModel):
+    layer_data: dict[str, LayerData]
+
+class Config(BaseModel):
+    increment: int = 1
+
+class State(BaseModel):
+    calls: int = 0
+
+def make_counter(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State]:
+    def count(ctx: RunContext[Deps]) -> int:
+        entry = access(ctx.deps)
         config = Config.model_validate(entry["config"])
         state = State.model_validate(entry["state"])
         state.calls += config.increment
-        entry["state"] = state.model_dump(mode="json")
+        access(ctx.deps)["state"] = dump_object(state)
         return state.calls
+
+    return Layer(config_type=Config, state_type=State,
+                 capability=Capability(id=layer_id, tools=[count]))
+
+def get_layers(deps: Deps) -> dict[str, LayerData]:
+    return deps.layer_data
+
+layers = make_layers({"counter": make_counter}, get_layers)
 ```
 
-`load_layers(configs, states, registry)` validates exports and names, fills
-default State from `{}`, and returns independent JSON copies. Unconfigured state
-names fail. `create_layers(deps, registry)` creates fresh native components by
-name. `snapshot_layers(deps, registry)` validates and copies only the current
-States. Both models must serialize to JSON objects.
+Factories, access rules, validators and instruction callbacks are deterministic
+and perform no external I/O. Static definitions never retain a session's deps,
+models, scope ID or clients. Tools (collection, names and argument schemas) and
+instructions stay stable for fixed Config. SDK callbacks may render those fixed
+declarations; dynamic business information belongs in State and tool results,
+so it does not change the model prefix.
+
+`prepare_layer_configs(configs, layers)` validates all names and Config before
+scope hooks, without constructing State. `load_layers(configs, states, layers)`
+validates and copies existing JSON; omitted State validates from `{}` and fails
+when required fields are missing. It calls no scope hooks. Unconfigured State and
+unknown names fail. `snapshot_layers(deps, layers, get_layers)` validates and copies
+only the selected States. Both models must serialize to JSON objects; inputs are
+copied before validation so custom validators cannot mutate caller-owned data.
 
 ## Business scopes
 
-Modules may independently export either of these async functions:
+A factory explicitly supplies either or both async functions on its Layer:
 
 ```python
 async def enter_scope(scope_id: UUID, config: Config) -> State: ...
@@ -50,7 +87,7 @@ async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> Non
 ```
 
 The layer's scope ID is the host session UUID, stable across runs and process
-restarts. Session creation validates all exports/Config and default States, then
+restarts. Session creation validates all Config and no-enter default States, then
 acquires the session lease and commits `creating` with its identity and fixed Config.
 Only acknowledged registration permits enters, in configured order outside database
 transactions. A valid returned State
@@ -101,10 +138,12 @@ details and report exhausted retryable errors as 503. Telegram saves the ID befo
 creation and queries it on inbox recovery. Neither interface automatically repeats
 creation after the hook's bounded attempts.
 
-`layers_capability(registry)` captures the module mapping at Agent construction
-and installs one stable `DynamicCapability(id="layers")`. Empty deps enables no
-layers. A Toolset is wrapped in a native capability; native capability hooks,
-instructions, tool flags and resource lifecycles remain SDK-owned. Layer
+`layers_capability(layers, get_layers=get_layers)` captures the static definitions
+and installs one stable `DynamicCapability(id="layers")`. Each resolution selects
+and validates current deps; an empty selection enables zero layers. Factories are
+not rerun. Native hooks, instructions, tool flags, `for_agent`/`for_run` binding and
+resource lifecycles remain SDK-owned. Stateless components may be shared; components
+with mutable run state return independent instances from native `for_run`. Layer
 instructions have no application ordering contract. SDK hook ordering, including
 the durable message recorder, still applies.
 
@@ -120,7 +159,7 @@ compare it with the installed native implementation and require review when the
 copied method or ownership fields change. A guard failure requires reviewing the
 upstream change before updating its fingerprint.
 
-These examples use deterministic SDK models and show fixed exports, explicit
+These examples use deterministic SDK models and show static assembly, injected access, explicit
 State writes, enabling/disabling selections, and resource cleanup:
 
 ```sh
@@ -137,8 +176,9 @@ the final run snapshot. Failed/cancelled tool calls return no State.
 
 ## Shell layer
 
-`registry.REGISTRY` registers `"shell": shell.layer`. The module exports
-`Config`, `State`, `Toolset`, `enter_scope`, and `exit_scope`. Create a durable session with:
+`shell.layer.make` returns `Layer[D, Config, State]` with the shared shell models,
+fixed native Toolset and explicit enter/exit hooks. Its deps contract needs only
+`session_id`; injected access defines where its data lives. Create a durable session with:
 
 ```json
 {"layers": {"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}}

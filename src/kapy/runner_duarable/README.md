@@ -77,14 +77,19 @@ configuration; internal PostgreSQL `sessions.layer_states` holds execution State
 `SessionService.start_durable_runner()` reads both JSON columns with the message
 snapshot/version under its admission lock and fixes `RunnerInput.layers`.
 
-The [layer module contract](../layers/README.md) uses fixed Config/State exports
-and native Capability/Toolset classes. The Agent installs one dynamic `layers`
-capability. Components read `ctx.deps.layers[name]` and explicitly replace their
-own State JSON. SDK tool Activities reconstruct the selected modules from the
-Workflow's serialized deps; State transport performs no session database I/O.
+The [layer factory contract](../layers/README.md) assembles static typed `LAYERS`
+with explicit model types, native capabilities and business hooks. The Agent
+installs one dynamic `layers` capability and selects enabled definitions from
+current deps using Kapy's injected `get_layers` rule. Tools read their own entry
+through factory-injected access and explicitly replace State JSON. Workflow and
+Activity each bind their process-local static capabilities through the SDK;
+stateful SDK components use `for_run` isolation. Factories and business hooks do
+not run on reconstruction or replay. Temporal serializes only deps data, without
+Layer, hook or access-function instances; State transport performs no database I/O.
 
 On ordinary tool success, an inner native Toolset wrapper validates the called
-layer's State and carries it in SDK `ToolReturn.metadata`. The outer Workflow
+layer's State using its captured Layer model type and injected access rule, then
+carries it in SDK `ToolReturn.metadata`. The outer Workflow
 wrapper applies only that layer's State before business hooks, then restores the
 original ordinary value or native ToolReturn, including its content, metadata
 and tools. Transport metadata never reaches model messages. Other layers'
@@ -106,7 +111,7 @@ by Temporal. SDK `ModelRetry` still asks the model for a new call through its
 normal protocol. A lost remote acknowledgement can mean an operation executed.
 
 Shell jobs survive a completed run. Exclusive session close calls every configured
-module's optional `exit_scope` in reverse configuration order with its latest State,
+Layer's optional `exit_scope` in reverse configuration order with its latest State,
 then validates and saves State
 after each hook attempt. Shell removes confirmed jobs sequentially within an attempt;
 the database save occurs at the attempt boundary. Cleanup failure retains CLOSING

@@ -150,7 +150,10 @@ Only the final versioned save replaces all layer States and messages together;
 an execution that never commits that save retains the preceding snapshot.
 
 
-Session creation validates layer exports/Config, default States and legacy plugin
+SessionService and the durable Agent share static typed definitions from
+`layers.registry.LAYERS`. Factory assembly performs no business I/O; only this
+service drives scope hooks. Session creation validates all Config, no-enter default
+States and legacy plugin
 config, acquires the existing lease, and commits a creating Session plus fixed Config
 and legacy bindings before calling optional enters outside transactions. Enter may
 allocate business resources and return required State fields; without enter, State
@@ -169,7 +172,7 @@ injected Temporal Client, it checks durable Workflow status under the session ro
 lock; active execution is busy and query failures propagate. Creating skips this
 query so abandoned scopes can be cleaned independently of Temporal; closed returns
 directly. Cleanup then records closing, closes fixed plugin bindings sequentially,
-and calls each configured module's optional
+and calls each configured Layer's optional
 `exit_scope`. Completed bindings are saved individually; normal session close
 validates and saves layer State after every hook attempt. The session becomes closed
 after all cleanup succeeds. Failure preserves CLOSING, unfinished bindings and saved

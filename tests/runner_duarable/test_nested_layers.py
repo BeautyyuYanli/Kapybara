@@ -10,7 +10,8 @@ from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin, Tem
 from pydantic_ai.durable_exec.temporal._run_context import deserialize_run_context
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage
-from runner_duarable.nested_workflow import NestedWorkflow, agent, entrance, registry
+from runner_duarable.nested_layer import Deps
+from runner_duarable.nested_workflow import NestedWorkflow, agent, entrance, layers
 from temporalio.worker import Replayer, Worker
 
 from kapy.application.resources import connect_temporal
@@ -18,21 +19,14 @@ from kapy.control.sessions import CreateSession, SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
 from kapy.layers import load_layers
-from kapy.layers.registry import REGISTRY
+from kapy.layers.registry import LAYERS
 from kapy.runner_duarable.activities import RunnerActivities
-from kapy.runner_duarable.types import DurableExecutionConfig, RunnerDeps
 
 
 def deps(session_id):
-    return RunnerDeps(
+    return Deps(
         session_id=session_id,
-        config=DurableExecutionConfig(
-            provider_class="pydantic_ai.providers.openai:OpenAIProvider",
-            model_class="pydantic_ai.models.openai:OpenAIChatModel",
-            model_name="unused",
-            api_key="unused",
-        ),
-        layers=load_layers({"nested": {}, "other": {}}, {}, registry),
+        payload=load_layers({"nested": {}, "other": {}}, {}, layers),
     )
 
 
@@ -64,8 +58,8 @@ async def test_nested_owned_tools_discover_with_serialized_activity_context():
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_nested_children_return_outer_layer_state_before_hooks(runner_database, monkeypatch):
-    for name, module in registry.items():
-        monkeypatch.setitem(REGISTRY, name, module)
+    for name, layer in layers.items():
+        monkeypatch.setitem(LAYERS, name, layer)
     service = SessionService(runner_database.sessions)
     session = await service.create_session(
         CreateSession(provider_id=uuid4(), model_name="unused", layers={"nested": {}, "other": {}})

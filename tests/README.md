@@ -38,11 +38,15 @@ KAPY_SHELLCTL_TEST_BIN_DIR=/work/packages/shellctl/server/bin \
   tests/runner_duarable/test_layers.py
 ```
 
-`tests/layers` checks the native module/JSON contract, fresh dynamic resolution,
-tool flags, hooks, instructions, resource ownership and Temporal replay.
+`tests/layers` checks typed factory assembly, arbitrary writable deps layouts,
+JSON snapshots, native for_run isolation, tool flags, hooks, instructions and
+Temporal replay. Its real Pyrefly probes use the project configuration to check
+model/hook signatures, including the required optional State on exit.
 `runner_duarable/test_layers.py` uses deterministic SDK streaming with real
 PostgreSQL, Temporal and a private shellctl server. It covers multiple calls,
 cross-run cursors, native retries, failure/cancellation preserving the preceding
 snapshot, replay, and session-close retry progress. Nested-capability tests also
 verify State is visible before hooks, other layers stay intact, and ordinary or
-native ToolReturn values retain their public shape. No external model API is called.
+native ToolReturn values retain their public shape across a consumer-specific deps
+layout. SDK ownership differential tests compare whole public tool definitions
+and calls with the installed SDK; method/field guards require review on upgrades. No external model API is called.

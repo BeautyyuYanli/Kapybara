@@ -165,7 +165,7 @@ Bot API, SQLite, Valkey and core PostgreSQL resources; exit does not set a user
 cancel flag. Existing legacy Telegram state is not imported.
 
 `/close` first acquires the session lease, then awaits sequential legacy plugin cleanup
-and each configured module's optional `exit_scope`. Normal close validates and saves
+and each configured Layer's optional `exit_scope`. Normal close validates and saves
 State after each hook attempt; the route/history remains available for inspection.
 A busy lease or active durable Workflow replies that close has
 not started and completes the inbox command; it is never automatically retried

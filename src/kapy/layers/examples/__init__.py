@@ -1,1 +1,1 @@
-"""Standalone consumers of native module layers; no durable database dependency."""
+"""Standalone consumers of typed static layers; no durable database dependency."""

@@ -5,7 +5,6 @@ construction is deliberately unrelated to these session-level hook calls.
 """
 
 import asyncio
-from types import ModuleType
 from uuid import UUID, uuid4
 
 import anyio
@@ -13,6 +12,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic_ai.capabilities import Capability
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -30,9 +30,9 @@ from kapy.control.sessions import (
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
 from kapy.interfaces.http import create_router
-from kapy.layers import RetryableScopeError
+from kapy.layers import Layer, RetryableScopeError
 from kapy.layers.examples import echo
-from kapy.layers.registry import REGISTRY
+from kapy.layers.registry import LAYERS
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.session_lease import LeaseLost, SessionBusy
 from kapy.session_lease.models import SessionLeaseRow
@@ -40,12 +40,14 @@ from kapy.session_lease.models import SessionLeaseRow
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-def module(*, config=echo.Config, state=echo.State, **hooks):
-    result = ModuleType("scope_test_layer")
-    result.__dict__.update(
-        {"Config": config, "State": state, "Capability": echo.Capability, **hooks}
+def layer(layer_id: str, *, config=echo.Config, state=echo.State, **hooks):
+    return Layer(
+        config_type=config,
+        state_type=state,
+        capability=Capability(id=layer_id),
+        enter_scope=hooks.get("enter_scope"),
+        exit_scope=hooks.get("exit_scope"),
     )
-    return result
 
 
 def selection(**layers):
@@ -75,11 +77,11 @@ async def test_enter_initializes_required_state_and_hooks_are_independently_opti
         exits.append((scope_id, config, state))
 
     monkeypatch.setitem(
-        REGISTRY, "both", module(state=State, enter_scope=enter, exit_scope=exit_hook)
+        LAYERS, "both", layer("both", state=State, enter_scope=enter, exit_scope=exit_hook)
     )
-    monkeypatch.setitem(REGISTRY, "enter", module(state=State, enter_scope=enter))
-    monkeypatch.setitem(REGISTRY, "exit", module(exit_scope=exit_hook))
-    monkeypatch.setitem(REGISTRY, "default", echo)
+    monkeypatch.setitem(LAYERS, "enter", layer("enter", state=State, enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "exit", layer("exit", exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "default", layer("default"))
     service = SessionService(database.sessions)
     session = await service.create_session(
         selection(both={"prefix": "fixed:"}, enter={}, exit={}, default={})
@@ -116,7 +118,7 @@ async def test_enter_receives_the_same_validated_config_as_persisted(database, m
         config.items.append("hook-local")
         return echo.State()
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(config=Config, enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", config=Config, enter_scope=enter))
     data = selection(scoped={"items": ["input"]})
     session = await SessionService(database.sessions).create_session(data)
     assert received == [["input", "validated"]]
@@ -124,27 +126,31 @@ async def test_enter_receives_the_same_validated_config_as_persisted(database, m
     assert data.layers == {"scoped": {"items": ["input"]}}
 
 
-@pytest.mark.parametrize("bad", ["unknown", "config", "export", "sync_hook"])
-async def test_every_export_and_config_is_validated_before_any_enter(database, monkeypatch, bad):
+@pytest.mark.parametrize("bad", ["unknown", "config", "default_state"])
+async def test_all_configs_and_default_states_are_validated_before_any_enter(
+    database, monkeypatch, bad
+):
     enters = []
+
+    class RequiredState(BaseModel):
+        resource: str
 
     async def enter(scope_id, config):
         enters.append(scope_id)
         return echo.State()
 
-    monkeypatch.setitem(REGISTRY, "first", module(enter_scope=enter))
-    second = (
-        module(enter_scope=lambda scope_id, config: echo.State()) if bad == "sync_hook" else echo
+    monkeypatch.setitem(LAYERS, "first", layer("first", enter_scope=enter))
+    monkeypatch.setitem(
+        LAYERS,
+        "second",
+        layer("second", state=RequiredState if bad == "default_state" else echo.State),
     )
-    if bad == "export":
-        second = module(state=dict)
-    monkeypatch.setitem(REGISTRY, "second", second)
-    layers = {"first": {}, "unknown" if bad == "unknown" else "second": {}}
+    configs = {"first": {}, "unknown" if bad == "unknown" else "second": {}}
     if bad == "config":
-        layers["second"] = {"unknown": True}
+        configs["second"] = {"unknown": True}
     service = SessionService(database.sessions)
     with pytest.raises((ValueError, ValidationError)):
-        await service.create_session(selection(**layers))
+        await service.create_session(selection(**configs))
     assert not enters and not (await service.list_sessions()).items
 
 
@@ -162,7 +168,7 @@ async def test_enter_retries_are_bounded_with_fixed_identity_and_fresh_config(
             raise error
         return echo.State(calls=7)
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter))
     service = SessionService(database.sessions)
     if succeeds:
         session = await service.create_session(selection(scoped={"prefix": "fixed"}))
@@ -204,7 +210,7 @@ async def test_enter_only_explicit_outer_retryable_error_allows_retry(
             raise SessionBusy("Business hook failed; this is not duplicate creation")
         raise RuntimeError("ordinary failure")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(state=State, enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", state=State, enter_scope=enter))
     service = SessionService(database.sessions)
     expected = asyncio.CancelledError if failure == "cancel" else SessionCreationError
     with pytest.raises(expected):
@@ -225,7 +231,7 @@ async def test_enter_host_errors_keep_the_current_creation_identity_at_service_a
         calls.append(scope_id)
         raise original
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter))
     service = SessionService(database.sessions)
     session_id = uuid4()
     with pytest.raises(SessionCreationError) as raised:
@@ -269,8 +275,8 @@ async def test_cancelled_creation_compensates_completed_enters(database, monkeyp
         waiting.set()
         await asyncio.Future()
 
-    monkeypatch.setitem(REGISTRY, "first", module(enter_scope=enter, exit_scope=exit_hook))
-    monkeypatch.setitem(REGISTRY, "blocked", module(enter_scope=blocked_enter))
+    monkeypatch.setitem(LAYERS, "first", layer("first", enter_scope=enter, exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "blocked", layer("blocked", enter_scope=blocked_enter))
     service = SessionService(database.sessions)
 
     async def create():
@@ -313,7 +319,7 @@ async def test_registration_failure_never_enters_business_scopes(database, monke
         await original(db_repo, *args, **kwargs)
         raise RuntimeError("definite write failure")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter, exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter, exit_scope=exit_hook))
     monkeypatch.setattr(SessionRepository, "register_creating", fail)
     service = SessionService(database.sessions)
     with pytest.raises(SessionCreationError) as raised:
@@ -356,7 +362,7 @@ async def test_uncertain_creation_commit_is_resolved_before_compensation(
                 raise asyncio.CancelledError()
             raise RuntimeError("uncertain commit")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter, exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter, exit_scope=exit_hook))
     monkeypatch.setattr(SessionRepository, phase, mark)
     service = SessionService(
         async_sessionmaker(database.engine, class_=UncertainCommit, expire_on_commit=False)
@@ -418,7 +424,7 @@ async def test_ready_commit_and_resolution_outage_preserves_creating_without_exi
                 raise OperationalError("database unavailable", {}, Exception("disconnected"))
             return await super().execute(*args, **kwargs)
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter, exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter, exit_scope=exit_hook))
     monkeypatch.setattr(SessionRepository, "publish_ready", mark)
     service = SessionService(
         async_sessionmaker(database.engine, class_=UnavailableResolution, expire_on_commit=False)
@@ -446,7 +452,7 @@ async def test_exit_retry_saves_partial_state_before_retry_and_does_not_change_c
         if len(calls) < 3:
             raise RetryableScopeError("partially cleaned")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", exit_scope=exit_hook))
     service = SessionService(database.sessions)
     session = await service.create_session(selection(scoped={"prefix": "fixed"}))
     assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
@@ -472,8 +478,8 @@ async def test_failed_exit_retains_progress_and_explicit_close_repeats_idempoten
         if failing:
             raise error
 
-    monkeypatch.setitem(REGISTRY, "a", module(exit_scope=exit_a))
-    monkeypatch.setitem(REGISTRY, "b", module(exit_scope=exit_b))
+    monkeypatch.setitem(LAYERS, "a", layer("a", exit_scope=exit_a))
+    monkeypatch.setitem(LAYERS, "b", layer("b", exit_scope=exit_b))
     service = SessionService(database.sessions)
     session = await service.create_session(selection(a={}, b={}))
     with pytest.raises(type(error)) as raised:
@@ -507,7 +513,7 @@ async def test_cancelled_exit_saves_mutations_without_retry(database, monkeypatc
             started.set()
             await asyncio.Future()
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", exit_scope=exit_hook))
     service = SessionService(database.sessions)
     session = await service.create_session(selection(scoped={}))
 
@@ -549,7 +555,7 @@ async def test_invalid_exit_mutation_is_not_saved_or_retried(database, monkeypat
         state.remaining = -1
         raise RetryableScopeError("invalid progress")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(state=State, exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", state=State, exit_scope=exit_hook))
     service = SessionService(database.sessions)
     session = await service.create_session(selection(scoped={}))
     with pytest.raises(ValidationError):
@@ -571,7 +577,7 @@ async def test_lost_lease_fences_exit_progress_and_stops_retry(database, monkeyp
             row.lock_token = uuid4()
         raise RetryableScopeError("partial cleanup")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", exit_scope=exit_hook))
     service = SessionService(database.sessions)
     session = await service.create_session(selection(scoped={}))
     with pytest.raises(LeaseLost):
@@ -593,7 +599,7 @@ async def test_cleanup_storage_failure_stops_hook_retry(database, monkeypatch, s
     async def unavailable(*args, **kwargs):
         raise storage_error("cleanup storage unavailable")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", exit_scope=exit_hook))
     monkeypatch.setattr(SessionRepository, "save_layer_cleanup", unavailable)
     service = SessionService(database.sessions)
     session = await service.create_session(selection(scoped={}))
@@ -636,7 +642,7 @@ async def test_scope_progress_transaction_finishes_before_lease_release_on_abort
     async def exit_hook(scope_id, config, state):
         state.calls = 1
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", exit_scope=exit_hook))
     monkeypatch.setattr(SessionRepository, "save_layer_cleanup", mark_progress)
     service = SessionService(
         async_sessionmaker(database.engine, class_=ObservedSession, expire_on_commit=False)
@@ -678,7 +684,7 @@ async def test_http_exposes_only_explicit_retryable_scope_errors_as_503(
         error = RetryableScopeError if retryable else RuntimeError
         raise error("secret upstream details")
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter))
     service = SessionService(database.sessions)
     app = FastAPI()
     app.include_router(create_router(ModelService(database.sessions), service))
@@ -706,7 +712,7 @@ async def test_creating_is_visible_but_not_admitted_and_identity_is_never_replay
         await finish.wait()
         return echo.State(calls=9)
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter))
     service = SessionService(database.sessions)
     data = selection(scoped={"prefix": "fixed"}).model_copy(update={"id": session_id})
     task = asyncio.create_task(service.create_session(data))
@@ -774,9 +780,9 @@ async def test_failed_creation_cleans_partial_and_uncalled_enters_without_state(
 
     for name, enter in (("a", enter_a), ("b", enter_b), ("c", enter_c)):
         monkeypatch.setitem(
-            REGISTRY,
+            LAYERS,
             name,
-            module(state=State, enter_scope=enter, exit_scope=exit_for(name)),
+            layer(name, state=State, enter_scope=enter, exit_scope=exit_for(name)),
         )
     service = SessionService(database.sessions)
     session_id = uuid4()
@@ -817,7 +823,7 @@ async def test_lost_creation_owner_cannot_publish_or_compensate_and_new_owner_ca
     async def exit_hook(scope_id, config, state):
         exits.append((scope_id, state))
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter, exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter, exit_scope=exit_hook))
     service = SessionService(database.sessions)
     with pytest.raises(SessionCreationError) as raised:
         await service.create_session(selection(scoped={}))
@@ -842,7 +848,7 @@ async def test_http_fixed_identity_conflict_does_not_repeat_enter_or_initial_inp
         calls.append(scope_id)
         return echo.State()
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(enter_scope=enter))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", enter_scope=enter))
     service = SessionService(database.sessions)
     app = FastAPI()
     app.include_router(create_router(ModelService(database.sessions), service))
@@ -870,7 +876,7 @@ async def test_ready_corrupt_state_is_rejected_before_any_exit(database, monkeyp
     async def exit_hook(scope_id, config, state):
         exits.append(state)
 
-    monkeypatch.setitem(REGISTRY, "scoped", module(exit_scope=exit_hook))
+    monkeypatch.setitem(LAYERS, "scoped", layer("scoped", exit_scope=exit_hook))
     service = SessionService(database.sessions)
     session = await service.create_session(selection(scoped={}))
     async with database.sessions.begin() as db:

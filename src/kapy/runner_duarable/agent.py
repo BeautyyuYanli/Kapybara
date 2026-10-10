@@ -23,7 +23,7 @@ from temporalio.workflow import ActivityCancellationType
 
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
 from kapy.layers import layers_capability
-from kapy.layers.registry import REGISTRY
+from kapy.layers.registry import LAYERS, get_layers
 
 from .context import RunnerActivityContext
 from .layers import LayerStateCapability, return_layer_state
@@ -68,8 +68,14 @@ agent = Agent(
     capabilities=[
         MessageRecordCapability(recorder),
         ResolveModelId(resolve_model),
-        layers_capability(REGISTRY, wrap_toolset=return_layer_state),
-        LayerStateCapability(),
+        layers_capability(
+            LAYERS,
+            get_layers=get_layers,
+            wrap_toolset=lambda layer, toolset: return_layer_state(
+                layer, toolset, get_layers=get_layers
+            ),
+        ),
+        LayerStateCapability(get_layers=get_layers),
         Hooks(
             before_model_request=recorder.predict_response_seq,
             ordering=CapabilityOrdering(

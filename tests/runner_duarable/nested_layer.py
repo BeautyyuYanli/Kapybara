@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel
 from pydantic_ai import RunContext
@@ -12,7 +13,18 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 from temporalio import workflow
 
-from kapy.runner_duarable.types import RunnerDeps
+from kapy.layers import Layer, LayerAccess, LayerData
+
+
+class Deps(BaseModel):
+    """An independent consumer stores layer data outside Kapy's deps.layers."""
+
+    session_id: UUID
+    payload: dict[str, LayerData]
+
+
+def get_layers(deps: Deps) -> dict[str, LayerData]:
+    return deps.payload
 
 
 class Config(BaseModel):
@@ -24,13 +36,13 @@ class State(BaseModel):
     hooks: int = 0
 
 
-class Counter(NativeCapability[RunnerDeps]):
-    def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(id=f"{name}.tool", tools=[self.echo])
+class Counter(NativeCapability[Deps]):
+    def __init__(self, layer_id: str, access: LayerAccess[Deps]) -> None:
+        self.access = access
+        super().__init__(id=f"{layer_id}.tool", tools=[self.echo])
 
-    def echo(self, ctx: RunContext[RunnerDeps], text: str) -> Any:
-        entry = ctx.deps.layers[self.name]
+    def echo(self, ctx: RunContext[Deps], text: str) -> Any:
+        entry = self.access(ctx.deps)
         state = State.model_validate(entry["state"])
         state.calls += 1
         entry["state"] = state.model_dump(mode="json")
@@ -48,7 +60,7 @@ class Counter(NativeCapability[RunnerDeps]):
 
     async def after_tool_execute(
         self,
-        ctx: RunContext[RunnerDeps],
+        ctx: RunContext[Deps],
         *,
         call: ToolCallPart,
         tool_def: ToolDefinition,
@@ -58,14 +70,14 @@ class Counter(NativeCapability[RunnerDeps]):
         if tool_def.capability_id != self.id:
             return result
         assert workflow.in_workflow() and ctx.capability_active is True
-        state = State.model_validate(ctx.deps.layers[self.name]["state"])
+        state = State.model_validate(self.access(ctx.deps)["state"])
         assert state.calls == state.hooks + 1
         state.hooks += 1
-        ctx.deps.layers[self.name]["state"] = state.model_dump(mode="json")
+        self.access(ctx.deps)["state"] = state.model_dump(mode="json")
         if args["text"] == "A":
-            ctx.deps.layers["other"]["state"] = {"calls": 10}
+            get_layers(ctx.deps)["other"]["state"] = {"calls": 10}
         else:
-            assert ctx.deps.layers["other"]["state"] == {"calls": 10}
+            assert get_layers(ctx.deps)["other"]["state"] == {"calls": 10}
         if args["text"] == "B":
             assert isinstance(result, ToolReturn)
             assert result.content == "native-extra" and result.tools == ["echo"]
@@ -77,19 +89,18 @@ class Counter(NativeCapability[RunnerDeps]):
         return f"{result}|hook:{state.hooks}"
 
 
-class Capability(CombinedCapability[RunnerDeps]):
-    def __init__(self, name: str) -> None:
-        self.name = name
+class Capability(CombinedCapability[Deps]):
+    def __init__(self, layer_id: str, access: LayerAccess[Deps]) -> None:
 
         def lazy_echo() -> str:
             return "lazy"
 
         super().__init__(
-            id=name,
+            id=layer_id,
             capabilities=[
-                Counter(name),
+                Counter(layer_id, access),
                 NativeCapability(
-                    id=f"{name}.lazy",
+                    id=f"{layer_id}.lazy",
                     defer_loading=True,
                     instructions="LAZY_CAPABILITY_RULE",
                     toolsets=[
@@ -103,3 +114,7 @@ class Capability(CombinedCapability[RunnerDeps]):
 
     def get_instructions(self):
         return "CONTAINER_RULE"
+
+
+def make(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State]:
+    return Layer(config_type=Config, state_type=State, capability=Capability(layer_id, access))

@@ -23,7 +23,7 @@ from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, PreparedTools
 from pydantic_ai.toolsets._capability_owned import CapabilityOwnedToolset
 from pydantic_ai.usage import RunUsage
 
-from kapy.layers import LayerDeps, layers_capability, load_layers
+from kapy.layers import LayerData, LayerDeps, layers_capability, load_layers, make_layers
 from kapy.layers.composition import _LayerCapabilities
 from layers import deferred
 
@@ -97,8 +97,10 @@ async def test_patched_composition_matches_installed_sdk(
         capabilities={"owner": owner, "outer": root},
     )
     native = CombinedCapability[LayerDeps](capabilities=[root]).get_toolset()
-    patched = _LayerCapabilities[LayerDeps](capabilities=[root]).get_toolset()
-    assert isinstance(native, AbstractToolset) and isinstance(patched, AbstractToolset)
+    contribution = _LayerCapabilities[LayerDeps](capabilities=[root]).get_toolset()
+    assert isinstance(native, AbstractToolset) and contribution is not None
+    native = await native.for_run(ctx)
+    patched = await contribution(ctx)
     expected, actual = await native.get_tools(ctx), await patched.get_tools(ctx)
     assert actual.keys() == expected.keys()
     for name in expected:
@@ -116,18 +118,21 @@ async def test_patched_composition_matches_installed_sdk(
 
 @pytest.mark.asyncio
 async def test_deferred_loading_matches_installed_sdk():
-    registry = {"lazy": deferred}
+    def get_layers(deps: LayerDeps) -> dict[str, LayerData]:
+        return deps.layers
+
+    layers = make_layers({"lazy": deferred.make}, get_layers)
     native = Agent(
         FunctionModel(deferred.lazy_model),
         deps_type=LayerDeps,
-        capabilities=[deferred.Capability("lazy")],
+        capabilities=[deferred.Capability[LayerDeps]("lazy")],
     )
     patched = Agent(
         FunctionModel(deferred.lazy_model),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(registry)],
+        capabilities=[layers_capability(layers, get_layers=get_layers)],
     )
-    deps = LayerDeps(layers=load_layers({"lazy": {}}, {}, registry))
+    deps = LayerDeps(layers=load_layers({"lazy": {}}, {}, layers))
     expected = await native.run("load lazy", deps=deps)
     actual = await patched.run("load lazy", deps=deps)
     assert json.loads(actual.output) == json.loads(expected.output)
