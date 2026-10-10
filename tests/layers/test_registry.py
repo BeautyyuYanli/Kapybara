@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from copy import copy
 from dataclasses import replace
 from typing import Any, Self
 from uuid import UUID
@@ -9,7 +10,13 @@ from uuid import UUID
 import pytest
 from pydantic import BaseModel, RootModel, ValidationError, model_validator
 from pydantic_ai import Agent, RunContext, Tool
-from pydantic_ai.capabilities import Capability, CombinedCapability
+from pydantic_ai.capabilities import (
+    Capability,
+    CapabilityOrdering,
+    CombinedCapability,
+    Hooks,
+    WrapperCapability,
+)
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
@@ -331,6 +338,93 @@ async def test_sdk_for_run_sees_finalized_capabilities_and_isolates_shared_tools
 
 
 @pytest.mark.asyncio
+async def test_selected_layers_preserve_leaf_hook_ordering():
+    calls: list[str] = []
+
+    def make(
+        layer_id: str, access: LayerAccess[LayerDeps]
+    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+        def before_run(ctx: RunContext[LayerDeps]) -> None:
+            calls.append(layer_id)
+
+        return Layer(
+            config_type=echo.Config,
+            state_type=echo.State,
+            capability=Hooks(
+                id=layer_id,
+                before_run=before_run,
+                ordering=CapabilityOrdering(position="outermost") if layer_id == "outer" else None,
+            ),
+        )
+
+    layers = make_layers({"first": make, "outer": make}, get_layers)
+    agent = Agent(
+        TestModel(),
+        deps_type=LayerDeps,
+        capabilities=[layers_capability(layers, get_layers=get_layers)],
+    )
+    await agent.run(
+        "run hooks", deps=LayerDeps(layers=load_layers({"first": {}, "outer": {}}, {}, layers))
+    )
+    assert calls == ["outer", "first"]
+
+
+@pytest.mark.asyncio
+async def test_leaf_toolset_getter_runs_after_capability_binding_and_run_isolation():
+    class BoundCapability(Capability[LayerDeps]):
+        bound = False
+        label: str | None = None
+
+        def for_agent(self, agent):
+            bound = copy(self)
+            bound.bound = True
+            return bound
+
+        async def for_run(self, ctx: RunContext[LayerDeps]):
+            bound = copy(self)
+            bound.label = echo.Config.model_validate(ctx.deps.layers["bound"]["config"]).prefix
+            return bound
+
+        def get_toolset(self):
+            assert self.bound and self.label is not None
+
+            def identify() -> str:
+                assert self.label is not None
+                return self.label
+
+            return FunctionToolset[LayerDeps](id="bound-tools", tools=[identify])
+
+    def make(
+        layer_id: str, access: LayerAccess[LayerDeps]
+    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+        return Layer(
+            config_type=echo.Config,
+            state_type=echo.State,
+            capability=WrapperCapability(BoundCapability(id=layer_id)),
+        )
+
+    layers = make_layers({"bound": make}, get_layers)
+    agent = Agent(
+        TestModel(),
+        deps_type=LayerDeps,
+        capabilities=[layers_capability(layers, get_layers=get_layers)],
+    )
+    results = await asyncio.gather(
+        *(
+            agent.run(
+                "identify",
+                deps=LayerDeps(layers=load_layers({"bound": {"prefix": label}}, {}, layers)),
+            )
+            for label in ("A", "B")
+        )
+    )
+    assert [json.loads(result.output) for result in results] == [
+        {"identify": "A"},
+        {"identify": "B"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_entrance_captures_static_configuration_and_rejects_bad_run_input():
     registry: dict[str, LayerFactory[LayerDeps]] = {"echo": echo.make}
     layers = make_layers(registry, get_layers)
@@ -428,9 +522,8 @@ async def test_deferred_loading_preserves_native_capability_and_toolset_instruct
     }
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("capability_id", [None, ""])
-async def test_nested_tool_owners_require_nonempty_declared_ids(capability_id):
+def test_nested_leaves_require_nonempty_declared_ids_during_preparation(capability_id):
     def make(
         layer_id: str, access: LayerAccess[LayerDeps]
     ) -> Layer[LayerDeps, echo.Config, echo.State]:
@@ -446,12 +539,5 @@ async def test_nested_tool_owners_require_nonempty_declared_ids(capability_id):
         )
 
     layers = make_layers({"invalid": make}, get_layers)
-    agent = Agent(
-        TestModel(),
-        deps_type=LayerDeps,
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
-    )
     with pytest.raises(UserError, match="nonempty stable id"):
-        await agent.run(
-            "call tool", deps=LayerDeps(layers=load_layers({"invalid": {}}, {}, layers))
-        )
+        layers_capability(layers, get_layers=get_layers)

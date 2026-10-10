@@ -1,4 +1,4 @@
-"""Run the same Agent with different JSON layer selections.
+"""Select from statically assembled layers using the same Agent and different JSON deps.
 
 Execute with ``python -m kapy.layers.examples.in_process``.
 """

@@ -35,7 +35,10 @@ with workflow.unsafe.imports_passed_through():
             if isinstance(part, ToolReturnPart)
         ]
         if not returns:
-            assert "echo" in {tool.name for tool in info.function_tools}
+            definition = next(tool for tool in info.function_tools if tool.name == "echo")
+            assert definition.capability_id == "nested.tool"
+            assert definition.metadata == {"kapy_layer": "nested"}
+            assert definition.sequential is True
             assert "lazy_echo" not in {tool.name for tool in info.function_tools}
             return ModelResponse(
                 parts=[ToolCallPart("echo", {"text": text}) for text in ("A", "B", "C")]

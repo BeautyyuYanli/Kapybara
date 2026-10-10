@@ -4,7 +4,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from kapy.layers import LayerDeps
-    from layers.temporal_agent import agent, approval_agent, wrapped_agent
+    from layers.temporal_agent import agent, approval_agent, deferred_agent, wrapped_agent
 
 
 @workflow.defn
@@ -22,3 +22,10 @@ class ApprovalWorkflow:
         output = (await approval_agent.run("inspect definition", deps=deps)).output
         assert isinstance(output, str)
         return output
+
+
+@workflow.defn
+class DeferredWorkflow:
+    @workflow.run
+    async def run(self, deps: LayerDeps) -> str:
+        return (await deferred_agent.run("load lazy", deps=deps)).output

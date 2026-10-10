@@ -16,10 +16,11 @@ from pydantic_ai.capabilities import CapabilityOrdering, Hooks, ResolveModelId
 from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model, ModelResolutionContext
+from pydantic_ai.toolsets import AbstractToolset, DynamicToolset
 from shellctl.shared.constants import SHELL_TOOL_HARD_TIMEOUT_SECONDS
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.workflow import ActivityCancellationType
+from temporalio.workflow import ActivityCancellationType, ActivityConfig
 
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
 from kapy.layers import layers_capability
@@ -60,6 +61,33 @@ async def resolve_model(ctx: ModelResolutionContext[RunnerDeps], model_id: str) 
         raise UserError("Invalid model execution configuration") from exc
 
 
+layer_capability = layers_capability(
+    LAYERS,
+    get_layers=get_layers,
+    wrap_toolset=lambda layer, toolset: return_layer_state(layer, toolset, get_layers=get_layers),
+)
+
+
+def _layer_activity_configs() -> dict[str, ActivityConfig]:
+    policy: ActivityConfig = {
+        "start_to_close_timeout": timedelta(seconds=SHELL_TOOL_HARD_TIMEOUT_SECONDS + 60),
+        "retry_policy": RetryPolicy(maximum_attempts=1),
+        "heartbeat_timeout": timedelta(seconds=10),
+        "cancellation_type": ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    }
+    configs: dict[str, ActivityConfig] = {}
+
+    def configure(toolset: AbstractToolset[RunnerDeps]) -> None:
+        if isinstance(toolset, DynamicToolset):
+            assert toolset.id is not None
+            configs[toolset.id] = policy
+
+    toolset = layer_capability.get_toolset()
+    if isinstance(toolset, AbstractToolset):
+        toolset.apply(configure)
+    return configs
+
+
 recorder = Recorder()
 agent = Agent(
     name="runner_duarable",
@@ -68,13 +96,7 @@ agent = Agent(
     capabilities=[
         MessageRecordCapability(recorder),
         ResolveModelId(resolve_model),
-        layers_capability(
-            LAYERS,
-            get_layers=get_layers,
-            wrap_toolset=lambda layer, toolset: return_layer_state(
-                layer, toolset, get_layers=get_layers
-            ),
-        ),
+        layer_capability,
         LayerStateCapability(get_layers=get_layers),
         Hooks(
             before_model_request=recorder.predict_response_seq,
@@ -91,16 +113,7 @@ agent = Agent(
                 # Temporal counts the initial attempt, so two attempts allow one retry.
                 "retry_policy": RetryPolicy(maximum_attempts=2),
             },
-            toolset_activity_config={
-                "layers": {
-                    "start_to_close_timeout": timedelta(
-                        seconds=SHELL_TOOL_HARD_TIMEOUT_SECONDS + 60
-                    ),
-                    "retry_policy": RetryPolicy(maximum_attempts=1),
-                    "heartbeat_timeout": timedelta(seconds=10),
-                    "cancellation_type": ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
-                }
-            },
+            toolset_activity_config=_layer_activity_configs(),
         ),
     ],
 )

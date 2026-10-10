@@ -21,8 +21,16 @@ from kapy.layers.examples.temporal_agent import agent as example_agent
 from kapy.layers.examples.temporal_agent import layers as example_layers
 from kapy.layers.examples.temporal_workflow import LayerExampleWorkflow
 from layers.temporal_agent import agent as resource_agent
-from layers.temporal_agent import approval_agent, approval_layers, events, layers, wrapped_agent
-from layers.temporal_workflow import ApprovalWorkflow, ResourceWorkflow
+from layers.temporal_agent import (
+    approval_agent,
+    approval_layers,
+    deferred_agent,
+    deferred_layers,
+    events,
+    layers,
+    wrapped_agent,
+)
+from layers.temporal_workflow import ApprovalWorkflow, DeferredWorkflow, ResourceWorkflow
 
 
 async def connect() -> Client:
@@ -84,9 +92,11 @@ async def test_temporal_dynamic_toolsets_rebuild_resources_and_replay_without_ef
         for event in history.events
         if event.HasField("activity_task_scheduled_event_attributes")
     }
-    for operation in ("get_tools", "validate_args", "call_tool"):
-        agent_name = "layers_wrapped_test" if wrapped else "layers_test"
-        assert f"agent__{agent_name}__dynamic_toolset__layers__{operation}" in activity_names
+    agent_name = "layers_wrapped_test" if wrapped else "layers_test"
+    for leaf_id in ("echo.tool", "resource"):
+        for operation in ("get_tools", "call_tool"):
+            assert f"agent__{agent_name}__dynamic_toolset__{leaf_id}__{operation}" in activity_names
+    assert f"agent__{agent_name}__dynamic_toolset__resource__validate_args" in activity_names
 
     effects = list(events)
     replayer = Replayer(workflows=[ResourceWorkflow], plugins=[PydanticAIPlugin()])
@@ -156,6 +166,33 @@ async def test_temporal_preserves_nondefault_tool_definition_after_discovery_act
     assert any(
         event.HasField("activity_task_scheduled_event_attributes")
         and event.activity_task_scheduled_event_attributes.activity_type.name
-        == "agent__layers_approval__dynamic_toolset__layers__get_tools"
+        == "agent__layers_approval__dynamic_toolset__approval__get_tools"
         for event in history.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_temporal_deferred_loading_preserves_both_instruction_sources_and_state_boundary():
+    client = await connect()
+    queue = f"layers-deferred-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[DeferredWorkflow],
+        plugins=[AgentPlugin(deferred_agent)],
+    ):
+        handle = await client.start_workflow(
+            DeferredWorkflow.run,
+            LayerDeps(layers=load_layers({"lazy": {}}, {}, deferred_layers)),
+            id=queue,
+            task_queue=queue,
+            execution_timeout=timedelta(seconds=45),
+        )
+        assert json.loads(await handle.result()) == {
+            "instructions": {"instructions": "CAPABILITY_RULE\n\nTOOLSET_RULE"},
+            "tool_result": "lazy-result",
+        }
+        history = await handle.fetch_history()
+    await Replayer(workflows=[DeferredWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
+        history
     )

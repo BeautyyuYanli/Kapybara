@@ -1,4 +1,4 @@
-"""The same deferred plugin and real SDK loading calls for native/static-layer comparisons."""
+"""Deferred leaf and deterministic model exercise native SDK loading and instructions."""
 
 import json
 

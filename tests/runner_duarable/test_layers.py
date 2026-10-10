@@ -4,12 +4,14 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
 from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
 from pydantic_ai.exceptions import ModelRetry, UserError
-from shellctl import ShellctlClientError
+from shellctl import ShellctlClient, ShellctlClientError
+from shellctl.shared.constants import SHELL_TOOL_HARD_TIMEOUT_SECONDS
 from shellctl_fixture import shell_server as shell_server
 from temporalio import activity
 from temporalio.client import WorkflowFailureError
@@ -136,11 +138,24 @@ async def test_two_tools_resume_replay_and_partial_close(
         )
         assert "echo:resume" in await second.result()
         assert (await state(runner_database, session.id))[0]["jobs"][job_a] > saved["jobs"][job_a]
-        for event in history.events:
-            if event.HasField("activity_task_scheduled_event_attributes"):
-                attrs = event.activity_task_scheduled_event_attributes
-                if attrs.activity_type.name.endswith("__call_tool"):
-                    assert attrs.retry_policy.maximum_attempts == 1
+        expected_activities = {
+            f"agent__runner_duarable__dynamic_toolset__shell__{operation}"
+            for operation in ("get_tools", "call_tool")
+        }
+        shell_activities = [
+            event.activity_task_scheduled_event_attributes
+            for event in history.events
+            if event.HasField("activity_task_scheduled_event_attributes")
+            and event.activity_task_scheduled_event_attributes.activity_type.name
+            in expected_activities
+        ]
+        assert {attrs.activity_type.name for attrs in shell_activities} == expected_activities
+        for attrs in shell_activities:
+            assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(
+                seconds=SHELL_TOOL_HARD_TIMEOUT_SECONDS + 60
+            )
+            assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=10)
+            assert attrs.retry_policy.maximum_attempts == 1
         before = await state(runner_database, session.id)
         await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
             history
@@ -227,22 +242,58 @@ async def test_cancel_after_job_registration_keeps_previous_snapshot(
     runner_database, shell_server, monkeypatch
 ):
     registered = asyncio.Event()
+    cleanup_started, release_cleanup, cleanup_finished = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    closing_client: ShellctlClient | None = None
+    original_close = ShellctlClient.close
 
     async def blocked_result(self, result):
+        nonlocal closing_client
         assert activity.in_activity()
+        closing_client = self.client
         registered.set()
         await asyncio.Future()
 
+    async def delayed_close(client: ShellctlClient) -> None:
+        # Gate only this Activity's real client; fixture and scope clients still close normally.
+        if client is closing_client:
+            assert activity.in_activity()
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            finally:
+                await original_close(client)
+                cleanup_finished.set()
+        else:
+            await original_close(client)
+
     monkeypatch.setattr(runtime.ShellOperations, "_result", blocked_result)
+    monkeypatch.setattr(ShellctlClient, "close", delayed_close)
     async with worker_service(runner_database) as service:
         session = await create_shell_session(runner_database, service, shell_server)
         handle = await service.start_durable_runner(
             session.id, user_prompt=prompt((run("printf 'cancel\\n'; sleep 30"),))
         )
-        await asyncio.wait_for(registered.wait(), 10)
-        await handle.cancel()
-        with pytest.raises(WorkflowFailureError):
-            await asyncio.wait_for(handle.result(), 20)
-        saved, version = await state(runner_database, session.id)
-        assert saved == {"jobs": {}} and version == 0
-        await service.close_session(session.id)
+        result = asyncio.create_task(handle.result())
+        try:
+            await asyncio.wait_for(registered.wait(), 10)
+            await handle.cancel()
+            await asyncio.wait_for(cleanup_started.wait(), 10)
+            # Cancellation must wait for resource cleanup before completing the Workflow.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(result), 0.5)
+            release_cleanup.set()
+            with pytest.raises(WorkflowFailureError):
+                await asyncio.wait_for(result, 20)
+            await asyncio.wait_for(cleanup_finished.wait(), 5)
+            saved, version = await state(runner_database, session.id)
+            assert saved == {"jobs": {}} and version == 0
+        finally:
+            release_cleanup.set()
+            if not result.done():
+                await handle.cancel()
+            await asyncio.wait_for(asyncio.gather(result, return_exceptions=True), 20)
+            await service.close_session(session.id)

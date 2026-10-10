@@ -11,9 +11,10 @@ values to the models; exit must accept `State | None`.
 without execution deps. It checks the returned Layer, model classes, native
 capability, async hooks and root capability ID. The root ID must equal the
 registered nonempty string; the framework never rewrites it. Function tools inherit
-the Capability ID during SDK construction. Nested owners and internal Toolsets
-may use independent or derived stable IDs; every Toolset-contributing capability
-owner must have one. IDs stay fixed after construction.
+the Capability ID during SDK construction. Nested leaves and internal Toolsets
+may use independent or derived stable IDs; every registered capability leaf must
+have one, including leaves without tools. IDs and composition membership stay
+fixed after construction. Native Combined containers do not need extra IDs.
 
 The caller supplies `get_layers(deps) -> dict[str, LayerData]`. Its mapping is the
 current enabled selection, separate from the installed factory allowlist. Each
@@ -138,26 +139,33 @@ details and report exhausted retryable errors as 503. Telegram saves the ID befo
 creation and queries it on inbox recovery. Neither interface automatically repeats
 creation after the hook's bounded attempts.
 
-`layers_capability(layers, get_layers=get_layers)` captures the static definitions
-and installs one stable `DynamicCapability(id="layers")`. Each resolution selects
-and validates current deps; an empty selection enables zero layers. Factories are
-not rerun. Native hooks, instructions, tool flags, `for_agent`/`for_run` binding and
-resource lifecycles remain SDK-owned. Stateless components may be shared; components
-with mutable run state return independent instances from native `for_run`. Layer
-instructions have no application ordering contract. SDK hook ordering, including
-the durable message recorder, still applies.
+`layers_capability(layers, get_layers=get_layers)` prepares a static selector.
+At Agent construction it exposes all installed entries so the SDK can register
+Activities. For each run it validates current Config/State and selects enabled
+definitions in the deps mapping's order; an empty selection enables zero layers.
+Unknown names or invalid data fail before capability execution. Factories are not
+rerun. Each registered leaf is wrapped in a native `DynamicCapability` whose
+Activity ID equals that leaf's stable capability ID. Missing leaf IDs fail during
+selector preparation. A Wrapper over one leaf is wrapped as a whole; Combined
+containers and Wrappers containing children retain their native structure.
 
-Layer composition uses one patched combined capability in ordinary runs and
-Temporal Activities. Every capability that contributes a Toolset, including
-nested owners, must declare a nonempty stable ID. Ownership uses that declared ID,
-so it does not need the live registry omitted by `TemporalRunContext`. The patch
-inherits the SDK's ownership wrapper and retains its deferred instruction
-collection: both capability and Toolset instructions remain available when loaded.
-The patch copies the SDK's `get_tools` definition processing because owner-ID
-resolution has no override hook. [SDK contract tests](../../../tests/layers/test_sdk_contract.py)
-compare it with the installed native implementation and require review when the
-copied method or ownership fields change. A guard failure requires reviewing the
-upstream change before updating its fingerprint.
+Native Combined owns composition, instructions, hook ordering and tool ownership
+in ordinary runs and on the Temporal Workflow side. Native Dynamic rebuilds each
+leaf inside Activities, which do not receive the live capability registry.
+Successful discovery returns tool definitions for native Workflow-side ownership
+and deferral processing. Deferred loading retains both capability and Toolset
+instructions without copying SDK implementation methods.
+
+Leaf Toolset contributions are read after capability binding. The optional
+`wrap_toolset(layer, toolset)` wraps each leaf with its complete owning Layer;
+the resulting Toolset binds through native `for_run` at tool resolution. Ordinary
+runs then have a finalized capability registry, while each Activity binds and
+enters its own resource instance. Stateful components return independent instances
+from native `for_run`; static definitions do no resource I/O. Capability factories
+producing unknown runtime subtrees are outside this static composition contract.
+Callable contributions and dynamic Toolsets within declared leaves remain supported.
+Layer instructions have no application ordering contract. SDK hook ordering,
+including the durable message recorder, still applies.
 
 These examples use deterministic SDK models and show static assembly, injected access, explicit
 State writes, enabling/disabling selections, and resource cleanup:

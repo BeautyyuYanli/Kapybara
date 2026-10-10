@@ -7,7 +7,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai import Agent, RunContext, Tool
-from pydantic_ai.capabilities import Capability, CombinedCapability
+from pydantic_ai.capabilities import Capability, CombinedCapability, WrapperCapability
 from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models import ModelRequestContext
@@ -20,7 +20,8 @@ from temporalio.common import RetryPolicy
 from kapy.layers import Layer, LayerAccess, LayerData, LayerDeps, layers_capability, make_layers
 from kapy.layers.examples import echo
 from kapy.layers.examples.echo import State
-from layers import tool_definitions
+from kapy.runner_duarable.layers import LayerStateCapability, return_layer_state
+from layers import deferred, tool_definitions
 
 events: list[tuple[str, str]] = []
 
@@ -141,7 +142,8 @@ def nested_echo(
         config_type=echo.Config,
         state_type=echo.State,
         capability=CombinedCapability(
-            id=layer_id, capabilities=[CombinedCapability(capabilities=[child])]
+            id=layer_id,
+            capabilities=[WrapperCapability(CombinedCapability(capabilities=[child]))],
         ),
     )
 
@@ -239,5 +241,23 @@ approval_agent = Agent(
                 "retry_policy": RetryPolicy(maximum_attempts=1),
             }
         ),
+    ],
+)
+
+deferred_layers = make_layers({"lazy": deferred.make}, get_layers)
+deferred_agent = Agent(
+    FunctionModel(deferred.lazy_model),
+    name="layers_deferred",
+    deps_type=LayerDeps,
+    capabilities=[
+        layers_capability(
+            deferred_layers,
+            get_layers=get_layers,
+            wrap_toolset=lambda layer, toolset: return_layer_state(
+                layer, toolset, get_layers=get_layers
+            ),
+        ),
+        LayerStateCapability(get_layers=get_layers),
+        TemporalDurability(),
     ],
 )

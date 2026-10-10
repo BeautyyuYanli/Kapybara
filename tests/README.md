@@ -48,5 +48,6 @@ cross-run cursors, native retries, failure/cancellation preserving the preceding
 snapshot, replay, and session-close retry progress. Nested-capability tests also
 verify State is visible before hooks, other layers stay intact, and ordinary or
 native ToolReturn values retain their public shape across a consumer-specific deps
-layout. SDK ownership differential tests compare whole public tool definitions
-and calls with the installed SDK; method/field guards require review on upgrades. No external model API is called.
+layout. Native ownership, nondefault tool flags and deferred capability/Toolset
+instructions are checked through ordinary Agent runs and real Temporal Activities.
+No external model API is called.

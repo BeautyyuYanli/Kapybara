@@ -1,4 +1,4 @@
-"""Static registration shared by the standalone example Worker and Workflow."""
+"""Register static leaf Activity entries shared by the example Worker and Workflow."""
 
 from pydantic_ai import Agent
 from pydantic_ai.durable_exec.temporal import TemporalDurability

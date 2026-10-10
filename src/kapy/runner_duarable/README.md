@@ -79,8 +79,10 @@ snapshot/version under its admission lock and fixes `RunnerInput.layers`.
 
 The [layer factory contract](../layers/README.md) assembles static typed `LAYERS`
 with explicit model types, native capabilities and business hooks. The Agent
-installs one dynamic `layers` capability and selects enabled definitions from
-current deps using Kapy's injected `get_layers` rule. Tools read their own entry
+installs a static layer selector and selects enabled definitions from
+current deps using Kapy's injected `get_layers` rule. Each known capability leaf
+has a native Dynamic Activity entry named by its stable capability ID; Combined
+composition and ownership remain in the Workflow. Tools read their own entry
 through factory-injected access and explicitly replace State JSON. Workflow and
 Activity each bind their process-local static capabilities through the SDK;
 stateful SDK components use `for_run` isolation. Factories and business hooks do
@@ -104,7 +106,10 @@ a later run failure leaves the previous database inventory intact. Session close
 can clean only jobs in that saved inventory.
 
 All layer tools execute sequentially, so the next Activity receives the preceding
-call's returned State. The dynamic layer Activities have a finite shell hard
+call's returned State, including calls to different leaves of the same layer.
+Tool ownership can be a leaf ID while State belongs to its enclosing layer ID.
+Runner obtains Activity entry IDs through the Toolset tree's public traversal,
+then applies the same policy to each entry. The leaf Activities have a finite shell hard
 timeout plus 60 seconds, a 10-second heartbeat timeout, at most one attempt, and
 wait for cancellation cleanup. Non-idempotent shell operations are not retried
 by Temporal. SDK `ModelRetry` still asks the model for a new call through its

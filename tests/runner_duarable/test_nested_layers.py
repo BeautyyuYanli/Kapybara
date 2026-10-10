@@ -4,14 +4,9 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from pydantic_ai import RunContext
-from pydantic_ai.durable_exec._toolset import get_dynamic_tools
-from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin, TemporalRunContext
-from pydantic_ai.durable_exec.temporal._run_context import deserialize_run_context
-from pydantic_ai.models import Model
-from pydantic_ai.usage import RunUsage
+from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
 from runner_duarable.nested_layer import Deps
-from runner_duarable.nested_workflow import NestedWorkflow, agent, entrance, layers
+from runner_duarable.nested_workflow import NestedWorkflow, agent, layers
 from temporalio.worker import Replayer, Worker
 
 from kapy.application.resources import connect_temporal
@@ -28,31 +23,6 @@ def deps(session_id):
         session_id=session_id,
         payload=load_layers({"nested": {}, "other": {}}, {}, layers),
     )
-
-
-@pytest.mark.asyncio
-async def test_nested_owned_tools_discover_with_serialized_activity_context():
-    data = deps(uuid4())
-    model = agent.model
-    assert isinstance(model, Model)
-    ctx = RunContext(deps=data, model=model, usage=RunUsage(), prompt="discover")
-    activity_ctx = deserialize_run_context(
-        TemporalRunContext,
-        TemporalRunContext.serialize_run_context(ctx),
-        deps=data,
-        agent=agent,
-    )
-    tools = await get_dynamic_tools(entrance.get_toolset(), activity_ctx)
-    assert set(tools.tools) == {"echo", "lazy_echo", "example_echo"}
-    assert tools.tools["echo"].tool_def.capability_id == "nested.tool"
-    assert tools.tools["lazy_echo"].tool_def.capability_id == "nested.lazy"
-    assert tools.tools["lazy_echo"].tool_def.defer_loading is True
-    assert tools.instructions is None
-    for tool in tools.tools.values():
-        assert tool.tool_def.metadata == {
-            "kapy_layer": "other" if tool.tool_def.name == "example_echo" else "nested"
-        }
-        assert tool.tool_def.sequential is True
 
 
 @pytest.mark.asyncio
