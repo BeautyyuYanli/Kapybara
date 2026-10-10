@@ -27,6 +27,7 @@ from kapy.control.sessions import (
     SubmitInput,
     UpdateSession,
 )
+from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleError
 from kapy.session_lease import SessionBusy
 
@@ -302,6 +303,15 @@ class TelegramController:
         except PluginOperationError:
             await self.repository.save_action(
                 item, {"command": "reply", "reply": "Plugin cleanup failed. Use /close to retry."}
+            )
+        except RetryableScopeError:
+            retry = "/close" if (item.resolved_action or {}).get("command") == "close" else "/new"
+            await self.repository.save_action(
+                item,
+                {
+                    "command": "reply",
+                    "reply": f"Layer scope operation failed. Use {retry} to retry.",
+                },
             )
         except LifecycleError:
             await self.repository.save_action(

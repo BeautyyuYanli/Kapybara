@@ -47,9 +47,16 @@ class SessionRepository:
         return row
 
     async def create_session(
-        self, data: CreateSession, *, layer_states: dict[str, JsonObject] | None = None
+        self,
+        data: CreateSession,
+        *,
+        session_id: UUID | None = None,
+        layer_states: dict[str, JsonObject] | None = None,
     ) -> SessionRecord:
-        row = SessionRow(**data.model_dump(exclude={"plugins"}), layer_states=layer_states or {})
+        values = data.model_dump(exclude={"plugins"})
+        if session_id is not None:
+            values["id"] = session_id
+        row = SessionRow(**values, layer_states=layer_states or {})
         self._db.add(row)
         await self._db.flush()
         return SessionRecord.model_validate(row)

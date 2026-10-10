@@ -556,7 +556,8 @@ async def test_telegram_model_command_updates_only_bound_session_and_new_default
         assert created_id is not None
         created = await sessions.get_session(created_id)
         assert (created.provider_id, created.model_name) == (new_provider.id, "new")
-        assert created.model_settings == {}
+        assert created.title == "keep title" and created.model_settings == {"temperature": 0.3}
+        assert created.compaction_replay_turns == 4
         assert len((await models.list_models()).items) == 2
 
 

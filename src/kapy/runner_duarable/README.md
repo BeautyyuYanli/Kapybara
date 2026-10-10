@@ -64,7 +64,9 @@ leaves both messages and layer States at the preceding successful snapshot.
 
 `CreateSession.layers` accepts registered names and configuration objects, such as
 `{"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}`. Creation
-validates Config and initializes State from `{}` without allocating resources.
+validates Config and calls optional `enter_scope`, which may allocate business
+resources and returns the initial State, including required fields. Without enter,
+State initializes from `{}`. See the [scope lifecycle contract](../layers/README.md#business-scopes).
 Names/configuration stay fixed for the session. The public session DTO returns
 configuration; internal PostgreSQL `sessions.layer_states` holds execution State.
 `SessionService.start_durable_runner()` reads both JSON columns with the message
@@ -98,9 +100,11 @@ wait for cancellation cleanup. Non-idempotent shell operations are not retried
 by Temporal. SDK `ModelRetry` still asks the model for a new call through its
 normal protocol. A lost remote acknowledgement can mean an operation executed.
 
-Shell jobs survive a completed run. Exclusive session close reads the latest
-saved inventory, deletes each known job, and saves progress after each confirmed
-deletion. Cleanup failure retains CLOSING and remaining jobs for a close retry.
+Shell jobs survive a completed run. Exclusive session close calls every configured
+module's optional `exit_scope` with its latest State, then validates and saves State
+after each hook attempt. Shell removes confirmed jobs sequentially within an attempt;
+the database save occurs at the attempt boundary. Cleanup failure retains CLOSING
+and saved layer progress for a close retry.
 New layer sessions reject legacy `plugins` and the old Python runner entry;
 existing legacy plugin sessions retain their original execution and StateStore.
 

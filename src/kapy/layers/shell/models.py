@@ -24,7 +24,7 @@ class Config(BaseModel):
     """Remote cwd/env are ordinary persisted config, never a secret store.
 
     Validation performs no I/O. token_env names an environment variable in the
-    plugin process, resolved separately for every execution and session close.
+    calling process, resolved separately for every tool call and scope exit.
     Ownership environment fields are metadata, not authorization or idempotency.
     """
 

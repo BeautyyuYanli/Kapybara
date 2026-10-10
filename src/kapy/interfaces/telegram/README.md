@@ -157,12 +157,16 @@ preview state. Cancellation unwinds the current read or send and closes the live
 Bot API, SQLite, Valkey and core PostgreSQL resources; exit does not set a user
 cancel flag. Existing legacy Telegram state is not imported.
 
-`/close` first acquires the session lease, then awaits sequential plugin and shell-layer cleanup
-and keeps the route/history for inspection. A busy lease or active durable Workflow replies that close has
+`/close` first acquires the session lease, then awaits sequential legacy plugin cleanup
+and each configured module's optional `exit_scope`. Normal close validates and saves
+State after each hook attempt; the route/history remains available for inspection.
+A busy lease or active durable Workflow replies that close has
 not started and completes the inbox command; it is never automatically retried
 as a future close. Retry `/close` after execution exits; `/cancel` only stores the legacy flag.
-Failure preserves closing progress and replies with a retry notice. Input to a
-closing/closed session is rejected without enqueueing; `/new` creates another one.
+Cleanup failure preserves closing and any saved progress. The interface records a
+retry reply for `PluginOperationError` and exhausted `RetryableScopeError`; uncaught
+errors propagate without guaranteeing a reply. Input to a closing/closed session is
+rejected without enqueueing; `/new` creates another one.
 `/status` includes the lifecycle status. HTTP and Telegram share SessionService and the independent durable Worker. Business
 plugin bindings and old checkpoints cannot start durable execution. Context plugin
 and compaction configuration remain stored but do not affect durable execution.

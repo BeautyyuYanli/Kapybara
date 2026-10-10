@@ -9,15 +9,19 @@ original history to live events without holding a transaction during iteration.
 """
 
 import asyncio
+import logging
 import math
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import anyio
+from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
@@ -57,9 +61,10 @@ from kapy.control.models.runtime import (
 from kapy.control.models.types import ModelRecord, ProviderConfig
 from kapy.control.types import utc_now
 from kapy.layers import load_layers
+from kapy.layers.modules import dump_object, layer_types, prepare_layer_configs
 from kapy.layers.registry import REGISTRY
-from kapy.layers.shell import layer as shell_layer
-from kapy.layers.types import JsonObject
+from kapy.layers.scopes import retry_scope
+from kapy.layers.types import JsonObject, LayerData
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow
@@ -82,6 +87,7 @@ class DurableRunnerConflict(Exception):
 
 
 _TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -156,33 +162,85 @@ class SessionService:
         self._execution_factory = execution_factory
 
     async def create_session(self, data: CreateSession) -> SessionRecord:
-        """Save configuration without execution or SDK clients.
+        """Enter business scopes, then atomically save configuration and initial State.
 
         An omitted/None threshold stays None for a known model capacity; otherwise
         creation stores 70% of 256 Ki tokens, rounded down. Updates do not default it.
+        Hook I/O is outside transactions. Definite failures compensate successful
+        enters in reverse order; a started COMMIT has an uncertain outcome and
+        must never trigger resource deletion. Hooks own incomplete allocation and
+        process-crash recovery; there is no cross-system creation transaction.
         """
         prepared = self.plugins.prepare_bindings(data.plugins)
         try:
-            layers = load_layers(data.layers, {}, REGISTRY)
+            configs = prepare_layer_configs(data.layers, REGISTRY)
         except UserError as exc:
             raise ValueError(str(exc)) from exc
         data = data.model_copy(
-            update={"layers": {name: entry["config"] for name, entry in layers.items()}}
+            update={"layers": {name: dump_object(config) for name, config in configs.items()}}
         )
-        async with self._session_factory.begin() as db:
-            try:
-                model = await ModelRepository(db).get_model(data.provider_id, data.model_name)
-            except LookupError:
-                model = None
-            threshold = data.compaction_threshold_tokens
-            if threshold is None and (model is None or model.context_window is None):
-                threshold = 256 * 1024 * 7 // 10
-            record = await SessionRepository(db).create_session(
-                data.model_copy(update={"compaction_threshold_tokens": threshold}),
-                layer_states={name: entry["state"] for name, entry in layers.items()},
-            )
-            self.plugins.create_bindings(db, record.id, prepared)
-        return record
+        session_id = uuid4()
+        states: dict[str, JsonObject] = {}
+        entered: list[tuple[str, BaseModel, BaseModel]] = []
+        commit_started = False
+        try:
+            for name, config in configs.items():
+                _, state_type, _ = layer_types(name, REGISTRY)
+                enter = getattr(REGISTRY[name], "enter_scope", None)
+                if enter is None:
+                    state = state_type.model_validate({})
+                else:
+                    returned = await retry_scope(
+                        lambda enter=enter, config=config: enter(
+                            session_id, config.model_copy(deep=True)
+                        )
+                    )
+                    if not isinstance(returned, state_type):
+                        raise TypeError(f"Layer {name!r} enter_scope must return its State")
+                    state = state_type.model_validate(dump_object(returned))
+                    entered.append((name, config, state))
+                states[name] = dump_object(state)
+            # Flush all writes before the commit boundary, including legacy bindings.
+            # A commit error/cancellation can follow a successful server-side commit.
+            async with self._session_factory() as db:
+                try:
+                    model = await ModelRepository(db).get_model(data.provider_id, data.model_name)
+                except LookupError:
+                    model = None
+                threshold = data.compaction_threshold_tokens
+                if threshold is None and (model is None or model.context_window is None):
+                    threshold = 256 * 1024 * 7 // 10
+                record = await SessionRepository(db).create_session(
+                    data.model_copy(update={"compaction_threshold_tokens": threshold}),
+                    session_id=session_id,
+                    layer_states=states,
+                )
+                self.plugins.create_bindings(db, session_id, prepared)
+                await db.flush()
+                commit_started = True
+                await db.commit()
+            return record
+        except BaseException:
+            if not commit_started:
+                # Shield compensation from the cancellation that caused creation
+                # to fail. Each hook remains responsible for bounded remote I/O.
+                with anyio.CancelScope(shield=True):
+                    for name, config, state in reversed(entered):
+                        exit_hook = getattr(REGISTRY[name], "exit_scope", None)
+                        if exit_hook is not None:
+                            try:
+                                await retry_scope(
+                                    lambda hook=exit_hook, cfg=config, value=state: hook(
+                                        session_id, cfg.model_copy(deep=True), value
+                                    )
+                                )
+                            except BaseException:
+                                _logger.exception(
+                                    "Scope compensation failed for session %s layer %s",
+                                    session_id,
+                                    name,
+                                )
+            raise
 
     async def require_ready(self, session_id: UUID, *, db: AsyncSession | None = None) -> None:
         """Lock the session for intake or lease admission in the caller's transaction."""
@@ -200,9 +258,12 @@ class SessionService:
         With a Temporal Client, check remote activity under the session row lock
         before changing lifecycle. Query failures propagate; close never stops a
         Workflow. Close never changes cancellation or pending inputs. Failures retain the
-        irreversible closing decision and completed bindings for explicit retry.
+        irreversible closing decision and completed cleanup progress for explicit retry.
         Registered resources are cleaned under the lease, including plugin exit;
         fencing cannot revoke already-issued external requests from a lost owner.
+        Optional layer exits save mutated State after every attempt, even on
+        error/cancellation. Only RetryableScopeError permits an automatic retry;
+        a later close can repeat earlier successful exits, which must be idempotent.
         """
         async with open_session_lease(
             session_id,
@@ -227,21 +288,49 @@ class SessionService:
                 if binding.status != LifecycleStatus.CLOSED:
                     await self.plugins.close_binding(binding, lease=lease)
             for name, entry in layers.items():
-                if REGISTRY[name] is shell_layer:
-
-                    async def save_state(state: JsonObject, layer_name: str = name) -> None:
-                        async with self._session_factory.begin() as db:
-                            await lease.lock_owned(db)
-                            await SessionRepository(db).save_layer_cleanup(
-                                session_id, layer_name, state
-                            )
-
-                    await shell_layer.close_session(entry["config"], entry["state"], save_state)
+                await self._exit_layer_scope(session_id, name, entry, lease)
             async with self._session_factory.begin() as db:
                 await lease.lock_owned(db)
                 row = await lock_session(db, session_id)
                 row.status, row.updated_at = LifecycleStatus.CLOSED, utc_now()
                 return SessionRecord.model_validate(row)
+
+    async def _exit_layer_scope(
+        self, session_id: UUID, name: str, entry: LayerData, lease: SessionLease
+    ) -> None:
+        """Persist valid exit progress under ownership before propagating or retrying."""
+        exit_hook = getattr(REGISTRY[name], "exit_scope", None)
+        if exit_hook is None:
+            return
+        config_type, state_type, _ = layer_types(name, REGISTRY)
+        config = config_type.model_validate(deepcopy(entry["config"]))
+        state = state_type.model_validate(deepcopy(entry["state"]))
+
+        async def attempt() -> None:
+            lease.check()
+            await exit_hook(session_id, config.model_copy(deep=True), state)
+
+        async def save_progress() -> None:
+            nonlocal state
+            # Model instances do not revalidate mutations by default. Round-trip
+            # through JSON so persisted progress and the next attempt are validated.
+            state = state_type.model_validate(dump_object(state))
+            saved = dump_object(state)
+            # Keep commit/rollback in this task: the maker's begin context
+            # shields a separate commit task that can outlive our deadline/lease.
+            db = self._session_factory()
+            try:
+                with anyio.fail_after(5, shield=True):
+                    await lease.lock_owned(db)
+                    await SessionRepository(db).save_layer_cleanup(session_id, name, saved)
+                    await db.commit()
+            finally:
+                # Closing performs rollback on an aborted transaction. Give it
+                # its own bounded shield after the operation's deadline expires.
+                with anyio.fail_after(5, shield=True):
+                    await db.close()
+
+        await retry_scope(attempt, after_attempt=save_progress)
 
     async def get_session(self, session_id: UUID) -> SessionRecord:
         async with self._session_factory.begin() as db:

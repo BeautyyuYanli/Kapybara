@@ -150,17 +150,21 @@ Only the final versioned save replaces all layer States and messages together;
 an execution that never commits that save retains the preceding snapshot.
 
 
-Session creation validates layer and plugin config before saving ready session/binding records
-in one transaction; it does not allocate external resources. `close_session(id)`
+Session creation validates layer exports/Config and legacy plugin config, then calls
+each configured module's optional `enter_scope`. The hook may allocate business resources
+and returns the initial State, including required fields; without enter, State
+initializes from `{}`. Ready session/binding records are then saved in one transaction.
+See the [layer scope contract](../layers/README.md#business-scopes). `close_session(id)`
 first acquires the shared session lease. SessionBusy leaves all business state,
 inputs and cancel flags unchanged. After admission it checks durable Workflow status under the session row lock;
-active execution is busy and query failures propagate. It then records closing, cleans fixed
-bindings sequentially, deletes known shell layer jobs, and records each completed
-binding/deletion and then the session as
-closed. Failure preserves CLOSING and unfinished bindings/jobs; an explicit retry
-continues from saved progress. Close
+active execution is busy and query failures propagate. It then records closing, closes
+fixed plugin bindings sequentially, and calls each configured module's optional
+`exit_scope`. Completed bindings are saved individually; normal session close
+validates and saves layer State after every hook attempt. The session becomes closed
+after all cleanup succeeds. Failure preserves CLOSING, unfinished bindings and saved
+layer progress; an explicit retry continues from that progress. Close
 never changes cancellation flags. Registered cleanup is confirmed; lost-owner
-external requests and orphan resources still require plugin reconciliation. See
+external requests and orphan resources still require layer/plugin reconciliation. See
 [Agent plugins](../agent_plugins/README.md) for StateStore and resource contracts.
 The native [shell layer](../layers/README.md) shares shell behavior with the legacy
 plugin and closes its own per-call clients. Its jobs remain alive after a run until

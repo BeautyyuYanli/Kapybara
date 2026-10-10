@@ -3,10 +3,28 @@
 Modules export Config, State and exactly one native Capability or Toolset.
 Validators and constructors must be deterministic and perform no I/O; Temporal
 reconstructs these components from the same deps in every tool Activity.
+
+Tools (names, collection and schemas) and instructions are static declarations,
+stable for fixed Config: never generate them from mutable State through factories.
+This preserves model prefix caching. SDK callbacks may render fixed instructions;
+dynamic business information belongs in State and tool results.
+
+Optional async module hooks own the longer business scope:
+enter_scope(scope_id: UUID, config: Config) -> State initializes a new session;
+exit_scope(scope_id: UUID, config: Config, state: State) -> None releases it.
+The scope ID is the session UUID, unrelated to individual SDK runs or clients.
+Hooks may raise RetryableScopeError for bounded retries and must be idempotent.
+Enter owns partial allocation until it returns valid State. Exit mutates State to
+record confirmed cleanup. During normal Session close, the host revalidates and
+saves it after success, failure or cancellation. Creation-failure compensation
+retains only the current in-memory State; there is no saved Session.
+Repeated close can invoke a previously successful exit again. Constructors,
+validators and instructions must never allocate scope resources.
 """
 
 from collections.abc import Callable, Mapping
 from copy import deepcopy
+from inspect import iscoroutinefunction
 from types import ModuleType
 from typing import Any, cast
 
@@ -42,6 +60,9 @@ def layer_types(
     expected = AbstractCapability if capability is not None else AbstractToolset
     if not isinstance(component, type) or not issubclass(component, expected):
         raise UserError(f"Layer {name!r} must use native Pydantic AI components")
+    for hook_name in ("enter_scope", "exit_scope"):
+        if hasattr(module, hook_name) and not iscoroutinefunction(getattr(module, hook_name)):
+            raise UserError(f"Layer {name!r} {hook_name} must be an async function")
     return (
         cast(type[BaseModel], config),
         cast(type[BaseModel], state),
@@ -55,6 +76,19 @@ def dump_object(model: BaseModel) -> JsonObject:
     if not isinstance(value, dict):
         raise UserError("Layer Config and State must encode JSON objects")
     return deepcopy(value)
+
+
+def prepare_layer_configs(
+    configs: Mapping[str, JsonObject], registry: Mapping[str, ModuleType]
+) -> dict[str, BaseModel]:
+    """Validate all exports/Config before any scope hook; State may require enter."""
+    result = {
+        name: layer_types(name, registry)[0].model_validate(deepcopy(config))
+        for name, config in configs.items()
+    }
+    for config in result.values():
+        dump_object(config)
+    return result
 
 
 def load_layers(

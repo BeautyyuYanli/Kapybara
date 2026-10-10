@@ -45,6 +45,7 @@ from kapy.interfaces.telegram.repository import TelegramRepository, delivery_key
 from kapy.interfaces.telegram.schema import migrate
 from kapy.interfaces.telegram.settings import StorageSettings, TelegramSettings
 from kapy.interfaces.telegram.storage import open_storage
+from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleStatus
 
 
@@ -1113,6 +1114,31 @@ async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp
     assert await app.process_once()
     assert client.send.await_args.args[-1] == "Session closed."
     assert sessions.close_session.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["enter", "exit"])
+async def test_scope_retry_exhaustion_becomes_explicit_retry_reply(repository, tmp_path, operation):
+    app, sessions, client = controller(repository, tmp_path)
+    failure = RetryableScopeError("secret upstream information")
+    if operation == "enter":
+        sessions.create_session.side_effect = failure
+        await repository.ingest(42, [update(1, "/new")])
+    else:
+        await repository.ingest(42, [update(1, "/new")])
+        assert await app.process_once()
+        sessions.close_session.side_effect = failure
+        await repository.ingest(42, [update(2, "/close")])
+    assert await app.process_once()
+    assert await app.process_once()
+    assert await repository.next_inbox(42) is None
+    retry = "/new" if operation == "enter" else "/close"
+    assert client.send.await_args.args[-1] == f"Layer scope operation failed. Use {retry} to retry."
+    assert "secret" not in str(client.send.await_args_list)
+    if operation == "enter":
+        sessions.create_session.assert_awaited_once()
+    else:
+        sessions.close_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio

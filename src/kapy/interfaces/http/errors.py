@@ -16,6 +16,7 @@ from kapy.control.models.types import (
     ModelDiscoveryError,
 )
 from kapy.control.sessions import DurableRunnerConflict
+from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleError
 from kapy.session_lease import SessionBusy
 
@@ -54,6 +55,11 @@ class ControlRoute(APIRoute):
                 return JSONResponse(
                     status_code=503,
                     content={"detail": "Plugin operation failed; session close can be retried"},
+                )
+            except RetryableScopeError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Layer scope operation failed; retry explicitly"},
                 )
             except ModelAlreadyExists:
                 return JSONResponse(status_code=409, content={"detail": "Resource conflict"})

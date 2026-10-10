@@ -134,5 +134,8 @@ for example `{"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}
 Unknown names, invalid Config, or combining nonempty layers with legacy plugins
 return 422. GET/list/create responses include normalized layer configuration;
 internal State is absent. PATCH cannot change layers or State. Durable starts
-restore the internal saved State, and close cleans up the shell inventory with
-the same retryable CLOSING lifecycle. See [Layers](../../layers/README.md).
+restore the internal saved State. Optional layer `enter_scope`/`exit_scope` hooks
+initialize business State and release registered resources. Close retains CLOSING
+and validated cleanup progress on failure. Explicit `RetryableScopeError` gets
+three bounded hook attempts and returns 503 if exhausted; ordinary hook errors do
+not automatically retry. See [Layers](../../layers/README.md).
