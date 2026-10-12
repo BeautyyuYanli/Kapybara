@@ -31,7 +31,7 @@ class Layer[D, C: BaseModel, S: BaseModel]:
 
     Capability/Toolset IDs stay fixed after construction. Stateful SDK components
     use native ``for_run`` isolation. Exit must tolerate absent persisted State,
-    partial allocation and repeated cleanup using the session UUID and Config.
+    partial allocation and repeated cleanup using the host's scope UUID and Config.
     """
 
     config_type: type[C]

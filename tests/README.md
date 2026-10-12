@@ -7,7 +7,7 @@ Run the full suite inside the runtime container so process, PTY and file tests u
 an isolated filesystem and real subprocesses:
 
 ```sh
-docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests
+docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests packages/pydantic-ai-layer-protocol/tests
 ```
 
 Interface lifespan and Temporal runner tests require a running Temporal service
@@ -38,7 +38,9 @@ KAPY_SHELLCTL_TEST_BIN_DIR=/work/packages/shellctl/server/bin \
   tests/runner_duarable/test_layers.py
 ```
 
-`tests/layers` checks typed factory assembly, arbitrary writable deps layouts,
+`tests/layers` checks Kapy shell behavior and host scope retries.
+The independent package's `packages/pydantic-ai-layer-protocol/tests` checks
+typed factory assembly, arbitrary writable deps layouts,
 JSON snapshots, native for_run isolation, tool flags, hooks, instructions and
 Temporal replay. Its real Pyrefly probes use the project configuration to check
 model/hook signatures, including the required optional State on exit.

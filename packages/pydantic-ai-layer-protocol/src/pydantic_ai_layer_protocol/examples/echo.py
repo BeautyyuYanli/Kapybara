@@ -4,8 +4,8 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.capabilities import Capability
 
-from kapy.layers.modules import dump_object
-from kapy.layers.types import Layer, LayerAccess
+from pydantic_ai_layer_protocol.registry import dump_object
+from pydantic_ai_layer_protocol.types import Layer, LayerAccess
 
 
 class Config(BaseModel):

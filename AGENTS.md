@@ -4,7 +4,9 @@
 Agent Runner、上下文压缩，以及基于 Valkey Pub/Sub 的实时输出和历史回放。
 HTTP 和 Telegram 作为独立接口进程，直接调用这些服务。HTTP 同时挂载配置前端。
 
-主实现位于 `src/kapy/`，测试位于 `tests/`，模块直接通过 `kapy.*` 导入。
+主实现位于 `src/kapy/`，测试位于 `tests/`，模块直接通过 `kapy.*` 导入。通用 layer 定义、注册与选择及可选 Temporal State
+传输位于独立包 [pydantic-ai-layer-protocol](packages/pydantic-ai-layer-protocol/README.md)，
+Kapy 使用该包并保留自己的 shell layer 与会话生命周期。
 独立引入的 shellctl 位于 [packages/shellctl](packages/shellctl/README.md)，包含
 Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
 `scripts/vendor_shellctl.py` 按固定 commit 同步，勿手工编辑脚本管理的路径。
@@ -87,7 +89,7 @@ HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
 进程和文件测试要求在容器中运行，避免在宿主机跳过。
 
 ```sh
-docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests
+docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests packages/pydantic-ai-layer-protocol/tests
 ```
 
 使用 `.env` 的模型端点和凭据，验收保留的旧 Python runner 入口：

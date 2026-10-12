@@ -3,8 +3,8 @@
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from kapy.layers import LayerDeps
-    from kapy.layers.examples.temporal_agent import agent
+    from pydantic_ai_layer_protocol import LayerDeps
+    from pydantic_ai_layer_protocol.examples.temporal_agent import agent
 
 
 @workflow.defn

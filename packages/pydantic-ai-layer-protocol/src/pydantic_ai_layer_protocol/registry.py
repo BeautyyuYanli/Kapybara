@@ -10,37 +10,72 @@ stable for fixed Config: never generate them from mutable State through factorie
 This preserves model prefix caching. SDK callbacks may render fixed instructions;
 dynamic business information belongs in State and tool results.
 
-Optional async Layer hooks own the longer business scope:
-enter_scope(scope_id: UUID, config: Config) -> State initializes a new session;
-exit_scope(scope_id: UUID, config: Config, state: State | None) -> None releases it.
-The scope ID is the session UUID, unrelated to individual SDK runs or clients.
-Exit must be idempotent and clean partial/unacknowledged enter allocations by scope
-ID and Config when State is None, including enters that were never called. None
-does not mean no resources. Enter need not be generally idempotent: a top-level
-RetryableScopeError explicitly promises that this particular call can safely be
-repeated. Restarted hosts abandon creating rather than replaying enter.
-The host persists identity/Config before enter, and saves complete State only with
-ready. Normal exit may mutate State to record confirmed progress; the host saves
-valid progress after success, failure or cancellation. Abandoned creation passes
-None uniformly, and repeated close may invoke a successful exit again. Late remote
-allocations require service-side terminal scope closure or layer reconciliation;
-the host lease fences database writes, not external requests. Constructors,
-validators and instructions must never allocate scope resources.
+Optional async Layer hooks describe a longer business scope. The host supplies
+its UUID, drives enter/exit and owns persistence and retry scheduling; assembly,
+validation and snapshots never invoke those hooks. Exit must be idempotent and
+handle partial or unacknowledged initialization with None State. Constructors,
+validators and instructions must never allocate business-scope resources.
 """
 
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from inspect import iscoroutinefunction
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import BaseModel
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, WrapperCapability
 from pydantic_ai.exceptions import UserError
 
 from .types import JsonObject, Layer, LayerData, LayerFactory
 
 
-def make_layers[D](
+class LayerRegistry[D](WrapperCapability[D]):
+    """Assemble factories once and install their native per-run selection in an Agent.
+
+    The installed definitions and writable deps access rule are process-local.
+    No session data or business resources are retained. Native WrapperCapability
+    owns Agent/run rebinding; changing the installation set requires a new registry.
+    """
+
+    def __init__(
+        self,
+        factories: Mapping[str, LayerFactory[D]],
+        *,
+        get_layers: Callable[[D], dict[str, LayerData]],
+    ) -> None:
+        self._definitions = MappingProxyType(_make_layers(dict(factories), get_layers))
+        self._get_layers = get_layers
+        super().__init__(self._build_capability())
+
+    @property
+    def definitions(self) -> Mapping[str, Layer[D, Any, Any]]:
+        """Read-only installed definitions for host-owned Config/State and scope hooks."""
+        return self._definitions
+
+    def prepare_configs(self, configs: Mapping[str, JsonObject]) -> dict[str, BaseModel]:
+        """Validate all names and Config before hooks, without constructing State."""
+        return _prepare_configs(configs, self.definitions)
+
+    def load(
+        self, configs: Mapping[str, JsonObject], states: Mapping[str, JsonObject]
+    ) -> dict[str, LayerData]:
+        """Validate and copy JSON; omitted State validates from {}, without hooks."""
+        return _load(configs, states, self.definitions)
+
+    def snapshot(self, deps: D) -> dict[str, JsonObject]:
+        """Validate and copy selected State through this registry's saved access rule."""
+        return _snapshot(deps, self.definitions, self._get_layers)
+
+    def _build_capability(self) -> AbstractCapability[D]:
+        # Keep optional integrations out of core imports. They override only this
+        # assembly step; SDK WrapperCapability still owns all lifecycle delegation.
+        from .composition import _layers_capability
+
+        return _layers_capability(self.definitions, get_layers=self._get_layers)
+
+
+def _make_layers[D](
     registry: Mapping[str, LayerFactory[D]],
     get_layers: Callable[[D], dict[str, LayerData]],
 ) -> dict[str, Layer[D, Any, Any]]:
@@ -86,7 +121,7 @@ def dump_object(model: BaseModel) -> JsonObject:
     return deepcopy(value)
 
 
-def prepare_layer_configs[D](
+def _prepare_configs[D](
     configs: Mapping[str, JsonObject], layers: Mapping[str, Layer[D, Any, Any]]
 ) -> dict[str, BaseModel]:
     """Validate all names/Config before any scope hook; State may require enter."""
@@ -102,7 +137,7 @@ def prepare_layer_configs[D](
     return result
 
 
-def load_layers[D](
+def _load[D](
     configs: Mapping[str, JsonObject],
     states: Mapping[str, JsonObject],
     layers: Mapping[str, Layer[D, Any, Any]],
@@ -118,11 +153,11 @@ def load_layers[D](
                 layers[name].state_type.model_validate(deepcopy(states.get(name, {})))
             ),
         }
-        for name, config in prepare_layer_configs(configs, layers).items()
+        for name, config in _prepare_configs(configs, layers).items()
     }
 
 
-def snapshot_layers[D](
+def _snapshot[D](
     deps: D,
     layers: Mapping[str, Layer[D, Any, Any]],
     get_layers: Callable[[D], dict[str, LayerData]],

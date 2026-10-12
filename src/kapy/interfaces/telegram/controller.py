@@ -30,9 +30,9 @@ from kapy.control.sessions import (
     SubmitInput,
     UpdateSession,
 )
-from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.session_lease import SessionBusy
+from pydantic_ai_layer_protocol import RetryableScopeError
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .models import InboxRow

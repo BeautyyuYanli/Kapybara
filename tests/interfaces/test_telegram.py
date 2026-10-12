@@ -46,8 +46,8 @@ from kapy.interfaces.telegram.repository import TelegramRepository, delivery_key
 from kapy.interfaces.telegram.schema import migrate
 from kapy.interfaces.telegram.settings import StorageSettings, TelegramSettings
 from kapy.interfaces.telegram.storage import open_storage
-from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleStatus
+from pydantic_ai_layer_protocol import RetryableScopeError
 
 
 @pytest_asyncio.fixture

@@ -22,7 +22,7 @@ from pydantic_ai.capabilities import (
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.toolsets import AbstractToolset, AgentToolset, DynamicToolset
 
-from .modules import load_layers
+from .registry import _load
 from .types import Layer, LayerData
 
 
@@ -83,7 +83,7 @@ class _SelectedLayers[DepsT](AbstractCapability[DepsT]):
     async def for_run(self, ctx: RunContext[DepsT]) -> AbstractCapability[DepsT]:
         selected = self.get_layers(ctx.deps)
         try:
-            load_layers(
+            _load(
                 {name: data["config"] for name, data in selected.items()},
                 {name: data["state"] for name, data in selected.items()},
                 self.installed,
@@ -93,21 +93,19 @@ class _SelectedLayers[DepsT](AbstractCapability[DepsT]):
         return await CombinedCapability([self.prepared[name] for name in selected]).for_run(ctx)
 
 
-def layers_capability[DepsT](
+def _layers_capability[DepsT](
     layers: Mapping[str, Layer[DepsT, Any, Any]],
     *,
     get_layers: Callable[[DepsT], dict[str, LayerData]],
     wrap_toolset: Callable[[Layer[DepsT, Any, Any], AbstractToolset[DepsT]], AbstractToolset[DepsT]]
     | None = None,
 ) -> AbstractCapability[DepsT]:
-    """Prepare installed leaves once; validate and select current deps for each run.
+    """Prepare stable installed leaves; select current deps without business-scope hooks.
 
-    Registered leaves require nonempty stable capability IDs. Native containers
-    retain their composition and instructions; membership stays fixed after
-    assembly. Per-run Toolsets may be callable or dynamic, while capability
-    factories producing unknown subtrees are outside this static contract.
-    The optional wrapper runs on each leaf's contribution with its whole Layer.
-    Assembly and selection never call business-scope hooks.
+    Native containers retain their structure. Callable or dynamic leaf Toolsets
+    are supported; capability factories producing unknown subtrees are outside
+    the static installation contract. Optional integrations wrap leaf Toolsets
+    before their native Activity binding.
     """
     installed = dict(layers)
     prepared: dict[str, AbstractCapability[DepsT]] = {}

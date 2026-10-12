@@ -18,10 +18,12 @@ with workflow.unsafe.imports_passed_through():
     from runner_duarable import nested_layer
     from temporalio import activity
 
-    from kapy.layers import layers_capability, make_layers, snapshot_layers
-    from kapy.layers.examples import echo
-    from kapy.runner_duarable.layers import LayerStateCapability, return_layer_state
     from kapy.runner_duarable.types import SaveRunnerStateInput
+    from pydantic_ai_layer_protocol.examples import echo
+    from pydantic_ai_layer_protocol.temporal import (
+        LAYER_STATE_OWNER_KEY,
+        TemporalLayerRegistry,
+    )
 
     from .nested_layer import Deps, get_layers
 
@@ -37,7 +39,7 @@ with workflow.unsafe.imports_passed_through():
         if not returns:
             definition = next(tool for tool in info.function_tools if tool.name == "echo")
             assert definition.capability_id == "nested.tool"
-            assert definition.metadata == {"kapy_layer": "nested"}
+            assert definition.metadata == {LAYER_STATE_OWNER_KEY: "nested"}
             assert definition.sequential is True
             assert "lazy_echo" not in {tool.name for tool in info.function_tools}
             return ModelResponse(
@@ -55,21 +57,15 @@ with workflow.unsafe.imports_passed_through():
         )
         return ModelResponse(parts=[TextPart(";".join(str(part.content) for part in returns))])
 
-    layers = make_layers({"nested": nested_layer.make, "other": echo.make}, get_layers)
-    entrance = layers_capability(
-        layers,
-        get_layers=get_layers,
-        wrap_toolset=lambda layer, toolset: return_layer_state(
-            layer, toolset, get_layers=get_layers
-        ),
+    layers = TemporalLayerRegistry(
+        {"nested": nested_layer.make, "other": echo.make}, get_layers=get_layers
     )
     agent = Agent(
         FunctionModel(model),
         name="nested_state_test",
         deps_type=Deps,
         capabilities=[
-            entrance,
-            LayerStateCapability(get_layers=get_layers),
+            layers,
             TemporalDurability(),
         ],
     )
@@ -86,7 +82,7 @@ class NestedWorkflow:
                 session_id=deps.session_id,
                 expected_version=0,
                 runner_state=result.all_messages_json().decode(),
-                layer_states=snapshot_layers(deps, layers, get_layers),
+                layer_states=layers.snapshot(deps),
             ),
             start_to_close_timeout=timedelta(seconds=30),
         )

@@ -14,7 +14,7 @@ from kapy.agent_runner.types import HistoryMessage
 from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
 from kapy.control.types import DTO, JsonObject, Name
-from kapy.layers.types import LayerData
+from pydantic_ai_layer_protocol.types import LayerData
 
 
 class DurableExecutionConfig(DTO):

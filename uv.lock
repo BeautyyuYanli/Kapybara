@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 members = [
     "kapy",
     "kapy-shellctl",
+    "pydantic-ai-layer-protocol",
 ]
 
 [[package]]
@@ -628,6 +629,7 @@ dependencies = [
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pydantic" },
     { name = "pydantic-ai-harness", extra = ["codemode"] },
+    { name = "pydantic-ai-layer-protocol", extra = ["temporal"] },
     { name = "pydantic-ai-slim", extra = ["google", "openai", "temporal"] },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
@@ -662,6 +664,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.5" },
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "pydantic-ai-harness", extras = ["codemode"], specifier = ">=0.54.0,<0.55.0" },
+    { name = "pydantic-ai-layer-protocol", extras = ["temporal"], editable = "packages/pydantic-ai-layer-protocol" },
     { name = "pydantic-ai-slim", extras = ["google", "openai", "temporal"], specifier = ">=2.54.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
@@ -1181,6 +1184,44 @@ wheels = [
 codemode = [
     { name = "pydantic-ai-slim", extra = ["duckduckgo"] },
     { name = "pydantic-monty" },
+]
+
+[[package]]
+name = "pydantic-ai-layer-protocol"
+version = "0.1.0"
+source = { editable = "packages/pydantic-ai-layer-protocol" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "pydantic-ai-slim" },
+]
+
+[package.optional-dependencies]
+temporal = [
+    { name = "pydantic-ai-slim", extra = ["temporal"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pyrefly" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pydantic", specifier = ">=2.13.5,<3" },
+    { name = "pydantic-ai-slim", specifier = ">=2.54.0,<3" },
+    { name = "pydantic-ai-slim", extras = ["temporal"], marker = "extra == 'temporal'", specifier = ">=2.54.0,<3" },
+]
+provides-extras = ["temporal"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pyrefly", specifier = ">=1.2.0" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest-asyncio", specifier = ">=1.4.0" },
+    { name = "ruff", specifier = ">=0.16.6" },
 ]
 
 [[package]]

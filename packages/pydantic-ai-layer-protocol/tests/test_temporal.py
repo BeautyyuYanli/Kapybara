@@ -1,6 +1,6 @@
 """Use a real Temporal service, sandbox and replay; no external model requests.
 
-Set KAPY_TEMPORAL_ADDRESS=temporal:7233 in a container (host default:
+Set TEMPORAL_ADDRESS=temporal:7233 in a container (host default:
 localhost:7233). These tests own unique Workflow IDs/task queues.
 """
 
@@ -16,12 +16,8 @@ from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.worker import Replayer, Worker
 
-from kapy.layers import LayerDeps, load_layers
-from kapy.layers.examples.temporal_agent import agent as example_agent
-from kapy.layers.examples.temporal_agent import layers as example_layers
-from kapy.layers.examples.temporal_workflow import LayerExampleWorkflow
-from layers.temporal_agent import agent as resource_agent
-from layers.temporal_agent import (
+from layer_protocol_tests.temporal_agent import agent as resource_agent
+from layer_protocol_tests.temporal_agent import (
     approval_agent,
     approval_layers,
     deferred_agent,
@@ -30,13 +26,21 @@ from layers.temporal_agent import (
     layers,
     wrapped_agent,
 )
-from layers.temporal_workflow import ApprovalWorkflow, DeferredWorkflow, ResourceWorkflow
+from layer_protocol_tests.temporal_workflow import (
+    ApprovalWorkflow,
+    DeferredWorkflow,
+    ResourceWorkflow,
+)
+from pydantic_ai_layer_protocol import LayerDeps
+from pydantic_ai_layer_protocol.examples.temporal_agent import agent as example_agent
+from pydantic_ai_layer_protocol.examples.temporal_agent import layers as example_layers
+from pydantic_ai_layer_protocol.examples.temporal_workflow import LayerExampleWorkflow
 
 
 async def connect() -> Client:
     return await Client.connect(
-        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
-        namespace=os.environ.get("KAPY_TEMPORAL_NAMESPACE", "default"),
+        os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"),
+        namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
         plugins=[PydanticAIPlugin()],
     )
 
@@ -51,9 +55,7 @@ async def test_temporal_dynamic_toolsets_rebuild_resources_and_replay_without_ef
     queue = f"layers-resource-{uuid4()}"
     inputs = [
         LayerDeps(
-            layers=load_layers(
-                {"echo": {"prefix": f"{label}:"}, "resource": {"label": label}}, {}, layers
-            )
+            layers=layers.load({"echo": {"prefix": f"{label}:"}, "resource": {"label": label}}, {})
         )
         for label in ("A", "B")
     ] + [LayerDeps()]
@@ -115,7 +117,7 @@ async def test_temporal_consumer_example_and_invalid_input() -> None:
         workflows=[LayerExampleWorkflow],
         plugins=[AgentPlugin(example_agent)],
     ):
-        deps = LayerDeps(layers=load_layers({"echo": {"prefix": "Temporal:"}}, {}, example_layers))
+        deps = LayerDeps(layers=example_layers.load({"echo": {"prefix": "Temporal:"}}, {}))
         output = await client.execute_workflow(
             LayerExampleWorkflow.run,
             args=["echo", deps],
@@ -140,7 +142,7 @@ async def test_temporal_consumer_example_and_invalid_input() -> None:
 async def test_temporal_preserves_nondefault_tool_definition_after_discovery_activity() -> None:
     client = await connect()
     queue = f"layers-approval-{uuid4()}"
-    deps = LayerDeps(layers=load_layers({"approval": {}}, {}, approval_layers))
+    deps = LayerDeps(layers=approval_layers.load({"approval": {}}, {}))
     async with Worker(
         client,
         task_queue=queue,
@@ -183,7 +185,7 @@ async def test_temporal_deferred_loading_preserves_both_instruction_sources_and_
     ):
         handle = await client.start_workflow(
             DeferredWorkflow.run,
-            LayerDeps(layers=load_layers({"lazy": {}}, {}, deferred_layers)),
+            LayerDeps(layers=deferred_layers.load({"lazy": {}}, {})),
             id=queue,
             task_queue=queue,
             execution_timeout=timedelta(seconds=45),

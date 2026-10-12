@@ -9,14 +9,16 @@ from pydantic_ai import Agent
 
 from kapy.control.models import ModelService
 from kapy.control.sessions import CreateSession, SessionService
+from kapy.control.sessions import service as sessions_service
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
 from kapy.control.types import JsonObject
 from kapy.interfaces.http import create_router
-from kapy.layers import make_layers
-from kapy.layers.examples import echo
-from kapy.layers.registry import LAYERS, get_layers
+from kapy.layers.registry import get_layers
+from kapy.layers.shell import layer as shell
 from kapy.lifecycle import LifecycleError, LifecycleStatus
+from pydantic_ai_layer_protocol import LayerRegistry
+from pydantic_ai_layer_protocol.examples import echo
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -65,7 +67,11 @@ async def test_http_layer_validation_defaults_and_immutable_configuration(databa
 
 
 async def test_atomic_layer_message_save_cleanup_and_retry_identity(database, monkeypatch):
-    monkeypatch.setitem(LAYERS, "echo", make_layers({"echo": echo.make}, get_layers)["echo"])
+    monkeypatch.setattr(
+        sessions_service,
+        "layer_registry",
+        LayerRegistry({"shell": shell.make, "echo": echo.make}, get_layers=get_layers),
+    )
     service = SessionService(database.sessions)
     session = await service.create_session(
         CreateSession(

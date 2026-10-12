@@ -1,91 +1,18 @@
-# Layers
+# Kapy layers
 
-A `Layer[D, Config, State]` is a static definition containing Pydantic model
-classes, one native `AbstractCapability[D]` instance and two independently
-optional business-scope hooks. An installed factory has the signature
-`make(layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]`.
-The concrete return annotation links the hook parameters and asynchronous return
-values to the models; exit must accept `State | None`.
-D is unbounded and opaque to the layer. Only C/S are bounded by BaseModel;
-all layer business data comes from injected access and those models.
+Kapy consumes the independent [Pydantic AI Layer Protocol](../../../packages/pydantic-ai-layer-protocol/README.md).
+The package owns Layer definitions, registry assembly, Config/State validation,
+native capability composition and optional Temporal State transport. The shell
+implementation, installed factory mapping, scope retry policy and SessionService
+remain in Kapy.
 
-`make_layers(registry, get_layers)` assembles every installed factory once,
-without execution deps. It checks the returned Layer, model classes, native
-capability, async hooks and root capability ID. The root ID must equal the
-registered nonempty string; the framework never rewrites it. Function tools inherit
-the Capability ID during SDK construction. Nested leaves and internal Toolsets
-may use independent or derived stable IDs; every registered capability leaf must
-have one, including leaves without tools. IDs and composition membership stay
-fixed after construction. Native Combined containers do not need extra IDs.
-
-The caller supplies `get_layers(deps) -> dict[str, LayerData]`. Its mapping is the
-current enabled selection, separate from the installed factory allowlist. Each
-injected `access(deps)` returns the actual writable entry for its own ID, without
-copying it or creating missing entries. Kapy's `registry.REGISTRY` installs
-`"shell": shell.make`, and its process-local `LAYERS` uses the `RunnerDeps.layers`
-adapter. SessionService, Workflow and Activity use that same static configuration;
-independent consumers assemble their own definitions and may store data elsewhere.
-Changing the installation set requires reassembly.
-
-Each entry is a JSON `config` object and `state` object. Config stays fixed for
-the session. Models read from current data are disposable copies; mutation requires
-an explicit writeback, which updates deps but does not itself save to a database:
-
-```python
-from pydantic import BaseModel
-from pydantic_ai import RunContext
-from pydantic_ai.capabilities import Capability
-from kapy.layers import Layer, LayerAccess, LayerData, make_layers
-from kapy.layers.modules import dump_object
-
-
-class Deps(BaseModel):
-    layer_data: dict[str, LayerData]
-
-
-class Config(BaseModel):
-    increment: int = 1
-
-
-class State(BaseModel):
-    calls: int = 0
-
-
-def make_counter(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State]:
-    def count(ctx: RunContext[Deps]) -> int:
-        entry = access(ctx.deps)
-        config = Config.model_validate(entry["config"])
-        state = State.model_validate(entry["state"])
-        state.calls += config.increment
-        access(ctx.deps)["state"] = dump_object(state)
-        return state.calls
-
-    return Layer(
-        config_type=Config, state_type=State, capability=Capability(id=layer_id, tools=[count])
-    )
-
-
-def get_layers(deps: Deps) -> dict[str, LayerData]:
-    return deps.layer_data
-
-
-layers = make_layers({"counter": make_counter}, get_layers)
-```
-
-Factories, access rules, validators and instruction callbacks are deterministic
-and perform no external I/O. Static definitions never retain a session's deps,
-models, scope ID or clients. Tools (collection, names and argument schemas) and
-instructions stay stable for fixed Config. SDK callbacks may render those fixed
-declarations; dynamic business information belongs in State and tool results,
-so it does not change the model prefix.
-
-`prepare_layer_configs(configs, layers)` validates all names and Config before
-scope hooks, without constructing State. `load_layers(configs, states, layers)`
-validates and copies existing JSON; omitted State validates from `{}` and fails
-when required fields are missing. It calls no scope hooks. Unconfigured State and
-unknown names fail. `snapshot_layers(deps, layers, get_layers)` validates and copies
-only the selected States. Both models must serialize to JSON objects; inputs are
-copied before validation so custom validators cannot mutate caller-owned data.
+`registry.layer_registry` is a process-local `TemporalLayerRegistry` constructed
+with `{"shell": shell.make}` and Kapy's RunnerDeps.layers adapter once.
+The Agent installs it directly; SessionService and Workflow use its
+`definitions`, `prepare_configs`, `load` and `snapshot` methods.
+SessionService, Workflow and Activity use these same static definitions. Only the
+adapter knows the deps layout; shell obtains all data through injected access and
+Config/State. Changing the installed set requires reassembly.
 
 ## Business scopes
 
@@ -127,7 +54,7 @@ All cleanup must succeed before `closed`;
 failure keeps `closing` and any saved progress. A repeated close can call an earlier
 successful exit again; an already closed session returns without calling hooks.
 
-Only an explicit `kapy.layers.RetryableScopeError` automatically retries a hook,
+Only an explicit `pydantic_ai_layer_protocol.RetryableScopeError` automatically retries a hook,
 at most three attempts separated by 0.5 seconds. Use exception chaining to retain
 the underlying cause. Ordinary errors, invalid State and cancellation are not
 retried; nested causes and exception groups do not imply retryability. Every retry
@@ -148,48 +75,6 @@ details and report exhausted retryable errors as 503. Telegram saves the ID befo
 creation and queries it on inbox recovery. Neither interface automatically repeats
 creation after the hook's bounded attempts.
 
-`layers_capability(layers, get_layers=get_layers)` prepares a static selector.
-At Agent construction it exposes all installed entries so the SDK can register
-Activities. For each run it validates current Config/State and selects enabled
-definitions in the deps mapping's order; an empty selection enables zero layers.
-Unknown names or invalid data fail before capability execution. Factories are not
-rerun. Each registered leaf is wrapped in a native `DynamicCapability` whose
-Activity ID equals that leaf's stable capability ID. Missing leaf IDs fail during
-selector preparation. A Wrapper over one leaf is wrapped as a whole; Combined
-containers and Wrappers containing children retain their native structure.
-
-Native Combined owns composition, instructions, hook ordering and tool ownership
-in ordinary runs and on the Temporal Workflow side. Native Dynamic rebuilds each
-leaf inside Activities, which do not receive the live capability registry.
-Successful discovery returns tool definitions for native Workflow-side ownership
-and deferral processing. Deferred loading retains both capability and Toolset
-instructions without copying SDK implementation methods.
-
-Leaf Toolset contributions are read after capability binding. The optional
-`wrap_toolset(layer, toolset)` wraps each leaf with its complete owning Layer;
-the resulting Toolset binds through native `for_run` at tool resolution. Ordinary
-runs then have a finalized capability registry, while each Activity binds and
-enters its own resource instance. Stateful components return independent instances
-from native `for_run`; static definitions do no resource I/O. Capability factories
-producing unknown runtime subtrees are outside this static composition contract.
-Callable contributions and dynamic Toolsets within declared leaves remain supported.
-Layer instructions have no application ordering contract. SDK hook ordering,
-including the durable message recorder, still applies.
-
-These examples use deterministic SDK models and show static assembly, injected access, explicit
-State writes, enabling/disabling selections, and resource cleanup:
-
-```sh
-python -m kapy.layers.examples.in_process
-python -m kapy.layers.examples.temporal
-```
-
-Standalone Temporal examples demonstrate composition only. SDK tool Activities
-receive serialized deps and return tool results; modified Activity deps do not
-return to the Workflow. Consumers that need State must own its transport boundary.
-Kapy's [durable runner](../runner_duarable/README.md) carries successful State with
-the native tool return, applies it before Workflow hooks, and persists it with
-the final run snapshot. Failed/cancelled tool calls return no State.
 
 ## Shell layer
 

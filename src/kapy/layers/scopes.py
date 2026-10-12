@@ -4,16 +4,7 @@ from collections.abc import Awaitable, Callable
 
 import anyio
 
-
-class RetryableScopeError(RuntimeError):
-    """A scope hook explicitly permits another attempt with the same scope ID.
-
-    Raising this error promises safe repetition after partial effects and uncertain
-    acknowledgements. Enter need not support retries otherwise. Exit is always
-    idempotent because explicit close/recovery may call it again with None.
-    Only this outer exception opts into retry; causes, groups and cancellation do
-    not. Use ``raise RetryableScopeError(...) from error`` to retain diagnostics.
-    """
+from pydantic_ai_layer_protocol import RetryableScopeError
 
 
 async def retry_scope[ResultT](

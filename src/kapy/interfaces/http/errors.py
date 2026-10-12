@@ -16,9 +16,9 @@ from kapy.control.models.types import (
     ModelDiscoveryError,
 )
 from kapy.control.sessions import DurableRunnerConflict, SessionAlreadyExists, SessionCreationError
-from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleError
 from kapy.session_lease import SessionBusy
+from pydantic_ai_layer_protocol import RetryableScopeError
 
 
 class ControlRoute(APIRoute):

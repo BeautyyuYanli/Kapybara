@@ -22,30 +22,27 @@ from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolRetu
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests
-from pydantic_ai.toolsets import FunctionToolset, WrapperToolset
+from pydantic_ai.toolsets import FunctionToolset
 
-from kapy.layers import (
+from layer_protocol_tests import deferred, tool_definitions
+from pydantic_ai_layer_protocol import (
     Layer,
     LayerAccess,
     LayerData,
     LayerDeps,
     LayerFactory,
-    layers_capability,
-    load_layers,
-    make_layers,
-    snapshot_layers,
+    LayerRegistry,
 )
-from kapy.layers.examples import echo, new_layer
-from kapy.layers.modules import dump_object
-from kapy.layers.types import JsonObject
-from layers import deferred, tool_definitions
+from pydantic_ai_layer_protocol.examples import echo, new_layer
+from pydantic_ai_layer_protocol.registry import dump_object
+from pydantic_ai_layer_protocol.types import JsonObject
 
 
 def get_layers(deps: LayerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
-ECHO = make_layers({"echo": echo.make}, get_layers)
+ECHO = LayerRegistry({"echo": echo.make}, get_layers=get_layers)
 
 
 async def echo_model(messages, info):
@@ -65,20 +62,20 @@ async def echo_model(messages, info):
 def test_json_loading_restores_defaults_copies_data_and_requires_explicit_writeback():
     configs: dict[str, JsonObject] = {"echo": {"prefix": "A:"}}
     states: dict[str, JsonObject] = {"echo": {"calls": 3}}
-    deps = LayerDeps(layers=load_layers(configs, states, ECHO))
+    deps = LayerDeps(layers=ECHO.load(configs, states))
     assert LayerDeps.model_validate_json(deps.model_dump_json()) == deps
     configs["echo"]["prefix"] = "changed"
     states["echo"]["calls"] = 10
     validated = echo.State.model_validate(deps.layers["echo"]["state"])
     validated.calls += 1
-    assert snapshot_layers(deps, ECHO, get_layers) == {"echo": {"calls": 3}}
+    assert ECHO.snapshot(deps) == {"echo": {"calls": 3}}
     deps.layers["echo"]["state"] = dump_object(validated)
-    snapshot = snapshot_layers(deps, ECHO, get_layers)
+    snapshot = ECHO.snapshot(deps)
     assert snapshot == {"echo": {"calls": 4}}
     snapshot["echo"]["calls"] = 20
     assert deps.layers["echo"]["state"] == {"calls": 4}
     assert deps.layers["echo"]["config"] == {"prefix": "A:", "uppercase": False}
-    assert load_layers({"echo": {}}, {}, ECHO)["echo"]["state"] == {"calls": 0}
+    assert ECHO.load({"echo": {}}, {})["echo"]["state"] == {"calls": 0}
 
 
 @pytest.mark.parametrize("bad", ["result", "config", "state", "capability", "enter", "exit"])
@@ -95,7 +92,7 @@ def test_factory_rejects_invalid_definitions_at_assembly(bad):
         }[bad]
 
     with pytest.raises(UserError):
-        make_layers({"invalid": factory}, get_layers)
+        LayerRegistry({"invalid": factory}, get_layers=get_layers)
 
 
 @pytest.mark.parametrize("actual_id", [None, "", "other"])
@@ -108,7 +105,7 @@ def test_root_id_mismatch_reports_expected_and_actual_without_rewriting(actual_i
         return Layer(config_type=echo.Config, state_type=echo.State, capability=capability)
 
     with pytest.raises(UserError, match=f"'expected'.*{actual_id!r}"):
-        make_layers({"expected": factory}, get_layers)
+        LayerRegistry({"expected": factory}, get_layers=get_layers)
     assert capability.id == actual_id
 
 
@@ -117,21 +114,21 @@ def test_empty_installed_name_is_rejected_before_factory_call():
         pytest.fail("An empty installation id must not reach a factory")
 
     with pytest.raises(UserError, match="nonempty"):
-        make_layers({"": factory}, get_layers)
+        LayerRegistry({"": factory}, get_layers=get_layers)
 
 
 def test_unknown_names_invalid_json_and_nonobject_models_fail():
     with pytest.raises(UserError, match="Unknown registered layer"):
-        load_layers({"unknown": {}}, {}, ECHO)
+        ECHO.load({"unknown": {}}, {})
     with pytest.raises(UserError, match="unconfigured"):
-        load_layers({}, {"echo": {}}, ECHO)
+        ECHO.load({}, {"echo": {}})
     invalid: list[tuple[dict[str, JsonObject], dict[str, JsonObject]]] = [
         ({"echo": {"unknown": True}}, {}),
         ({"echo": {}}, {"echo": {"calls": []}}),
     ]
     for configs, states in invalid:
         with pytest.raises(ValidationError):
-            load_layers(configs, states, ECHO)
+            ECHO.load(configs, states)
 
     def make_null(
         layer_id: str, access: LayerAccess[LayerDeps]
@@ -142,13 +139,11 @@ def test_unknown_names_invalid_json_and_nonobject_models_fail():
             capability=Capability(id=layer_id),
         )
 
-    nonobject = make_layers({"null": make_null}, get_layers)
+    nonobject = LayerRegistry({"null": make_null}, get_layers=get_layers)
     with pytest.raises(UserError, match="JSON objects"):
-        load_layers({"null": None}, {}, nonobject)  # pyrefly: ignore[bad-assignment]
+        nonobject.load({"null": None}, {})  # pyrefly: ignore[bad-assignment]
     with pytest.raises(UserError, match="Unknown registered layer"):
-        snapshot_layers(
-            LayerDeps(layers={"unknown": {"config": {}, "state": {}}}), ECHO, get_layers
-        )
+        ECHO.snapshot(LayerDeps(layers={"unknown": {"config": {}, "state": {}}}))
 
 
 def test_load_copies_inputs_before_custom_validators():
@@ -170,9 +165,9 @@ def test_load_copies_inputs_before_custom_validators():
             capability=Capability(id=layer_id),
         )
 
-    layers = make_layers({"copy": make_copy}, get_layers)
+    layers = LayerRegistry({"copy": make_copy}, get_layers=get_layers)
     configs: dict[str, JsonObject] = {"copy": {"items": ["input"]}}
-    loaded = load_layers(configs, {}, layers)
+    loaded = layers.load(configs, {})
     assert configs == {"copy": {"items": ["input"]}}
     assert loaded["copy"]["config"] == {"items": ["input", "validated"]}
 
@@ -182,19 +177,19 @@ async def test_same_agent_reconfigures_disables_and_keeps_json_state_per_run():
     agent = Agent(
         FunctionModel(echo_model),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(ECHO, get_layers=get_layers)],
+        capabilities=[ECHO],
     )
     inputs = [
-        LayerDeps(layers=load_layers({"echo": {"prefix": "A:"}}, {}, ECHO)),
-        LayerDeps(layers=load_layers({"echo": {"prefix": "B:", "uppercase": True}}, {}, ECHO)),
+        LayerDeps(layers=ECHO.load({"echo": {"prefix": "A:"}}, {})),
+        LayerDeps(layers=ECHO.load({"echo": {"prefix": "B:", "uppercase": True}}, {})),
         LayerDeps(),
     ]
     results = await asyncio.gather(*(agent.run("hello", deps=deps) for deps in inputs))
     assert [result.output for result in results] == ["A:hello", "B:HELLO", "disabled"]
-    assert snapshot_layers(inputs[0], ECHO, get_layers) == {"echo": {"calls": 1}}
-    assert snapshot_layers(inputs[1], ECHO, get_layers) == {"echo": {"calls": 1}}
+    assert ECHO.snapshot(inputs[0]) == {"echo": {"calls": 1}}
+    assert ECHO.snapshot(inputs[1]) == {"echo": {"calls": 1}}
     assert (await agent.run("hello", deps=inputs[0])).output == "A:hello"
-    assert snapshot_layers(inputs[0], ECHO, get_layers) == {"echo": {"calls": 2}}
+    assert ECHO.snapshot(inputs[0]) == {"echo": {"calls": 2}}
 
 
 @pytest.mark.asyncio
@@ -237,24 +232,23 @@ async def test_factory_assembly_binds_independent_writable_access_for_arbitrary_
     def access(deps: Deps) -> dict[str, LayerData]:
         return deps.payload
 
-    layers = make_layers({"one": make, "two": make}, access)
+    layers = LayerRegistry({"one": make, "two": make}, get_layers=access)
+    assert layers.prepare_configs({"one": {"increment": 1}}) == {"one": Config(increment=1)}
+    assert layers.definitions["one"].state_type is State
     with pytest.raises(ValidationError):
-        load_layers({"one": {"increment": 1}}, {}, layers)
+        layers.load({"one": {"increment": 1}}, {})
     deps = Deps(
-        payload=load_layers(
+        payload=layers.load(
             {"one": {"increment": 1}, "two": {"increment": 10}},
             {"one": {"calls": 2}, "two": {"calls": 3}},
-            layers,
         )
     )
-    agent = Agent(
-        TestModel(), deps_type=Deps, capabilities=[layers_capability(layers, get_layers=access)]
-    )
+    agent = Agent(TestModel(), deps_type=Deps, capabilities=[layers])
     assert json.loads((await agent.run("count", deps=deps)).output) == {
         "one_count": 3,
         "two_count": 13,
     }
-    assert snapshot_layers(deps, layers, access) == {"one": {"calls": 3}, "two": {"calls": 13}}
+    assert layers.snapshot(deps) == {"one": {"calls": 3}, "two": {"calls": 13}}
     del deps.payload["two"]
     assert json.loads((await agent.run("count", deps=deps)).output) == {"one_count": 4}
     assert constructed == ["one", "two"]
@@ -310,12 +304,8 @@ async def test_sdk_for_run_sees_finalized_capabilities_and_isolates_shared_tools
             capability=Capability(id=layer_id, toolsets=[Toolset(access)]),
         )
 
-    layers = make_layers({"isolated": make}, get_layers)
-    contribution = (
-        layers_capability(layers, get_layers=get_layers)
-        if as_layer
-        else layers["isolated"].capability
-    )
+    layers = LayerRegistry({"isolated": make}, get_layers=get_layers)
+    contribution = layers if as_layer else layers.definitions["isolated"].capability
     agent = Agent(
         TestModel(),
         deps_type=LayerDeps,
@@ -325,7 +315,7 @@ async def test_sdk_for_run_sees_finalized_capabilities_and_isolates_shared_tools
         *(
             agent.run(
                 "identify",
-                deps=LayerDeps(layers=load_layers({"isolated": {"prefix": label}}, {}, layers)),
+                deps=LayerDeps(layers=layers.load({"isolated": {"prefix": label}}, {})),
             )
             for label in ("A", "B")
         )
@@ -357,15 +347,13 @@ async def test_selected_layers_preserve_leaf_hook_ordering():
             ),
         )
 
-    layers = make_layers({"first": make, "outer": make}, get_layers)
+    layers = LayerRegistry({"first": make, "outer": make}, get_layers=get_layers)
     agent = Agent(
         TestModel(),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
+        capabilities=[layers],
     )
-    await agent.run(
-        "run hooks", deps=LayerDeps(layers=load_layers({"first": {}, "outer": {}}, {}, layers))
-    )
+    await agent.run("run hooks", deps=LayerDeps(layers=layers.load({"first": {}, "outer": {}}, {})))
     assert calls == ["outer", "first"]
 
 
@@ -403,17 +391,17 @@ async def test_leaf_toolset_getter_runs_after_capability_binding_and_run_isolati
             capability=WrapperCapability(BoundCapability(id=layer_id)),
         )
 
-    layers = make_layers({"bound": make}, get_layers)
+    layers = LayerRegistry({"bound": make}, get_layers=get_layers)
     agent = Agent(
         TestModel(),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
+        capabilities=[layers],
     )
     results = await asyncio.gather(
         *(
             agent.run(
                 "identify",
-                deps=LayerDeps(layers=load_layers({"bound": {"prefix": label}}, {}, layers)),
+                deps=LayerDeps(layers=layers.load({"bound": {"prefix": label}}, {})),
             )
             for label in ("A", "B")
         )
@@ -427,44 +415,46 @@ async def test_leaf_toolset_getter_runs_after_capability_binding_and_run_isolati
 @pytest.mark.asyncio
 async def test_entrance_captures_static_configuration_and_rejects_bad_run_input():
     registry: dict[str, LayerFactory[LayerDeps]] = {"echo": echo.make}
-    layers = make_layers(registry, get_layers)
+    layers = LayerRegistry(registry, get_layers=get_layers)
     agent = Agent(
         TestModel(),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
+        capabilities=[layers],
     )
     registry["new"] = new_layer.make
+    assert "new" not in layers.definitions
     for name, config in (("new", {"instructions": "new"}), ("echo", {"extra": True})):
         with pytest.raises(UserError):
             await agent.run("hello", deps=LayerDeps(layers={name: {"config": config, "state": {}}}))
-    updated_layers = make_layers(registry, get_layers)
+    with pytest.raises(UserError):
+        await agent.run(
+            "hello", deps=LayerDeps(layers={"echo": {"config": {}, "state": {"calls": []}}})
+        )
+    assert (await agent.run("hello", deps=LayerDeps())).output == "success (no tool calls)"
+    updated_layers = LayerRegistry(registry, get_layers=get_layers)
     updated = Agent(
         TestModel(),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(updated_layers, get_layers=get_layers)],
+        capabilities=[updated_layers],
     )
     assert (
         await updated.run(
             "hello",
-            deps=LayerDeps(
-                layers=load_layers({"new": {"instructions": "new"}}, {}, updated_layers)
-            ),
+            deps=LayerDeps(layers=updated_layers.load({"new": {"instructions": "new"}}, {})),
         )
     ).output == "success (no tool calls)"
 
 
 @pytest.mark.asyncio
 async def test_tool_name_conflicts_use_native_sdk():
-    layers = make_layers({"one": echo.make, "two": echo.make}, get_layers)
+    layers = LayerRegistry({"one": echo.make, "two": echo.make}, get_layers=get_layers)
     agent = Agent(
         TestModel(),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
+        capabilities=[layers],
     )
     with pytest.raises(UserError, match="example_echo"):
-        await agent.run(
-            "hello", deps=LayerDeps(layers=load_layers({"one": {}, "two": {}}, {}, layers))
-        )
+        await agent.run("hello", deps=LayerDeps(layers=layers.load({"one": {}, "two": {}}, {})))
 
 
 @pytest.mark.asyncio
@@ -477,15 +467,15 @@ async def test_tool_definitions_preserve_native_flags_and_declared_ownership():
         assert definition.capability_id == "declared_owner"
         return ModelResponse(parts=[TextPart("checked")])
 
-    layers = make_layers({"approval": tool_definitions.make}, get_layers)
+    layers = LayerRegistry({"approval": tool_definitions.make}, get_layers=get_layers)
     agent = Agent(
         FunctionModel(model),
         deps_type=LayerDeps,
         output_type=str | DeferredToolRequests,
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
+        capabilities=[layers],
     )
     assert (
-        await agent.run("hello", deps=LayerDeps(layers=load_layers({"approval": {}}, {}, layers)))
+        await agent.run("hello", deps=LayerDeps(layers=layers.load({"approval": {}}, {})))
     ).output == "checked"
 
 
@@ -501,21 +491,13 @@ async def test_deferred_loading_preserves_native_capability_and_toolset_instruct
         )
 
     name = "container" if nested else "lazy"
-    layers = make_layers({name: make if nested else deferred.make}, get_layers)
+    layers = LayerRegistry({name: make if nested else deferred.make}, get_layers=get_layers)
     agent = Agent(
         FunctionModel(deferred.lazy_model),
         deps_type=LayerDeps,
-        capabilities=[
-            layers_capability(
-                layers,
-                get_layers=get_layers,
-                wrap_toolset=(lambda _, toolset: WrapperToolset(toolset)) if nested else None,
-            )
-        ],
+        capabilities=[layers],
     )
-    result = await agent.run(
-        "load lazy", deps=LayerDeps(layers=load_layers({name: {}}, {}, layers))
-    )
+    result = await agent.run("load lazy", deps=LayerDeps(layers=layers.load({name: {}}, {})))
     assert json.loads(result.output) == {
         "instructions": {"instructions": "CAPABILITY_RULE\n\nTOOLSET_RULE"},
         "tool_result": "lazy-result",
@@ -538,6 +520,5 @@ def test_nested_leaves_require_nonempty_declared_ids_during_preparation(capabili
             ),
         )
 
-    layers = make_layers({"invalid": make}, get_layers)
     with pytest.raises(UserError, match="nonempty stable id"):
-        layers_capability(layers, get_layers=get_layers)
+        LayerRegistry({"invalid": make}, get_layers=get_layers)

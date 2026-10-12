@@ -13,15 +13,15 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
-from pydantic_ai.toolsets import FunctionToolset, WrapperToolset
+from pydantic_ai.toolsets import FunctionToolset
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 
-from kapy.layers import Layer, LayerAccess, LayerData, LayerDeps, layers_capability, make_layers
-from kapy.layers.examples import echo
-from kapy.layers.examples.echo import State
-from kapy.runner_duarable.layers import LayerStateCapability, return_layer_state
-from layers import deferred, tool_definitions
+from layer_protocol_tests import deferred, tool_definitions
+from pydantic_ai_layer_protocol import Layer, LayerAccess, LayerData, LayerDeps, LayerRegistry
+from pydantic_ai_layer_protocol.examples import echo
+from pydantic_ai_layer_protocol.examples.echo import State
+from pydantic_ai_layer_protocol.temporal import LAYER_STATE_OWNER_KEY, TemporalLayerRegistry
 
 events: list[tuple[str, str]] = []
 
@@ -123,6 +123,8 @@ class ResourceCapability(Capability[LayerDeps]):
                 "resource_echo": "resource",
             }[call.tool_name]
         )
+        if LAYER_STATE_OWNER_KEY in (tool_def.metadata or {}):
+            assert get_layers(ctx.deps)["echo"]["state"] == {"calls": 1}
         return f"{result}|tool-hook:{self.label(ctx)}"
 
 
@@ -154,6 +156,13 @@ async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         part for message in messages for part in message.parts if isinstance(part, ToolReturnPart)
     ]
     if info.function_tools and not returns:
+        if any(LAYER_STATE_OWNER_KEY in (tool.metadata or {}) for tool in info.function_tools):
+            for tool in info.function_tools:
+                assert tool.sequential is True
+                assert (tool.metadata or {})[LAYER_STATE_OWNER_KEY] == {
+                    "example_echo": "echo",
+                    "resource_echo": "resource",
+                }[tool.name]
         return ModelResponse(
             parts=[ToolCallPart(tool.name, {"text": "hello"}) for tool in info.function_tools]
         )
@@ -169,13 +178,13 @@ def get_layers(deps: LayerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
-layers = make_layers(registry, get_layers)
+layers = LayerRegistry(registry, get_layers=get_layers)
 agent = Agent(
     FunctionModel(model),
     name="layers_test",
     deps_type=LayerDeps,
     capabilities=[
-        layers_capability(layers, get_layers=get_layers),
+        layers,
         TemporalDurability(
             activity_config={
                 "start_to_close_timeout": timedelta(seconds=15),
@@ -185,16 +194,13 @@ agent = Agent(
     ],
 )
 
+wrapped_layers = TemporalLayerRegistry(registry, get_layers=get_layers)
 wrapped_agent = Agent(
     FunctionModel(model),
     name="layers_wrapped_test",
     deps_type=LayerDeps,
     capabilities=[
-        layers_capability(
-            layers,
-            get_layers=get_layers,
-            wrap_toolset=lambda name, toolset: WrapperToolset(toolset),
-        ),
+        wrapped_layers,
         TemporalDurability(
             activity_config={
                 "start_to_close_timeout": timedelta(seconds=15),
@@ -227,14 +233,14 @@ async def approval_model(messages: list[ModelMessage], info: AgentInfo) -> Model
     )
 
 
-approval_layers = make_layers({"approval": tool_definitions.make}, get_layers)
+approval_layers = LayerRegistry({"approval": tool_definitions.make}, get_layers=get_layers)
 approval_agent = Agent(
     FunctionModel(approval_model),
     name="layers_approval",
     deps_type=LayerDeps,
     output_type=str | DeferredToolRequests,
     capabilities=[
-        layers_capability(approval_layers, get_layers=get_layers),
+        approval_layers,
         TemporalDurability(
             activity_config={
                 "start_to_close_timeout": timedelta(seconds=15),
@@ -244,20 +250,13 @@ approval_agent = Agent(
     ],
 )
 
-deferred_layers = make_layers({"lazy": deferred.make}, get_layers)
+deferred_layers = TemporalLayerRegistry({"lazy": deferred.make}, get_layers=get_layers)
 deferred_agent = Agent(
     FunctionModel(deferred.lazy_model),
     name="layers_deferred",
     deps_type=LayerDeps,
     capabilities=[
-        layers_capability(
-            deferred_layers,
-            get_layers=get_layers,
-            wrap_toolset=lambda layer, toolset: return_layer_state(
-                layer, toolset, get_layers=get_layers
-            ),
-        ),
-        LayerStateCapability(get_layers=get_layers),
+        deferred_layers,
         TemporalDurability(),
     ],
 )

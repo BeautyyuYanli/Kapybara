@@ -13,7 +13,7 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 from temporalio import workflow
 
-from kapy.layers import Layer, LayerAccess, LayerData
+from pydantic_ai_layer_protocol import Layer, LayerAccess, LayerData
 
 
 class Deps(BaseModel):

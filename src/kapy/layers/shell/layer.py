@@ -19,9 +19,9 @@ from pydantic_ai.toolsets import FunctionToolset
 from shellctl import ShellctlClientError
 from shellctl.shared.constants import DEFAULT_TERMINATE_GRACE_SECONDS, DEFAULT_TIMEOUT_SECONDS
 
-from kapy.layers.modules import dump_object
-from kapy.layers.scopes import RetryableScopeError
-from kapy.layers.types import Layer, LayerAccess
+from pydantic_ai_layer_protocol import RetryableScopeError
+from pydantic_ai_layer_protocol.registry import dump_object
+from pydantic_ai_layer_protocol.types import Layer, LayerAccess
 
 from . import runtime
 from .models import Config, NonEmpty, RunTimeout, State, WaitTimeout

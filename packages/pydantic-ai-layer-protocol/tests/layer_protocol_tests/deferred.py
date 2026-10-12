@@ -7,8 +7,8 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.models.function import AgentInfo
 from pydantic_ai.toolsets import FunctionToolset
 
-from kapy.layers import Layer, LayerAccess
-from kapy.layers.examples.echo import Config, State
+from pydantic_ai_layer_protocol import Layer, LayerAccess
+from pydantic_ai_layer_protocol.examples.echo import Config, State
 
 __all__ = ["Capability", "lazy_model", "make"]
 

@@ -151,7 +151,7 @@ an execution that never commits that save retains the preceding snapshot.
 
 
 SessionService and the durable Agent share static typed definitions from
-`layers.registry.LAYERS`. Factory assembly performs no business I/O; only this
+`layers.registry.layer_registry.definitions`. Factory assembly performs no business I/O; only this
 service drives scope hooks. Session creation validates all Config, no-enter default
 States and legacy plugin
 config, acquires the existing lease, and commits a creating Session plus fixed Config

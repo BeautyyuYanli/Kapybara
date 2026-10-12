@@ -1,0 +1,36 @@
+[project]
+name = "pydantic-ai-layer-protocol"
+version = "0.1.0"
+description = "Typed layer definitions, registry assembly, and State transport for Pydantic AI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.13.5,<3", "pydantic-ai-slim>=2.54.0,<3"]
+
+[project.optional-dependencies]
+temporal = ["pydantic-ai-slim[temporal]>=2.54.0,<3"]
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pydantic_ai_layer_protocol", "layer_protocol_tests"]
+
+[tool.pyrefly]
+project-includes = ["src", "tests"]
+search-path = ["src", "tests"]
+python-version = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+
+[dependency-groups]
+dev = ["pyrefly>=1.2.0", "pytest>=9.1.1", "pytest-asyncio>=1.4.0", "ruff>=0.16.6"]

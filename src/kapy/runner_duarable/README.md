@@ -77,10 +77,10 @@ configuration; internal PostgreSQL `sessions.layer_states` holds execution State
 `SessionService.start_durable_runner()` reads both JSON columns with the message
 snapshot/version under its admission lock and fixes `RunnerInput.layers`.
 
-The [layer factory contract](../layers/README.md) assembles static typed `LAYERS`
-with explicit model types, native capabilities and business hooks. The Agent
-installs a static layer selector and selects enabled definitions from
-current deps using Kapy's injected `get_layers` rule. Each known capability leaf
+The [independent layer protocol](../../../packages/pydantic-ai-layer-protocol/README.md) provides Kapy's single
+`layer_registry`, with static typed `definitions`, native capabilities and business
+hooks. The Agent installs it directly and it selects enabled definitions from
+current deps using the access rule provided once at construction. Each known capability leaf
 has a native Dynamic Activity entry named by its stable capability ID; Combined
 composition and ownership remain in the Workflow. Tools read their own entry
 through factory-injected access and explicitly replace State JSON. Workflow and
@@ -91,6 +91,12 @@ Layer, hook or access-function instances; State transport performs no database I
 The layer's D is unbounded: shell reads its scope identity from required State
 `scope_id`, initialized by enter, rather than RunnerDeps.session_id. Successful
 State transport and final snapshots retain that identity with the jobs inventory.
+
+Kapy constructs `TemporalLayerRegistry({"shell": shell.make}, get_layers=get_layers)`
+from the package's optional Temporal module. This registry pairs leaf State return with
+Workflow State application; the host supplies no wrapper callback or separate
+State capability. Tool definitions use the neutral `pydantic_ai_layer` owner marker.
+There is no adapter or fallback for the previous Temporal protocol.
 
 On ordinary tool success, an inner native Toolset wrapper validates the called
 layer's State using its captured Layer model type and injected access rule, then
@@ -107,7 +113,7 @@ State together, so replay needs neither database nor shell I/O for this boundary
 Activity errors, cancellation and native `ModelRetry` follow the SDK's existing
 protocol and return no local State. Remote shell operations already performed are
 not rolled back or compensated. Even successful tool States stay only in the
-running Workflow until `snapshot_layers()` joins the final message transaction;
+running Workflow until `layer_registry.snapshot(deps)` joins the final message transaction;
 a later run failure leaves the previous database inventory intact. Session close
 can clean only jobs in that saved inventory.
 

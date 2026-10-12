@@ -11,25 +11,23 @@ from temporalio.worker import Replayer, Worker
 
 from kapy.application.resources import connect_temporal
 from kapy.control.sessions import CreateSession, SessionService
+from kapy.control.sessions import service as sessions_service
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
-from kapy.layers import load_layers
-from kapy.layers.registry import LAYERS
 from kapy.runner_duarable.activities import RunnerActivities
 
 
 def deps(session_id):
     return Deps(
         session_id=session_id,
-        payload=load_layers({"nested": {}, "other": {}}, {}, layers),
+        payload=layers.load({"nested": {}, "other": {}}, {}),
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_nested_children_return_outer_layer_state_before_hooks(runner_database, monkeypatch):
-    for name, layer in layers.items():
-        monkeypatch.setitem(LAYERS, name, layer)
+    monkeypatch.setattr(sessions_service, "layer_registry", layers)
     service = SessionService(runner_database.sessions)
     session = await service.create_session(
         CreateSession(provider_id=uuid4(), model_name="unused", layers={"nested": {}, "other": {}})

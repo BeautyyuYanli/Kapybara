@@ -23,11 +23,9 @@ from temporalio.common import RetryPolicy
 from temporalio.workflow import ActivityCancellationType, ActivityConfig
 
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
-from kapy.layers import layers_capability
-from kapy.layers.registry import LAYERS, get_layers
+from kapy.layers.registry import layer_registry
 
 from .context import RunnerActivityContext
-from .layers import LayerStateCapability, return_layer_state
 from .output import handle_deltas
 from .recording import MessageRecordCapability, Recorder
 from .types import RunnerDeps
@@ -61,13 +59,6 @@ async def resolve_model(ctx: ModelResolutionContext[RunnerDeps], model_id: str) 
         raise UserError("Invalid model execution configuration") from exc
 
 
-layer_capability = layers_capability(
-    LAYERS,
-    get_layers=get_layers,
-    wrap_toolset=lambda layer, toolset: return_layer_state(layer, toolset, get_layers=get_layers),
-)
-
-
 def _layer_activity_configs() -> dict[str, ActivityConfig]:
     policy: ActivityConfig = {
         "start_to_close_timeout": timedelta(seconds=SHELL_TOOL_HARD_TIMEOUT_SECONDS + 60),
@@ -82,7 +73,7 @@ def _layer_activity_configs() -> dict[str, ActivityConfig]:
             assert toolset.id is not None
             configs[toolset.id] = policy
 
-    toolset = layer_capability.get_toolset()
+    toolset = layer_registry.get_toolset()
     if isinstance(toolset, AbstractToolset):
         toolset.apply(configure)
     return configs
@@ -96,8 +87,7 @@ agent = Agent(
     capabilities=[
         MessageRecordCapability(recorder),
         ResolveModelId(resolve_model),
-        layer_capability,
-        LayerStateCapability(get_layers=get_layers),
+        layer_registry,
         Hooks(
             before_model_request=recorder.predict_response_seq,
             ordering=CapabilityOrdering(

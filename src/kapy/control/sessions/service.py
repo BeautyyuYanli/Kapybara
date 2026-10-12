@@ -3,7 +3,7 @@
 Ordinary methods own short transactions. Durable admission holds the session row
 lock through bounded Temporal RPCs; model work remains in the Worker. Legacy
 consumption borrows the runner's fenced transaction for atomic queue-to-history
-transfer. Static model/hook definitions come from layers.registry.LAYERS, shared with the
+transfer. Static model/hook definitions come from layers.registry.layer_registry, shared with the
 Runner; only this service drives their business scopes. This service owns no
 long-lived ORM session, Agent, or engine. Output transport
 is borrowed from agent_output; each live call owns its subscription/read task and joins
@@ -62,15 +62,14 @@ from kapy.control.models.runtime import (
 )
 from kapy.control.models.types import ModelRecord, ProviderConfig
 from kapy.control.types import utc_now
-from kapy.layers import load_layers
-from kapy.layers.modules import dump_object, prepare_layer_configs
-from kapy.layers.registry import LAYERS
+from kapy.layers.registry import layer_registry
 from kapy.layers.scopes import retry_scope
-from kapy.layers.types import JsonObject
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow
 from kapy.session_lease import SessionLease, is_session_busy, open_session_lease
+from pydantic_ai_layer_protocol import dump_object
+from pydantic_ai_layer_protocol.types import JsonObject
 
 from .repository import SessionRepository, lock_session
 from .types import (
@@ -180,7 +179,7 @@ class SessionService:
         """
         prepared = self.plugins.prepare_bindings(data.plugins)
         try:
-            configs = prepare_layer_configs(data.layers, LAYERS)
+            configs = layer_registry.prepare_configs(data.layers)
         except UserError as exc:
             raise ValueError(str(exc)) from exc
         data = data.model_copy(
@@ -192,8 +191,10 @@ class SessionService:
         # Validate default States before reservation; enter-backed States may have
         # required fields and need not be constructible until the hook returns.
         for name in configs:
-            if LAYERS[name].enter_scope is None:
-                states[name] = dump_object(LAYERS[name].state_type.model_validate({}))
+            if layer_registry.definitions[name].enter_scope is None:
+                states[name] = dump_object(
+                    layer_registry.definitions[name].state_type.model_validate({})
+                )
         try:
             async with self._lease(session_id) as lease:
                 # Never call enter unless registration COMMIT was acknowledged.
@@ -216,7 +217,7 @@ class SessionService:
                 registered = True
                 try:
                     for name, config in configs.items():
-                        enter = LAYERS[name].enter_scope
+                        enter = layer_registry.definitions[name].enter_scope
                         if enter is None:
                             continue
 
@@ -225,7 +226,7 @@ class SessionService:
                             return await enter(session_id, config.model_copy(deep=True))
 
                         returned = await retry_scope(attempt)
-                        state_type = LAYERS[name].state_type
+                        state_type = layer_registry.definitions[name].state_type
                         if not isinstance(returned, state_type):
                             raise TypeError(f"Layer {name!r} enter_scope must return its State")
                         states[name] = dump_object(state_type.model_validate(dump_object(returned)))
@@ -340,7 +341,7 @@ class SessionService:
                 and await self.is_durable_runner_running(session_id)
             ):
                 raise SessionBusy(f"Session {session_id} has an active Workflow")
-            configs = prepare_layer_configs(row.layers, LAYERS)
+            configs = layer_registry.prepare_configs(row.layers)
             # READY always has a complete validated snapshot. An abandoned creating
             # record stores no States at all; do not fabricate defaults for it.
             states = deepcopy(row.layer_states)
@@ -348,7 +349,9 @@ class SessionService:
                 if states.keys() != row.layers.keys():
                     raise ValueError("Saved layer states must match the configured layer names")
                 states = {
-                    name: dump_object(LAYERS[name].state_type.model_validate(value))
+                    name: dump_object(
+                        layer_registry.definitions[name].state_type.model_validate(value)
+                    )
                     for name, value in states.items()
                 }
             row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
@@ -388,10 +391,10 @@ class SessionService:
         lease: SessionLease,
     ) -> None:
         """Persist valid exit progress under ownership before propagating or retrying."""
-        exit_hook = LAYERS[name].exit_scope
+        exit_hook = layer_registry.definitions[name].exit_scope
         if exit_hook is None:
             return
-        state_type = LAYERS[name].state_type
+        state_type = layer_registry.definitions[name].state_type
         state = None if saved_state is None else state_type.model_validate(deepcopy(saved_state))
 
         async def attempt() -> None:
@@ -508,7 +511,7 @@ class SessionService:
                 session_id=session_id,
                 runner_state=state,
                 runner_state_version=version,
-                layers=load_layers(row.layers, row.layer_states, LAYERS),
+                layers=layer_registry.load(row.layers, row.layer_states),
                 user_prompt=user_prompt,
                 config=DurableExecutionConfig(
                     provider_class=provider.provider_class,

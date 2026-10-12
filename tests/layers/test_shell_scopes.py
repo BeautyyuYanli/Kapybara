@@ -17,18 +17,11 @@ from shellctl import ShellctlClient, ShellctlClientError
 from shellctl_fixture import shell_server as shell_server
 
 from kapy.agent_plugins.builtin.shell import ShellPluginState
-from kapy.layers import (
-    LayerData,
-    RetryableScopeError,
-    layers_capability,
-    load_layers,
-    make_layers,
-    snapshot_layers,
-)
-from kapy.layers.modules import dump_object
 from kapy.layers.scopes import retry_scope
 from kapy.layers.shell import layer, runtime
-from kapy.layers.types import JsonObject
+from pydantic_ai_layer_protocol import LayerData, LayerRegistry, RetryableScopeError
+from pydantic_ai_layer_protocol.registry import dump_object
+from pydantic_ai_layer_protocol.types import JsonObject
 
 pytestmark = pytest.mark.asyncio
 
@@ -99,11 +92,11 @@ async def test_old_jobs_only_state_is_legacy_only_and_fails_layer_selection_befo
     assert ShellPluginState().model_dump(mode="json") == {"jobs": {}}
     with pytest.raises(ValidationError, match="scope_id"):
         layer.State.model_validate(saved)
-    layers = make_layers({"shell": layer.make}, get_layers)
+    layers = LayerRegistry({"shell": layer.make}, get_layers=get_layers)
     agent = Agent(
         FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart("unused")])),
         deps_type=dict[str, LayerData],
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
+        capabilities=[layers],
     )
     with pytest.raises(UserError, match="Invalid layer configuration or state"):
         await agent.run("must reject", deps={"shell": {"config": {"cwd": "/tmp"}, "state": saved}})
@@ -117,16 +110,14 @@ async def test_old_jobs_only_state_is_legacy_only_and_fails_layer_selection_befo
 async def test_ordinary_agent_uses_opaque_deps_and_preserves_scope_across_job_updates(shell_server):
     client, cwd = shell_server
     scope_id = uuid4()
-    layers = make_layers({"opaque-shell": layer.make}, get_layers)
-    definition = layers["opaque-shell"]
+    layers = LayerRegistry({"opaque-shell": layer.make}, get_layers=get_layers)
+    definition = layers.definitions["opaque-shell"]
     assert definition.enter_scope is not None
     config = layer.Config(cwd=str(cwd), base_url=client.base_url)
     initial = await definition.enter_scope(scope_id, config)
     # A plain dict has neither session_id nor layers attributes. Access is its sole adapter.
-    deps = load_layers(
-        {"opaque-shell": dump_object(config)},
-        {"opaque-shell": dump_object(initial)},
-        layers,
+    deps = layers.load(
+        {"opaque-shell": dump_object(config)}, {"opaque-shell": dump_object(initial)}
     )
 
     def metadata(observation):
@@ -176,7 +167,7 @@ async def test_ordinary_agent_uses_opaque_deps_and_preserves_scope_across_job_up
     agent = Agent(
         FunctionModel(model),
         deps_type=dict[str, LayerData],
-        capabilities=[layers_capability(layers, get_layers=get_layers)],
+        capabilities=[layers],
     )
     result = await agent.run("shell", deps=deps)
     observations = [
@@ -189,7 +180,7 @@ async def test_ordinary_agent_uses_opaque_deps_and_preserves_scope_across_job_up
     assert "echo:resume" in observations[1]
     first = metadata(observations[0])
     job_id = first["job_id"]
-    saved = layer.State.model_validate(snapshot_layers(deps, layers, get_layers)["opaque-shell"])
+    saved = layer.State.model_validate(layers.snapshot(deps)["opaque-shell"])
     assert saved.scope_id == scope_id
     assert saved.jobs[job_id] >= cursors[1] > cursors[0]
     ownership = json.loads((Path(first["output_path"]).parent / ".job-env.json").read_text())
@@ -208,7 +199,7 @@ async def test_ordinary_agent_uses_opaque_deps_and_preserves_scope_across_job_up
         )
 
     await agent.run("expired", deps=deps, model=FunctionModel(missing_model))
-    assert snapshot_layers(deps, layers, get_layers)["opaque-shell"] == {
+    assert layers.snapshot(deps)["opaque-shell"] == {
         "scope_id": str(scope_id),
         "jobs": {},
     }

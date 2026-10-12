@@ -6,9 +6,10 @@ from pathlib import Path
 import pytest
 
 SOURCE = """from uuid import UUID
+from typing import assert_type
 from pydantic import BaseModel
 from pydantic_ai.capabilities import Capability
-from kapy.layers import Layer, LayerDeps
+from pydantic_ai_layer_protocol import Layer, LayerAccess, LayerData, LayerDeps, LayerRegistry
 
 class Config(BaseModel):
     prefix: str
@@ -29,6 +30,15 @@ layer = Layer[LayerDeps, Config, State](
     enter_scope=enter,
     exit_scope=exit,
 )
+
+def make(layer_id: str, access: LayerAccess[LayerDeps]) -> Layer[LayerDeps, Config, State]:
+    return layer
+
+def get_layers(deps: LayerDeps) -> dict[str, LayerData]:
+    return deps.layers
+
+registry = LayerRegistry({"typed": make}, get_layers=get_layers)
+assert_type(registry, LayerRegistry[LayerDeps])
 """
 
 
@@ -66,7 +76,7 @@ layer = Layer[LayerDeps, Config, State](
 def test_layer_hook_types_are_checked_with_project_configuration(tmp_path, old, new, diagnostic):
     probe = tmp_path / "layer_types.py"
     probe.write_text(SOURCE.replace(old, new) if old else SOURCE)
-    config = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    config = Path(__file__).resolve().parents[1] / "pyproject.toml"
     result = subprocess.run(
         ["pyrefly", "check", "--config", str(config), str(probe)],
         capture_output=True,

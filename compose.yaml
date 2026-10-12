@@ -83,6 +83,7 @@ services:
       KAPY_TEMPORAL_TASK_QUEUE: ${KAPY_TEMPORAL_TASK_QUEUE:-kapy-runner}
     volumes:
       - ./src:/app/src:ro
+      - ./packages/pydantic-ai-layer-protocol:/app/packages/pydantic-ai-layer-protocol:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -129,6 +130,7 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL:-}
     volumes:
       - ./src:/app/src:ro
+      - ./packages/pydantic-ai-layer-protocol:/app/packages/pydantic-ai-layer-protocol:ro
       - ./tests:/app/tests:ro
       - ./scripts:/app/scripts:ro
       - ./pyproject.toml:/app/pyproject.toml:ro
@@ -166,6 +168,7 @@ services:
       KAPY_TELEGRAM_SESSION_TEMPLATE: ${KAPY_TELEGRAM_SESSION_TEMPLATE:-null}
     volumes:
       - ./src:/app/src:ro
+      - ./packages/pydantic-ai-layer-protocol:/app/packages/pydantic-ai-layer-protocol:ro
       - telegram-data:/var/lib/kapy
     depends_on:
       postgres:

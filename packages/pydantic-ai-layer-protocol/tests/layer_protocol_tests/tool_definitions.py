@@ -8,8 +8,8 @@ from pydantic_ai.capabilities import CombinedCapability
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset, PreparedToolset
 
-from kapy.layers import Layer, LayerAccess
-from kapy.layers.examples.echo import Config, State
+from pydantic_ai_layer_protocol import Layer, LayerAccess
+from pydantic_ai_layer_protocol.examples.echo import Config, State
 
 __all__ = ["make"]
 
