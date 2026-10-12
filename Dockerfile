@@ -12,9 +12,12 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PATH="/app/.venv/bin:$PATH"
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY packages/shellctl/pyproject.toml ./packages/shellctl/pyproject.toml
+COPY packages/mcp_gateway/pyproject.toml ./packages/mcp_gateway/pyproject.toml
 RUN uv sync --locked --no-install-workspace
 COPY packages/shellctl/src ./packages/shellctl/src
 COPY packages/shellctl/LICENSE packages/shellctl/README.md ./packages/shellctl/
+COPY packages/mcp_gateway/src ./packages/mcp_gateway/src
+COPY packages/mcp_gateway/README.md ./packages/mcp_gateway/
 COPY src ./src
 RUN uv sync --locked
 COPY tests ./tests

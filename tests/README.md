@@ -51,3 +51,17 @@ native ToolReturn values retain their public shape across a consumer-specific de
 layout. Native ownership, nondefault tool flags and deferred capability/Toolset
 instructions are checked through ordinary Agent runs and real Temporal Activities.
 No external model API is called.
+
+`tests/layers/test_mcps.py` runs real Agent → native MCPToolset → stdio Gateway →
+upstream subprocesses. It checks per-run configuration and credential isolation,
+disabled selections, JSON round trips, and process cleanup after success, failure
+and cancellation. It also calls dotted, underscored and long upstream names through
+stable model aliases, checking naming limits and reverse dispatch.
+`tests/runner_duarable/test_mcps.py` uses real PostgreSQL and
+Temporal with a deterministic SDK model; it checks native discovery/tool Activity
+placement, persisted configuration/empty State, process cleanup and replay without
+MCP I/O. Multiple tool calls use separate Activity-owned Gateways under the native
+SDK lifecycle.
+These tests need no JWE or external model credentials. The independent
+Gateway's HTTP/JWE and inline suites live in `packages/mcp_gateway/tests` and are
+run separately from the default root suite.

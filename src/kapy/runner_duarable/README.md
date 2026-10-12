@@ -77,6 +77,12 @@ configuration; internal PostgreSQL `sessions.layer_states` holds execution State
 `SessionService.start_durable_runner()` reads both JSON columns with the message
 snapshot/version under its admission lock and fixes `RunnerInput.layers`.
 
+The installed [MCPs layer](../layers/README.md#mcps-layer) accepts inline upstream
+configuration and credentials. Native discovery and tool Activities each create
+and close their own stdio Gateway through the SDK's MCPToolset lifecycle. Session
+creation and Workflow replay perform no MCP I/O. The private pipe uses no JWE;
+the layer has empty State and no scope hooks.
+
 The [layer factory contract](../layers/README.md) assembles static typed `LAYERS`
 with explicit model types, native capabilities and business hooks. The Agent
 installs a static layer selector and selects enabled definitions from
@@ -219,7 +225,8 @@ Module passthrough is centralized in the package exports: shared model helpers
 transitively import SQLModel definitions that cannot be reinitialized in the
 sandbox. Model class resolution also passes imports through because dynamically
 loading Google SDK dependencies there otherwise triggers restricted environment
-access. The Workflow module itself uses normal imports; sandboxing remains enabled.
+access. The Workflow passes static layer definitions through so native MCP
+dependencies are not reinitialized in the sandbox; sandboxing remains enabled.
 
 Class references select installed trusted code, just as existing model
 configuration does. The DTO contains the actual API key: Temporal persists it in

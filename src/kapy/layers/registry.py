@@ -7,6 +7,7 @@ Changing the installed set requires assembling a new configuration.
 
 from typing import TYPE_CHECKING
 
+from .mcps import layer as mcps
 from .modules import make_layers
 from .shell import layer as shell
 from .types import LayerData, LayerFactory
@@ -20,5 +21,5 @@ def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
-REGISTRY: dict[str, LayerFactory[RunnerDeps]] = {"shell": shell.make}
+REGISTRY: dict[str, LayerFactory[RunnerDeps]] = {"shell": shell.make, "mcps": mcps.make}
 LAYERS = make_layers(REGISTRY, get_layers)

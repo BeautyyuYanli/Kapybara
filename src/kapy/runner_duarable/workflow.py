@@ -10,7 +10,11 @@ from pydantic_ai.settings import ModelSettings
 from temporalio import workflow
 
 from kapy.layers import load_layers, snapshot_layers
-from kapy.layers.registry import LAYERS, get_layers
+
+# Static layer definitions import native MCP dependencies that must not be
+# reinitialized in a Workflow sandbox. Connection I/O stays inside SDK Activities.
+with workflow.unsafe.imports_passed_through():
+    from kapy.layers.registry import LAYERS, get_layers
 
 from .agent import MODEL_ID, agent
 from .types import RunnerDeps, RunnerInput, SaveRunnerStateInput

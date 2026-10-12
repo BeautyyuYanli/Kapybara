@@ -1,0 +1,49 @@
+[project]
+name = "kapy-mcp-gateway"
+version = "0.1.0"
+description = "Namespaced FastMCP gateway with inline stdio and encrypted HTTP credentials"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=4.1.0,<5",
+    "httpx2>=2.12.0,<3",
+    "jwcrypto>=1.6.1,<2",
+    "pydantic>=2.13.5,<3",
+]
+
+[project.scripts]
+mcp-gateway = "mcp_gateway.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "mcp_gateway"
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.2.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pyrefly]
+project-includes = ["src", "tests"]
+search-path = ["src", "tests"]
+python-version = "3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mcp_gateway"]
