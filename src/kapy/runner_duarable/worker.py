@@ -1,6 +1,7 @@
 """Independent Temporal Worker; SIGTERM drains it before the process exits.
 
-The Worker executes both Workflow and Activity tasks on the configured queue.
+The main Worker executes Workflow and SDK Activity tasks on the configured queue;
+a companion Worker polls its -mcp queue for run-owned Gateway Activities.
 It shares the application resource factory; resources outlive all Worker tasks.
 Database and Valkey clients belong to Activities, never Workflow state.
 """
@@ -21,6 +22,7 @@ from kapy.application.settings import CommonSettings
 from .activities import RunnerActivities
 from .agent import agent
 from .context import bind_output_service
+from .mcp_gateway import hold_mcp_gateway
 from .workflow import RunnerWorkflow
 
 
@@ -31,16 +33,23 @@ async def serve(settings: CommonSettings) -> None:
         )
         activities = RunnerActivities(resources.core_session_factory, output_service)
         with bind_output_service(output_service):
-            async with Worker(
-                resources.temporal_client,
-                task_queue=settings.temporal_task_queue,
-                workflows=[RunnerWorkflow],
-                activities=[
-                    activities.record_messages,
-                    activities.save_runner_state,
-                ],
-                plugins=[AgentPlugin(agent)],
-                graceful_shutdown_timeout=timedelta(seconds=15),
+            async with (
+                Worker(
+                    resources.temporal_client,
+                    task_queue=settings.temporal_task_queue + "-mcp",
+                    activities=[hold_mcp_gateway],
+                    # Owners run until Agent completion; retire them immediately
+                    # after main Activities drain so another owner can retry.
+                    graceful_shutdown_timeout=timedelta(seconds=0),
+                ),
+                Worker(
+                    resources.temporal_client,
+                    task_queue=settings.temporal_task_queue,
+                    workflows=[RunnerWorkflow],
+                    activities=[activities.record_messages, activities.save_runner_state],
+                    plugins=[AgentPlugin(agent)],
+                    graceful_shutdown_timeout=timedelta(seconds=15),
+                ),
             ):
                 await asyncio.Future()
 

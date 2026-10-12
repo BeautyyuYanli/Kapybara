@@ -14,6 +14,7 @@ from kapy.agent_runner.types import HistoryMessage
 from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
 from kapy.control.types import DTO, JsonObject, Name
+from kapy.layers.mcps.models import GatewayEndpoint
 from kapy.layers.types import LayerData
 
 
@@ -61,12 +62,17 @@ class RunnerInput(DTO):
 
 
 class RunnerDeps(DTO):
-    """Run input plus the current request's provisional response position."""
+    """Run input, provisional response position and an ephemeral relay descriptor.
+
+    The MCP endpoint is passed to Activities and updated by readiness signals.
+    It is not part of session configuration, Layer State or the saved messages.
+    """
 
     config: DurableExecutionConfig
     session_id: UUID
     response_seq: int | None = Field(default=None, ge=0, strict=True)
     layers: dict[str, LayerData] = Field(default_factory=dict)
+    mcp_gateway: GatewayEndpoint | None = Field(default=None, repr=False)
 
 
 class MessageBatch(DTO):

@@ -9,6 +9,7 @@ from pydantic_ai.durable_exec.temporal import TemporalRunContext
 from pydantic_ai.exceptions import UserError
 
 from kapy.agent_output import AgentOutputService
+from kapy.layers.mcps.models import GatewayEndpoint
 
 from .types import RunnerDeps
 
@@ -30,6 +31,11 @@ class RunnerActivityContext(TemporalRunContext[RunnerDeps]):
     """
 
     output_service: AgentOutputService
+
+    @property
+    def mcp_gateway(self) -> GatewayEndpoint | None:
+        """Borrow the run-owned relay descriptor reconstructed with Activity deps."""
+        return self.deps.mcp_gateway
 
     def __init__(self, deps: RunnerDeps, **kwargs: Any) -> None:
         super().__init__(deps, **kwargs)

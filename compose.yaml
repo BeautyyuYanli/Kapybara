@@ -81,6 +81,7 @@ services:
       KAPY_TEMPORAL_ADDRESS: temporal:7233
       KAPY_TEMPORAL_NAMESPACE: ${KAPY_TEMPORAL_NAMESPACE:-default}
       KAPY_TEMPORAL_TASK_QUEUE: ${KAPY_TEMPORAL_TASK_QUEUE:-kapy-runner}
+      KAPY_MCP_RUN_HOST: ${KAPY_MCP_RUN_HOST:-}
     volumes:
       - ./src:/app/src:ro
     depends_on:

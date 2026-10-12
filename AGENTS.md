@@ -11,6 +11,14 @@ Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
 早期实现及其测试、脚本原样归档在 `prototype/`，不参与当前安装、构建和默认检查。
 `kapy` 命令提供 `interface` 与 `db` 两个入口；旧控制面 CLI 随原型一起归档。
 
+独立 MCP Gateway 位于 [packages/mcp_gateway](packages/mcp_gateway/README.md)，
+使用 FastMCP 聚合上游，提供 inline stdio 和 HTTP / JWE 两种入口。
+[MCPs layer](src/kapy/layers/README.md#mcps-layer) 从 session 配置创建独立 stdio
+Gateway，并供应原生 MCPToolset；这条私有管道不使用 JWE。普通 Agent 由 SDK 管理
+进程；Temporal Runner 使用 run 级持有 Activity 和内部转发入口，在多个工具 Activity
+间复用同一 Gateway，run 结束统一关闭。
+也可通过 `uv run --locked --package kapy-mcp-gateway mcp-gateway` 单独运行。
+
 ## 本地启动
 
 需要 Docker Compose。镜像提供 Python 3.14 和锁定版本的开发依赖。

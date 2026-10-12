@@ -77,6 +77,59 @@ configuration; internal PostgreSQL `sessions.layer_states` holds execution State
 `SessionService.start_durable_runner()` reads both JSON columns with the message
 snapshot/version under its admission lock and fixes `RunnerInput.layers`.
 
+The installed [MCPs layer](../layers/README.md#mcps-layer) accepts inline upstream
+configuration and credentials, sharing a run-owned stdio Gateway across native
+discovery and tool Activities. Session creation and Workflow replay do not launch
+MCP clients. It has empty State and no scope hooks.
+
+## MCP Gateway run ownership
+
+When `mcps` is enabled, the Workflow starts `kapy.hold_mcp_gateway` on its task
+queue plus `-mcp`, then waits for its readiness signal before entering the Agent.
+The owner keeps a native stdio MCP client entered, holding the same Gateway
+process across discovery and multiple calls. It exposes a temporary HTTP relay
+for SDK Activities, which may run on other Workers. Those short-lived clients
+close only their HTTP sessions. A random run bearer protects the relay and is
+not forwarded upstream; the stdio Gateway still requires no JWE or authentication.
+
+The Workflow cancels and waits for the owner in `finally` after `agent.run` ends,
+before saving the final snapshot. This covers success, error and cancellation.
+The owner heartbeats during startup and execution; every ten seconds it also
+checks the exact Workflow run's status to reclaim resources after termination.
+Each owner attempt has a one-day start-to-close timeout, a ten-second heartbeat
+timeout and at most three attempts. An owner Worker shutdown closes its sockets
+and pipe, then reports a retryable failure unless the Workflow requested cancellation.
+
+Main Worker restarts do not interrupt an owner on another Worker. If the owner
+fails or restarts, Temporal creates a new owner/Gateway and readiness signals
+update the descriptor for subsequent calls. Late signals from older attempts are
+ignored. Successful recorded calls are not replayed; Gateway process memory is
+ephemeral and is not restored. An in-flight tool call still follows the existing
+single-attempt policy: losing its connection can fail the run without repeating
+an ambiguous side effect. This lifetime applies to the Gateway; its upstream
+connections remain request-scoped as described in the aggregation contract.
+
+Only the URL, bearer and attempt travel in `RunnerDeps.mcp_gateway`, never live
+clients or processes. The descriptor is not saved in PostgreSQL configuration,
+Layer State or messages; Temporal records it as execution payload. Replay consumes
+recorded readiness/completions without starting an owner or connecting to a relay.
+The Workflow patch `kapy-mcp-run-gateway-v1` preserves the previous Activity-local
+path when replaying older MCP histories without this marker.
+
+Owners bind an ephemeral TCP port on the Worker's network interface. All main
+Workers must be able to reach it. By default the advertised host is the owner's
+hostname IPv4 address; `KAPY_MCP_RUN_HOST` overrides it. Compose forwards this
+setting to `runner-worker`; its default network needs no extra published ports.
+The relay is separate from Kapy's public HTTP interface.
+
+Custom deployments register `hold_mcp_gateway` on a companion Worker polling
+`<runner task queue>-mcp`; it needs a Pydantic-AI-configured Temporal Client but
+no database or output service. It can live in the main Worker process or a separate
+process/host. Keep the normal AgentPlugin and persistence Activities on the main
+queue, and bind the output service for those main Workers as below.
+
+## Layer State transport
+
 The [layer factory contract](../layers/README.md) assembles static typed `LAYERS`
 with explicit model types, native capabilities and business hooks. The Agent
 installs a static layer selector and selects enabled definitions from
@@ -219,18 +272,21 @@ Module passthrough is centralized in the package exports: shared model helpers
 transitively import SQLModel definitions that cannot be reinitialized in the
 sandbox. Model class resolution also passes imports through because dynamically
 loading Google SDK dependencies there otherwise triggers restricted environment
-access. The Workflow module itself uses normal imports; sandboxing remains enabled.
+access. The Workflow also passes static registry and owner definitions through;
+sandboxing remains enabled and their resource operations execute only in Activities.
 
 Class references select installed trusted code, just as existing model
 configuration does. The DTO contains the actual API key: Temporal persists it in
 Workflow and Activity payloads. `repr=False` only suppresses repr output; payload
 protection and access control belong to the deployment.
 
-`python -m kapy.runner_duarable.worker` starts the independent Worker for both
-Workflow and Activity tasks. It uses `PydanticAIPlugin()` on its Client and
-`AgentPlugin(agent)` on its Worker. These are SDK registration plugins, not Kapy
-business plugins. SIGTERM and SIGINT shut down the Worker; running Activities
-receive up to 15 seconds to finish before cancellation.
+`python -m kapy.runner_duarable.worker` starts the main Worker for Workflow and
+SDK Activity tasks and its companion MCP owner Worker. It uses `PydanticAIPlugin()`
+on their Client and `AgentPlugin(agent)` on the main Worker. These are SDK registration plugins, not Kapy
+business plugins. SIGTERM and SIGINT shut down both Workers; main Activities
+receive up to 15 seconds to finish before cancellation. The owner Worker then
+retires its long-lived Activities immediately so their pipes close and other
+Workers can retry ownership.
 
 The Worker owns PostgreSQL and Valkey clients through `open_resources()`. It
 creates one `AgentOutputService` with prefix `settings.valkey_namespace +

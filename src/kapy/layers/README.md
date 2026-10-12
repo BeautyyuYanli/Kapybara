@@ -20,7 +20,7 @@ The caller supplies `get_layers(deps) -> dict[str, LayerData]`. Its mapping is t
 current enabled selection, separate from the installed factory allowlist. Each
 injected `access(deps)` returns the actual writable entry for its own ID, without
 copying it or creating missing entries. Kapy's `registry.REGISTRY` installs
-`"shell": shell.make`, and its process-local `LAYERS` uses the `RunnerDeps.layers`
+`"shell": shell.make` and `"mcps": mcps.make`; its process-local `LAYERS` uses the `RunnerDeps.layers`
 adapter. SessionService, Workflow and Activity use that same static configuration;
 independent consumers assemble their own definitions and may store data elsewhere.
 Changing the installation set requires reassembly.
@@ -220,3 +220,101 @@ exactly-once protocol. For abandoned initialization, shell exit accepts None and
 makes no request because enter allocated no resources and tools could not run before
 ready. Ready close requires its valid saved jobs inventory. shellctl's jobs listing
 has no scope ownership field; cleanup cannot discover jobs missing from the snapshot.
+
+## MCPs layer
+
+`mcps.make` contributes a native Pydantic AI `MCPToolset` with a `RenamedToolset`
+wrapper through a run-local `DynamicToolset`.
+It launches the independent [MCP Gateway](../../../packages/mcp_gateway/README.md)
+as a stdio child process with complete inline configuration. This private pipe
+uses no JWE or downstream authentication. Upstream authentication remains in Config.
+Create a session with:
+
+```json
+{
+  "layers": {
+    "mcps": {
+      "servers": {
+        "github": {"transport": "http", "url": "https://github-mcp.example.com/mcp"},
+        "local": {
+          "transport": "stdio",
+          "command": "uvx",
+          "args": ["example-mcp-server"],
+          "credential_env": ["API_KEY"]
+        }
+      },
+      "credentials": {
+        "github": {"bearer": "upstream-access-token"},
+        "local": {"env": {"API_KEY": "local-api-key"}}
+      }
+    }
+  }
+}
+```
+
+Upstream keys become namespaces: the Gateway exposes `github.search` and
+`local.search` as distinct tools. The layer maps these to stable model aliases such
+as `github_search_<digest>`, using letters, digits, underscores and dashes with a
+64-character limit. A digest prevents `a.b` and `a_b` from sharing an alias; any
+remaining collision fails discovery. The SDK's native renaming wrapper routes
+calls back to the original MCP name and preserves schemas and tool flags.
+HTTP, SSE and stdio upstreams are supported. Omitted credentials use the
+upstream's fixed headers/env or anonymous access; all configured upstreams are exposed.
+HTTP credentials accept bearer, basic or explicit headers. Stdio credentials may
+only set names declared by `credential_env`. Custom Python auth factories require
+the Gateway's Python API and cannot be serialized through this layer's CLI path.
+`init_timeout` defaults to 30 seconds; `read_timeout` to 300 seconds. Each upstream
+also has its own `timeout`, defaulting to 30 seconds.
+
+Layer assembly, Config validation and session creation perform no process or network
+I/O. Each selected Agent run creates and enters a fresh MCPToolset; disabled runs
+create none. In ordinary runs the SDK closes the Gateway on success, error or
+cancellation. In Kapy's Temporal Runner, a run owner Activity holds one entered
+stdio client and exposes a temporary internal HTTP relay. Native discovery and
+tool Activities connect to this relay, so they can execute on different Workers
+while sharing the same Gateway process. The Workflow closes the owner after
+`agent.run` finishes, including errors and cancellation. Workflow replay performs
+no MCP I/O. State is always `{}` and there are no business-scope hooks or clients
+saved in the session.
+
+The private stdio pipe still has no authentication or JWE. The internal relay uses
+a random bearer for that run, sent only between Workers and never to upstreams.
+Its descriptor travels in `RunnerDeps.mcp_gateway`; `RunnerActivityContext` exposes
+it through the optional `GatewayContext` protocol. `make_toolset(..., gateway=...)`
+connects to an externally owned relay, while the default builder still owns stdio.
+Generic Temporal consumers without this Kapy run owner retain Activity-local stdio.
+See [run ownership and Worker setup](../runner_duarable/README.md#mcp-gateway-run-ownership).
+
+Config fixes the upstream set for that session; different sessions may supply
+different configurations. The native MCPToolset discovers upstream tools for each
+new run, then uses its discovered schema during that run. Configuration changes
+require a new Gateway/session. The Gateway connects upstreams per request, so
+upstream stdio processes are also closed after each request and their in-memory
+state does not persist across tool calls. See the Gateway's aggregation contract
+for resources, prompts and protocol forwarding; the layer supplies MCP tools to the model.
+
+For standalone SDK consumers, `make_toolset` builds an unconnected `Toolset`
+wrapper around a native client:
+
+```python
+from kapy.layers.mcps import Config, make_toolset
+from pydantic_ai import Agent
+
+config = Config.model_validate({
+    "servers": {"public": {"transport": "http", "url": "http://localhost:9000/mcp"}}
+})
+agent = Agent("openai:gpt-4.1", toolsets=[make_toolset(config)])
+# await agent.run("Use public's tools") starts and closes its Gateway.
+```
+
+`toolset.mcp` gives the native `MCPToolset` for direct calls using original MCP
+names, such as `await toolset.mcp.direct_call_tool("public.search", {...})` inside
+`async with toolset`. `toolset.name_map` contains model alias → original MCP name
+after discovery. The registered layer and standalone builder use the same wrapper.
+
+Kapy's Config JSON export deliberately retains plaintext upstream credentials so
+PostgreSQL configuration and Temporal Activity inputs can restore them; repr hides
+secret values. These credentials are part of the stored configuration and public
+session DTO, like the supplied inline data. Processes, connections and JWE keys
+never enter State. The independent `InlineGatewayConfig` keeps its ordinary JSON
+export redacted and exposes plaintext only through its explicit startup export.
