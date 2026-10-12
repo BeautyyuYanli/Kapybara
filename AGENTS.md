@@ -10,6 +10,9 @@ Kapy 使用该包并保留自己的 shell layer 与会话生命周期。
 独立引入的 shellctl 位于 [packages/shellctl](packages/shellctl/README.md)，包含
 Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
 `scripts/vendor_shellctl.py` 按固定 commit 同步，勿手工编辑脚本管理的路径。
+反向 HTTP 隧道库 [Holt](packages/holt/README.md) 位于 `packages/holt/`，
+通过 Git 子模块引入 [BeautyyuYanli/holt](https://github.com/BeautyyuYanli/holt) fork，
+版本由本仓库记录的子模块 commit 固定。
 早期实现及其测试、脚本原样归档在 `prototype/`，不参与当前安装、构建和默认检查。
 `kapy` 命令提供 `interface` 与 `db` 两个入口；旧控制面 CLI 随原型一起归档。
 
@@ -21,6 +24,7 @@ Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
 镜像构建时使用 npm 生成前端产物，无需手动维护 `dist`。
 
 ```sh
+git submodule update --init --recursive
 docker compose build runtime
 docker compose up -d --wait postgres valkey temporal
 # 首次启动：核心和 Telegram 数据库分别升级，serve 不自动迁移。
