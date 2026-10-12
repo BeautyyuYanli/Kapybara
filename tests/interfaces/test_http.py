@@ -45,7 +45,7 @@ async def test_creation_is_configuration_only_and_removed_contracts_are_rejected
     async def unexpected_start(*args, **kwargs):
         pytest.fail("configuration creation must not submit execution")
 
-    monkeypatch.setattr(sessions, "start_durable_runner", unexpected_start)
+    monkeypatch.setattr(sessions, "start_runner", unexpected_start)
     body = {"provider_id": str(existing.provider_id), "model_name": existing.model_name}
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
@@ -197,9 +197,9 @@ async def test_http_waits_for_durable_start_confirmation(database, seed_session,
     async def start(session_id, **kwargs):
         started.set()
         await release.wait()
-        return SimpleNamespace(id=f"kapy-runner:{session_id}", result_run_id="accepted-run")
+        return SimpleNamespace(id=f"kapy-runner:{session_id}", run_id="accepted-run")
 
-    monkeypatch.setattr(sessions, "start_durable_runner", start)
+    monkeypatch.setattr(sessions, "start_runner", start)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
     ) as client:

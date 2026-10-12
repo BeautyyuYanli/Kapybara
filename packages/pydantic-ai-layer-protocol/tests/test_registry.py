@@ -522,3 +522,78 @@ def test_nested_leaves_require_nonempty_declared_ids_during_preparation(capabili
 
     with pytest.raises(UserError, match="nonempty stable id"):
         LayerRegistry({"invalid": make}, get_layers=get_layers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contribution", ["callable", "dynamic"])
+async def test_native_toolset_factories_expose_tools_and_isolate_concurrent_runs(contribution):
+    from pydantic_ai.toolsets import DynamicToolset
+
+    started, opened, closed, factories = [], [], [], []
+    both_started = asyncio.Event()
+
+    class Tools(FunctionToolset[LayerDeps]):
+        def __init__(self, label: str):
+            self.resource_label, self.entered = label, False
+
+            async def identify() -> str:
+                assert self.entered
+                started.append(self.resource_label)
+                if len(started) == 2:
+                    both_started.set()
+                await asyncio.wait_for(both_started.wait(), 5)
+                return self.resource_label
+
+            super().__init__(id="factory-tools", tools=[identify])
+
+        async def __aenter__(self) -> Self:
+            await super().__aenter__()
+            self.entered = True
+            opened.append(self.resource_label)
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            try:
+                await super().__aexit__(*args)
+            finally:
+                self.entered = False
+                closed.append(self.resource_label)
+
+    def make(
+        layer_id: str, access: LayerAccess[LayerDeps]
+    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+        def factory(ctx: RunContext[LayerDeps]) -> Tools:
+            assert ctx.capabilities[layer_id].id == layer_id
+            label = echo.Config.model_validate(access(ctx.deps)["config"]).prefix
+            factories.append(label)
+            return Tools(label)
+
+        toolset = (
+            factory
+            if contribution == "callable"
+            else DynamicToolset(factory, per_run_step=False, id="factory")
+        )
+        return Layer(
+            config_type=echo.Config,
+            state_type=echo.State,
+            capability=Capability(id=layer_id, toolsets=[toolset]),
+        )
+
+    layers = LayerRegistry({"factory": make}, get_layers=get_layers)
+    agent = Agent(TestModel(), deps_type=LayerDeps, capabilities=[layers])
+    results = await asyncio.gather(
+        *(
+            agent.run(
+                "identify",
+                deps=LayerDeps(layers=layers.load({"factory": {"prefix": label}}, {})),
+            )
+            for label in ("A", "B")
+        )
+    )
+    assert [json.loads(result.output) for result in results] == [
+        {"identify": "A"},
+        {"identify": "B"},
+    ]
+    assert sorted(started) == ["A", "B"]
+    assert set(factories) == {"A", "B"}
+    assert sorted(opened) == sorted(closed)

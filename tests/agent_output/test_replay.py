@@ -19,8 +19,7 @@ from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent,
 from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import lock_session
-from kapy.runner_duarable.activities import RunnerActivities
-from kapy.runner_duarable.types import MessageBatch
+from kapy.runner import Recorder, RunnerDeps
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -79,12 +78,13 @@ async def test_live_replays_completed_activity_batches(database, valkey_client, 
     await seed_session(session_id)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
-    activities = RunnerActivities(database.sessions, outputs)
     for seq, prompt in ((0, "first"), (2, "second")):
-        await activities.record_messages(
-            MessageBatch(
-                session_id=session_id,
-                messages=[
+        await Recorder().persist_messages(
+            *(
+                RunnerDeps(
+                    session_id=session_id, session_factory=database.sessions, output_service=outputs
+                ),
+                [
                     HistoryMessage(session_id, seq, ModelRequest([UserPromptPart(prompt)])),
                     HistoryMessage(session_id, seq + 1, response("one two")),
                 ],
@@ -358,10 +358,12 @@ async def test_unstarted_session_can_follow_new_execution(
 
     async def produce():
         await replayed.wait()
-        await RunnerActivities(database.sessions, outputs).record_messages(
-            MessageBatch(
-                session_id=session_id,
-                messages=[
+        await Recorder().persist_messages(
+            *(
+                RunnerDeps(
+                    session_id=session_id, session_factory=database.sessions, output_service=outputs
+                ),
+                [
                     HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("go")])),
                     HistoryMessage(session_id, 1, response()),
                 ],

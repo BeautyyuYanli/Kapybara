@@ -19,9 +19,9 @@ Each process creates its own core PostgreSQL pool, Valkey client, SessionService
 and Temporal Client through `open_resources()`. They communicate through core tables
 and a common Valkey output namespace. HTTP also exposes these borrowed resources
 on `app.state.resources`. SessionService resolves configuration per direct runner
-start, and submits the existing RunnerWorkflow to the common Temporal task queue.
-An independent `python -m kapy.runner_duarable.worker` owns Agent/model resources;
-interfaces submit durable execution and do not start a Worker. Session creation
+start, and submits the standalone Agent Activity to the common Temporal task queue.
+An independent `python -m kapy.runner.worker` owns Agent/model resources;
+interfaces submit Activity execution and do not start a Worker. Session creation
 only creates configuration; execution is submitted separately.
 
 Common environment values (read only during command execution):
@@ -41,7 +41,7 @@ Common environment values (read only during command execution):
 | KAPY_OUTPUT_FLUSH_INTERVAL | 0.5 seconds |
 
 Session/layer scope lease users sharing core tables use compatible heartbeat settings.
-The durable Worker owns model/output policy and does not use those leases.
+The Activity Worker owns model/output policy and does not use those leases.
 No command implicitly reads `.env`; export configuration or use `uv run --env-file`.
 Private interface databases do not inherit the core URL or schema. The process manager's
 own local database retains its existing independent lifecycle.

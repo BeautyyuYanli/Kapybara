@@ -22,7 +22,7 @@ from temporalio.service import RPCError
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
-    DurableRunnerConflict,
+    RunnerConflict,
     SessionAlreadyExists,
     SessionCreationError,
     SessionService,
@@ -256,14 +256,13 @@ class TelegramController:
             if command in {"run", "new"}:
                 if action["text"] and not action.get("submitted"):
                     try:
-                        await self.sessions.start_durable_runner(
-                            session_id, user_prompt=action["text"]
-                        )
+                        await self.sessions.start_runner(session_id, user_prompt=action["text"])
                     except SessionBusy:
                         action["reply"] = "Session is busy; this text was not submitted."
-                    except DurableRunnerConflict:
+                    except RunnerConflict:
                         action["reply"] = (
-                            "Previous Workflow did not complete. Use /new to continue."
+                            "Previous execution is unsuccessful or unconfirmed. "
+                            "Use /new to continue."
                         )
                     else:
                         action["submitted"] = True
@@ -279,10 +278,10 @@ class TelegramController:
                     action["reply"] = "Session closed."
             elif command == "status":
                 session = await self.sessions.get_session(session_id)
-                running = await self.sessions.is_durable_runner_running(session_id)
+                running = await self.sessions.is_runner_running(session_id)
                 action["reply"] = (
                     f"Session: {session_id}\nStatus: {session.status}\n"
-                    f"Workflow: {'running' if running else 'idle'}"
+                    f"Activity: {'running' if running else 'idle'}"
                 )
             action["completed"] = True
             await self.repository.save_action(item, action)
@@ -307,10 +306,10 @@ class TelegramController:
             )
         except RPCError:
             # A failed start RPC may already have been accepted. Do not resubmit
-            # automatically: the next status query observes the fixed Workflow ID.
+            # automatically: the next status query observes the fixed Activity ID.
             await self.repository.save_action(
                 item,
-                {"command": "reply", "reply": "Unable to confirm Workflow state. Use /status."},
+                {"command": "reply", "reply": "Unable to confirm Activity state. Use /status."},
             )
         except SessionCreationError as error:
             await self.repository.save_action(

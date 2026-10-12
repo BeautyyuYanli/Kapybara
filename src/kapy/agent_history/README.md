@@ -25,9 +25,11 @@ the latest matching window in ascending order; has_more means older rows exist.
 Missing session history returns empty values. Cursor validation and pagination are
 independent of durable snapshot encoding.
 
-`RunnerActivities.record_messages` owns the row lock and transaction, then publishes
-accepted messages through [agent_output](../agent_output/README.md). Recording and
-final runner-state saving remain separate transactions: a failed run can leave
-recorded history while its previous successful snapshot remains. SessionService's
+[`kapy.runner.recording.Recorder.persist_messages`](../runner/recording.py) borrows
+Worker resources from run deps, owns the row lock and short transaction, then
+publishes accepted messages through [agent_output](../agent_output/README.md) after
+commit. Recording and final runner-state saving remain separate transactions: a
+failure before the final save commits can leave recorded history while the
+previous successful snapshot remains. SessionService's
 [Temporal admission](../control/README.md) prevents starting a new run after such
 failure. `live()` combines these immutable messages with best-effort previews.

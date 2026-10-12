@@ -3,7 +3,7 @@
 from kapy.agent_history import HistoryMessage
 from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 
-from .service import DurableRunnerConflict, SessionService
+from .service import RunnerConflict, SessionService
 from .types import (
     CreateSession,
     SessionAlreadyExists,
@@ -23,5 +23,5 @@ __all__ = [
     "SessionService",
     "SessionAlreadyExists",
     "SessionCreationError",
-    "DurableRunnerConflict",
+    "RunnerConflict",
 ]

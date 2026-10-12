@@ -6,7 +6,6 @@ SDK history. Unrecorded run tails remain only in runner_state until another node
 """
 
 from copy import deepcopy
-from datetime import timedelta
 
 from pydantic_ai import ModelRequestNode, RunContext
 from pydantic_ai.capabilities import (
@@ -18,18 +17,20 @@ from pydantic_ai.capabilities import (
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import ModelRequestContext
-from temporalio import workflow
+from sqlmodel import col, select
 
-from kapy.agent_history import HistoryMessage
+from kapy.agent_history import HistoryMessage, HistoryRepository
+from kapy.agent_output import MessageCommitted
+from kapy.control.sessions.models import SessionRow
 
-from .types import MessageBatch, RunnerDeps
+from .types import RunnerDeps
 
 
 class Recorder:
     """Shared, stateless numbering and persistence for recording and prediction hooks.
 
-    Run-local predictions live in RunnerDeps. Only acknowledged Activities mark
-    live SDK messages; prediction never changes messages or performs an Activity.
+    Run-local predictions live in RunnerDeps. Only acknowledged writes mark
+    live SDK messages; prediction never changes messages or performs I/O.
     """
 
     def _pending_messages(self, messages: list[ModelMessage]) -> tuple[int, list[ModelMessage]]:
@@ -62,7 +63,7 @@ class Recorder:
     async def record_messages(self, deps: RunnerDeps, messages: list[ModelMessage]) -> None:
         """Commit/broadcast copies, then mark live messages.
 
-        Empty suffixes perform no Activity. Failure leaves live metadata intact.
+        Empty suffixes perform no I/O. Failure leaves live metadata intact.
         """
         start_seq, pending = self._pending_messages(messages)
         batch = []
@@ -73,18 +74,36 @@ class Recorder:
             }
             batch.append(HistoryMessage(deps.session_id, offset, message))
         if batch:
-            await workflow.execute_activity(
-                "kapy.record_history",
-                MessageBatch(session_id=deps.session_id, messages=batch),
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-            # The graph cannot advance while awaiting the Activity. Replay repeats
-            # these assignments using its recorded completion, without external I/O.
+            await self.persist_messages(deps, batch)
+            # Persist and publish finish before the graph can advance; failed
+            # writes leave live SDK metadata unchanged.
             for message, entry in zip(pending, batch, strict=True):
                 message.metadata = {
                     **(message.metadata or {}),
                     "seq": entry.seq,
                 }
+
+    async def persist_messages(self, deps: RunnerDeps, messages: list[HistoryMessage]) -> None:
+        """Lock the session, commit accepted messages, then publish their snapshots.
+
+        Sealed positions are discarded. A missed broadcast is recovered by the
+        existing history follower; no transaction spans publisher I/O.
+        """
+        async with deps.session_factory.begin() as db:
+            session_id = (
+                await db.execute(
+                    select(SessionRow.id)
+                    .where(col(SessionRow.id) == deps.session_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if session_id is None:
+                raise LookupError(f"Session {deps.session_id} does not exist")
+            accepted = await HistoryRepository(db).append_history(session_id, messages)
+        if accepted:
+            async with deps.output_service.publisher(deps.session_id) as publish:
+                for message in accepted:
+                    await publish(MessageCommitted(message))
 
 
 class MessageRecordCapability(AbstractCapability[RunnerDeps]):

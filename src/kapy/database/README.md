@@ -39,8 +39,7 @@ derived from legacy history.
 
 Native layer Config and internal State use separate sessions.layers/layer_states
 JSON columns. Creation fixes identity/Config with CREATING and empty State, then
-publishes complete initial State with READY. Successful tools return State to the
-Workflow. Final save replaces all States and messages together under the same
+publishes complete initial State with READY. Tools mutate the Activity's per-run State directly. Final save replaces all States and messages together under the same
 version; CLOSING cleanup alone saves individual layer progress. No separate
 StateStore or layer-owned database is introduced.
 
@@ -59,7 +58,7 @@ kapy db revision --message 'Record shell scope identity in layer state' --plan s
 
 The explicit plan requires no structural schema differences and emits fixed SQL.
 Run this migration with runners and interfaces stopped. It converts current
-database State, without rewriting Temporal Workflow inputs or Activity results;
+database State, without rewriting recorded Temporal inputs or results;
 historical payloads missing scope_id have no runtime compatibility inference.
 
 `agent_history` retains complete SDK messages keyed by `(session_id, seq)`.

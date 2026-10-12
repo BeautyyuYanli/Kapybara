@@ -51,8 +51,8 @@ Session routes are:
 | GET /sessions/{id} | get_session | SessionRecord |
 | PATCH /sessions/{id} | update_session | SessionRecord |
 | POST /sessions/{id}/close | close_session | SessionRecord |
-| POST /sessions/{id}/runner | start_durable_runner | 202 DurableRun: workflow_id, run_id |
-| GET /sessions/{id}/runner | is_runner_running | bool for an active Temporal Workflow |
+| POST /sessions/{id}/runner | start_runner | 202 RunnerRun: activity_id, run_id |
+| GET /sessions/{id}/runner | is_runner_running | bool for an active Temporal Activity |
 | GET /sessions/{id}/history | read_history | Page[HistoryMessage] |
 | WS /sessions/{id}/live?after_seq=N | live_ws | one nonempty OutputEvent[] per text frame |
 
@@ -66,15 +66,18 @@ without upstream payloads. Query GET by this ID before deciding whether to close
 create another session. The host never automatically repeats creation.
 
 `POST /sessions/{id}/runner` accepts `{user_prompt: string}`. It waits for Temporal
-start confirmation, then returns Workflow ID and actual run ID; 202 does not mean
+start confirmation, then returns Activity ID and actual run ID; 202 does not mean
 model completion. An active execution returns 409. Non-successful terminal execution
-also returns 409; it cannot restart from the preceding successful snapshot. Worker
-recovery and Activity retries remain in the original Workflow. Temporal RPC errors
-return 503 without upstream payloads; a failed RPC may already have started work.
+also returns 409; it cannot restart from the preceding successful snapshot. Each
+Agent Activity has one attempt; Worker loss, timeout or cancellation does not resume
+its internal steps. A missing Activity record permits a first run only if no
+snapshot/version progress or history exists, so expired successful records also
+require a new session. Temporal RPC errors return 503 without upstream payloads; a
+failed RPC may already have started work.
 Query runner status instead of automatically resubmitting an ambiguous request.
 Direct submission is not a request-ID deduplication protocol.
 
-Close returns 409 while the durable Workflow or a session scope lease is active. It does
+Close returns 409 while the durable Activity or a session scope lease is active. It does
 not request Temporal cancellation. Retry explicitly when execution finishes.
 
 List providers/models/sessions with offset=0 and limit=100. Page contains only

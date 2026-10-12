@@ -3,7 +3,7 @@
 `ModelService` manages provider/model configuration. `SessionService` manages
 session configuration and native layer scopes, admits durable execution through
 Temporal, and joins immutable history with live output. The independent Worker
-owns the Agent, model and tool resources. Durable is the only supported runner.
+owns the Agent, model and tool resources. A standalone Activity is the only supported runner.
 
 Applications own engines, session factories, Valkey and Temporal clients. Services
 borrow them and never migrate schemas implicitly. Initialize with `kapy db upgrade`;
@@ -24,34 +24,35 @@ async def run(settings: CommonSettings, provider_id, model_name: str):
         session = await sessions.create_session(
             CreateSession(provider_id=provider_id, model_name=model_name)
         )
-        handle = await sessions.start_durable_runner(session.id, user_prompt="Hello")
+        handle = await sessions.start_runner(session.id, user_prompt="Hello")
         return await handle.result()  # Requires an independent runner-worker.
 ```
 
 ## Execution admission and state
 
-`start_durable_runner(id, user_prompt="...")` accepts a string prompt and returns
-`WorkflowHandle[RunnerWorkflow, str]` after Temporal confirms the start. The fixed
-Workflow ID is `kapy-runner:{id}`. `is_durable_runner_running(id)` observes Temporal;
-only NOT_FOUND means absent, and RPC failures propagate. RPCs have a ten-second
-budget. Session leases represent scope ownership, not runner status.
+`start_runner(id, user_prompt="...")` accepts a string prompt and returns
+`ActivityHandle[str]` after Temporal confirms the start. The fixed
+Activity ID is `kapy-runner:{id}`. `is_runner_running(id)` observes Temporal;
+only NOT_FOUND means absent, and RPC failures propagate. Missing records admit
+only a session without a snapshot, version progress or stored history. Retention or
+explicit deletion of a successful record also requires a new session because its
+completion cannot be confirmed. RPCs have a ten-second budget. Session leases represent scope ownership, not runner status.
 
 Admission holds a short session row lock through readiness/configuration checks,
-Workflow status, the atomic state/version read and start confirmation. Model work
+Activity status, the atomic state/version read and start confirmation. Model work
 runs outside this transaction. Only an initial execution or a preceding COMPLETED
-execution admits a new run. Busy raises SessionBusy; other terminal statuses raise
-DurableRunnerConflict because starting an older successful snapshot could conflict
+execution admits a new run. Running/paused Activities are busy. Busy raises SessionBusy; other terminal statuses raise
+RunnerConflict because starting an older successful snapshot could conflict
 with already recorded history. An ambiguous start error never retries automatically;
-query the fixed Workflow ID before resubmitting. Worker recovery continues the
-original Workflow.
+query the fixed Activity ID before resubmitting. Each run has one Temporal attempt; Worker loss fails the run without resumption.
 
-Provider values and merged model/session settings become DurableExecutionConfig.
+Provider values and merged model/session settings become ExecutionConfig.
 The interface validates SDK settings without opening model resources. Native layer
 Config and State are read from the locked row alongside the snapshot/version.
 The Worker saves messages and every layer State together using a versioned,
 idempotent replacement. New sessions have `(runner_state=None, version=0)`.
 These internal values are absent from SessionRecord and HTTP. See the
-[durable runner](../runner_duarable/README.md) for the complete save contract.
+[Activity runner](../runner/README.md) for the complete save contract.
 
 ## Configuration
 
@@ -116,7 +117,7 @@ Only RetryableScopeError permits three bounded automatic attempts. Exits must be
 idempotent and support None for abandoned creation; a later explicit close may
 repeat successful exits. Ordinary failures do not prevent the remaining exits.
 The session becomes CLOSED after all cleanup succeeds; failures retain CLOSING and
-saved progress. Close and interface shutdown do not stop a Temporal Workflow.
+saved progress. Close and interface shutdown do not stop a Temporal Activity.
 
 Lease heartbeat settings satisfy finite `0 < interval < timeout`; all scope users
 sharing a table use compatible policy. Expired-token takeover alone waits the

@@ -9,12 +9,12 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
-from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.client import ActivityExecutionDescription, ActivityExecutionStatus, Client
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.control.models import ModelService
-from kapy.control.sessions import DurableRunnerConflict, SessionService
+from kapy.control.sessions import RunnerConflict, SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.interfaces.http import create_router
 from kapy.lifecycle import LifecycleError, LifecycleStatus
@@ -25,7 +25,8 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 async def client():
     return await Client.connect(
-        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"), plugins=[PydanticAIPlugin()]
+        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+        data_converter=pydantic_data_converter,
     )
 
 
@@ -46,12 +47,12 @@ async def test_non_ready_session_rejects_execution_before_temporal_calls(
         database.sessions, temporal_client=temporal, temporal_task_queue="unused"
     )
     with pytest.raises(LifecycleError):
-        await sessions.start_durable_runner(session_id, user_prompt="do not execute")
-    temporal.get_workflow_handle.assert_not_called()
-    temporal.start_workflow.assert_not_called()
+        await sessions.start_runner(session_id, user_prompt="do not execute")
+    temporal.get_activity_handle.assert_not_called()
+    temporal.start_activity.assert_not_called()
 
 
-async def test_real_temporal_admission_and_status_use_workflow_without_execution_lease(
+async def test_real_temporal_admission_and_status_use_activity_without_execution_lease(
     database, seed_session
 ):
     temporal = await client()
@@ -60,26 +61,26 @@ async def test_real_temporal_admission_and_status_use_workflow_without_execution
     sessions = SessionService(
         database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
     )
-    assert not await sessions.is_durable_runner_running(session_id)
-    # A scope lease is not an execution dependency or evidence of a running Workflow.
+    assert not await sessions.is_runner_running(session_id)
+    # A scope lease is not an execution dependency or evidence of a running Activity.
     async with open_session_lease(session_id, session_factory=database.sessions):
-        handle = await sessions.start_durable_runner(session_id, user_prompt="direct prompt")
+        handle = await sessions.start_runner(session_id, user_prompt="direct prompt")
     try:
-        assert handle.id == f"kapy-runner:{session_id}" and handle.result_run_id
-        assert await sessions.is_durable_runner_running(session_id)
+        assert handle.id == f"kapy-runner:{session_id}" and handle.run_id
+        assert await sessions.is_runner_running(session_id)
         with pytest.raises(SessionBusy):
-            await sessions.start_durable_runner(session_id, user_prompt="busy")
+            await sessions.start_runner(session_id, user_prompt="busy")
         with pytest.raises(SessionBusy):
             await sessions.close_session(session_id)
         assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
     finally:
-        await handle.terminate("test cleanup")
-    assert not await sessions.is_durable_runner_running(session_id)
-    with pytest.raises(DurableRunnerConflict):
-        await sessions.start_durable_runner(session_id, user_prompt="do not restart old state")
+        await handle.terminate(reason="test cleanup")
+    assert not await sessions.is_runner_running(session_id)
+    with pytest.raises(RunnerConflict):
+        await sessions.start_runner(session_id, user_prompt="do not restart old state")
     await sessions.close_session(session_id)
     with pytest.raises(LifecycleError):
-        await sessions.start_durable_runner(session_id, user_prompt="closed")
+        await sessions.start_runner(session_id, user_prompt="closed")
 
 
 async def test_concurrent_starts_admit_one_execution(database, seed_session):
@@ -90,7 +91,7 @@ async def test_concurrent_starts_admit_one_execution(database, seed_session):
         database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
     )
     results = await asyncio.gather(
-        *(sessions.start_durable_runner(session_id, user_prompt=text) for text in ["one", "two"]),
+        *(sessions.start_runner(session_id, user_prompt=text) for text in ["one", "two"]),
         return_exceptions=True,
     )
     handles = [result for result in results if not isinstance(result, BaseException)]
@@ -99,7 +100,7 @@ async def test_concurrent_starts_admit_one_execution(database, seed_session):
         assert sum(isinstance(result, SessionBusy) for result in results) == 1
     finally:
         for handle in handles:
-            await handle.terminate("test cleanup")
+            await handle.terminate(reason="test cleanup")
 
 
 async def test_close_serializes_with_inflight_start_confirmation(database, seed_session):
@@ -107,7 +108,7 @@ async def test_close_serializes_with_inflight_start_confirmation(database, seed_
     session_id = uuid4()
     await seed_session(session_id)
     accepted, release = asyncio.Event(), asyncio.Event()
-    original = temporal.start_workflow
+    original = temporal.start_activity
     handles = []
 
     async def held_start(*args, **kwargs):
@@ -117,11 +118,11 @@ async def test_close_serializes_with_inflight_start_confirmation(database, seed_
         await release.wait()
         return handle
 
-    temporal.start_workflow = held_start
+    temporal.start_activity = held_start
     sessions = SessionService(
         database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
     )
-    start = asyncio.create_task(sessions.start_durable_runner(session_id, user_prompt="one"))
+    start = asyncio.create_task(sessions.start_runner(session_id, user_prompt="one"))
     close = None
     try:
         await asyncio.wait_for(accepted.wait(), 5)
@@ -141,7 +142,7 @@ async def test_close_serializes_with_inflight_start_confirmation(database, seed_
                 with suppress(asyncio.CancelledError, SessionBusy):
                     await task
         for handle in handles:
-            await handle.terminate("test cleanup")
+            await handle.terminate(reason="test cleanup")
 
 
 @pytest.mark.parametrize("status", [RPCStatusCode.UNAVAILABLE, RPCStatusCode.DEADLINE_EXCEEDED])
@@ -151,12 +152,12 @@ async def test_temporal_rpc_failures_are_not_idle_or_leaked_over_http(
     session_id = uuid4()
     await seed_session(session_id)
     temporal = Mock(spec=Client)
-    temporal.get_workflow_handle.return_value.describe = AsyncMock(
+    temporal.get_activity_handle.return_value.describe = AsyncMock(
         side_effect=RPCError("secret-provider-payload", status, b"")
     )
     sessions = SessionService(database.sessions, temporal_client=temporal, temporal_task_queue="q")
     with pytest.raises(RPCError):
-        await sessions.is_durable_runner_running(session_id)
+        await sessions.is_runner_running(session_id)
     with pytest.raises(RPCError):
         await sessions.close_session(session_id)
     assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
@@ -171,7 +172,7 @@ async def test_temporal_rpc_failures_are_not_idle_or_leaked_over_http(
         ):
             assert result.status_code == 503
             assert "secret" not in result.text
-    temporal.start_workflow.assert_not_called()
+    temporal.start_activity.assert_not_called()
 
 
 async def test_http_start_returns_temporal_run_identity_and_busy_conflicts(database, seed_session):
@@ -193,19 +194,21 @@ async def test_http_start_returns_temporal_run_identity_and_busy_conflicts(datab
             result = await http.post(path, json={"user_prompt": "hello"})
             assert result.status_code == 202
             data = result.json()
-            description = await temporal.get_workflow_handle(data["workflow_id"]).describe()
+            description = await temporal.get_activity_handle(data["activity_id"]).describe()
             assert data == {
-                "workflow_id": f"kapy-runner:{session_id}",
-                "run_id": description.run_id,
+                "activity_id": f"kapy-runner:{session_id}",
+                "run_id": description.activity_run_id,
             }
             assert (await http.get(path)).json() is True
             assert (await http.post(path, json={"user_prompt": "busy"})).status_code == 409
-            await temporal.get_workflow_handle(data["workflow_id"]).terminate("test terminal")
+            await temporal.get_activity_handle(data["activity_id"]).terminate(
+                reason="test terminal"
+            )
             assert (await http.post(path, json={"user_prompt": "failed"})).status_code == 409
     finally:
-        handle = temporal.get_workflow_handle(f"kapy-runner:{session_id}")
-        if (await handle.describe()).status == WorkflowExecutionStatus.RUNNING:
-            await handle.terminate("test cleanup")
+        handle = temporal.get_activity_handle(f"kapy-runner:{session_id}")
+        if (await handle.describe()).status == ActivityExecutionStatus.RUNNING:
+            await handle.terminate(reason="test cleanup")
 
 
 @pytest.mark.parametrize("failure", ["rpc", "cancelled"])
@@ -215,7 +218,7 @@ async def test_accepted_start_survives_local_confirmation_failure(
     temporal = await client()
     session_id = uuid4()
     await seed_session(session_id)
-    original = temporal.start_workflow
+    original = temporal.start_activity
     accepted, release = asyncio.Event(), asyncio.Event()
     handles = []
     attempts = 0
@@ -230,11 +233,11 @@ async def test_accepted_start_survives_local_confirmation_failure(
         await release.wait()
         raise rpc_failure
 
-    monkeypatch.setattr(temporal, "start_workflow", unconfirmed_start)
+    monkeypatch.setattr(temporal, "start_activity", unconfirmed_start)
     sessions = SessionService(
         database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
     )
-    start = asyncio.create_task(sessions.start_durable_runner(session_id, user_prompt="one"))
+    start = asyncio.create_task(sessions.start_runner(session_id, user_prompt="one"))
     try:
         await asyncio.wait_for(accepted.wait(), 5)
         if failure == "cancelled":
@@ -246,10 +249,10 @@ async def test_accepted_start_survives_local_confirmation_failure(
             with pytest.raises(RPCError) as caught:
                 await start
             assert caught.value is rpc_failure
-        assert (await handles[0].describe()).status == WorkflowExecutionStatus.RUNNING
-        assert await sessions.is_durable_runner_running(session_id)
+        assert (await handles[0].describe()).status == ActivityExecutionStatus.RUNNING
+        assert await sessions.is_runner_running(session_id)
         with pytest.raises(SessionBusy):
-            await sessions.start_durable_runner(session_id, user_prompt="another prompt")
+            await sessions.start_runner(session_id, user_prompt="another prompt")
         with pytest.raises(SessionBusy):
             await sessions.close_session(session_id)
         assert attempts == 1
@@ -258,4 +261,25 @@ async def test_accepted_start_survives_local_confirmation_failure(
         start.cancel()
         await asyncio.gather(start, return_exceptions=True)
         for handle in handles:
-            await handle.terminate("test cleanup")
+            await handle.terminate(reason="test cleanup")
+
+
+async def test_paused_activity_still_owns_session_admission(database, seed_session):
+    session_id = uuid4()
+    await seed_session(session_id)
+    # Pausing is an optional server operator API. Its SDK status still represents
+    # an existing execution and must not permit closing the underlying scope.
+    temporal = Mock(spec=Client)
+    temporal.get_activity_handle.return_value.describe = AsyncMock(
+        return_value=Mock(spec=ActivityExecutionDescription, status=ActivityExecutionStatus.PAUSED)
+    )
+    sessions = SessionService(
+        database.sessions, temporal_client=temporal, temporal_task_queue="unused"
+    )
+    assert await sessions.is_runner_running(session_id)
+    with pytest.raises(SessionBusy):
+        await sessions.start_runner(session_id, user_prompt="busy")
+    with pytest.raises(SessionBusy):
+        await sessions.close_session(session_id)
+    assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
+    temporal.start_activity.assert_not_called()

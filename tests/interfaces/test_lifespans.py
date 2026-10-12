@@ -173,7 +173,7 @@ async def test_http_shutdown_joins_start_request_before_resources_close(
             events.append("runner-cleaned")
 
     monkeypatch.setattr(http_app, "open_resources", resources)
-    monkeypatch.setattr(SessionService, "start_durable_runner", runner)
+    monkeypatch.setattr(SessionService, "start_runner", runner)
     app = create_app(
         HttpSettings(
             common=CommonSettings(
@@ -279,7 +279,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
 
     monkeypatch.setattr(telegram_main, "open_resources", resources)
     monkeypatch.setattr(TelegramClient, "api", api)
-    monkeypatch.setattr(SessionService, "start_durable_runner", runner)
+    monkeypatch.setattr(SessionService, "start_runner", runner)
     task = asyncio.create_task(telegram_main.serve(settings))
     try:
         await asyncio.wait_for(started.wait(), 3)

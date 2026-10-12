@@ -11,11 +11,11 @@ docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests pac
 ```
 
 Interface lifespan and Temporal runner tests require a running Temporal service
-(`docker compose up -d temporal`). Compose sets
+(`docker compose up -d temporal-namespace`). Compose sets
 `KAPY_TEMPORAL_ADDRESS=temporal:7233` for runtime (host default:
-`localhost:7233`). Runner tests use unique Workflow IDs/task queues and a local HTTP
+`localhost:7233`). Runner tests use unique Activity IDs/task queues and a local HTTP
 server for the actual SDK model protocols. See
-[`runner_duarable`](../src/kapy/runner_duarable/README.md).
+[`runner`](../src/kapy/runner/README.md).
 
 Database tests own disposable PostgreSQL schemas and Valkey namespaces. The normal
 suite uses deterministic SDK models and local model protocol servers. Browser
@@ -35,24 +35,21 @@ to a deployed shellctl instance.
 KAPY_SHELLCTL_TEST_BIN_DIR=/work/packages/shellctl/server/bin \
   python -m pytest -q -p no:cacheprovider \
   tests/layers/test_shell_scopes.py \
-  tests/runner_duarable/test_layers.py
+  tests/runner/test_layers.py
 ```
 
 `tests/layers` checks Kapy shell behavior and host scope retries.
 The independent package's `packages/pydantic-ai-layer-protocol/tests` checks
 typed factory assembly, arbitrary writable deps layouts,
-JSON snapshots, native for_run isolation, tool flags, hooks, instructions and
-Temporal replay. Its real Pyrefly probes use the project configuration to check
+JSON snapshots, native for_run isolation, tool flags, hooks, instructions and ordinary run isolation. Its real Pyrefly probes use the project configuration to check
 model/hook signatures, including the required optional State on exit.
-`runner_duarable/test_layers.py` uses deterministic SDK streaming with real
-PostgreSQL, Temporal and a private shellctl server. It covers multiple calls,
-cross-run cursors, native retries, failure/cancellation preserving the preceding
-snapshot, replay, and session-close retry progress. Nested-capability tests also
-verify State is visible before hooks, other layers stay intact, and ordinary or
-native ToolReturn values retain their public shape across a consumer-specific deps
-layout. Native ownership, nondefault tool flags and deferred capability/Toolset
-instructions are checked through ordinary Agent runs and real Temporal Activities.
-No external model API is called.
+`runner/test_layers.py` uses deterministic SDK streaming with real
+PostgreSQL, standalone Temporal Activities and a private shellctl server. It covers
+sequential calls, cross-run cursors, native ModelRetry, failure/cancellation keeping
+the preceding snapshot and session-close retry progress. The runner tests also
+exercise three model protocols, single-attempt failures, final-save failure and
+resource cleanup. Native ownership, tool flags and deferred capability/Toolset
+instructions are checked through ordinary Agent runs. No external model API is called.
 
 Shared PostgreSQL/Valkey fixtures live in `tests/conftest.py`. `tests/control`
 covers catalog, durable admission, session state and layer lifecycle;

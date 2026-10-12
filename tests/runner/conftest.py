@@ -16,7 +16,7 @@ from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
 from kapy.control.sessions.models import SessionRow
 from kapy.database.schema import migrate
-from kapy.runner_duarable.context import bind_output_service
+from kapy.runner import RunnerDeps
 
 
 @dataclass
@@ -26,6 +26,13 @@ class RunnerDatabase:
     session_id: UUID
     outputs: AgentOutputService
     valkey: Valkey
+
+    def deps(self, session_id: UUID | None = None) -> RunnerDeps:
+        return RunnerDeps(
+            session_id=session_id or self.session_id,
+            session_factory=self.sessions,
+            output_service=self.outputs,
+        )
 
 
 @pytest_asyncio.fixture
@@ -48,8 +55,7 @@ async def runner_database() -> AsyncIterator[RunnerDatabase]:
                 outputs = AgentOutputService(
                     client, channel_prefix=settings.valkey_namespace + ":agent-output"
                 )
-                with bind_output_service(outputs):
-                    yield RunnerDatabase(settings, sessions, session_id, outputs, client)
+                yield RunnerDatabase(settings, sessions, session_id, outputs, client)
     finally:
         async with await psycopg.AsyncConnection.connect(
             settings.database_url.get_secret_value(), autocommit=True

@@ -27,26 +27,48 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-  temporal:
-    image: temporalio/auto-setup:1.29.1
+  temporal-schema:
+    image: temporalio/admin-tools:1.32.1
+    entrypoint: ["sh", "/scripts/setup_temporal_schema.sh"]
     environment:
-      DB: postgres12
-      POSTGRES_SEEDS: postgres
-      DB_PORT: 5432
-      POSTGRES_USER: kapy
-      POSTGRES_PWD: kapy-local
-      DBNAME: temporal
-      VISIBILITY_DBNAME: temporal_visibility
-      ENABLE_ES: "false"
+      SQL_PLUGIN: postgres12
+      SQL_HOST: postgres
+      SQL_PORT: "5432"
+      SQL_USER: kapy
+      SQL_PASSWORD: kapy-local
+    volumes:
+      - ./scripts/setup_temporal_schema.sh:/scripts/setup_temporal_schema.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+  temporal:
+    image: temporalio/server:1.32.1
+    environment:
+      BIND_ON_IP: 0.0.0.0
+      TEMPORAL_SERVER_CONFIG_FILE_PATH: /etc/temporal/server.yaml
+      TEMPORAL_ALLOW_NO_AUTH: "true"
+    volumes:
+      - ./config/temporal/server.yaml:/etc/temporal/server.yaml:ro
     ports:
       - "127.0.0.1:${KAPY_TEMPORAL_PORT:-7233}:7233"
     healthcheck:
-      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 30
     depends_on:
-      postgres:
+      temporal-schema:
+        condition: service_completed_successfully
+  temporal-namespace:
+    image: temporalio/admin-tools:1.32.1
+    entrypoint: ["sh", "/scripts/setup_temporal_namespace.sh"]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      KAPY_TEMPORAL_NAMESPACE: ${KAPY_TEMPORAL_NAMESPACE:-default}
+    volumes:
+      - ./scripts/setup_temporal_namespace.sh:/scripts/setup_temporal_namespace.sh:ro
+    depends_on:
+      temporal:
         condition: service_healthy
   temporal-ui:
     image: temporalio/ui:2.54.1
@@ -67,7 +89,7 @@ services:
     image: kapy-v2:tmpv2
     build: .
     init: true
-    command: ["python", "-m", "kapy.runner_duarable.worker"]
+    command: ["python", "-m", "kapy.runner.worker"]
     user: "10001:10001"
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
@@ -89,8 +111,8 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      temporal:
-        condition: service_healthy
+      temporal-namespace:
+        condition: service_completed_successfully
     mem_limit: 2g
     pids_limit: 256
   valkey:
@@ -137,8 +159,8 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      temporal:
-        condition: service_healthy
+      temporal-namespace:
+        condition: service_completed_successfully
     mem_limit: 2g
     pids_limit: 256
   telegram:
@@ -172,8 +194,8 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      temporal:
-        condition: service_healthy
+      temporal-namespace:
+        condition: service_completed_successfully
     mem_limit: 2g
     pids_limit: 256
 volumes:

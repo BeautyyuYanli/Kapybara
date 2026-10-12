@@ -20,12 +20,14 @@ import anyio
 from pydantic import BaseModel
 from pydantic_ai.exceptions import UserError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle
-from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from sqlmodel import col, select
+from temporalio.client import ActivityExecutionStatus, ActivityHandle, Client
+from temporalio.common import ActivityIDConflictPolicy, ActivityIDReusePolicy, RetryPolicy
+from temporalio.exceptions import ActivityAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
+from kapy.agent_history.models import AgentHistoryRow
 from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent, TextDelta
 from kapy.control.models.repository import ModelRepository
 from kapy.control.models.runtime import resolve_classes, validate_settings
@@ -34,7 +36,7 @@ from kapy.layers.registry import layer_registry
 from kapy.layers.scopes import retry_scope
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
-from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow
+from kapy.runner.types import ExecutionConfig, RunnerInput
 from kapy.session_lease import SessionBusy, SessionLease, open_session_lease
 from pydantic_ai_layer_protocol import dump_object
 from pydantic_ai_layer_protocol.types import JsonObject
@@ -49,8 +51,8 @@ from .types import (
 )
 
 
-class DurableRunnerConflict(Exception):
-    """The preceding Workflow did not complete successfully; do not restart old state."""
+class RunnerConflict(Exception):
+    """Prior progress cannot resume without a confirmed successful Activity record."""
 
 
 _TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
@@ -60,7 +62,7 @@ _logger = logging.getLogger(__name__)
 class SessionService:
     """Borrow session/output factories and Temporal; own no model or engine.
 
-    Model configuration is fixed when admission starts a Workflow. Heartbeat policy
+    Model configuration is fixed when admission starts an Activity. Heartbeat policy
     belongs only to native layer scope creation/close, not runner execution.
     """
 
@@ -211,7 +213,7 @@ class SessionService:
         With a Temporal Client, ready/closing sessions check remote activity under
         the row lock before changing lifecycle. Creating skips the query so abandoned
         scopes can be cleaned independently of Temporal; closed returns directly.
-        Query failures propagate; close never stops a Workflow. Close never changes
+        Query failures propagate; close never stops an Activity. Close never changes
         execution. Failures retain the irreversible closing
         decision and completed cleanup progress for explicit retry.
         Registered layer scopes are cleaned under the lease;
@@ -229,7 +231,7 @@ class SessionService:
         self, session_id: UUID, lease: SessionLease, *, failed_creation: bool = False
     ) -> SessionRecord:
         """Resolve abandoned creation or perform close while retaining the same lease."""
-        # Admission includes the existing ten-second Workflow query; preserve that
+        # Admission includes the existing ten-second Activity query; preserve that
         # RPC budget rather than timing it out at the shorter DB-only deadline.
         async with self._scope_transaction(
             lease, budget=_TEMPORAL_RPC_TIMEOUT.total_seconds() + 5
@@ -243,9 +245,9 @@ class SessionService:
                 not failed_creation
                 and row.status != LifecycleStatus.CREATING
                 and self._temporal_client is not None
-                and await self.is_durable_runner_running(session_id)
+                and await self.is_runner_running(session_id)
             ):
-                raise SessionBusy(f"Session {session_id} has an active Workflow")
+                raise SessionBusy(f"Session {session_id} has an active Activity")
             configs = layer_registry.prepare_configs(row.layers)
             # READY always has a complete validated snapshot. An abandoned creating
             # record stores no States at all; do not fabricate defaults for it.
@@ -340,11 +342,11 @@ class SessionService:
         async with self._session_factory.begin() as db:
             return await SessionRepository(db).update_session(session_id, values)
 
-    async def _durable_status(self, session_id: UUID) -> WorkflowExecutionStatus | None:
+    async def _runner_status(self, session_id: UUID) -> ActivityExecutionStatus | None:
         if self._temporal_client is None:
-            raise RuntimeError("Durable execution requires a Temporal client")
+            raise RuntimeError("Runner execution requires a Temporal client")
         try:
-            description = await self._temporal_client.get_workflow_handle(
+            description = await self._temporal_client.get_activity_handle(
                 f"kapy-runner:{session_id}"
             ).describe(rpc_timeout=_TEMPORAL_RPC_TIMEOUT)
         except RPCError as error:
@@ -353,25 +355,29 @@ class SessionService:
             raise
         return description.status
 
-    async def is_durable_runner_running(self, session_id: UUID) -> bool:
+    async def is_runner_running(self, session_id: UUID) -> bool:
         """Observe Temporal execution; only NOT_FOUND means absent, RPC failures propagate."""
-        return await self._durable_status(session_id) == WorkflowExecutionStatus.RUNNING
+        return await self._runner_status(session_id) in {
+            ActivityExecutionStatus.RUNNING,
+            ActivityExecutionStatus.PAUSED,
+        }
 
-    async def start_durable_runner(
-        self, session_id: UUID, *, user_prompt: str
-    ) -> WorkflowHandle[RunnerWorkflow, str]:
+    async def start_runner(self, session_id: UUID, *, user_prompt: str) -> ActivityHandle[str]:
         """Submit one text prompt, returning after Temporal confirms the start.
 
         Borrow the Client and serialize admission/close with a session row lock,
         held only through bounded RPCs. A new execution may follow only COMPLETED,
-        preserving recorded
-        history across replay. A failed/ambiguous RPC never triggers a new attempt
-        here; callers query the fixed Workflow ID to discover accepted execution.
+        preserving immutable history and the successful snapshot. A failed or
+        ambiguous RPC never triggers a new attempt here; callers query the fixed
+        Activity ID to discover accepted execution. When that record is missing,
+        only a session without snapshot/version progress or history can start.
+        Expired or deleted successful records also require a new session because
+        their completion can no longer be confirmed.
         The Worker owns model resources and state saving; cancelling this await
-        does not cancel a Workflow.
+        does not cancel an Activity.
         """
         if self._temporal_client is None or not self._temporal_task_queue:
-            raise RuntimeError("Durable execution requires a Temporal client and task queue")
+            raise RuntimeError("Runner execution requires a Temporal client and task queue")
         if not isinstance(user_prompt, str):
             raise ValueError("user_prompt must be a string")
         async with self._session_factory.begin() as db:
@@ -380,11 +386,25 @@ class SessionService:
                 raise LifecycleError(f"Session {session_id} is {row.status}")
             if row.layer_states.keys() != row.layers.keys():
                 raise ValueError("Saved layer states must match the configured layer names")
-            status = await self._durable_status(session_id)
-            if status == WorkflowExecutionStatus.RUNNING:
-                raise SessionBusy(f"Session {session_id} has an active Workflow")
-            if status is not None and status != WorkflowExecutionStatus.COMPLETED:
-                raise DurableRunnerConflict(f"Previous Workflow ended with {status.name}")
+            status = await self._runner_status(session_id)
+            if status in {ActivityExecutionStatus.RUNNING, ActivityExecutionStatus.PAUSED}:
+                raise SessionBusy(f"Session {session_id} has an active Activity")
+            if status is not None and status != ActivityExecutionStatus.COMPLETED:
+                raise RunnerConflict(f"Previous Activity ended with {status.name}")
+            if status is None:
+                if row.runner_state is not None or row.runner_state_version != 0:
+                    raise RunnerConflict("Previous Activity record is missing; use a new session")
+                # NOT_FOUND includes deleted/expired terminal records. Committed
+                # history can outlive a failed run with no final snapshot.
+                has_history = (
+                    await db.execute(
+                        select(AgentHistoryRow.seq)
+                        .where(col(AgentHistoryRow.session_id) == session_id)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none() is not None
+                if has_history:
+                    raise RunnerConflict("Previous Activity record is missing; use a new session")
             repo = ModelRepository(db)
             model = await repo.get_model(row.provider_id, row.model_name)
             provider = await repo.get_provider_config(row.provider_id)
@@ -397,7 +417,7 @@ class SessionService:
                 runner_state_version=version,
                 layers=layer_registry.load(row.layers, row.layer_states),
                 user_prompt=user_prompt,
-                config=DurableExecutionConfig(
+                config=ExecutionConfig(
                     provider_class=provider.provider_class,
                     model_class=provider.model_class,
                     model_name=model.model_name,
@@ -409,17 +429,22 @@ class SessionService:
                 ),
             )
             try:
-                return await self._temporal_client.start_workflow(
-                    RunnerWorkflow.run,
+                return await self._temporal_client.start_activity(
+                    "kapy.run_agent",
                     data,
+                    result_type=str,
                     id=f"kapy-runner:{session_id}",
                     task_queue=self._temporal_task_queue,
-                    id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
-                    id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                    id_conflict_policy=ActivityIDConflictPolicy.FAIL,
+                    id_reuse_policy=ActivityIDReusePolicy.ALLOW_DUPLICATE,
+                    schedule_to_close_timeout=timedelta(hours=1),
+                    start_to_close_timeout=timedelta(hours=1),
+                    heartbeat_timeout=timedelta(seconds=10),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
                     rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
                 )
-            except WorkflowAlreadyStartedError as error:
-                raise SessionBusy(f"Session {session_id} has an active Workflow") from error
+            except ActivityAlreadyStartedError as error:
+                raise SessionBusy(f"Session {session_id} has an active Activity") from error
 
     async def read_history(
         self, session_id: UUID, *, before_seq: int | None = None, limit: int = 100

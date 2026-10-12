@@ -195,8 +195,8 @@ async def test_sdk_settings_validation_and_update_semantics(database):
     temporal = await Client.connect(os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"))
     executing = SessionService(database.sessions, temporal_client=temporal, temporal_task_queue="q")
     with pytest.raises(ValueError):
-        await executing.start_durable_runner(session.id, user_prompt="go")
-    assert not await executing.is_durable_runner_running(session.id)
+        await executing.start_runner(session.id, user_prompt="go")
+    assert not await executing.is_runner_running(session.id)
     changed = await catalog.update_provider(
         provider.id, UpdateProvider(api_key=SecretStr("new-secret"), base_url=None)
     )

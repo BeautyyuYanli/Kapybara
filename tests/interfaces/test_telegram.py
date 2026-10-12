@@ -23,7 +23,7 @@ from pydantic_ai.messages import (
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from temporalio.client import WorkflowHandle
+from temporalio.client import ActivityHandle
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 
 from kapy.agent_history import HistoryMessage
@@ -100,7 +100,7 @@ def controller(repository, tmp_path):
 
     sessions.create_session.side_effect = create
     sessions.get_session.side_effect = get
-    sessions.is_durable_runner_running.return_value = False
+    sessions.is_runner_running.return_value = False
     client = telegram_client()
     result = TelegramController(
         client=client,
@@ -121,7 +121,7 @@ async def test_removed_commands_do_not_create_or_submit_execution(repository, tm
     await repository.ingest(42, [update(1, f"/{command}")])
     assert await app.process_once()
     sessions.create_session.assert_not_awaited()
-    sessions.start_durable_runner.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
     assert client.send.await_args.args[-1] == "Unknown command. Use /help."
 
 
@@ -134,7 +134,7 @@ async def test_saved_obsolete_action_is_reported_without_allocating_resources(re
     await repository.save_action(item, {"command": "queue", "session_id": None, "text": "text"})
     assert await app.process_once()
     sessions.create_session.assert_not_awaited()
-    sessions.start_durable_runner.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
     assert client.send.await_args.args[-1] == "Unknown command. Use /help."
 
 
@@ -479,7 +479,7 @@ async def test_inbox_dedup_topics_and_session_business_only(repository, tmp_path
         assert await app.process_once()
     assert not await app.process_once()
     sessions.create_session.assert_awaited_once()
-    sessions.start_durable_runner.assert_awaited_once_with(
+    sessions.start_runner.assert_awaited_once_with(
         sessions.create_session.return_value.id, user_prompt="hello"
     )
     assert await repository.route(42, 123, 0) == sessions.create_session.return_value.id
@@ -503,7 +503,7 @@ async def test_retry_after_confirmation_does_not_resubmit_or_recreate(repository
     client.send.side_effect = None
     await app.process_once()
     sessions.create_session.assert_awaited_once()
-    sessions.start_durable_runner.assert_awaited_once()
+    sessions.start_runner.assert_awaited_once()
     assert await repository.next_inbox(42) is None
 
 
@@ -537,14 +537,14 @@ async def test_bind_failure_after_creation_recovers_saved_identity(
     assert item.resolved_action["creating_session_id"] == str(created_id)
     assert item.resolved_action["session_id"] is None
     assert await repository.route(42, 123, 0) is None
-    sessions.start_durable_runner.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
     monkeypatch.setattr(repository, "bind", original)
     restarted, _, client = controller(repository, tmp_path)
     restarted.sessions = sessions
     await restarted.process_once()
     assert await repository.route(42, 123, 0) == created_id
     sessions.create_session.assert_awaited_once()
-    sessions.start_durable_runner.assert_awaited_once_with(created_id, user_prompt="first")
+    sessions.start_runner.assert_awaited_once_with(created_id, user_prompt="first")
     assert client.send.await_args.args[-1] == "New session created."
     assert await repository.next_inbox(42) is None
 
@@ -569,7 +569,7 @@ async def test_inbox_recovery_reports_unfinished_scope_without_replaying_enter(
     await app.process_once()
     await app.process_once()
     sessions.create_session.assert_not_awaited()
-    sessions.start_durable_runner.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
     assert await repository.route(42, 123, 0) is None
     assert str(identity) in client.send.await_args.args[-1]
     assert f"Status: {phase}" in client.send.await_args.args[-1]
@@ -1034,9 +1034,9 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
 ):
     app, sessions, _ = controller(repository, tmp_path)
     content = "retain this input"
-    sessions.start_durable_runner.side_effect = [
-        OperationalError("start_durable_runner", {}, Exception("temporary connection failure")),
-        Mock(spec=WorkflowHandle),
+    sessions.start_runner.side_effect = [
+        OperationalError("start_runner", {}, Exception("temporary connection failure")),
+        Mock(spec=ActivityHandle),
     ]
     await repository.ingest(42, [update(1, "/new " + content, thread=17)])
     with pytest.raises(OperationalError):
@@ -1060,13 +1060,12 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
         assert await restored.next_inbox(42) is None
     sessions.create_session.assert_awaited_once()
     # Two attempts are expected: the failed call's business effect may be ambiguous.
-    assert [call.args for call in sessions.start_durable_runner.await_args_list] == [
+    assert [call.args for call in sessions.start_runner.await_args_list] == [
         (target,),
         (target,),
     ]
     assert all(
-        call.kwargs == {"user_prompt": content}
-        for call in sessions.start_durable_runner.await_args_list
+        call.kwargs == {"user_prompt": content} for call in sessions.start_runner.await_args_list
     )
 
 
@@ -1267,7 +1266,7 @@ async def test_durable_busy_and_ambiguous_start_are_not_retried_as_queued_input(
 
     app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1), update(2, "next")])
-    sessions.start_durable_runner.side_effect = [
+    sessions.start_runner.side_effect = [
         SessionBusy("busy"),
         RPCError("secret", RPCStatusCode.DEADLINE_EXCEEDED, b""),
     ]
@@ -1275,7 +1274,7 @@ async def test_durable_busy_and_ambiguous_start_are_not_retried_as_queued_input(
     await app.process_once()
     # RPC errors are recorded as a reply; following attempts only send that reply.
     await app.process_once()
-    assert sessions.start_durable_runner.await_count == 2
+    assert sessions.start_runner.await_count == 2
     assert "busy" in client.send.call_args_list[0].args[2]
     assert "/status" in client.send.call_args_list[1].args[2]
     assert "secret" not in str(client.send.call_args_list)

@@ -2,15 +2,15 @@
 
 Kapy consumes the independent [Pydantic AI Layer Protocol](../../../packages/pydantic-ai-layer-protocol/README.md).
 The package owns Layer definitions, registry assembly, Config/State validation,
-native capability composition and optional Temporal State transport. The shell
+native capability composition. The shell
 implementation, installed factory mapping, scope retry policy and SessionService
 remain in Kapy.
 
-`registry.layer_registry` is a process-local `TemporalLayerRegistry` constructed
+`registry.layer_registry` is a process-local `LayerRegistry` constructed
 with `{"shell": shell.make}` and Kapy's RunnerDeps.layers adapter once.
-The Agent installs it directly; SessionService and Workflow use its
+The Agent installs it directly; SessionService and Activity use its
 `definitions`, `prepare_configs`, `load` and `snapshot` methods.
-SessionService, Workflow and Activity use these same static definitions. Only the
+SessionService and Activity use these same static definitions. Only the
 adapter knows the deps layout; shell obtains all data through injected access and
 Config/State. Changing the installed set requires reassembly.
 
@@ -44,7 +44,7 @@ After a ready COMMIT error, the original transaction ends before a new protected
 transaction resolves the authoritative row: ready is retained, creating is closed.
 Unavailable storage leaves the outcome unconfirmed and does not trigger blind exit.
 
-Session close obtains the existing exclusive lease, checks active Workflows for
+Session close obtains the existing exclusive lease, checks active Activities for
 initialized sessions, and persists `closing` before calling exits outside database
 transactions. An exit may
 mutate State to record confirmed cleanup. The host validates and saves that State
@@ -103,6 +103,7 @@ saved byte cursor; cursors never decrease. Interrupt retains the job and its
 readable logs. Confirmed `job_not_found` removes the entry. Output limits,
 truncation, tail supplementation and redaction follow `layers.shell.output`.
 
+Tools explicitly run sequentially because their State shares one job inventory.
 Each tool owns and closes its HTTP client, with bounded shielded cleanup. The
 remote job survives client close and successful runner completion. `enter_scope`
 starts an empty inventory with its scope identity. `exit_scope` deletes known jobs one

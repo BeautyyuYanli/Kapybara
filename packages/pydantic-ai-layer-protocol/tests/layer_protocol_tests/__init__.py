@@ -1,1 +1,1 @@
-"""Independent protocol test capabilities and Temporal Workflows."""
+"""Independent protocol test capabilities for ordinary Agent runs."""

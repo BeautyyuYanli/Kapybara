@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { CloseSessionData, CloseSessionErrors, CloseSessionResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProviderData, DeleteProviderErrors, DeleteProviderResponses, DiscoverModelsData, DiscoverModelsErrors, DiscoverModelsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProviderData, GetProviderErrors, GetProviderResponses, GetSessionData, GetSessionErrors, GetSessionResponses, IsRunnerRunningData, IsRunnerRunningErrors, IsRunnerRunningResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ReadHistoryData, ReadHistoryErrors, ReadHistoryResponses, StartDurableRunnerData, StartDurableRunnerErrors, StartDurableRunnerResponses, UpdateModelData, UpdateModelErrors, UpdateModelResponses, UpdateProviderData, UpdateProviderErrors, UpdateProviderResponses, UpdateSessionData, UpdateSessionErrors, UpdateSessionResponses } from './types.gen';
+import type { CloseSessionData, CloseSessionErrors, CloseSessionResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProviderData, DeleteProviderErrors, DeleteProviderResponses, DiscoverModelsData, DiscoverModelsErrors, DiscoverModelsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProviderData, GetProviderErrors, GetProviderResponses, GetSessionData, GetSessionErrors, GetSessionResponses, IsRunnerRunningData, IsRunnerRunningErrors, IsRunnerRunningResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ReadHistoryData, ReadHistoryErrors, ReadHistoryResponses, StartRunnerData, StartRunnerErrors, StartRunnerResponses, UpdateModelData, UpdateModelErrors, UpdateModelResponses, UpdateProviderData, UpdateProviderErrors, UpdateProviderResponses, UpdateSessionData, UpdateSessionErrors, UpdateSessionResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -146,9 +146,9 @@ export const closeSession = <ThrowOnError extends boolean = false>(options: Opti
 export const isRunnerRunning = <ThrowOnError extends boolean = false>(options: Options<IsRunnerRunningData, ThrowOnError>): RequestResult<IsRunnerRunningResponses, IsRunnerRunningErrors, ThrowOnError> => (options.client ?? client).get<IsRunnerRunningResponses, IsRunnerRunningErrors, ThrowOnError>({ url: '/api/sessions/{session_id}/runner', ...options });
 
 /**
- * Start Durable Runner
+ * Start Runner
  */
-export const startDurableRunner = <ThrowOnError extends boolean = false>(options: Options<StartDurableRunnerData, ThrowOnError>): RequestResult<StartDurableRunnerResponses, StartDurableRunnerErrors, ThrowOnError> => (options.client ?? client).post<StartDurableRunnerResponses, StartDurableRunnerErrors, ThrowOnError>({
+export const startRunner = <ThrowOnError extends boolean = false>(options: Options<StartRunnerData, ThrowOnError>): RequestResult<StartRunnerResponses, StartRunnerErrors, ThrowOnError> => (options.client ?? client).post<StartRunnerResponses, StartRunnerErrors, ThrowOnError>({
     url: '/api/sessions/{session_id}/runner',
     ...options,
     headers: {

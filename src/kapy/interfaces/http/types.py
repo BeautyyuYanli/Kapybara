@@ -3,10 +3,10 @@
 from kapy.control.types import DTO
 
 
-class StartDurableRunner(DTO):
+class StartRunner(DTO):
     user_prompt: str
 
 
-class DurableRun(DTO):
-    workflow_id: str
+class RunnerRun(DTO):
+    activity_id: str
     run_id: str

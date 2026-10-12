@@ -1,9 +1,7 @@
-"""Select static layers while native Dynamic capabilities own leaf Activities.
+"""Select static layers and bind native capabilities and Toolsets to each run.
 
-Composition and capability ownership stay outside Temporal Activities, whose
-serialized contexts have no live capability registry. Registered leaves have
-stable IDs and bind their Toolsets inside the SDK's native Activity boundary.
-Static definitions retain no execution deps or business-scope resources.
+Static definitions retain no execution deps or business-scope resources. Native
+SDK for_agent/for_run hooks keep capability and Toolset lifecycles independent.
 """
 
 from collections.abc import Callable, Mapping
@@ -12,60 +10,16 @@ from typing import Any
 
 from pydantic_ai import RunContext
 from pydantic_ai.agent.abstract import AbstractAgent
-from pydantic_ai.capabilities import (
-    AbstractCapability,
-    CapabilityOrdering,
-    CombinedCapability,
-    DynamicCapability,
-    WrapperCapability,
-)
+from pydantic_ai.capabilities import AbstractCapability, CombinedCapability
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.toolsets import AbstractToolset, AgentToolset, DynamicToolset
 
 from .registry import _load
 from .types import Layer, LayerData
 
 
 @dataclass
-class _LayerLeaf[DepsT](WrapperCapability[DepsT]):
-    """Delegate capability behavior and bind its Toolset at tool resolution.
-
-    Dynamic resolves the capability before ordinary runs finalize their registry.
-    Its callable Toolset contribution runs later, with that complete context, or
-    with an Activity's freshly reconstructed context and resources.
-    """
-
-    layer: Layer[DepsT, Any, Any]
-    wrap_toolset: (
-        Callable[[Layer[DepsT, Any, Any], AbstractToolset[DepsT]], AbstractToolset[DepsT]] | None
-    )
-
-    def get_ordering(self) -> CapabilityOrdering | None:
-        # SDK WrapperCapability does not forward ordering; Combined re-sorts
-        # resolved leaves using these constraints.
-        return self.wrapped.get_ordering()
-
-    def get_toolset(self) -> AgentToolset[DepsT] | None:
-        contribution = self.wrapped.get_toolset()
-        if contribution is None:
-            return None
-        toolset = (
-            contribution
-            if isinstance(contribution, AbstractToolset)
-            else DynamicToolset(contribution)
-        )
-        if self.wrap_toolset is not None:
-            toolset = self.wrap_toolset(self.layer, toolset)
-
-        async def bind(ctx: RunContext[DepsT]) -> AbstractToolset[DepsT]:
-            return await toolset.for_run(ctx)
-
-        return bind
-
-
-@dataclass
 class _SelectedLayers[DepsT](AbstractCapability[DepsT]):
-    """Expose all Activity entries, then replace selection with a run-local composition."""
+    """Replace selection with a run-local composition of installed definitions."""
 
     installed: Mapping[str, Layer[DepsT, Any, Any]]
     prepared: Mapping[str, AbstractCapability[DepsT]]
@@ -75,10 +29,6 @@ class _SelectedLayers[DepsT](AbstractCapability[DepsT]):
         return replace(
             self, prepared={name: cap.for_agent(agent) for name, cap in self.prepared.items()}
         )
-
-    def get_toolset(self) -> AgentToolset[DepsT] | None:
-        # Durable engines register the complete installed entry set at construction.
-        return CombinedCapability(list(self.prepared.values())).get_toolset()
 
     async def for_run(self, ctx: RunContext[DepsT]) -> AbstractCapability[DepsT]:
         selected = self.get_layers(ctx.deps)
@@ -97,36 +47,23 @@ def _layers_capability[DepsT](
     layers: Mapping[str, Layer[DepsT, Any, Any]],
     *,
     get_layers: Callable[[DepsT], dict[str, LayerData]],
-    wrap_toolset: Callable[[Layer[DepsT, Any, Any], AbstractToolset[DepsT]], AbstractToolset[DepsT]]
-    | None = None,
 ) -> AbstractCapability[DepsT]:
     """Prepare stable installed leaves; select current deps without business-scope hooks.
 
     Native containers retain their structure. Callable or dynamic leaf Toolsets
     are supported; capability factories producing unknown subtrees are outside
-    the static installation contract. Optional integrations wrap leaf Toolsets
-    before their native Activity binding.
+    the static installation contract.
     """
     installed = dict(layers)
-    prepared: dict[str, AbstractCapability[DepsT]] = {}
-    for name, layer in installed.items():
 
-        def convert(
-            capability: AbstractCapability[DepsT], *, layer=layer
-        ) -> AbstractCapability[DepsT]:
-            registered: list[AbstractCapability[DepsT]] = []
-            capability.apply(registered.append)
-            if len(registered) != 1 or registered[0] is not capability:
-                return capability
-            if not capability.id:
-                raise UserError("Layer capability leaves must declare a nonempty stable id")
+    def validate_leaf(capability: AbstractCapability[DepsT]) -> None:
+        if not capability.id:
+            raise UserError("Layer capability leaves must declare a nonempty stable id")
 
-            def resolve(ctx: RunContext[DepsT]) -> AbstractCapability[DepsT]:
-                return _LayerLeaf(capability, layer=layer, wrap_toolset=wrap_toolset)
-
-            return DynamicCapability(resolve, id=capability.id)
-
-        capability = layer.capability.visit_and_replace(convert)
-        assert capability is not None
-        prepared[name] = capability
-    return _SelectedLayers(installed=installed, prepared=prepared, get_layers=get_layers)
+    for layer in installed.values():
+        layer.capability.apply(validate_leaf)
+    return _SelectedLayers(
+        installed=installed,
+        prepared={name: layer.capability for name, layer in installed.items()},
+        get_layers=get_layers,
+    )

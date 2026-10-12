@@ -209,8 +209,7 @@ async def test_durable_only_closes_legacy_sessions_and_retains_history_snapshots
                 assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
                 assert [m.seq for m in (await service.read_history(session_id)).items] == [3]
                 with pytest.raises(LifecycleError):
-                    await service.start_durable_runner(session_id, user_prompt="do not reset")
-            temporal.get_workflow_handle.assert_not_called()
+                    await service.start_runner(session_id, user_prompt="do not reset")
     finally:
         async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
             await db.execute(

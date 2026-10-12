@@ -629,12 +629,13 @@ dependencies = [
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pydantic" },
     { name = "pydantic-ai-harness", extra = ["codemode"] },
-    { name = "pydantic-ai-layer-protocol", extra = ["temporal"] },
-    { name = "pydantic-ai-slim", extra = ["google", "openai", "temporal"] },
+    { name = "pydantic-ai-layer-protocol" },
+    { name = "pydantic-ai-slim", extra = ["google", "openai"] },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
     { name = "sqlglot" },
     { name = "sqlmodel" },
+    { name = "temporalio" },
     { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "uvloop" },
@@ -664,12 +665,13 @@ requires-dist = [
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.5" },
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "pydantic-ai-harness", extras = ["codemode"], specifier = ">=0.54.0,<0.55.0" },
-    { name = "pydantic-ai-layer-protocol", extras = ["temporal"], editable = "packages/pydantic-ai-layer-protocol" },
-    { name = "pydantic-ai-slim", extras = ["google", "openai", "temporal"], specifier = ">=2.54.0" },
+    { name = "pydantic-ai-layer-protocol", editable = "packages/pydantic-ai-layer-protocol" },
+    { name = "pydantic-ai-slim", extras = ["google", "openai"], specifier = ">=2.54.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "sqlglot", specifier = ">=30.18.0" },
     { name = "sqlmodel", specifier = ">=0.0.42" },
+    { name = "temporalio", specifier = ">=1.33.0" },
     { name = "typer", specifier = ">=0.27.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.4" },
     { name = "uvloop", specifier = ">=0.22.1" },
@@ -1195,11 +1197,6 @@ dependencies = [
     { name = "pydantic-ai-slim" },
 ]
 
-[package.optional-dependencies]
-temporal = [
-    { name = "pydantic-ai-slim", extra = ["temporal"] },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "pyrefly" },
@@ -1212,9 +1209,7 @@ dev = [
 requires-dist = [
     { name = "pydantic", specifier = ">=2.13.5,<3" },
     { name = "pydantic-ai-slim", specifier = ">=2.54.0,<3" },
-    { name = "pydantic-ai-slim", extras = ["temporal"], marker = "extra == 'temporal'", specifier = ">=2.54.0,<3" },
 ]
-provides-extras = ["temporal"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1253,9 +1248,6 @@ google = [
 openai = [
     { name = "openai" },
     { name = "tiktoken" },
-]
-temporal = [
-    { name = "temporalio" },
 ]
 
 [[package]]

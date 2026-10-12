@@ -7,7 +7,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -15,6 +14,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from temporalio.client import Client
+from temporalio.contrib.pydantic import pydantic_data_converter
 from valkey.asyncio import Valkey
 
 from .settings import CommonSettings
@@ -45,7 +45,7 @@ class Resources:
 
 
 async def connect_temporal(settings: CommonSettings) -> Client:
-    """Connect once per process using the Agent payload converter and sandbox plugin.
+    """Connect once per process using the native Pydantic payload converter.
 
     Temporal's Client has no explicit close API. Owners retain it for their
     lifespan and finish users (including Workers) before releasing references.
@@ -53,7 +53,7 @@ async def connect_temporal(settings: CommonSettings) -> Client:
     return await Client.connect(
         settings.temporal_address,
         namespace=settings.temporal_namespace,
-        plugins=[PydanticAIPlugin()],
+        data_converter=pydantic_data_converter,
     )
 
 

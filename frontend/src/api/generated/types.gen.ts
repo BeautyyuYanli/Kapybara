@@ -275,20 +275,6 @@ export type DocumentUrl = {
 };
 
 /**
- * DurableRun
- */
-export type DurableRun = {
-    /**
-     * Workflow Id
-     */
-    workflow_id: string;
-    /**
-     * Run Id
-     */
-    run_id: string;
-};
-
-/**
  * ErrorDetails
  */
 export type ErrorDetails = {
@@ -1120,6 +1106,20 @@ export type RetryPromptPart = {
 };
 
 /**
+ * RunnerRun
+ */
+export type RunnerRun = {
+    /**
+     * Activity Id
+     */
+    activity_id: string;
+    /**
+     * Run Id
+     */
+    run_id: string;
+};
+
+/**
  * SessionRecord
  */
 export type SessionRecord = {
@@ -1207,9 +1207,9 @@ export type SpeechPart = {
 };
 
 /**
- * StartDurableRunner
+ * StartRunner
  */
-export type StartDurableRunner = {
+export type StartRunner = {
     /**
      * User Prompt
      */
@@ -2961,8 +2961,8 @@ export type IsRunnerRunningResponses = {
 
 export type IsRunnerRunningResponse = IsRunnerRunningResponses[keyof IsRunnerRunningResponses];
 
-export type StartDurableRunnerData = {
-    body: StartDurableRunner;
+export type StartRunnerData = {
+    body: StartRunner;
     path: {
         /**
          * Session Id
@@ -2973,23 +2973,23 @@ export type StartDurableRunnerData = {
     url: '/api/sessions/{session_id}/runner';
 };
 
-export type StartDurableRunnerErrors = {
+export type StartRunnerErrors = {
     /**
      * Validation Error
      */
     422: HttpValidationError;
 };
 
-export type StartDurableRunnerError = StartDurableRunnerErrors[keyof StartDurableRunnerErrors];
+export type StartRunnerError = StartRunnerErrors[keyof StartRunnerErrors];
 
-export type StartDurableRunnerResponses = {
+export type StartRunnerResponses = {
     /**
      * Successful Response
      */
-    202: DurableRun;
+    202: RunnerRun;
 };
 
-export type StartDurableRunnerResponse = StartDurableRunnerResponses[keyof StartDurableRunnerResponses];
+export type StartRunnerResponse = StartRunnerResponses[keyof StartRunnerResponses];
 
 export type ReadHistoryData = {
     body?: never;

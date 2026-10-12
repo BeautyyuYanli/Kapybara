@@ -1,8 +1,8 @@
 """Independent Temporal Worker; SIGTERM drains it before the process exits.
 
-The Worker executes both Workflow and Activity tasks on the configured queue.
+The Worker executes one standalone Activity on the configured queue.
 It shares the application resource factory; resources outlive all Worker tasks.
-Database and Valkey clients belong to Activities, never Workflow state.
+Database and Valkey clients outlive all Activity calls.
 """
 
 import asyncio
@@ -11,17 +11,13 @@ import os
 import signal
 from datetime import timedelta
 
-from pydantic_ai.durable_exec.temporal import AgentPlugin
 from temporalio.worker import Worker
 
 from kapy.agent_output import AgentOutputService
 from kapy.application.resources import open_resources
 from kapy.application.settings import CommonSettings
 
-from .activities import RunnerActivities
-from .agent import agent
-from .context import bind_output_service
-from .workflow import RunnerWorkflow
+from .activities import RunnerActivity
 
 
 async def serve(settings: CommonSettings) -> None:
@@ -29,20 +25,14 @@ async def serve(settings: CommonSettings) -> None:
         output_service = AgentOutputService(
             resources.valkey, channel_prefix=settings.valkey_namespace + ":agent-output"
         )
-        activities = RunnerActivities(resources.core_session_factory, output_service)
-        with bind_output_service(output_service):
-            async with Worker(
-                resources.temporal_client,
-                task_queue=settings.temporal_task_queue,
-                workflows=[RunnerWorkflow],
-                activities=[
-                    activities.record_messages,
-                    activities.save_runner_state,
-                ],
-                plugins=[AgentPlugin(agent)],
-                graceful_shutdown_timeout=timedelta(seconds=15),
-            ):
-                await asyncio.Future()
+        runner = RunnerActivity(resources.core_session_factory, output_service)
+        async with Worker(
+            resources.temporal_client,
+            task_queue=settings.temporal_task_queue,
+            activities=[runner.run],
+            graceful_shutdown_timeout=timedelta(seconds=15),
+        ):
+            await asyncio.Future()
 
 
 async def _serve_with_signals(settings: CommonSettings) -> None:

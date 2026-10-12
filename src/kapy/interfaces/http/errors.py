@@ -14,7 +14,7 @@ from kapy.control.models.types import (
     ModelAlreadyExists,
     ModelDiscoveryError,
 )
-from kapy.control.sessions import DurableRunnerConflict, SessionAlreadyExists, SessionCreationError
+from kapy.control.sessions import RunnerConflict, SessionAlreadyExists, SessionCreationError
 from kapy.lifecycle import LifecycleError
 from kapy.session_lease import SessionBusy
 from pydantic_ai_layer_protocol import RetryableScopeError
@@ -54,13 +54,14 @@ class ControlRoute(APIRoute):
                 return JSONResponse(status_code=422, content={"detail": detail})
             except SessionBusy:
                 return JSONResponse(status_code=409, content={"detail": "Session busy"})
-            except DurableRunnerConflict:
+            except RunnerConflict:
                 return JSONResponse(
-                    status_code=409, content={"detail": "Previous Workflow did not complete"}
+                    status_code=409,
+                    content={"detail": "Previous execution is unsuccessful or unconfirmed"},
                 )
             except RPCError:
                 return JSONResponse(
-                    status_code=503, content={"detail": "Unable to confirm Workflow state"}
+                    status_code=503, content={"detail": "Unable to confirm Activity state"}
                 )
             except LifecycleError:
                 return JSONResponse(

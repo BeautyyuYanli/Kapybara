@@ -1,0 +1,62 @@
+# enable-template
+# Single local cluster. Databases are initialized by temporal-schema first.
+log:
+  stdout: true
+  level: info
+persistence:
+  numHistoryShards: 4
+  defaultStore: default
+  visibilityStore: visibility
+  datastores:
+    default:
+      sql:
+        pluginName: postgres12
+        databaseName: temporal
+        connectAddr: postgres:5432
+        connectProtocol: tcp
+        user: kapy
+        password: kapy-local
+    visibility:
+      sql:
+        pluginName: postgres12
+        databaseName: temporal_visibility
+        connectAddr: postgres:5432
+        connectProtocol: tcp
+        user: kapy
+        password: kapy-local
+global:
+  membership:
+    maxJoinDuration: 30s
+    broadcastAddress: {{ env "TEMPORAL_BROADCAST_ADDRESS" | quote }}
+services:
+  frontend:
+    rpc:
+      grpcPort: 7233
+      membershipPort: 6933
+      bindOnIP: 0.0.0.0
+  matching:
+    rpc:
+      grpcPort: 7235
+      membershipPort: 6935
+      bindOnIP: 0.0.0.0
+  history:
+    rpc:
+      grpcPort: 7234
+      membershipPort: 6934
+      bindOnIP: 0.0.0.0
+  worker:
+    rpc:
+      grpcPort: 7239
+      membershipPort: 6939
+      bindOnIP: 0.0.0.0
+clusterMetadata:
+  enableGlobalNamespace: false
+  failoverVersionIncrement: 10
+  masterClusterName: active
+  currentClusterName: active
+  clusterInformation:
+    active:
+      enabled: true
+      initialFailoverVersion: 1
+      rpcName: frontend
+      rpcAddress: temporal:7233

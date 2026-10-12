@@ -2,8 +2,8 @@
 
 Sessions store the latest opaque runner snapshot and its submission version; the
 runner owns the encoding. Fixed native layer Config and mutable internal State
-live in separate JSON columns. Tools return State to the Workflow; its final
-snapshot saves all States and messages together. CLOSING cleanup saves individual
+live in separate JSON columns. Tools mutate their run-local State; the executing
+Activity's final snapshot saves all States and messages together. CLOSING cleanup saves individual
 layer progress. CREATING stores fixed Config and empty States before enter;
 publication saves all initial States with READY, and abandoned creation keeps the
 States empty through cleanup. Model references may dangle; no physical FKs tie

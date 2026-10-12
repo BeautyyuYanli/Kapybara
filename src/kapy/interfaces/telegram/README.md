@@ -36,7 +36,7 @@ Adding a model to the catalog does not automatically choose a Telegram default.
 Provider credentials and catalog editing stay in the frontend; the Telegram command
 only reads an existing model identity. Optional `KAPY_TELEGRAM_API_BASE` defaults to
 `https://api.telegram.org`, and `KAPY_TELEGRAM_POLL_TIMEOUT` to 25 seconds.
-The durable Workflow owns execution recovery.
+The independent Worker runs each Agent invocation in one standalone Activity.
 
 Private SQLite defaults to
 `platformdirs.user_state_path("kapy") / "plugins/telegram/telegram.sqlite3"`, matching
@@ -59,9 +59,9 @@ storage identifiers; moving the Python package to `interfaces` does not change t
 
 | Input | Behavior |
 | --- | --- |
-| /new [text] | Create/bind a session, optionally start a durable Workflow |
-| Text | Start a durable Workflow; create a session if unbound |
-| /status | Current UUID, lifecycle and active Workflow |
+| /new [text] | Create/bind a session, optionally start a durable Activity |
+| Text | Start a durable Activity; create a session if unbound |
+| /status | Current UUID, lifecycle and active Activity |
 | /close | Close the session and registered layer resources; repeat to retry failures |
 | /model [provider UUID model name] | Show the bot default; with arguments, update the bound session and save the default |
 | /help | List these session commands |
@@ -102,12 +102,12 @@ so a Telegram confirmation retry does not re-submit that input.
 
 Ordinary text and `/new <text>` directly await durable start confirmation, without
 waiting for model completion. Busy submission replies explicitly and is not queued.
-A non-successful terminal Workflow requires a new session; normal Worker recovery
-continues the original Workflow. A Temporal RPC error may mean start was accepted;
+A non-successful terminal Activity requires a new session; each run has one
+Temporal attempt and Worker loss does not resume Agent execution. A Temporal RPC error may mean start was accepted;
 the inbox records a status-query notice instead of automatically repeating that RPC.
 A crash after acceptance but before saving inbox progress still follows the existing
 at-least-once contract. Neither process shutdown nor request cancellation stops a
-remote Workflow. No queue, steer or cancellation-flag commands are available.
+remote Activity. No queue, steer or cancellation-flag commands are available.
 Previously persisted obsolete commands return an unknown-command reply without
 allocating a session.
 
@@ -159,7 +159,7 @@ Bot API, SQLite, Valkey and core PostgreSQL resources. Existing legacy Telegram 
 `/close` first acquires the session lease, then awaits each configured Layer's
 optional `exit_scope`. Normal close validates and saves
 State after each hook attempt; the route/history remains available for inspection.
-A busy lease or active durable Workflow replies that close has
+A busy lease or active durable Activity replies that close has
 not started and completes the inbox command; it is never automatically retried
 as a future close. Retry `/close` after execution exits.
 Cleanup failure preserves closing and any saved progress. The interface records a

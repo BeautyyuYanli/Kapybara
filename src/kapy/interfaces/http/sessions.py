@@ -25,7 +25,7 @@ from kapy.pagination import Page
 
 from .dependencies import HistoryPage, LiveCursor, OffsetPage
 from .errors import ControlRoute
-from .types import DurableRun, StartDurableRunner
+from .types import RunnerRun, StartRunner
 
 _logger = logging.getLogger(__name__)
 _output_adapter = TypeAdapter(list[OutputEvent])
@@ -58,17 +58,15 @@ def create_session_router(sessions: SessionService) -> APIRouter:
     async def close_session(session_id: UUID) -> SessionRecord:
         return await sessions.close_session(session_id)
 
-    @router.post(
-        "/sessions/{session_id}/runner", status_code=202, operation_id="start_durable_runner"
-    )
-    async def start_durable_runner(session_id: UUID, data: StartDurableRunner) -> DurableRun:
-        handle = await sessions.start_durable_runner(session_id, user_prompt=data.user_prompt)
-        assert handle.result_run_id is not None
-        return DurableRun(workflow_id=handle.id, run_id=handle.result_run_id)
+    @router.post("/sessions/{session_id}/runner", status_code=202, operation_id="start_runner")
+    async def start_runner(session_id: UUID, data: StartRunner) -> RunnerRun:
+        handle = await sessions.start_runner(session_id, user_prompt=data.user_prompt)
+        assert handle.run_id is not None
+        return RunnerRun(activity_id=handle.id, run_id=handle.run_id)
 
     @router.get("/sessions/{session_id}/runner", operation_id="is_runner_running")
     async def is_runner_running(session_id: UUID) -> bool:
-        return await sessions.is_durable_runner_running(session_id)
+        return await sessions.is_runner_running(session_id)
 
     @router.get("/sessions/{session_id}/history", operation_id="read_history")
     async def read_history(session_id: UUID, page: HistoryPage) -> Page[HistoryMessage]:
