@@ -46,31 +46,22 @@ Session routes are:
 
 | Method/path below /api | Endpoint | Result |
 | --- | --- | --- |
-| POST /sessions | create_session_and_schedule | 201 SessionRecord |
+| POST /sessions | create_session | 201 SessionRecord |
 | GET /sessions | list_sessions | Page[SessionRecord] |
 | GET /sessions/{id} | get_session | SessionRecord |
 | PATCH /sessions/{id} | update_session | SessionRecord |
 | POST /sessions/{id}/close | close_session | SessionRecord |
-| POST /sessions/{id}/inputs | submit_input_and_schedule | 202 SessionInput |
-| GET /sessions/{id}/inputs | read_inputs | FIFO SessionInput[]; channel defaults queued |
-| DELETE /sessions/{id}/inputs/{input_id} | delete_input | bool; positive input_id |
 | POST /sessions/{id}/runner | start_durable_runner | 202 DurableRun: workflow_id, run_id |
 | GET /sessions/{id}/runner | is_runner_running | bool for an active Temporal Workflow |
-| POST /sessions/{id}/cancel | request_cancel | 202 empty body |
-| GET /sessions/{id}/cancel | read_cancel | bool |
 | GET /sessions/{id}/history | read_history | Page[HistoryMessage] |
 | WS /sessions/{id}/live?after_seq=N | live_ws | one nonempty OutputEvent[] per text frame |
 
-CreateSessionAndSchedule retains its existing optional
-`input: {content, channel="queued"}`. Creation and optional input submission use
-separate committed transactions. The inputs endpoint retains queued/steer storage,
-query and withdrawal semantics, including multimodal UserInput. Enqueueing never
-starts a runner. Existing operation IDs retain their names for client compatibility.
-Cancel endpoints store/read the legacy flag; durable execution does not consume it.
+`POST /sessions` accepts CreateSession and only creates configuration. It does
+not submit execution. Model requests are submitted through the runner endpoint.
+There are no input queue, steer or cancellation-flag routes.
 
 Creation accepts an optional UUID `id`; retain it across lost responses. Duplicate
-IDs return 409 with `session_id` and do not replay scope enter or optional initial
-input. Errors after reservation begins include that ID in the safe error response,
+IDs return 409 with `session_id` and do not replay scope enter. Errors after reservation begins include that ID in the safe error response,
 without upstream payloads. Query GET by this ID before deciding whether to close or
 create another session. The host never automatically repeats creation.
 
@@ -83,7 +74,7 @@ return 503 without upstream payloads; a failed RPC may already have started work
 Query runner status instead of automatically resubmitting an ambiguous request.
 Direct submission is not a request-ID deduplication protocol.
 
-Close returns 409 while the durable Workflow or a legacy lease is active. It does
+Close returns 409 while the durable Workflow or a session scope lease is active. It does
 not request Temporal cancellation. Retry explicitly when execution finishes.
 
 List providers/models/sessions with offset=0 and limit=100. Page contains only
@@ -108,38 +99,28 @@ A connection can span multiple runs. Temporary deltas have no replay guarantee:
 clear them on reconnect and resume from the last fully applied complete message.
 Only complete messages advance that cursor. After application, discard previews
 at/below its seq, including numeric gaps, and keep those at later positions.
-Legacy and durable history use the same complete-message cursor contract.
-
-Frontends may replace their pending-input list from read_inputs after submissions,
-deletions and committed input messages, while merging history by seq. No separate
-input/history association or execution outcome state is exposed; an active Workflow
-does not prove model health.
 
 Router-local error handling returns FastAPI detail objects: 422 validation,
 404 LookupError, 409 identity/lifecycle/execution conflict or busy session, 503 Temporal RPC or
-plugin close failure (retry the same close call), 502 model discovery, otherwise
+exhausted layer scope retry (retry explicitly), 502 model discovery, otherwise
 500. Validation details keep only loc/msg/type; upstream exception text, raw
 request data and credentials are not returned. HTTP operation IDs match endpoint
 names. The controller owns protocol adaptation; services
-own DTOs, parameter constraints, queue consumption, replay and execution handoff.
+own DTOs, parameter constraints, immutable history, replay and execution admission.
 
 Mount the SPA beside the API with `app.include_router(create_frontend_router(dist_dir))`.
 The host supplies the explicit Vite build directory and shares its existing resource
 lifespan. Missing index.html fails setup. See the root frontend/README.md.
 
-CreateSession accepts fixed `plugins` (provider/name/config); SessionRecord returns
-`status`. Creation first commits creating and only publishes ready with complete
-State. Close transitions creating or ready -> closing -> closed and retains records.
-Intake, direct runner submission and execution configuration changes require ready;
-title metadata and read/history/live remain available in every phase. Model references may dangle;
-SDK settings/model availability are checked before direct execution starts. Business
-plugin bindings and legacy checkpoints cannot start durable execution. Context and
-compaction settings retain their CRUD behavior but are unused by the durable Worker.
+SessionRecord includes lifecycle `status`. Creation first commits creating and
+publishes ready only with complete State. Close transitions creating or ready ->
+closing -> closed and retains the record. Direct submission and execution
+configuration changes require ready; title and read/history/live remain available
+in every phase. SDK settings/model availability are checked before execution starts.
 
-CreateSession also accepts native `layers` as registered name-to-Config JSON,
+CreateSession accepts native `layers` as registered name-to-Config JSON,
 for example `{"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}`.
-Unknown names, invalid Config, or combining nonempty layers with legacy plugins
-return 422. GET/list/create responses include normalized layer configuration;
+Unknown names and invalid Config return 422. GET/list/create responses include normalized layer configuration;
 internal State is absent. PATCH cannot change layers or State. Durable starts
 restore the internal saved State. Optional layer `enter_scope`/`exit_scope` hooks
 initialize business State and release registered resources. Enter runs after durable

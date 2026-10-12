@@ -36,7 +36,7 @@ async def serve(settings: TelegramSettings) -> None:
         open_storage(settings.database_path) as storage,
         httpx2.AsyncClient(timeout=settings.poll_timeout + 10, trust_env=False) as http,
     ):
-        # Keep chat pacing when publisher batching is disabled.
+        # Keep default draft pacing for a zero configured interval.
         draft_interval = settings.common.output_flush_interval or 0.5
         client = TelegramClient(
             http,

@@ -42,4 +42,3 @@ class TelegramSettings(StorageSettings):
     session_template: CreateSession | None = None
     api_base: str = "https://api.telegram.org"
     poll_timeout: int = Field(default=25, ge=1, le=50)
-    recovery_interval: float = Field(default=5, gt=0, allow_inf_nan=False)

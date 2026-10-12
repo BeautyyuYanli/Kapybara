@@ -1,308 +1,145 @@
 # Control services
 
-`ModelService` manages local provider/model configuration. `SessionService` is the
-user-side entry point for session configuration, inputs, cancellation, output and
-execution. The agent runner remains independent: it accepts an Agent, values and
-callbacks, and owns only the lease, history, checkpoint and context paging flow.
+`ModelService` manages provider/model configuration. `SessionService` manages
+session configuration and native layer scopes, admits durable execution through
+Temporal, and joins immutable history with live output. The independent Worker
+owns the Agent, model and tool resources. Durable is the only supported runner.
 
-Import both services before creating `ControlTable.metadata` tables; application
-code owns database creation/migrations, engines and session factories. All control
-tables use the connection's default schema, generic JSON and application-checked
-references without physical foreign keys. The runner's execution repository still
-requires PostgreSQL row locking and database-clock lease checks.
-
-Application commands initialize the core database with `kapy db upgrade`; see
-[database migrations](../database/README.md). The following in-process example
-assumes that migration has already run:
+Applications own engines, session factories, Valkey and Temporal clients. Services
+borrow them and never migrate schemas implicitly. Initialize with `kapy db upgrade`;
+see [database migrations](../database/README.md). Core references are checked by
+services without physical foreign keys; history retention is independent of
+configuration and lifecycle.
 
 ```python
-from pydantic import SecretStr
-from pydantic_ai import Agent
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-from kapy.control.models import CreateModel, CreateProvider, ModelService
-from kapy.control.sessions import CreateSession, SessionService
+from kapy.application.resources import open_resources
+from kapy.application.sessions import create_session_service
+from kapy.application.settings import CommonSettings
+from kapy.control.sessions import CreateSession
 
 
-async def example(database_url: str, api_key: str, model_name: str):
-    engine = create_async_engine(database_url)
-    try:
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        models = ModelService(factory)
-        sessions = SessionService(factory, heartbeat_interval=10, heartbeat_timeout=60)
-        provider = await models.create_provider(
-            CreateProvider(
-                name="OpenAI",
-                provider_class="pydantic_ai.providers.openai:OpenAIProvider",
-                model_class="pydantic_ai.models.openai:OpenAIResponsesModel",
-                api_key=SecretStr(api_key),
-            )
-        )
-        model = await models.create_model(
-            CreateModel(
-                provider_id=provider.id,
-                model_name=model_name,
-            )
-        )
+async def run(settings: CommonSettings, provider_id, model_name: str):
+    async with open_resources(settings) as resources:
+        sessions = create_session_service(resources, settings)
         session = await sessions.create_session(
-            CreateSession(
-                provider_id=provider.id,
-                model_name=model.model_name,
-                compaction_threshold_tokens=20_000,
-            )
+            CreateSession(provider_id=provider_id, model_name=model_name)
         )
-        await sessions.enqueue_input(session.id, "queued", "Explain this project.")
-        agent = Agent(instructions="Be concise and precise.")
-        return await sessions.start_runner(session.id, agent=agent)
-    finally:
-        await engine.dispose()
+        handle = await sessions.start_durable_runner(session.id, user_prompt="Hello")
+        return await handle.result()  # Requires an independent runner-worker.
 ```
 
-## Durable execution used by HTTP and Telegram
+## Execution admission and state
 
-Construct SessionService with borrowed `temporal_client` and `temporal_task_queue`
-(the application factory injects both). `await start_durable_runner(id,
-user_prompt="...")` submits one string prompt and returns the Temporal
-`WorkflowHandle[RunnerWorkflow, str]` after start confirmation. Await its `result()`
-only when model completion is needed. `is_durable_runner_running(id)` observes the
-fixed `kapy-runner:{id}` Workflow; only explicit NOT_FOUND means absent, and RPC
-failures propagate. Calls have a finite 10-second RPC timeout.
+`start_durable_runner(id, user_prompt="...")` accepts a string prompt and returns
+`WorkflowHandle[RunnerWorkflow, str]` after Temporal confirms the start. The fixed
+Workflow ID is `kapy-runner:{id}`. `is_durable_runner_running(id)` observes Temporal;
+only NOT_FOUND means absent, and RPC failures propagate. RPCs have a ten-second
+budget. Session leases represent scope ownership, not runner status.
 
-A short session row lock coordinates admission with other starts and close. It
-covers readiness/configuration checks, Workflow status, the atomic state/version
-read, and start confirmation; no legacy lease or model execution occurs inside
-this transaction. Fixed Workflow IDs reject concurrent runs. Only first execution
-or a preceding COMPLETED execution admits a new run. Non-successful terminal
-status raises DurableRunnerConflict; normal Activity retries and Worker recovery
-continue the same Workflow. An ambiguous start error never retries automatically.
+Admission holds a short session row lock through readiness/configuration checks,
+Workflow status, the atomic state/version read and start confirmation. Model work
+runs outside this transaction. Only an initial execution or a preceding COMPLETED
+execution admits a new run. Busy raises SessionBusy; other terminal statuses raise
+DurableRunnerConflict because starting an older successful snapshot could conflict
+with already recorded history. An ambiguous start error never retries automatically;
+query the fixed Workflow ID before resubmitting. Worker recovery continues the
+original Workflow.
 
-Provider values and merged model/session settings become DurableExecutionConfig;
-the interface validates protocol settings without constructing SDK resources.
-The Worker owns resources, output and saving. Native layers are selected through
-`CreateSession.layers`, a name-to-Config JSON dictionary. Creation validates the
-registered modules and default States; the choices remain fixed. Admission reads
-their configuration and latest State in the same locked session row as the message
-snapshot. Business plugin bindings and legacy
-checkpoints are rejected; context/compaction configuration, pending inputs and
-cancel flags remain stored but unused. Do not mix legacy/durable writers in one
-session or bypass this admission boundary. Closing checks durable status under
-the same row lock before changing lifecycle, and keeps its existing lease for
-plugin cleanup. Neither closing, legacy cancel flags nor interface shutdown stops
-Temporal execution. Queue APIs remain independently usable during execution or
-Temporal unavailability. The in-process example above uses the retained legacy API;
-the lease/execution-factory descriptions below apply to that legacy runner.
+Provider values and merged model/session settings become DurableExecutionConfig.
+The interface validates SDK settings without opening model resources. Native layer
+Config and State are read from the locked row alongside the snapshot/version.
+The Worker saves messages and every layer State together using a versioned,
+idempotent replacement. New sessions have `(runner_state=None, version=0)`.
+These internal values are absent from SessionRecord and HTTP. See the
+[durable runner](../runner_duarable/README.md) for the complete save contract.
+
+## Configuration
 
 Providers have UUID identities and immutable importable Provider/Model class
-references. The supported model protocols are OpenAIChatModel,
-OpenAIResponsesModel and GoogleModel, including compatible subclasses. Provider
-construction passes the stored api_key, optional base_url and JSON provider_kwargs
-directly to its SDK constructor. Class references select installed code: they do
-not translate incompatible SDK protocols. ProviderRecord returns provider_kwargs unchanged as ordinary constructor configuration.
-Only api_key is excluded from ordinary results; actual credentials are stored in the database;
-SecretStr only controls their Python representation. Client injection parameters
-are not accepted as stored configuration.
+references. OpenAIChatModel, OpenAIResponsesModel and GoogleModel are supported,
+including compatible subclasses. Stored api_key, optional base_url and JSON
+provider_kwargs go directly to the SDK constructor. Class references select trusted
+installed code; client injection parameters are rejected. ProviderRecord returns
+kwargs unchanged and excludes api_key. Credentials remain in the database.
 
-Models use `(provider_id, model_name)` as their identity, with a separate display
-name, JSON request settings and nullable context_window. Google names are
-normalized by removing `models/`; use the returned model_name in later operations.
-An omitted/None capacity on creation is inferred from the SDK's native profile
-without making a model request. Unknown capacity stays None. Updating capacity to
-None clears it without inference. No profile object is persisted.
+Models use `(provider_id, model_name)` identity with a display name, request settings
+and nullable context_window. Google names strip `models/`; later operations use the
+returned name. Creation infers omitted/None capacity from the SDK profile without
+making a model request. Unknown capacity remains None; setting it to None later
+clears it without inference. Durable execution needs no compaction threshold.
 
-`discover_models(provider_id)` traverses the SDK's model-list pages and atomically
-imports missing models, using the same SDK capacity inference. It preserves all
-existing settings, names, capacity values and timestamps, and never removes absent
-remote models. Google discovery includes only generateContent models. Unsupported
-listing and remote failures raise ModelDiscoveryError; manual creation is still
-available. Provider/model get and update operations raise LookupError for missing
-records; delete succeeds idempotently if the resource is already absent.
-ModelAlreadyExists reports duplicate model identity. Session model references are
-weak: create/update may retain unresolved identifiers, and deleting a provider
-deletes its local models without blocking on or rewriting session references.
-No remote resources are deleted.
+`discover_models(provider_id)` imports missing models across SDK pages atomically,
+preserving existing records and timestamps. Google discovery includes only
+generateContent models. Unsupported listing/remote failure raises ModelDiscoveryError.
+Get/update raises LookupError for missing configuration; deletion is idempotent.
+ModelAlreadyExists identifies duplicate model identity. Session model references
+may dangle: provider deletion removes its local models without rewriting sessions
+or deleting remote resources. Execution requires the referenced model/provider.
 
-Sessions have UUID identities, title, model identity, JSON model_settings and two
-paging columns, context_plugin JSON, fixed `layers` configuration JSON and a
-creating/ready/closing/closed lifecycle status. create/get/list/update
-and close APIs retain records; there is no physical deletion. Fixed plugin bindings
-are supplied in CreateSession.plugins; a nonempty layers selection cannot coexist
-with these legacy bindings. The shared legacy application factory collects
-business capabilities and creates a fully configured base Agent per execution;
-direct Agent calls remain available for sessions without plugins. DTOs reject
-unknown fields. Updates preserve omitted fields and replace supplied JSON
-objects as a whole; `{}` clears a preset/override. Explicit None is accepted only
-for provider base_url, model context_window and session compaction_threshold_tokens.
-Model switches must supply both provider_id and model_name. Lists use stable
-creation-time/identity order with offset >= 0 and limit between 1 and 200, returning
-`Page(items, has_more)`. `read_history(id, before_seq=None, limit=100)` returns the
-latest matching page in ascending seq order; before_seq is exclusive and has_more
-means older history exists. History and ordinary lists share kapy.pagination.
+Sessions expose UUID, title, model identity/settings, fixed native `layers` Config,
+lifecycle status and timestamps. Unknown DTO fields are rejected. Updates preserve
+omitted values and replace supplied JSON objects as a whole; `{}` clears an override.
+Session fields cannot be explicitly null. Model switches supply both provider_id
+and model_name. Model settings merge at the top level and are validated at admission;
+updates apply to the next run. Only READY permits execution configuration changes;
+title remains editable in every phase. Layers and lifecycle cannot be patched.
+Lists use creation-time/identity order, offset >= 0 and limit 1..200, returning
+`Page(items, has_more)`.
 
-The session repository also stores an opaque runner state string and a submission
-version, initially NULL/0. The runner owns the encoding; these fields are absent
-from session configuration DTOs. Internal read/save methods expose an atomic
-state/version pair and versioned replacement, including idempotent retries. See
-the [Temporal runner](../runner_duarable/README.md) for its save contract.
-`SessionRecord.layers` exposes validated configuration only. Internal
-`sessions.layer_states` stores per-layer State; HTTP/PATCH cannot read or replace
-it. Successful tools return State to the Workflow without a database round trip.
-Only the final versioned save replaces all layer States and messages together;
-an execution that never commits that save retains the preceding snapshot.
+## Native layer scopes and session leases
 
+SessionService and the durable Agent share static typed `layers.registry.LAYERS`.
+Factory assembly performs no business I/O. Creation validates Config and no-enter
+default States, acquires the session lease, commits CREATING with fixed identity/
+Config and empty State, then calls optional enters outside database transactions.
+Enter can allocate resources and return required State. Without enter, State is
+validated from `{}`. Complete State and READY are published atomically under the
+same ownership. Failed initialization records CLOSING and exits every configured
+layer in reverse with None, including partial and uncalled enters. No partial
+initial State is saved. Compensation continues through hook cancellation; failed
+cleanup remains CLOSING for explicit retry. See [layer scopes](../layers/README.md#business-scopes).
 
-SessionService and the durable Agent share static typed definitions from
-`layers.registry.LAYERS`. Factory assembly performs no business I/O; only this
-service drives scope hooks. Session creation validates all Config, no-enter default
-States and legacy plugin
-config, acquires the existing lease, and commits a creating Session plus fixed Config
-and legacy bindings before calling optional enters outside transactions. Enter may
-allocate business resources and return required State fields; without enter, State
-initializes from `{}`. Complete State and ready are then published atomically under
-the same ownership. Failed initialization first persists closing, then exits all
-configured layers in reverse with None, including partial or uncalled enters.
-No partial State is saved. Exit must clean by scope ID/Config without State and be
-idempotent; enter only promises safe repetition when raising RetryableScopeError.
-Creation compensation continues through hook cancellation, preserves the original
-creation error and leaves closing for explicit retry; normal close propagates
-cancellation after saving that hook's progress.
-See the [layer scope contract](../layers/README.md#business-scopes). `close_session(id)`
-first acquires the shared session lease. SessionBusy leaves all business state,
-inputs and cancel flags unchanged. For normal close of ready/closing sessions with an
-injected Temporal Client, it checks durable Workflow status under the session row
-lock; active execution is busy and query failures propagate. Creating skips this
-query so abandoned scopes can be cleaned independently of Temporal; closed returns
-directly. Cleanup then records closing, closes fixed plugin bindings sequentially,
-and calls each configured Layer's optional
-`exit_scope`. Completed bindings are saved individually; normal session close
-validates and saves layer State after every hook attempt. The session becomes closed
-after all cleanup succeeds. Failure preserves CLOSING, unfinished bindings and saved
-layer progress; an explicit retry continues from that progress. Abandoned creating
-sessions use None rather than fabricated default State. Only all successful exits
-allow closed; one failed layer does not prevent the remaining exits. Close
-never changes cancellation flags. Registered cleanup is confirmed; lost-owner
-external requests and orphan resources still require layer/plugin reconciliation. See
-[Agent plugins](../agent_plugins/README.md) for StateStore and resource contracts.
-The native [shell layer](../layers/README.md) shares shell behavior with the legacy
-plugin and closes its own per-call clients. Its jobs remain alive after a run until
-session cleanup or shellctl retention removes them. Failed/cancelled execution
-can leave remote jobs outside the saved inventory; close cannot discover them.
-The legacy `start_runner()`
-entry rejects a session configured with layers before opening resources.
+Optional fixed creation `id` survives lost responses. Duplicate IDs raise
+SessionAlreadyExists without replaying enter. Errors after reservation begins raise
+SessionCreationError carrying this ID and the original cause; cancellation propagates.
+After an uncertain READY commit, the transaction ends before an owned transaction
+probes the authoritative row. READY confirms success; CREATING permits compensation.
+An unreachable database leaves the outcome unconfirmed. Query or close that same ID;
+there is no enter replay or background sweeper.
 
-Creation accepts an optional fixed `id`; duplicate IDs raise SessionAlreadyExists
-without replaying enter. Errors after reservation begins raise SessionCreationError
-with that ID and the original cause; cancellation still propagates.
-Hook errors carrying another Session ID are wrapped with this creation's ID.
-After an uncertain ready COMMIT, its transaction finishes before a new owned
-transaction locks the main
-database row: ready confirms success, creating permits closing/compensation. If the
-database is unreachable, the outcome remains unconfirmed. Callers query or explicitly
-close the same ID. There is no enter replay, creating Workflow or background sweeper.
+`close_session(id)` first acquires the session lease. READY/CLOSING checks active
+Temporal execution under the row lock before changing lifecycle; active execution
+is busy and query failures propagate. CREATING skips Temporal so abandoned scopes
+can be cleaned; CLOSED returns directly. Close records CLOSING, calls layer exits
+in reverse, and validates/saves each hook attempt's mutated State under fencing.
+Only RetryableScopeError permits three bounded automatic attempts. Exits must be
+idempotent and support None for abandoned creation; a later explicit close may
+repeat successful exits. Ordinary failures do not prevent the remaining exits.
+The session becomes CLOSED after all cleanup succeeds; failures retain CLOSING and
+saved progress. Close and interface shutdown do not stop a Temporal Workflow.
 
-Input intake, execution configuration updates and execution admission require ready.
-Title metadata remains editable in every phase. Admission is fenced by the
-acquired lease; no normal closer can change lifecycle until execution cleanup ends.
-Queries/history/live, cancellation and input withdrawal remain usable in every phase.
-SDK-dependent model settings are validated
-at execution startup, leaving inputs untouched on failure. Plugin choices and
-lifecycle fields cannot be patched through UpdateSession.
+Lease heartbeat settings satisfy finite `0 < interval < timeout`; all scope users
+sharing a table use compatible policy. Expired-token takeover alone waits the
+positive grace period while renewing heartbeat. Ownership checks fence transactions;
+heartbeat failure cancels business and normal exit joins heartbeat before conditional
+release. Fencing cannot revoke an external request already issued by a lost owner.
+Shell jobs persist across successful runs. Failed execution can leave remote jobs
+outside the saved inventory, which session close cannot discover.
 
-At startup, SessionService reads session/model/provider configuration once in a
-short transaction, then releases it before constructing SDK resources. It merges
-model.settings with session.model_settings at the top level, validates against the
-SDK's protocol Settings type, and delegates that snapshot to the application
-execution factory. The factory opens Provider/Model and plugin resources inside
-the lease, creates the Agent with its model/settings, and collects
-plugin capabilities and paging configuration into RunnerExecution. The runner
-installs capabilities when opening the SDK graph. The service does not wrap the
-factory's Agent or append business capabilities. Direct caller-owned Agents use
-a separate adapter with task-local model/settings overrides, retaining their
-prompts, tools, deps and output type. The same configuration values remain active
-through every queued run, lease reacquisition and temporary compaction;
-configuration updates affect the next start. Explicit SDK options retain their
-SDK semantics; no extra runner-specific settings blacklist is applied.
+## History and live output
 
-A configured SessionExecutionFactory receives the service, a validated
-SessionExecutionConfig snapshot, the service's ContextPluginRegistry and the
-current SessionLease, and yields RunnerExecution within its resource context.
-Every factory, including custom factories, owns admission on each entry and lease
-reacquisition: in the same short transaction, first `await lease.lock_owned(db)`,
-then `await service.require_ready(config.session.id, db=db)`, before creating any
-model or plugin resources. An acquired lease does not imply READY, and the status
-in the configuration snapshot may be stale. The default implementation is
-application.agent.create_execution_factory; application.sessions retains it for
-legacy Python calls. HTTP and Telegram use durable execution.
+`read_history(id, before_seq=None, limit=100)` returns the latest page in ascending
+seq order. before_seq is exclusive; has_more means older history exists. Missing
+session history is empty. The [history repository](../agent_history/README.md)
+retains complete messages across close, with permanently sealed positions and gaps.
 
-`SessionService(..., context_plugin_registry=...)` selects an implementation from the
-session's `context_plugin: {"name": "kapy/summary", "config": {}}`. The name is fixed
-on creation. PATCH replaces the supplied config object completely and cannot change
-the name. Constructors validate plugin configuration inside each acquired execution,
-before input consumption. Unknown names or invalid config fail without draining inputs.
-All configuration is snapshotted for a start call; edits apply on the next start.
-HTTP and Telegram share `application.sessions.create_session_service`.
-
-The host owns pagination independently of plugin config. A positive
-compaction_threshold_tokens enables paging; null resolves to 70% of model capacity
-at startup. Creation stores 183500 when capacity is unknown and no threshold is
-provided; updates do not apply this default. A stored null with unknown capacity
-fails startup. compaction_replay_turns is nonnegative, defaults to 10, and controls
-the prior original rounds supplied as plugin reference. Only the summary plugin
-chooses to replay these in its returned upper context. Lower-level callers inject
-context_plugin plus separate host threshold/reference options; see the
-[paging contracts](../agent_runner/README.md).
-
-
-Heartbeat interval and timeout are finite constructor settings satisfying
-`0 < interval < timeout`. Every worker using the same session lease table must use the
-same policy, including callers that bypass SessionService. A finite positive
-`takeover_grace_period` defaults to 30 seconds. Only an expired-token takeover waits
-before business admission, while maintaining heartbeat. Grace does not prove that
-an old process exited; runner and plugin transactions retain ownership fencing.
-Heartbeat failure cancels business through an AnyIO task group; normal exit joins
-heartbeat before conditional release. Single failures retain their original type,
-while simultaneous real failures remain exception groups. is_runner_running uses
-this timeout and the database clock to observe a non-expired owned lease, even if
-the checkpoint is done. The owner may be a non-runner operation; this observation
-does not mean the Agent is generating. It does not acquire execution or prove process liveness;
-start_runner still atomically acquires the lease and raises SessionBusy if occupied.
-
-Input is enqueued with `enqueue_input(id, "queued", content)` for the next run, or
-`"steer"` to supplement the current run at its next input boundary. Intake
-locks/checks ready in the same transaction as its queue changes; consumption
-borrows the runner's fenced checkpoint transaction. Enqueue does
-not launch a runner. `read_inputs` returns a FIFO snapshot without consuming it and
-without requiring a business session row. `submit_input(id, SubmitInput(...))`
-commits input first, then returns InputSubmission(input, should_start_runner); this
-is only a lease observation, not execution ownership. The caller schedules work.
-`delete_input(id, input_id)` returns whether it withdrew a still-pending input.
-It races with checkpoint consumption through the same queue row: True means the
-input cannot enter a later checkpoint, False means no matching pending row remained.
-Consumption uses DELETE RETURNING, so only actually consumed input enters history
-and the SDK request. Queue deletion and checkpoint commit remain atomic.
-Read-only inputs/history/live/cancel/lease queries do not precheck business sessions;
-get/update/start read the configuration they require, and enqueue/request_cancel
-validate their own references. Empty queue/history/cancel/lease queries return
-empty results or False. Full AgentState and its lease internals stay in the runner. SessionService
-never keeps a database transaction open across model/tool work or output iteration.
-SDK Provider and Model contexts belong to each execution: they open after lease
-acquisition and close after graph and plugin cleanup, before lease release.
-
-After each lower runner returns and releases its lease, SessionService checks both
-input channels again. Pending input triggers reacquisition with fresh execution
-resources using the same configuration snapshot and publisher; losing this later
-race returns the preceding result, whereas an initial SessionBusy propagates.
-Execution/cleanup failures are not retried.
-This closes the final queue-check/release handoff window without a persistent job
-queue. Cancel ends the current run at a boundary and leaves queued inputs intact.
-
-`live(id, after_seq=-1)` subscribes before replaying history and following complete
-messages/deltas in nonempty event lists. Consumers apply each batch in order and
-persist the seq of their last fully applied complete message. Consecutive complete
-broadcasts advance the connection cursor directly; numeric jumps trigger ordered
-history backfill. Deltas neither advance cursors nor trigger reads. Periodic reads
-recover missed commits even during preview traffic. History allows numeric gaps;
-old complete messages and gaps remain fixed. Legacy and durable history share this
-cursor contract.
-History pagination uses before_seq independently. Use aclosing when
-stopping early. See [HTTP adapters](../interfaces/http/README.md) for application wiring,
-direct submission and WebSocket lifetime.
+`live(id, after_seq=-1)` subscribes before replay and follows nonempty event batches.
+Consumers apply each batch in order and persist the seq of the last fully applied
+complete message. Consecutive broadcasts advance the connection cursor directly;
+numeric jumps trigger ordered backfill. Deltas never advance cursors or trigger
+reads. Periodic reads recover missed commits even during preview traffic. Complete
+messages and stored gaps are immutable. Clear previews on reconnect; discard
+previews at/below every applied complete seq and retain later previews. Use aclosing
+when stopping early. No transaction spans a yield. History pagination and live
+cursors are independent. See [HTTP](../interfaces/http/README.md) and
+[output transport](../agent_output/README.md).

@@ -12,8 +12,7 @@ from pathlib import Path
 
 from sqlalchemy.schema import CreateSchema
 
-from kapy.agent_plugins import models as plugin_tables  # noqa: F401
-from kapy.agent_runner.models import agent_metadata
+from kapy.agent_history.models import history_metadata
 from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
 from kapy.control.database import ControlTable
@@ -48,7 +47,8 @@ async def migrate(
     plan: str | None = None,
 ) -> None:
     if plan is not None and (
-        operation != "revision" or plan not in {"context-pages", "immutable-history"}
+        operation != "revision"
+        or plan not in {"context-pages", "immutable-history", "durable-only"}
     ):
         raise ValueError("plan must name a supported revision generation plan")
     async with open_core_database(settings) as engine:
@@ -62,18 +62,18 @@ async def migrate(
                 config = migration_config(
                     db,
                     directory=Path(__file__).parent / "migrations",
-                    metadata=[ControlTable.metadata, agent_metadata, lease_metadata],
+                    metadata=[ControlTable.metadata, history_metadata, lease_metadata],
                     version_table="core_schema_version",
                     owns_table=OWNED_TABLES.__contains__,
                 )
                 if plan is not None:
                     from . import revision_plans
 
-                    config.attributes["process_revision_directives"] = (
-                        revision_plans.context_pages
-                        if plan == "context-pages"
-                        else revision_plans.immutable_history
-                    )
+                    config.attributes["process_revision_directives"] = {
+                        "context-pages": revision_plans.context_pages,
+                        "immutable-history": revision_plans.immutable_history,
+                        "durable-only": revision_plans.durable_only,
+                    }[plan]
                 execute(config, operation, message=message)
 
             await connection.run_sync(run)
@@ -83,7 +83,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="kapy db")
     parser.add_argument("operation", choices=["upgrade", "current", "revision"])
     parser.add_argument("--message")
-    parser.add_argument("--plan", choices=["context-pages", "immutable-history"])
+    parser.add_argument("--plan", choices=["context-pages", "immutable-history", "durable-only"])
     args = parser.parse_args(argv)
     asyncio.run(
         migrate(

@@ -1,9 +1,9 @@
 # Core and interface migrations
 
-Core PostgreSQL tables and each interface's private storage have independent Alembic
+Core PostgreSQL and each interface's private storage have independent Alembic
 environments and version tables. Model definitions stay in their owning modules.
-The generic migration adapter only receives a connection, metadata, script directory,
-version-table name and table-ownership predicate; it knows no interfaces or dialect setup.
+The shared adapter receives a connection, metadata, script directory, version table
+and ownership predicate; it knows no interfaces or dialect configuration.
 
 ```sh
 kapy db upgrade
@@ -14,108 +14,97 @@ kapy interface telegram db current
 kapy interface telegram db revision --message 'Describe the Telegram change'
 ```
 
-Upgrade creates a fresh database's tables through the initial revision, or advances
-an already versioned database to head. Serve never performs a migration. For the
-initial development baseline, discard older databases and initialize empty storage;
-no conversion or preservation of pre-baseline data is supported. Existing tables
-are deliberately not auto-stamped or overwritten. Core upgrade may create
-the configured PostgreSQL schema, but never creates or migrates an interface database.
-Telegram commands only open its SQLite file. Stopping a process never drops data.
+Upgrade initializes an empty schema through the initial revision or advances a
+versioned schema to head. Serve never migrates. Core upgrade creates the configured
+PostgreSQL schema when absent, without changing interface databases. Telegram only
+opens its own SQLite file. Unversioned/pre-baseline databases are not silently
+stamped or converted; recreate those development databases. Stopping processes
+never drops data. The process manager's SQLite is outside these histories.
 
-Core metadata is explicitly ControlTable, agent_metadata and lease_metadata.
-Sessions also store `context_plugin` JSON with a server default of kapy/summary and
-empty config, backfilling existing session rows through the generated column revision.
-This selection does not add plugin-owned tables or change context-page payloads.
-Sessions also retain the latest opaque `runner_state` TEXT and its BIGINT
-`runner_state_version`. The generated column revision initializes existing rows
-to NULL/0, without deriving state from legacy history. The runner owns encoding;
-the session repository owns versioned, idempotent replacement. These columns are
-internal storage and are absent from ordinary session configuration DTOs.
+Current core metadata consists of ControlTable, history_metadata and lease_metadata.
+Current tables are providers, models, sessions, agent_history and session_leases.
+`OWNED_TABLES` also retains removed/renamed table names so autogeneration can discover
+removal. Reflection excludes unrelated tables and schemas. Core versions live in
+`database/migrations/` with `core_schema_version`; Telegram versions live in
+`interfaces/telegram/migrations/` with `plugin_telegram_schema_version`, scoped to
+`plugin_telegram_*`. HTTP has no private database history. SQLite uses batch
+rendering for structural changes.
 
-Sessions store native layer configuration in `layers` JSON and internal execution
-State in `layer_states` JSON. The generated column revision gives both independent
-`{}` defaults and backfills existing rows with empty selections. Configuration
-names are fixed on creation. Successful tool calls return State to the Workflow
-without accessing these columns. The final successful snapshot saves all States
-and the opaque messages together using the existing version. Single-layer database
-updates are reserved for CLOSING session cleanup progress. Retry identity includes
-both snapshot contents. Generate this schema change with
-`kapy db revision --message 'Add session layer configuration and state'` against a
-disposable schema at the preceding revision. Layer State introduces no separate
-database, StateStore, or plugin-owned tables.
+## Durable snapshots, layers and history
 
-`agent_history` stores fixed complete messages keyed by `(session_id, seq)`.
-Under the session row lock, durable writes insert only above the batch's pre-write
-maximum seq; old rows and their numeric gaps remain sealed. SDK `metadata.seq`
-marks successful recording for restoration and numbering, while storage uses
-columns rather than JSON payload to decide positions.
+Sessions retain opaque `runner_state` TEXT and BIGINT `runner_state_version`,
+initially NULL/0. Runner owns encoding; the session repository owns versioned,
+idempotent replacement. Neither is exposed in configuration DTOs. No snapshot is
+derived from legacy history.
 
-The offline immutable-history revision removes the old authority column/index.
-It preserves every response and confirmed request, and all history belonging to
-legacy checkpoint sessions. Unconfirmed durable requests are removed; matching
-runner_state messages retain their content but lose seq. Retained positions,
-content, timestamps and runner-state versions stay unchanged, and obsolete
-metadata authority flags are removed. Telegram's separate revision folds sent
-reply receipts into after_seq, clears covered pending sends, retains unfinished
-body/format/character offsets, and drops receipt/edit state. Run these migrations
-with runners and interfaces stopped. They have no online compatibility or old
-Workflow replay adapter. Both data conversions reject downgrade because discarded
-provisional records and receipt state cannot be reconstructed.
+Native layer Config and internal State use separate sessions.layers/layer_states
+JSON columns. Creation fixes identity/Config with CREATING and empty State, then
+publishes complete initial State with READY. Successful tools return State to the
+Workflow. Final save replaces all States and messages together under the same
+version; CLOSING cleanup alone saves individual layer progress. No separate
+StateStore or layer-owned database is introduced.
 
-Generate each revision against a development database at its preceding revision:
+`agent_history` retains complete SDK messages keyed by `(session_id, seq)`.
+Under the session row lock, append inserts only above the batch's pre-write maximum.
+Stored positions and gaps remain sealed. Columns decide position, while SDK
+metadata.seq marks successful recording in the opaque snapshot. Read/codec behavior
+is described in [agent_history](../agent_history/README.md).
+
+## Removing legacy execution data
+
+Revision `5de14eebe20b` removes agent_states, agent_context_pages,
+plugin_agent_bindings, session_inputs and session_cancels. It explicitly drops both
+compaction CHECK constraints and the sessions.context_plugin,
+compaction_threshold_tokens and compaction_replay_turns columns.
+
+Before dropping the identifying tables, fixed SQL marks every session with a
+checkpoint or plugin binding CLOSED. It preserves session identity, history and
+any existing durable snapshot/version rather than fabricating a snapshot from
+incompatible recovery data. Other session lifecycle, layer Config/State, history
+messages/timestamps and lease rows remain intact. Closed legacy sessions can still
+be queried and replayed; execution requires a new session. Removed queue and cancel
+data has no durable consumer and is discarded. The revision is irreversible.
+
+Run this upgrade offline with interfaces and runners stopped and in-flight
+Workflows drained. Clean legacy plugin resources using the preceding release
+before dropping their State; the migration cannot execute removed business hooks.
+No online compatibility layer or old Workflow replay adapter is provided.
+
+Generate the revision against a disposable schema at `da2b698fbbac`:
 
 ```sh
+kapy db revision --message 'Remove legacy runner and context configuration' --plan durable-only
+```
+
+`revision_plans.durable_only` accepts only the complete expected legacy removal,
+reflects the two named compaction checks and prepends session closure. Generated
+operations are fixed and never import this plan or current models. Historical
+revisions remain unchanged.
+
+## Generating revisions
+
+Use a development checkout with locked dependencies and a disposable database at
+the preceding revision. Never generate against a deployment schema. Alembic's
+post-write hooks fix imports and format the generated file with Ruff. Never edit
+revisions by hand; change ORM/generation inputs and regenerate an unpublished
+revision. Every historical script fixes its own schema operations. Data conversion
+or changes Alembic cannot infer need an explicit generation plan.
+
+The retained historical plans document earlier offline conversions:
+
+```sh
+kapy db revision --message 'Generalize summaries to context pages' --plan context-pages
 kapy db revision --message 'Make complete history immutable' --plan immutable-history
 kapy interface telegram db revision --message 'Use complete message delivery cursors' --plan immutable-history
 ```
 
-The explicit plans reject unrelated schema differences and emit fixed SQL before
-the generated column/index removal; generated revisions import no current models
-or conversion plans.
-
-ControlTable includes `plugin_agent_bindings` and the shared session/binding lifecycle
-columns. Agent plugins store small JSON state in this core-owned table; data_version
-migrations transform individual binding data on context loading and are separate
-from Alembic schema upgrades. Telegram private SQLite remains independent.
-Sessions add creating before any layer enter. They persist fixed identity/Config with
-empty layer_states, then atomically publish complete State with ready. No partial
-initialization State or extra progress table is stored. The shared non-native enum
-now needs VARCHAR(8); its generated revision expands both lifecycle columns while
-retaining existing data/status. Legacy bindings still use ready/closing/closed.
-`session_leases` independently stores ownership; `agent_states` stores checkpoint
-position without lock fields. The stable OWNED_TABLES
-catalog retains removed table names so future autogenerated drops stay visible.
-Core version history is `database/migrations/`, with `core_schema_version`.
-Telegram history is `interfaces/telegram/migrations/`, with
-`plugin_telegram_schema_version`; comparison is restricted to `plugin_telegram_*`.
-Each history starts with the initial development baseline; later changes append
-revisions. Superseded pre-baseline development revisions are not retained. Databases stamped with a discarded
-development revision must be recreated from the initial revision.
-Reflection excludes other schemas and unrelated tables. SQLite uses Alembic batch
-rendering for structural changes. HTTP has no private tables or empty migration chain.
-
-Generate revisions in a development checkout (`uv sync --group dev`) through
-these commands and review the generated operations. Alembic post-write hooks run
-Ruff import fixes and formatting as part of generation.
-Never edit generated revisions by hand; adjust the ORM or generation inputs and
-regenerate an unpublished revision when necessary. Each history script fixes its
-operations and does not import current ORM models. Production data migrations or
-changes Alembic cannot infer require an explicit generation design before use.
-The local process manager's SQLite database is outside these version histories.
-
-The core page revision renames agent_compactions to agent_context_pages, retaining
-session, anchor and created_at while converting text to summary/v1 JSON payload.
-The removed table name remains in OWNED_TABLES for autogeneration ownership. Page
-state belongs to execution recovery, not a transport interface.
-
-This conversion is generated on a development database at the preceding revision:
-
-```sh
-kapy db revision --message 'Generalize summaries to context pages' --plan context-pages
-```
-
-The explicit `revision_plans.context_pages` input accepts only the expected old-table
-drop/new-table create comparison and replaces it with rename/conversion operations.
-Any unrelated schema difference rejects generation. Generated revisions contain
-fixed operations, never runtime imports of that plan. Downgrade preserves summary/v1
-rows and rejects other page protocols rather than discarding their payloads.
+The page revision renamed agent_compactions and converted summary text to
+summary/v1 JSON at the same session/anchor/timestamp. Its downgrade permits only
+that summary protocol. The immutable-history revision removed authority flags,
+retained confirmed history and checkpoint-session history, removed unconfirmed
+durable requests and unmarked their snapshot entries while keeping SDK content.
+It did not change snapshot versions. Telegram's matching conversion folded sent
+reply receipts into after_seq and kept unfinished pending-send offsets. These
+conversions also require stopped interfaces/runners and reject irreversible
+downgrades. The durable-only head subsequently removes legacy page/checkpoint
+storage while retaining the complete history produced by those revisions.

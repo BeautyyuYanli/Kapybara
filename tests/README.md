@@ -18,10 +18,10 @@ server for the actual SDK model protocols. See
 [`runner_duarable`](../src/kapy/runner_duarable/README.md).
 
 Database tests own disposable PostgreSQL schemas and Valkey namespaces. The normal
-suite uses deterministic SDK models; the live credential test is opt-in. Browser
+suite uses deterministic SDK models and local model protocol servers. Browser
 checks and the isolated frontend API host are documented in `frontend/README.md`.
 
-The shell plugin and durable shell-layer real-service tests additionally need the four shellctl Go
+The durable shell-layer real-service tests additionally need the four shellctl Go
 binaries (`make -C packages/shellctl build-server`) and `tmux`. Run it inside a
 disposable container with those binaries mounted read-only, and set
 `KAPY_SHELLCTL_TEST_BIN_DIR` to their absolute container directory. Without this
@@ -34,7 +34,7 @@ to a deployed shellctl instance.
 ```sh
 KAPY_SHELLCTL_TEST_BIN_DIR=/work/packages/shellctl/server/bin \
   python -m pytest -q -p no:cacheprovider \
-  tests/agent_runner/test_shell_plugin.py tests/agent_runner/test_agent_plugins.py \
+  tests/layers/test_shell_scopes.py \
   tests/runner_duarable/test_layers.py
 ```
 
@@ -51,3 +51,11 @@ native ToolReturn values retain their public shape across a consumer-specific de
 layout. Native ownership, nondefault tool flags and deferred capability/Toolset
 instructions are checked through ordinary Agent runs and real Temporal Activities.
 No external model API is called.
+
+Shared PostgreSQL/Valkey fixtures live in `tests/conftest.py`. `tests/control`
+covers catalog, durable admission, session state and layer lifecycle;
+`tests/session_lease` covers heartbeat/fencing independently of execution.
+`tests/agent_output` covers transport and history replay, and `tests/database`
+checks both historical revisions and the durable-only removal. History fixtures
+write through HistoryRepository under the session row lock; no legacy runner is
+used to seed current tests.

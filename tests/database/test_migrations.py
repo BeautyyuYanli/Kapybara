@@ -1,0 +1,591 @@
+"""Real PostgreSQL migration histories preserve data and isolate table ownership."""
+
+import json
+from pathlib import Path
+from unittest.mock import Mock
+from uuid import uuid4
+
+import psycopg
+import pytest
+from alembic import command
+from psycopg import sql
+from pydantic import SecretStr
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
+from sqlalchemy import inspect, text
+from sqlalchemy.schema import CreateSchema
+from temporalio.client import Client
+
+from kapy.agent_history.models import history_metadata
+from kapy.application.resources import open_core_database
+from kapy.application.settings import CommonSettings
+from kapy.control.database import ControlTable
+from kapy.control.sessions import SessionService
+from kapy.database.migration import migration_config
+from kapy.database.schema import OWNED_TABLES, migrate
+from kapy.layers.shell.models import Config as ShellConfig
+from kapy.layers.shell.models import State as ShellState
+from kapy.lifecycle import LifecycleError, LifecycleStatus
+from kapy.session_lease.models import lease_metadata
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.mark.asyncio
+async def test_durable_only_closes_legacy_sessions_and_retains_history_snapshots_and_leases(
+    database,
+):
+    schema = "durable_only_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    checkpoint_id, plugin_id, durable_id, empty_id = [uuid4() for _ in range(4)]
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            [UserPromptPart("Continue reading the retained shell job.")],
+            metadata={"seq": 3, "scope": {"turn": 7}},
+        ),
+        ModelResponse(
+            [TextPart("The retained job has produced output through byte 1024.")],
+            metadata={"seq": 4},
+            provider_details={"request_id": "retained-model-response"},
+        ),
+    ]
+    snapshot = ModelMessagesTypeAdapter.dump_json(messages).decode()
+    layers = {
+        "shell": ShellConfig(
+            cwd="/workspace/retained",
+            base_url="http://shellctl:8765/",
+            env={"LANG": "C.UTF-8", "TASK": "retained-migration-job"},
+            token_env="MIGRATION_SHELL_TOKEN",
+            redact_patterns=[r"secret-\d+"],
+        ).model_dump(mode="json")
+    }
+    layer_states = {
+        "shell": ShellState(jobs={"retained-job-a": 1024, "retained-job-b": 57}).model_dump(
+            mode="json"
+        )
+    }
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def config(connection):
+                    connection.dialect.default_schema_name = schema
+                    return migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "da2b698fbbac"))
+                for session_id in (checkpoint_id, plugin_id, durable_id, empty_id):
+                    await db.execute(
+                        text("""INSERT INTO sessions
+                            (id, provider_id, model_name, title, status, model_settings,
+                             compaction_replay_turns, runner_state, runner_state_version,
+                             layers, layer_states, created_at, updated_at)
+                            VALUES (:id, :provider, 'test', 'retained', 'ready', '{}', 10,
+                                    :state, :version, CAST(:layers AS JSON),
+                                    CAST(:layer_states AS JSON),
+                                    '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z')"""),
+                        {
+                            "id": session_id,
+                            "provider": uuid4(),
+                            "state": snapshot if session_id == durable_id else None,
+                            "version": 7 if session_id == durable_id else 0,
+                            "layers": json.dumps(layers if session_id == durable_id else {}),
+                            "layer_states": json.dumps(
+                                layer_states if session_id == durable_id else {}
+                            ),
+                        },
+                    )
+                    history: list[ModelMessage] = (
+                        messages if session_id == durable_id else [ModelRequest([])]
+                    )
+                    payloads = ModelMessagesTypeAdapter.dump_python(history, mode="json")
+                    for seq, payload in enumerate(payloads, start=3):
+                        kind, parts = payload.pop("kind"), payload.pop("parts")
+                        payload.pop("usage", None)
+                        payload.pop("finish_reason", None)
+                        await db.execute(
+                            text("""INSERT INTO agent_history
+                                (session_id, seq, kind, message, message_metadata, created_at)
+                                VALUES (:id, :seq, :kind, CAST(:message AS JSON),
+                                        CAST(:metadata AS JSON), '2026-09-01T00:00:00Z')"""),
+                            {
+                                "id": session_id,
+                                "seq": seq,
+                                "kind": kind,
+                                "message": json.dumps({"parts": parts}),
+                                "metadata": json.dumps(payload),
+                            },
+                        )
+                await db.execute(
+                    text("INSERT INTO agent_states (session_id, next_step) VALUES (:id, 'done')"),
+                    {"id": checkpoint_id},
+                )
+                await db.execute(
+                    text("""INSERT INTO agent_context_pages
+                        (session_id, anchor_seq, policy_key, payload)
+                        VALUES (:id, 3, 'summary/v1', '{"summary":"legacy"}')"""),
+                    {"id": checkpoint_id},
+                )
+                await db.execute(
+                    text("""INSERT INTO plugin_agent_bindings
+                        (session_id, plugin_provider, plugin_name, data_version, config, state,
+                         revision, status, created_at, updated_at)
+                        VALUES (:id, 'builtin', 'shell', 1, '{}', '{"jobs":{}}', :revision,
+                                'ready', now(), now())"""),
+                    {"id": plugin_id, "revision": uuid4()},
+                )
+                await db.execute(
+                    text("""INSERT INTO session_leases (session_id, lock_token, heartbeat_at)
+                        VALUES (:id, :token, '2026-09-01T00:00:00Z')"""),
+                    {"id": durable_id, "token": uuid4()},
+                )
+                before = (
+                    await db.execute(text("SELECT * FROM agent_history ORDER BY session_id, seq"))
+                ).all()
+                leases = (await db.execute(text("SELECT * FROM session_leases"))).all()
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                await db.run_sync(lambda conn: command.check(config(conn)))
+                assert (
+                    await db.execute(text("SELECT * FROM agent_history ORDER BY session_id, seq"))
+                ).all() == before
+                assert (await db.execute(text("SELECT * FROM session_leases"))).all() == leases
+                rows = {r.id: r for r in (await db.execute(text("SELECT * FROM sessions"))).all()}
+                for session_id in (checkpoint_id, plugin_id):
+                    assert rows[session_id].status == "closed"
+                    assert rows[session_id].runner_state is None
+                    assert rows[session_id].runner_state_version == 0
+                for session_id in (durable_id, empty_id):
+                    assert rows[session_id].status == "ready"
+                    assert rows[session_id].updated_at.isoformat() == "2026-09-02T00:00:00+00:00"
+                assert (rows[durable_id].runner_state, rows[durable_id].runner_state_version) == (
+                    snapshot,
+                    7,
+                )
+                assert rows[durable_id].layers == layers
+                assert rows[durable_id].layer_states == layer_states
+                assert all(r.title == "retained" for r in rows.values())
+                for session_id in (checkpoint_id, plugin_id, empty_id):
+                    assert rows[session_id].layers == {}
+                    assert rows[session_id].layer_states == {}
+                assert not set(await db.run_sync(lambda conn: inspect(conn).get_table_names())) & {
+                    "agent_states",
+                    "agent_context_pages",
+                    "plugin_agent_bindings",
+                    "session_inputs",
+                    "session_cancels",
+                }
+                assert not {
+                    c["name"]
+                    for c in await db.run_sync(lambda conn: inspect(conn).get_columns("sessions"))
+                } & {"context_plugin", "compaction_threshold_tokens", "compaction_replay_turns"}
+                assert not await db.run_sync(
+                    lambda conn: inspect(conn).get_check_constraints("sessions")
+                )
+                with pytest.raises(NotImplementedError, match="irreversible"):
+                    await db.run_sync(lambda conn: command.downgrade(config(conn), "da2b698fbbac"))
+            from sqlalchemy.ext.asyncio import async_sessionmaker
+
+            temporal = Mock(spec=Client)
+            service = SessionService(
+                async_sessionmaker(engine, expire_on_commit=False),
+                temporal_client=temporal,
+                temporal_task_queue="unused",
+            )
+            for session_id in (checkpoint_id, plugin_id):
+                assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
+                assert [m.seq for m in (await service.read_history(session_id)).items] == [3]
+                with pytest.raises(LifecycleError):
+                    await service.start_durable_runner(session_id, user_prompt="do not reset")
+            temporal.get_workflow_handle.assert_not_called()
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_core_migrations_own_only_core_tables(database):
+    schema = "tmpv2_migrations_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    try:
+        await migrate(settings, "upgrade")
+        await migrate(settings, "upgrade")
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(text("CREATE TABLE unrelated (id INTEGER)"))
+                await db.execute(text("CREATE TABLE plugin_other_state (id INTEGER)"))
+                tables = await db.run_sync(lambda conn: inspect(conn).get_table_names())
+                assert set(tables) == (
+                    set(ControlTable.metadata.tables)
+                    | set(history_metadata.tables)
+                    | set(lease_metadata.tables)
+                ) | {
+                    "core_schema_version",
+                    "unrelated",
+                    "plugin_other_state",
+                }
+
+                def check(connection):
+                    connection.dialect.default_schema_name = schema
+                    config = migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+                    command.check(config)
+
+                await db.run_sync(check)
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_creating_revision_preserves_legacy_status_and_json(database):
+    schema = "tmpv2_creating_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    session_id = uuid4()
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def upgrade(connection, target):
+                    connection.dialect.default_schema_name = schema
+                    config = migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+                    command.upgrade(config, target)
+
+                await db.run_sync(lambda connection: upgrade(connection, "0618cbf51930"))
+                await db.execute(
+                    text(
+                        "INSERT INTO sessions (id, title, provider_id, model_name, model_settings, "
+                        "status, layers, layer_states, compaction_replay_turns, "
+                        "created_at, updated_at) "
+                        "VALUES (:id, 'retained', :provider, 'test', '{}', 'closing', "
+                        '\'{"shell": {"cwd": "/tmp"}}\', '
+                        '\'{"shell": {"jobs": {"known": 8}}}\', 10, now(), now())'
+                    ),
+                    {"id": session_id, "provider": uuid4()},
+                )
+                await db.execute(
+                    text(
+                        "INSERT INTO plugin_agent_bindings (session_id, "
+                        "plugin_provider, plugin_name, "
+                        "data_version, config, state, revision, status, created_at, updated_at) "
+                        "VALUES (:id, 'builtin', 'example', 1, '{\"kept\": true}', "
+                        "'{\"progress\": 1}', :revision, 'closed', now(), now())"
+                    ),
+                    {"id": session_id, "revision": uuid4()},
+                )
+                session = (await db.execute(text("SELECT * FROM sessions"))).one()
+                binding = (await db.execute(text("SELECT * FROM plugin_agent_bindings"))).one()
+                await db.run_sync(lambda connection: upgrade(connection, "da2b698fbbac"))
+                assert (await db.execute(text("SELECT * FROM sessions"))).one() == session
+                assert (
+                    await db.execute(text("SELECT * FROM plugin_agent_bindings"))
+                ).one() == binding
+                await db.execute(
+                    text("UPDATE sessions SET status='creating' WHERE id=:id"), {"id": session_id}
+                )
+                assert (
+                    await db.execute(text("SELECT status FROM sessions"))
+                ).scalar_one() == "creating"
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_core_migrations_preserve_pages_and_execution(database):
+    schema = "tmpv2_page_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    session_id = uuid4()
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def migrate_to(connection, target, *, downgrade=False):
+                    connection.dialect.default_schema_name = schema
+                    config = migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+                    (command.downgrade if downgrade else command.upgrade)(config, target)
+
+                await db.run_sync(lambda connection: migrate_to(connection, "12fd53fd60d5"))
+                await db.execute(
+                    text(
+                        "INSERT INTO agent_compactions "
+                        "(session_id, last_message_seq, text, created_at) "
+                        "VALUES (:session, 9, :summary, '2026-09-01T00:00:00Z')"
+                    ),
+                    {"session": session_id, "summary": "summary with Unicode 摘要"},
+                )
+                await db.run_sync(lambda connection: migrate_to(connection, "eae2fdb48969"))
+                row = (await db.execute(text("SELECT * FROM agent_context_pages"))).one()
+                assert row.session_id == session_id and row.anchor_seq == 9
+                assert row.policy_key == "summary/v1"
+                assert row.payload == {"summary": "summary with Unicode 摘要"}
+                assert row.created_at.isoformat() == "2026-09-01T00:00:00+00:00"
+                await db.run_sync(
+                    lambda connection: migrate_to(connection, "12fd53fd60d5", downgrade=True)
+                )
+                old = (await db.execute(text("SELECT * FROM agent_compactions"))).one()
+                assert old.last_message_seq == 9 and old.text == row.payload["summary"]
+                assert old.created_at == row.created_at
+                await db.run_sync(lambda connection: migrate_to(connection, "eae2fdb48969"))
+                await db.execute(
+                    text(
+                        "INSERT INTO agent_states (session_id, next_step) "
+                        "VALUES (:session, 'model_request')"
+                    ),
+                    {"session": session_id},
+                )
+                await db.execute(
+                    text(
+                        "INSERT INTO agent_history "
+                        "(session_id, seq, kind, message, message_metadata) "
+                        "VALUES (:session, 10, 'request', "
+                        "'{\"parts\": []}', '{}')"
+                    ),
+                    {"session": session_id},
+                )
+                await db.execute(
+                    text(
+                        "INSERT INTO sessions (id, title, provider_id, model_name, model_settings, "
+                        "compaction_replay_turns, created_at, updated_at) "
+                        "VALUES (:session, 'existing', :provider, 'test', '{}', 10, now(), now())"
+                    ),
+                    {"session": session_id, "provider": uuid4()},
+                )
+                # Upgrade from the deployed context-pages head, preserving both
+                # the page and pending execution while moving ownership storage.
+                await db.run_sync(lambda connection: migrate_to(connection, "da2b698fbbac"))
+                assert (await db.execute(text("SELECT * FROM agent_context_pages"))).one() == row
+                assert (
+                    await db.execute(text("SELECT context_plugin FROM sessions"))
+                ).scalar_one() == {
+                    "name": "kapy/summary",
+                    "config": {},
+                }
+                assert (
+                    await db.execute(
+                        text("SELECT runner_state, runner_state_version FROM sessions")
+                    )
+                ).one() == (None, 0)
+                assert (
+                    await db.execute(text("SELECT next_step FROM agent_states"))
+                ).scalar_one() == "model_request"
+                assert (await db.execute(text("SELECT seq FROM agent_history"))).scalar_one() == 10
+                assert (
+                    await db.execute(text("SELECT count(*) FROM session_leases"))
+                ).scalar_one() == 0
+                columns = await db.run_sync(
+                    lambda connection: inspect(connection).get_columns("agent_states")
+                )
+                assert {column["name"] for column in columns}.isdisjoint(
+                    {"lock_token", "heartbeat_at"}
+                )
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_offline_history_migration_preserves_recorded_messages_and_unmarks_removed_tail(
+    database,
+):
+    schema = "tmpv2_immutable_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    durable_id, legacy_id = uuid4(), uuid4()
+    histories = {
+        durable_id: [
+            ModelRequest(
+                [UserPromptPart("confirmed")],
+                metadata={
+                    "seq": 0,
+                    "authoritative": True,
+                    "source": "input",
+                    "business": {"id": 7},
+                },
+                instructions="Keep request instructions",
+                run_id="migration-run",
+            ),
+            ModelResponse(
+                [TextPart("reply")],
+                metadata={"seq": 2, "authoritative": True, "source": "response"},
+                model_name="stored-model",
+                provider_name="stored-provider",
+                provider_url="https://provider.invalid/v1",
+                provider_response_id="stored-response",
+                provider_details={"request_id": "provider-request"},
+            ),
+            # Storage columns decide removal even if SDK metadata claims authority.
+            ModelRequest([UserPromptPart("pending")], metadata={"seq": 3, "authoritative": True}),
+            ModelResponse(
+                [TextPart("sent")],
+                metadata={"seq": 4, "authoritative": False, "source": "already-sent"},
+                provider_details={"kept": [1, "value"]},
+            ),
+            ModelRequest(
+                [UserPromptPart("tail")], metadata={"authoritative": False, "source": "hook"}
+            ),
+        ],
+        legacy_id: [
+            ModelRequest(
+                [UserPromptPart("legacy")],
+                metadata={"seq": 0, "authoritative": False, "source": "legacy"},
+                instructions="Keep legacy instructions",
+            ),
+            ModelResponse([TextPart("kept")], metadata={"seq": 1, "authoritative": False}),
+        ],
+    }
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def config(connection):
+                    connection.dialect.default_schema_name = schema
+                    return migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+
+                await db.run_sync(
+                    lambda connection: command.upgrade(config(connection), "f0e75989c93b")
+                )
+                for session_id, messages in histories.items():
+                    await db.execute(
+                        text(
+                            "INSERT INTO sessions (id, provider_id, model_name, title, "
+                            "model_settings, compaction_replay_turns, runner_state, "
+                            "runner_state_version, created_at, updated_at) "
+                            "VALUES (:id, :provider, 'test', 'kept', '{}', 10, :state, 7, "
+                            "'2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z')"
+                        ),
+                        {
+                            "id": session_id,
+                            "provider": uuid4(),
+                            "state": ModelMessagesTypeAdapter.dump_json(messages).decode(),
+                        },
+                    )
+                    for message in messages:
+                        seq = (message.metadata or {}).get("seq")
+                        if seq is None:
+                            continue
+                        payload = ModelMessagesTypeAdapter.dump_python([message], mode="json")[0]
+                        kind, parts = payload.pop("kind"), payload.pop("parts")
+                        payload.pop("usage", None)
+                        payload.pop("finish_reason", None)
+                        await db.execute(
+                            text(
+                                "INSERT INTO agent_history (session_id, seq, authoritative, kind, "
+                                "message, message_metadata, created_at) "
+                                "VALUES (:session, :seq, :authority, :kind, "
+                                "CAST(:message AS JSON), "
+                                "CAST(:metadata AS JSON), '2026-09-01T00:00:00Z')"
+                            ),
+                            {
+                                "session": session_id,
+                                "seq": seq,
+                                "authority": session_id == durable_id and seq in {0, 2},
+                                "kind": kind,
+                                "message": json.dumps({"parts": parts}),
+                                "metadata": json.dumps(payload),
+                            },
+                        )
+                await db.execute(
+                    text("INSERT INTO agent_states (session_id, next_step) VALUES (:id, 'done')"),
+                    {"id": legacy_id},
+                )
+                before_metadata = {
+                    (row.session_id, row.seq): row.message_metadata
+                    for row in (await db.execute(text("SELECT * FROM agent_history"))).all()
+                }
+                await db.run_sync(
+                    lambda connection: command.upgrade(config(connection), "b1d9c9e540c5")
+                )
+                rows = (
+                    await db.execute(text("SELECT * FROM agent_history ORDER BY session_id, seq"))
+                ).all()
+                assert [row.seq for row in rows if row.session_id == durable_id] == [0, 2, 4]
+                assert [row.seq for row in rows if row.session_id == legacy_id] == [0, 1]
+                for row in rows:
+                    assert row.created_at.isoformat() == "2026-09-01T00:00:00+00:00"
+                    expected = next(
+                        m
+                        for m in histories[row.session_id]
+                        if (m.metadata or {}).get("seq") == row.seq
+                    )
+                    assert row.message == {
+                        "parts": ModelMessagesTypeAdapter.dump_python([expected], mode="json")[0][
+                            "parts"
+                        ]
+                    }
+                    expected_metadata = before_metadata[row.session_id, row.seq]
+                    expected_metadata["metadata"].pop("authoritative")
+                    assert row.message_metadata == expected_metadata
+                states = (
+                    await db.execute(
+                        text(
+                            "SELECT id, runner_state, runner_state_version, updated_at "
+                            "FROM sessions"
+                        )
+                    )
+                ).all()
+                for row in states:
+                    restored = ModelMessagesTypeAdapter.validate_json(row.runner_state)
+                    for before, after in zip(histories[row.id], restored, strict=True):
+                        expected_metadata = dict(before.metadata or {})
+                        expected_metadata.pop("authoritative", None)
+                        if row.id == durable_id and expected_metadata.get("seq") == 3:
+                            expected_metadata.pop("seq")
+                        before.metadata = expected_metadata
+                        assert after == before
+                    assert row.runner_state_version == 7
+                    assert row.updated_at.isoformat() == "2026-09-02T00:00:00+00:00"
+                with pytest.raises(NotImplementedError, match="irreversible"):
+                    await db.run_sync(
+                        lambda connection: command.downgrade(config(connection), "f0e75989c93b")
+                    )
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )

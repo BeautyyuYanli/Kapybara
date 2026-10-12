@@ -1,30 +1,13 @@
-"""Shared session composition for every interface process.
-
-HTTP and Telegram borrow Temporal through the same service. The registry and
-execution factory remain available to legacy Python runners and plugin cleanup;
-durable execution owns its resources in the independent Worker.
-"""
+"""Shared session composition; durable Worker owns model and tool resources."""
 
 from kapy.agent_output import AgentOutputService
-from kapy.agent_plugins import AgentPluginService, PluginRegistry
-from kapy.context_plugins import ContextPluginRegistry, create_default_registry
 from kapy.control.sessions import SessionService
 
-from .agent import create_execution_factory, create_registry
 from .resources import Resources
 from .settings import CommonSettings
 
 
-def create_session_service(
-    resources: Resources,
-    settings: CommonSettings,
-    *,
-    context_plugin_registry: ContextPluginRegistry | None = None,
-    plugin_registry: PluginRegistry | None = None,
-) -> SessionService:
-    plugins = AgentPluginService(
-        resources.core_session_factory, plugin_registry or create_registry()
-    )
+def create_session_service(resources: Resources, settings: CommonSettings) -> SessionService:
     return SessionService(
         resources.core_session_factory,
         output_service=AgentOutputService(
@@ -35,7 +18,4 @@ def create_session_service(
         heartbeat_interval=settings.heartbeat_interval,
         heartbeat_timeout=settings.heartbeat_timeout,
         takeover_grace_period=settings.takeover_grace_period,
-        context_plugin_registry=context_plugin_registry or create_default_registry(),
-        plugin_service=plugins,
-        execution_factory=create_execution_factory(plugins),
     )

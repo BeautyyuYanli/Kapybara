@@ -1,4 +1,4 @@
-"""Shared progress; creating is Session-only, while legacy bindings start ready.
+"""Session progress from scope creation through readiness and cleanup.
 
 Closed confirms configured cleanup, not discovery/revocation of external requests.
 """

@@ -1,24 +1,17 @@
 """Session/configuration operations borrow a transaction and never inspect agent state."""
 
-from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
-from pydantic import TypeAdapter
-from sqlalchemy import delete
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
-from kapy.agent_runner.types import UserInput
 from kapy.control.types import JsonObject, utc_now
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import Page, paginate
 
-from .models import SessionCancelRow, SessionInputRow, SessionRow
-from .types import CreateSession, InputChannel, SessionAlreadyExists, SessionInput, SessionRecord
-
-_input_adapter = TypeAdapter(UserInput)
+from .models import SessionRow
+from .types import CreateSession, SessionAlreadyExists, SessionRecord
 
 
 async def lock_session(db: AsyncSession, session_id: UUID) -> SessionRow:
@@ -55,7 +48,7 @@ class SessionRepository:
         """Reserve fixed Config before any enter; caller holds the identity's lease."""
         if await self._db.get(SessionRow, session_id) is not None:
             raise SessionAlreadyExists(session_id)
-        values = data.model_dump(exclude={"plugins", "id"})
+        values = data.model_dump(exclude={"id"})
         row = SessionRow(**values, id=session_id, status=LifecycleStatus.CREATING)
         self._db.add(row)
         await self._db.flush()
@@ -169,91 +162,6 @@ class SessionRepository:
         row = await lock_session(self._db, session_id)
         if row.status != LifecycleStatus.READY and values.keys() - {"title"}:
             raise LifecycleError(f"Session {session_id} is {row.status}")
-        if "context_plugin" in values:
-            if values["context_plugin"]["name"] != row.context_plugin["name"]:
-                raise ValueError("context_plugin.name cannot change after session creation")
         row.sqlmodel_update(values | {"updated_at": utc_now()})
         await self._db.flush()
         return SessionRecord.model_validate(row)
-
-    async def enqueue_input(
-        self, session_id: UUID, channel: InputChannel, content: UserInput
-    ) -> SessionInput:
-        content = _input_adapter.validate_python(content)
-        row = SessionInputRow(
-            session_id=session_id,
-            channel=channel,
-            content=_input_adapter.dump_python(content, mode="json"),
-        )
-        self._db.add(row)
-        await self._db.flush()
-        assert row.id is not None
-        return SessionInput(row.id, _input_adapter.validate_python(row.content))
-
-    async def read_inputs(
-        self, session_id: UUID, channel: InputChannel
-    ) -> tuple[SessionInput, ...]:
-        statement = (
-            select(SessionInputRow)
-            .where(
-                col(SessionInputRow.session_id) == session_id,
-                col(SessionInputRow.channel) == channel,
-            )
-            .order_by(col(SessionInputRow.id))
-        )
-        rows = (await self._db.execute(statement)).scalars()
-        return tuple(
-            SessionInput(row.id, _input_adapter.validate_python(row.content))
-            for row in rows
-            if row.id is not None
-        )
-
-    async def delete_input(self, session_id: UUID, input_id: int) -> bool:
-        statement = (
-            delete(SessionInputRow)
-            .where(
-                col(SessionInputRow.session_id) == session_id, col(SessionInputRow.id) == input_id
-            )
-            .returning(col(SessionInputRow.id))
-        )
-        return (await self._db.execute(statement)).scalar_one_or_none() is not None
-
-    async def consume_inputs(
-        self, session_id: UUID, channel: InputChannel, *, ids: Sequence[int]
-    ) -> tuple[SessionInput, ...]:
-        """Return only rows actually removed, in FIFO order, in the borrowed transaction."""
-        if not ids:
-            return ()
-        statement = (
-            delete(SessionInputRow)
-            .where(
-                col(SessionInputRow.session_id) == session_id,
-                col(SessionInputRow.channel) == channel,
-                col(SessionInputRow.id).in_(ids),
-            )
-            .returning(col(SessionInputRow.id), col(SessionInputRow.content))
-        )
-        rows = (await self._db.execute(statement)).all()
-        return tuple(
-            SessionInput(row.id, _input_adapter.validate_python(row.content))
-            for row in sorted(rows, key=lambda row: row.id)
-        )
-
-    async def set_cancel(self, session_id: UUID) -> None:
-        await self._db.execute(
-            insert(SessionCancelRow).values(session_id=session_id).on_conflict_do_nothing()
-        )
-
-    async def read_cancel(self, session_id: UUID) -> bool:
-        statement = select(col(SessionCancelRow.session_id)).where(
-            col(SessionCancelRow.session_id) == session_id
-        )
-        return (await self._db.execute(statement)).scalar_one_or_none() is not None
-
-    async def consume_cancel(self, session_id: UUID) -> bool:
-        statement = (
-            delete(SessionCancelRow)
-            .where(col(SessionCancelRow.session_id) == session_id)
-            .returning(col(SessionCancelRow.session_id))
-        )
-        return (await self._db.execute(statement)).scalar_one_or_none() is not None

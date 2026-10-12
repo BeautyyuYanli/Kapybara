@@ -1,4 +1,4 @@
-"""Pure SDK text/thinking conversion shared by ordinary and Temporal runners."""
+"""Pure SDK text/thinking conversion for durable runner previews."""
 
 from uuid import UUID
 
@@ -12,7 +12,7 @@ from pydantic_ai.messages import (
     ThinkingPartDelta,
 )
 
-from kapy.agent_runner.types import TextDelta
+from .types import TextDelta
 
 
 def to_text_delta(

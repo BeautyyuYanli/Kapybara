@@ -66,7 +66,7 @@ def instructions(config: Config, prefix: str, redact: Redactor) -> str:
 class ShellOperations:
     """Remote operations with caller-supplied inventory callbacks.
 
-    Legacy callbacks merge CAS updates; layer callbacks explicitly replace JSON.
+    Layer callbacks explicitly replace State JSON.
     Register the ID before any tail read to update the caller's inventory; the
     caller owns persistence. Durable Activity failure/cancellation does not commit
     its local layer State.
@@ -88,9 +88,6 @@ class ShellOperations:
         self.config, self.client, self.redact = config, client, redact
         self.session_id, self.provider, self.name = session_id, provider, name
         self.known, self.register, self.change = known, register, change
-
-    async def instructions(self) -> str:
-        return instructions(self.config, f"{self.provider}_{self.name}", self.redact)
 
     async def _remote_error(self, error: Exception, job_id: str) -> str:
         if isinstance(error, ShellctlClientError) and error.code == "job_not_found":

@@ -1,4 +1,4 @@
-"""Session ownership, independent of business configuration and runner checkpoints."""
+"""Session scope ownership, independent of configuration and Temporal execution."""
 
 from datetime import datetime
 from typing import ClassVar

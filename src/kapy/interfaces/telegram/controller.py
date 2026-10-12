@@ -19,7 +19,6 @@ from uuid import UUID, uuid4
 from sqlalchemy.exc import SQLAlchemyError
 from temporalio.service import RPCError
 
-from kapy.agent_plugins import PluginOperationError
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
@@ -27,7 +26,6 @@ from kapy.control.sessions import (
     SessionAlreadyExists,
     SessionCreationError,
     SessionService,
-    SubmitInput,
     UpdateSession,
 )
 from kapy.layers import RetryableScopeError
@@ -42,10 +40,7 @@ from .settings import TelegramSettings
 logger = logging.getLogger(__name__)
 COMMANDS = {
     "new": "Create a new session",
-    "queue": "Store queued input (not consumed by durable runner)",
-    "steer": "Store steer input (not consumed by durable runner)",
     "status": "Show session status",
-    "cancel": "Store cancel flag (not consumed by durable runner)",
     "close": "Close this session and release its registered resources",
     "model": "Set the session model and bot default, or show the default",
     "help": "Show commands",
@@ -164,8 +159,6 @@ class TelegramController:
                 return {"command": "reply", "reply": "Unknown command. Use /help."}
         if command == "help":
             return {"command": "reply", "reply": HELP}
-        if command in {"queue", "steer"} and not text.strip():
-            return {"command": "reply", "reply": f"Usage: /{command} <text>"}
         session_id = await self.repository.route(self.bot_id, item.chat_id, item.thread_id)
         if session_id is not None:
             try:
@@ -177,7 +170,7 @@ class TelegramController:
                 session_id = None
         if command == "model":
             return await self.resolve_model(text, session_id)
-        if command in {"status", "cancel", "close"} and session_id is None:
+        if command in {"status", "close"} and session_id is None:
             return {"command": "reply", "reply": "No current session. Use /new or send text."}
         create = command == "new" or session_id is None
         template = await self.session_template() if create else None
@@ -196,12 +189,17 @@ class TelegramController:
         }
 
     async def handle(self, item: InboxRow) -> None:
-        action = item.resolved_action
-        if action is None:
-            action = await self.resolve(item)
-            await self.repository.save_action(item, action)
-        action = dict(action)
+        resolved = item.resolved_action
+        if resolved is None:
+            resolved = await self.resolve(item)
+            await self.repository.save_action(item, resolved)
+        action: dict[str, Any] = dict(resolved)
         command = action["command"]
+        if command not in {*COMMANDS, "run", "ignore", "reply"}:
+            # Persisted inbox actions may predate removal of legacy commands. They
+            # must not create a session or pretend to submit obsolete operations.
+            action = {"command": "reply", "reply": "Unknown command. Use /help."}
+            command = "reply"
         if command == "model" and not action.get("completed"):
             if action["session_id"] is not None and not action.get("session_updated"):
                 await self.sessions.update_session(
@@ -272,17 +270,6 @@ class TelegramController:
                     await self.repository.save_action(item, action)
                 if command == "new" and "reply" not in action:
                     action["reply"] = "New session created."
-            elif command in {"queue", "steer"}:
-                if action["text"] and not action.get("submitted"):
-                    await self.sessions.submit_input(
-                        session_id,
-                        SubmitInput(
-                            content=action["text"],
-                            channel="steer" if command == "steer" else "queued",
-                        ),
-                    )
-                    action["submitted"] = True
-                    await self.repository.save_action(item, action)
             elif command == "close":
                 try:
                     await self.sessions.close_session(session_id)
@@ -290,20 +277,12 @@ class TelegramController:
                     action["reply"] = "Session is busy; close has not started. Retry explicitly."
                 else:
                     action["reply"] = "Session closed."
-            elif command == "cancel":
-                await self.sessions.request_cancel(session_id)
-                action["reply"] = "Cancellation flag saved; durable execution does not consume it."
             elif command == "status":
                 session = await self.sessions.get_session(session_id)
                 running = await self.sessions.is_durable_runner_running(session_id)
-                cancelled = await self.sessions.read_cancel(session_id)
-                queued = await self.sessions.read_inputs(session_id, "queued")
-                steer = await self.sessions.read_inputs(session_id, "steer")
                 action["reply"] = (
                     f"Session: {session_id}\nStatus: {session.status}\n"
-                    f"Workflow: {'running' if running else 'idle'}\n"
-                    f"Cancellation requested: {cancelled}\n"
-                    f"Queued: {len(queued)}; steer: {len(steer)}"
+                    f"Workflow: {'running' if running else 'idle'}"
                 )
             action["completed"] = True
             await self.repository.save_action(item, action)
@@ -343,10 +322,6 @@ class TelegramController:
                         "Query or close this ID explicitly."
                     ),
                 },
-            )
-        except PluginOperationError:
-            await self.repository.save_action(
-                item, {"command": "reply", "reply": "Plugin cleanup failed. Use /close to retry."}
             )
         except RetryableScopeError:
             retry = "/close" if (item.resolved_action or {}).get("command") == "close" else "/new"

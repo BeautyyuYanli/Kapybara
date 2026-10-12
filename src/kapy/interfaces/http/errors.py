@@ -10,7 +10,6 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from temporalio.service import RPCError
 
-from kapy.agent_plugins import PluginOperationError
 from kapy.control.models.types import (
     ModelAlreadyExists,
     ModelDiscoveryError,
@@ -66,11 +65,6 @@ class ControlRoute(APIRoute):
             except LifecycleError:
                 return JSONResponse(
                     status_code=409, content={"detail": "Session lifecycle conflict"}
-                )
-            except PluginOperationError:
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Plugin operation failed; session close can be retried"},
                 )
             except RetryableScopeError:
                 return JSONResponse(

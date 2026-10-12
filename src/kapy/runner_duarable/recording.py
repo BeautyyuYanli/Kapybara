@@ -20,7 +20,7 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import ModelRequestContext
 from temporalio import workflow
 
-from kapy.agent_runner.types import HistoryMessage
+from kapy.agent_history import HistoryMessage
 
 from .types import MessageBatch, RunnerDeps
 

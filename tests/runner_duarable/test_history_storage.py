@@ -21,9 +21,10 @@ from sqlmodel import col, select
 from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 
-from kapy.agent_runner import HistoryMessage, MessageCommitted
-from kapy.agent_runner.models import AgentHistoryRow, AgentStateRow
-from kapy.agent_runner.repository import AgentRepository
+from kapy.agent_history import HistoryMessage
+from kapy.agent_history.models import AgentHistoryRow
+from kapy.agent_history.repository import HistoryRepository
+from kapy.agent_output import MessageCommitted
 from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository, lock_session
@@ -115,13 +116,12 @@ async def test_stored_message_is_immutable_and_broadcast_preserves_complete_inpu
         assert row.message == {
             "parts": ModelMessagesTypeAdapter.dump_python([response], mode="json")[0]["parts"]
         }
-        stored = await AgentRepository(db).read_history_entries(session_id)
+        stored = await HistoryRepository(db).read_history_entries(session_id)
         assert stored[0].seq == 10 and stored[0].message.metadata == response.metadata
         assert isinstance(stored[0].message, ModelResponse)
         assert stored[0].message.usage.input_tokens == 100
         assert stored[0].message.usage.output_tokens == 20
-        assert await AgentRepository(db).read_history_entries(session_id, after_seq=10) == ()
-        assert await db.get(AgentStateRow, session_id) is None
+        assert await HistoryRepository(db).read_history_entries(session_id, after_seq=10) == ()
         assert await SessionRepository(db).read_runner_state(session_id) == (None, 0)
 
 
@@ -157,7 +157,7 @@ async def test_invalid_batch_does_not_write_or_broadcast(runner_database, monkey
     assert error.value.type == "InvalidHistory" and error.value.non_retryable
     assert published == []
     async with runner_database.sessions.begin() as db:
-        assert await AgentRepository(db).read_history_entries(session_id) == ()
+        assert await HistoryRepository(db).read_history_entries(session_id) == ()
 
 
 def history(session_id, seq, content="message"):
@@ -184,7 +184,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 .where(col(SessionRow.id) == session_id)
                 .with_for_update(nowait=True)
             )
-            stored = await AgentRepository(db).read_history_entries(session_id)
+            stored = await HistoryRepository(db).read_history_entries(session_id)
             assert [e.seq for e in stored] == [0, 10, 12, 13, 15, 16]
 
         async def publish(message):
@@ -204,7 +204,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
     await activities.record_messages(MessageBatch(session_id=session_id, messages=batch))
     assert published == [MessageCommitted(entry) for entry in batch[2:]]
     async with runner_database.sessions.begin() as db:
-        stored = await AgentRepository(db).read_history_entries(session_id)
+        stored = await HistoryRepository(db).read_history_entries(session_id)
         assert stored[:2] == tuple(initial)
         assert (await db.get(AgentHistoryRow, (session_id, 10))).created_at == created_at
 
@@ -221,7 +221,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
     await activities.record_messages(MessageBatch(session_id=session_id, messages=[]))
     assert published == []
     async with runner_database.sessions.begin() as db:
-        assert await AgentRepository(db).read_history_entries(session_id) == stored
+        assert await HistoryRepository(db).read_history_entries(session_id) == stored
 
 
 @pytest.mark.integration
@@ -234,13 +234,15 @@ async def test_append_borrows_transaction_and_returns_accepted_inputs(runner_dat
     ]
     async with runner_database.sessions.begin() as db:
         await lock_session(db, session_id)
-        assert await AgentRepository(db).append_history(session_id, initial) == tuple(initial)
+        assert await HistoryRepository(db).append_history(session_id, initial) == tuple(initial)
     with pytest.raises(RuntimeError, match="rollback"):
         async with runner_database.sessions.begin() as db:
             await lock_session(db, session_id)
             entry = history(session_id, 7)
-            assert await AgentRepository(db).append_history(session_id, [entry]) == (entry,)
-            assert [e.seq for e in await AgentRepository(db).read_history_entries(session_id)] == [
+            assert await HistoryRepository(db).append_history(session_id, [entry]) == (entry,)
+            assert [
+                e.seq for e in await HistoryRepository(db).read_history_entries(session_id)
+            ] == [
                 0,
                 1,
                 4,
@@ -248,7 +250,7 @@ async def test_append_borrows_transaction_and_returns_accepted_inputs(runner_dat
             ]
             raise RuntimeError("rollback")
     async with runner_database.sessions.begin() as db:
-        assert await AgentRepository(db).read_history_entries(session_id) == tuple(initial)
+        assert await HistoryRepository(db).read_history_entries(session_id) == tuple(initial)
 
 
 @pytest.mark.integration
@@ -267,7 +269,7 @@ async def test_record_missing_session_is_non_retryable_and_does_not_publish(
         )
     assert error.value.type == "SessionNotFound" and error.value.non_retryable
     async with runner_database.sessions.begin() as db:
-        assert await AgentRepository(db).read_history_entries(session_id) == ()
+        assert await HistoryRepository(db).read_history_entries(session_id) == ()
 
 
 @pytest.mark.integration
@@ -287,7 +289,7 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
     try:
         async with runner_database.sessions.begin() as db:
             await lock_session(db, session_id)
-            await AgentRepository(db).append_history(session_id, [history(session_id, 2)])
+            await HistoryRepository(db).append_history(session_id, [history(session_id, 2)])
             event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
             task = asyncio.create_task(
                 activities.record_messages(
@@ -309,8 +311,8 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
     async with runner_database.sessions.begin() as db:
-        assert [e.seq for e in await AgentRepository(db).read_history_entries(session_id)] == [2]
-        assert [e.seq for e in await AgentRepository(db).read_history_entries(other_id)] == [1]
+        assert [e.seq for e in await HistoryRepository(db).read_history_entries(session_id)] == [2]
+        assert [e.seq for e in await HistoryRepository(db).read_history_entries(other_id)] == [1]
 
 
 @pytest.mark.integration
