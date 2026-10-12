@@ -125,9 +125,6 @@ services:
       KAPY_VALKEY_URL: redis://valkey:6379/0
       KAPY_VALKEY_NAMESPACE: ${KAPY_VALKEY_NAMESPACE:-kapy_tmpv2}
       KAPY_OUTPUT_FLUSH_INTERVAL: ${KAPY_OUTPUT_FLUSH_INTERVAL:-0.5}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_MODEL: ${OPENAI_MODEL:-}
     volumes:
       - ./src:/app/src:ro
       - ./packages/pydantic-ai-layer-protocol:/app/packages/pydantic-ai-layer-protocol:ro

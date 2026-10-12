@@ -42,8 +42,8 @@ from temporalio import activity
 from temporalio.client import Client
 from temporalio.worker import Replayer, Worker
 
-from kapy.agent_runner import MessageCommitted, OutputEvent, TextDelta
-from kapy.agent_runner.models import AgentHistoryRow
+from kapy.agent_history.models import AgentHistoryRow
+from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 from kapy.application.resources import connect_temporal
 from kapy.application.settings import CommonSettings
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
@@ -487,10 +487,10 @@ async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, 
         state, version = await repo.read_runner_state(runner_database.session_id)
         saved_at = (await repo.get_session(runner_database.session_id)).updated_at
     assert state is not None and version == 1
-    from kapy.agent_runner.repository import AgentRepository
+    from kapy.agent_history.repository import HistoryRepository
 
     async with runner_database.sessions.begin() as db:
-        stored = await AgentRepository(db).read_history_entries(runner_database.session_id)
+        stored = await HistoryRepository(db).read_history_entries(runner_database.session_id)
     assert [entry.seq for entry in stored] == [0, 1]
     assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == [0, 1]
     assert [(e.response_seq, e.text) for e in broadcasts if isinstance(e, TextDelta)] == [
@@ -534,7 +534,7 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_databa
     from pydantic_ai.exceptions import UserError
     from temporalio.client import WorkflowFailureError
 
-    from kapy.agent_runner.repository import AgentRepository
+    from kapy.agent_history.repository import HistoryRepository
 
     base_url, requests = endpoint
     models = []
@@ -547,7 +547,9 @@ async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_databa
     async def fail_request(self, *args, **kwargs):
         assert activity.in_activity()
         async with runner_database.sessions.begin() as db:
-            assert await AgentRepository(db).read_history_entries(runner_database.session_id) == ()
+            assert (
+                await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
+            )
         models.append(self)
         raise UserError("invalid model request")
         yield  # pragma: no cover - retain the SDK async context manager contract
@@ -741,7 +743,7 @@ async def test_save_business_errors_fail_workflow(endpoint, runner_database, mis
 async def test_workflow_restores_state_and_records_after_run_tail_once(
     endpoint, runner_database, monkeypatch
 ):
-    from kapy.agent_runner.repository import AgentRepository
+    from kapy.agent_history.repository import HistoryRepository
 
     base_url, requests = endpoint
     broadcasts: list[OutputEvent] = []
@@ -805,7 +807,7 @@ async def test_workflow_restores_state_and_records_after_run_tail_once(
                     first_state, first_version = await SessionRepository(db).read_runner_state(
                         runner_database.session_id
                     )
-                    first_entries = await AgentRepository(db).read_history_entries(
+                    first_entries = await HistoryRepository(db).read_history_entries(
                         runner_database.session_id
                     )
                 assert first_state is not None and first_version == 1
@@ -829,7 +831,7 @@ async def test_workflow_restores_state_and_records_after_run_tail_once(
     ]
     async with runner_database.sessions.begin() as db:
         state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
-        entries = await AgentRepository(db).read_history_entries(runner_database.session_id)
+        entries = await HistoryRepository(db).read_history_entries(runner_database.session_id)
     assert state is not None and version == 2
     messages = ModelMessagesTypeAdapter.validate_json(state)
     assert [m.metadata for m in messages] == [
@@ -883,7 +885,7 @@ async def test_invalid_state_fails_workflow_before_model_call(
     from temporalio.client import WorkflowFailureError
     from temporalio.exceptions import ApplicationError
 
-    from kapy.agent_runner.repository import AgentRepository
+    from kapy.agent_history.repository import HistoryRepository
 
     base_url, requests = endpoint
     saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
@@ -919,7 +921,7 @@ async def test_invalid_state_fails_workflow_before_model_call(
             None,
             0,
         )
-        assert await AgentRepository(db).read_history_entries(runner_database.session_id) == ()
+        assert await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
 
 
 @pytest.mark.integration
@@ -929,7 +931,7 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(
 ):
     from temporalio.exceptions import ApplicationError
 
-    from kapy.agent_runner.repository import AgentRepository
+    from kapy.agent_history.repository import HistoryRepository
 
     base_url, requests = endpoint
     saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
@@ -978,7 +980,7 @@ async def test_history_activity_lost_ack_retries_same_batch_and_replays(
     assert len(inputs) == 2 and inputs[0] == inputs[1]
     assert [m.seq for m in inputs[0].messages] == [0, 1]
     async with runner_database.sessions.begin() as db:
-        entries = await AgentRepository(db).read_history_entries(runner_database.session_id)
+        entries = await HistoryRepository(db).read_history_entries(runner_database.session_id)
         state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
     assert [entry.seq for entry in entries] == [0, 1]
     assert state is not None and version == 1
@@ -1049,7 +1051,6 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         provider_id=provider.id,
         model_name="gpt-4o-mini",
         model_settings={"temperature": 0.5},
-        context_plugin={"name": "not-installed", "config": {}},
     )
     path = tmp_path / "telegram.sqlite3"
     await migrate(path, "upgrade")
@@ -1127,7 +1128,6 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
                 state, version = await SessionRepository(db).read_runner_state(session_id)
             assert state is not None and version == 2
             assert not await sessions.is_durable_runner_running(session_id)
-            assert not await sessions.read_inputs(session_id, "queued")
             async with asyncio.timeout(5):
                 while (  # noqa: ASYNC110
                     (await repository.get_delivery(delivery_key(row))).after_seq < 3
@@ -1143,9 +1143,9 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
             saved = await repository.get_delivery(delivery_key(row))
             assert saved.after_seq == 3
             async with runner_database.sessions.begin() as db:
-                from kapy.agent_runner.repository import AgentRepository
+                from kapy.agent_history.repository import HistoryRepository
 
-                entries = await AgentRepository(db).read_history_entries(session_id)
+                entries = await HistoryRepository(db).read_history_entries(session_id)
             assert [entry.seq for entry in entries] == [0, 1, 2, 3]
         finally:
             follower.cancel()

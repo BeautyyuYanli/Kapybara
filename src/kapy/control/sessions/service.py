@@ -1,86 +1,50 @@
-"""User-side session configuration, interaction channels and runner composition.
+"""Session configuration, durable execution admission and immutable output replay.
 
-Ordinary methods own short transactions. Durable admission holds the session row
-lock through bounded Temporal RPCs; model work remains in the Worker. Legacy
-consumption borrows the runner's fenced transaction for atomic queue-to-history
-transfer. Static model/hook definitions come from layers.registry.layer_registry, shared with the
-Runner; only this service drives their business scopes. This service owns no
-long-lived ORM session, Agent, or engine. Output transport
-is borrowed from agent_output; each live call owns its subscription/read task and joins
-original history to live events without holding a transaction during iteration.
+Short transactions own configuration. Admission holds the session row lock through
+bounded Temporal RPCs; the Worker owns model execution and resources. Native layer
+business scopes use the separate session lease for creation/close with fencing.
+Static definitions come from layers.registry.layer_registry, shared with the Worker.
+Each live call owns its subscription/read task; no transaction spans a yield.
 """
 
 import asyncio
 import logging
 import math
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
 from datetime import timedelta
-from functools import partial
-from typing import Any, cast
 from uuid import UUID, uuid4
 
 import anyio
 from pydantic import BaseModel
-from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.models import Model
-from pydantic_ai.providers import Provider
-from pydantic_ai.settings import ModelSettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
-from kapy.agent_output import AgentOutputService
-from kapy.agent_plugins import AgentPluginService, PluginRegistry
-from kapy.agent_plugins.repository import BindingRepository
-from kapy.agent_runner import (
-    HistoryMessage,
-    InputBatch,
-    MessageCommitted,
-    OutputEvent,
-    RunnerExecution,
-    SessionBusy,
-    TextDelta,
-    TurnResult,
-    UserInput,
-)
-from kapy.agent_runner import start_runner as run_agent_session
-from kapy.agent_runner.models import AgentStateRow
-from kapy.agent_runner.repository import AgentRepository
-from kapy.context_plugins import ContextPluginRegistry, create_default_registry
+from kapy.agent_history import HistoryMessage, HistoryRepository
+from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent, TextDelta
 from kapy.control.models.repository import ModelRepository
-from kapy.control.models.runtime import (
-    build_model,
-    build_provider,
-    resolve_classes,
-    validate_settings,
-)
-from kapy.control.models.types import ModelRecord, ProviderConfig
+from kapy.control.models.runtime import resolve_classes, validate_settings
 from kapy.control.types import utc_now
 from kapy.layers.registry import layer_registry
 from kapy.layers.scopes import retry_scope
 from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.runner_duarable import DurableExecutionConfig, RunnerInput, RunnerWorkflow
-from kapy.session_lease import SessionLease, is_session_busy, open_session_lease
+from kapy.session_lease import SessionBusy, SessionLease, open_session_lease
 from pydantic_ai_layer_protocol import dump_object
 from pydantic_ai_layer_protocol.types import JsonObject
 
 from .repository import SessionRepository, lock_session
 from .types import (
     CreateSession,
-    InputChannel,
-    InputSubmission,
     SessionAlreadyExists,
     SessionCreationError,
-    SessionInput,
     SessionRecord,
-    SubmitInput,
     UpdateSession,
 )
 
@@ -93,38 +57,11 @@ _TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
 _logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class SessionExecutionConfig:
-    """Validated configuration snapshot reused across one start call's leases.
-
-    Contains values only, without open model/plugin resources. Each execution
-    factory uses this snapshot to own a fresh resource scope inside its lease.
-    """
-
-    session: SessionRecord
-    model: ModelRecord
-    provider: ProviderConfig
-    provider_class: type[Provider]
-    model_class: type[Model]
-    model_settings: ModelSettings
-    compaction_threshold_tokens: int
-
-
-type SessionExecutionFactory = Callable[
-    [SessionService, SessionExecutionConfig, ContextPluginRegistry, SessionLease],
-    AbstractAsyncContextManager[RunnerExecution[Any]],
-]
-
-
 class SessionService:
-    """User-side configuration, execution admission and output for both runners.
+    """Borrow session/output factories and Temporal; own no model or engine.
 
-    The instance borrows factories, output transport and the Temporal Client.
-    Durable admission uses a row lock through bounded RPCs; the Worker owns execution.
-    Legacy execution uses heartbeat policy, factories and context plugin registry.
-    Model configuration is fixed for each start call. The execution factory owns model
-    and plugin resources inside each lease. Direct caller-owned Agents use a
-    separate adapter with a task-local model/settings override.
+    Model configuration is fixed when admission starts a Workflow. Heartbeat policy
+    belongs only to native layer scope creation/close, not runner execution.
     """
 
     def __init__(
@@ -138,9 +75,6 @@ class SessionService:
         heartbeat_timeout: float = 60.0,
         takeover_grace_period: float = 30.0,
         live_poll_interval: float = 5.0,
-        context_plugin_registry: ContextPluginRegistry | None = None,
-        plugin_service: AgentPluginService | None = None,
-        execution_factory: SessionExecutionFactory | None = None,
     ) -> None:
         if not (
             math.isfinite(heartbeat_interval)
@@ -160,15 +94,10 @@ class SessionService:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
         self._takeover_grace_period = takeover_grace_period
-        self._context_plugin_registry = context_plugin_registry or create_default_registry()
-        self.plugins = plugin_service or AgentPluginService(session_factory, PluginRegistry())
-        self._execution_factory = execution_factory
 
     async def create_session(self, data: CreateSession) -> SessionRecord:
         """Reserve identity/Config, enter under its lease, then publish complete State.
 
-        An omitted/None threshold stays None for a known model capacity; otherwise
-        creation stores 70% of 256 Ki tokens, rounded down. Updates do not default it.
         Hook I/O is outside transactions. Failed initialization closes all configured
         scopes with None, including partial and uncalled enters. A cancelled cleanup
         hook leaves closing and does not prevent the other scopes' compensation.
@@ -177,7 +106,6 @@ class SessionService:
         creating is closed. An unavailable database leaves an unconfirmed outcome.
         Restarted hosts never replay enter. Callers retain the fixed ID to query/close.
         """
-        prepared = self.plugins.prepare_bindings(data.plugins)
         try:
             configs = layer_registry.prepare_configs(data.layers)
         except UserError as exc:
@@ -199,20 +127,7 @@ class SessionService:
             async with self._lease(session_id) as lease:
                 # Never call enter unless registration COMMIT was acknowledged.
                 async with self._scope_transaction(lease) as db:
-                    try:
-                        model = await ModelRepository(db).get_model(
-                            data.provider_id, data.model_name
-                        )
-                    except LookupError:
-                        model = None
-                    threshold = data.compaction_threshold_tokens
-                    if threshold is None and (model is None or model.context_window is None):
-                        threshold = 256 * 1024 * 7 // 10
-                    await SessionRepository(db).register_creating(
-                        data.model_copy(update={"compaction_threshold_tokens": threshold}),
-                        session_id=session_id,
-                    )
-                    self.plugins.create_bindings(db, session_id, prepared)
+                    await SessionRepository(db).register_creating(data, session_id=session_id)
                     await db.flush()
                 registered = True
                 try:
@@ -290,16 +205,6 @@ class SessionService:
             with anyio.fail_after(5, shield=True):
                 await db.close()
 
-    async def require_ready(self, session_id: UUID, *, db: AsyncSession | None = None) -> None:
-        """Lock the session for intake or lease admission in the caller's transaction."""
-        if db is None:
-            async with self._session_factory.begin() as owned:
-                await self.require_ready(session_id, db=owned)
-            return
-        row = await lock_session(db, session_id)
-        if row.status != LifecycleStatus.READY:
-            raise LifecycleError(f"Session {session_id} is {row.status}")
-
     async def close_session(self, session_id: UUID) -> SessionRecord:
         """Acquire exclusive ownership before deciding closing; Busy changes no state.
 
@@ -307,9 +212,9 @@ class SessionService:
         the row lock before changing lifecycle. Creating skips the query so abandoned
         scopes can be cleaned independently of Temporal; closed returns directly.
         Query failures propagate; close never stops a Workflow. Close never changes
-        cancellation or pending inputs. Failures retain the irreversible closing
+        execution. Failures retain the irreversible closing
         decision and completed cleanup progress for explicit retry.
-        Registered resources are cleaned under the lease, including plugin exit;
+        Registered layer scopes are cleaned under the lease;
         fencing cannot revoke already-issued external requests from a lost owner.
         Optional layer exits save mutated State after every attempt, even on
         error/cancellation. Only RetryableScopeError permits an automatic retry;
@@ -355,11 +260,7 @@ class SessionService:
                     for name, value in states.items()
                 }
             row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
-            bindings = await BindingRepository(db).list(session_id)
         error: Exception | asyncio.CancelledError | None = None
-        for binding in bindings:
-            if binding.status != LifecycleStatus.CLOSED:
-                await self.plugins.close_binding(binding, lease=lease)
         for name, config in reversed(configs.items()):
             try:
                 await self._exit_layer_scope(session_id, name, config, states.get(name), lease)
@@ -436,21 +337,8 @@ class SessionService:
     async def update_session(self, session_id: UUID, data: UpdateSession) -> SessionRecord:
         """Replace supplied fields; model switches supply both parts of the model identity."""
         values = data.model_dump(exclude_unset=True)
-        if data.context_plugin is not None:
-            # A supplied plugin spec replaces its config; nested defaults must not
-            # disappear under the PATCH model's recursive exclude_unset behavior.
-            values["context_plugin"] = data.context_plugin.model_dump()
         async with self._session_factory.begin() as db:
             return await SessionRepository(db).update_session(session_id, values)
-
-    async def is_runner_running(self, session_id: UUID) -> bool:
-        """Observe lease occupancy with this service's timeout, not Agent generation.
-
-        The owner can be any cooperating session operation, even at a done checkpoint.
-        This compatibility name neither acquires ownership nor proves process liveness.
-        """
-        async with self._session_factory.begin() as db:
-            return await is_session_busy(db, session_id, heartbeat_timeout=self._heartbeat_timeout)
 
     async def _durable_status(self, session_id: UUID) -> WorkflowExecutionStatus | None:
         if self._temporal_client is None:
@@ -475,12 +363,12 @@ class SessionService:
         """Submit one text prompt, returning after Temporal confirms the start.
 
         Borrow the Client and serialize admission/close with a session row lock,
-        held only through bounded RPCs. No legacy lease, queue or cancel flag is
-        used. A new execution may follow only COMPLETED, preserving recorded
+        held only through bounded RPCs. A new execution may follow only COMPLETED,
+        preserving recorded
         history across replay. A failed/ambiguous RPC never triggers a new attempt
         here; callers query the fixed Workflow ID to discover accepted execution.
         The Worker owns model resources and state saving; cancelling this await
-        does not cancel a Workflow. Never mix legacy and durable session writers.
+        does not cancel a Workflow.
         """
         if self._temporal_client is None or not self._temporal_task_queue:
             raise RuntimeError("Durable execution requires a Temporal client and task queue")
@@ -490,10 +378,6 @@ class SessionService:
             row = await lock_session(db, session_id)
             if row.status != LifecycleStatus.READY:
                 raise LifecycleError(f"Session {session_id} is {row.status}")
-            if await BindingRepository(db).list(session_id):
-                raise ValueError("Durable execution does not support business plugins")
-            if await db.get(AgentStateRow, session_id) is not None:
-                raise ValueError("Legacy checkpoints cannot be resumed by durable execution")
             if row.layer_states.keys() != row.layers.keys():
                 raise ValueError("Saved layer states must match the configured layer names")
             status = await self._durable_status(session_id)
@@ -537,223 +421,15 @@ class SessionService:
             except WorkflowAlreadyStartedError as error:
                 raise SessionBusy(f"Session {session_id} has an active Workflow") from error
 
-    async def enqueue_input(
-        self, session_id: UUID, channel: InputChannel, content: UserInput
-    ) -> SessionInput:
-        async with self._session_factory.begin() as db:
-            repo = SessionRepository(db)
-            await self.require_ready(session_id, db=db)
-            item = await repo.enqueue_input(session_id, channel, content)
-        return item
-
-    async def submit_input(self, session_id: UUID, data: SubmitInput) -> InputSubmission:
-        """Commit input before observing the lease; callers choose how to schedule execution."""
-        item = await self.enqueue_input(session_id, data.channel, data.content)
-        running = await self.is_runner_running(session_id)
-        return InputSubmission(input=item, should_start_runner=not running)
-
-    async def delete_input(self, session_id: UUID, input_id: int) -> bool:
-        """Withdraw a pending input; False means it was consumed, deleted or never present."""
-        if type(input_id) is not int or input_id <= 0:
-            raise ValueError("input_id must be a positive integer")
-        async with self._session_factory.begin() as db:
-            return await SessionRepository(db).delete_input(session_id, input_id)
-
     async def read_history(
         self, session_id: UUID, *, before_seq: int | None = None, limit: int = 100
     ) -> Page[HistoryMessage]:
         """Read the latest page before an exclusive cursor, ordered oldest to newest."""
         BeforeSeqPagination(before_seq=before_seq, limit=limit)
         async with self._session_factory.begin() as db:
-            return await AgentRepository(db).read_history_page(
+            return await HistoryRepository(db).read_history_page(
                 session_id, before_seq=before_seq, limit=limit
             )
-
-    async def read_inputs(
-        self, session_id: UUID, channel: InputChannel
-    ) -> tuple[SessionInput, ...]:
-        """Read FIFO inputs without consumption or requiring a business session row."""
-        async with self._session_factory.begin() as db:
-            return await SessionRepository(db).read_inputs(session_id, channel)
-
-    async def request_cancel(self, session_id: UUID) -> None:
-        async with self._session_factory.begin() as db:
-            repo = SessionRepository(db)
-            await repo.get_session(session_id)
-            await repo.set_cancel(session_id)
-
-    async def read_cancel(self, session_id: UUID) -> bool:
-        async with self._session_factory.begin() as db:
-            return await SessionRepository(db).read_cancel(session_id)
-
-    async def consume_inputs(
-        self,
-        session_id: UUID,
-        channel: InputChannel,
-        *,
-        db: AsyncSession,
-        ids: Sequence[int],
-    ) -> tuple[SessionInput, ...]:
-        """Return actual consumption in the borrowed checkpoint transaction; never commit."""
-        return await SessionRepository(db).consume_inputs(session_id, channel, ids=ids)
-
-    async def consume_cancel(self, session_id: UUID, *, db: AsyncSession) -> bool:
-        """Borrow the runner transaction after its lock_owned check."""
-        return await SessionRepository(db).consume_cancel(session_id)
-
-    async def start_runner[DepsT, OutputT](
-        self,
-        session_id: UUID,
-        *,
-        agent: Agent[DepsT, OutputT] | None = None,
-        deps: DepsT = None,
-        realtime_output: bool = False,
-        output_flush_interval: float = 0.5,
-    ) -> TurnResult[OutputT]:
-        """Await steer/cancel turns and queued runs, optionally broadcasting live output.
-
-        Disabled output needs no transport. Enabled output requires output_service
-        before acquiring a lease and owns one publisher across all queued runs.
-        The flush interval is finite and nonnegative; zero schedules background
-        publication immediately.
-        Session/model/provider configuration is read once and remains fixed across
-        queued runs and page actions. Each lease enters the configured execution factory,
-        which owns all business assembly and execution resources. Direct Agents are
-        supported for sessions without plugins through a separate adapter retaining
-        prompts/tools/output type and overriding only the stored model and settings.
-        Configuration reads, class resolution, settings validation and threshold
-        resolution precede output publication and lease acquisition. Provider/Model
-        resource construction and plugin assembly happen inside the lease; failures
-        still precede input consumption.
-        Provider and Model contexts enclose each leased execution, including page actions.
-        After lease release, pending inputs trigger reacquisition with the same
-        configuration. Across the entire call, output retains the last non-None
-        output, while finished comes from the last normally returned result. Later
-        empty runs or fully withdrawn inputs do not clear an earlier output.
-        A later SessionBusy returns the preceding successful aggregate; an initial
-        SessionBusy and all other failures propagate. No background task is created here.
-        """
-        if realtime_output and self._output_service is None:
-            raise RuntimeError("Realtime output requires an output service")
-
-        async with self._session_factory.begin() as db:
-            session = await SessionRepository(db).get_session(session_id)
-            if session.layers:
-                raise ValueError("Layer sessions require durable execution")
-            repo = ModelRepository(db)
-            model = await repo.get_model(session.provider_id, session.model_name)
-            config = await repo.get_provider_config(session.provider_id)
-        if agent is None and self._execution_factory is None:
-            raise ValueError("Provide an Agent or configure an execution factory")
-        if agent is not None and await self.plugins.list_bindings(session_id):
-            raise ValueError("Plugin sessions require the application execution factory")
-        threshold = resolve_compaction_threshold(
-            session.compaction_threshold_tokens, model.context_window
-        )
-        provider_cls, model_cls = resolve_classes(config)
-        settings = validate_settings(model_cls, model.settings | session.model_settings)
-        execution_config = SessionExecutionConfig(
-            session=session,
-            model=model,
-            provider=config,
-            provider_class=provider_cls,
-            model_class=model_cls,
-            model_settings=cast(ModelSettings, settings),
-            compaction_threshold_tokens=threshold,
-        )
-        if agent is None:
-            assert self._execution_factory is not None
-            execution_factory = partial(
-                self._execution_factory, self, execution_config, self._context_plugin_registry
-            )
-        else:
-            execution_factory = partial(self._open_agent_execution, execution_config, agent, deps)
-
-        async def read_batch(channel: InputChannel) -> InputBatch | None:
-            rows = await self.read_inputs(session_id, channel)
-            if not rows:
-                return None
-            ids = tuple(row.id for row in rows)
-
-            async def consume(db: AsyncSession) -> tuple[UserInput, ...]:
-                accepted = await self.consume_inputs(session_id, channel, db=db, ids=ids)
-                return tuple(row.content for row in accepted)
-
-            return InputBatch(tuple(row.content for row in rows), consume)
-
-        async def consume_cancel(db: AsyncSession) -> bool:
-            return await self.consume_cancel(session_id, db=db)
-
-        publisher = (
-            self._output_service.publisher(session_id, flush_interval=output_flush_interval)
-            if realtime_output and self._output_service is not None
-            else nullcontext(None)
-        )
-        async with publisher as on_output:
-            result: TurnResult[OutputT] | None = None
-            while True:
-                try:
-                    current = await run_agent_session(
-                        session_id,
-                        execution_factory=execution_factory,
-                        session_factory=self._session_factory,
-                        read_steer=partial(read_batch, "steer"),
-                        read_queued=partial(read_batch, "queued"),
-                        consume_cancel=consume_cancel,
-                        heartbeat_interval=self._heartbeat_interval,
-                        heartbeat_timeout=self._heartbeat_timeout,
-                        takeover_grace_period=self._takeover_grace_period,
-                        on_output=on_output,
-                    )
-                except SessionBusy:
-                    if result is None:
-                        raise
-                    return result
-                result = TurnResult(
-                    current.finished,
-                    current.output
-                    if current.output is not None
-                    else (result.output if result is not None else None),
-                )
-                # Reacquisition creates a fresh execution after lease release.
-                await self.require_ready(session_id)
-                if not (
-                    await self.read_inputs(session_id, "queued")
-                    or await self.read_inputs(session_id, "steer")
-                ):
-                    return result
-
-    @asynccontextmanager
-    async def _open_agent_execution[DepsT, OutputT](
-        self,
-        config: SessionExecutionConfig,
-        agent: Agent[DepsT, OutputT],
-        deps: DepsT,
-        lease: SessionLease,
-    ) -> AsyncIterator[RunnerExecution[OutputT]]:
-        """Adapt a borrowed custom Agent without changing its prompts/tools/output."""
-        session = config.session
-        async with self._session_factory.begin() as db:
-            await lease.lock_owned(db)
-            await self.require_ready(session.id, db=db)
-        async with (
-            build_provider(config.provider_class, config.provider) as provider,
-            build_model(
-                config.model_class,
-                config.model.model_name,
-                provider,
-                profile={"context_window": config.model.context_window},
-            ) as model,
-        ):
-            plugin = self._context_plugin_registry.create(session.context_plugin)
-            with agent.override(model=model, model_settings=config.model_settings):
-                yield RunnerExecution(
-                    agent=agent,
-                    deps=deps,
-                    context_plugin=plugin,
-                    compaction_threshold_tokens=config.compaction_threshold_tokens,
-                    compaction_replay_turns=session.compaction_replay_turns,
-                )
 
     async def live(
         self, session_id: UUID, *, after_seq: int = -1
@@ -779,7 +455,7 @@ class SessionService:
 
         async def read_history() -> tuple[HistoryMessage, ...]:
             async with self._session_factory.begin() as db:
-                return await AgentRepository(db).read_history_entries(
+                return await HistoryRepository(db).read_history_entries(
                     session_id, after_seq=last_seq
                 )
 
@@ -849,16 +525,3 @@ class SessionService:
                 if pending is not None:
                     pending.cancel()
                     await asyncio.gather(pending, return_exceptions=True)
-
-
-def resolve_compaction_threshold(configured: int | None, context_window: int | None) -> int:
-    """Resolve a stored threshold at startup; None requires a known model capacity."""
-    if configured is not None:
-        if type(configured) is not int or configured <= 0:
-            raise ValueError("compaction_threshold_tokens must be a positive integer")
-        return configured
-    if context_window is None:
-        raise ValueError(
-            "session.compaction_threshold_tokens is required when context_window is unknown"
-        )
-    return max(1, context_window * 7 // 10)

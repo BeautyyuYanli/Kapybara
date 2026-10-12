@@ -10,7 +10,7 @@ from uuid import UUID
 
 from pydantic import ConfigDict, Field, SecretStr, model_validator
 
-from kapy.agent_runner.types import HistoryMessage
+from kapy.agent_history import HistoryMessage
 from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
 from kapy.control.types import DTO, JsonObject, Name

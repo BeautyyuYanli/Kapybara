@@ -16,7 +16,6 @@ from pydantic_ai.models.function import FunctionModel
 from shellctl import ShellctlClient, ShellctlClientError
 from shellctl_fixture import shell_server as shell_server
 
-from kapy.agent_plugins.builtin.shell import ShellPluginState
 from kapy.layers.scopes import retry_scope
 from kapy.layers.shell import layer, runtime
 from pydantic_ai_layer_protocol import LayerData, LayerRegistry, RetryableScopeError
@@ -85,11 +84,9 @@ async def test_enter_allocates_nothing_and_exit_forgets_only_confirmed_deletions
     assert len(requests) == 4 and len(closed) == 2
 
 
-async def test_old_jobs_only_state_is_legacy_only_and_fails_layer_selection_before_io(remote):
+async def test_old_jobs_only_state_fails_layer_selection_before_io(remote):
     requests, _, closed = remote
     saved: JsonObject = {"jobs": {"known": 5}}
-    assert ShellPluginState.model_validate(saved).model_dump(mode="json") == saved
-    assert ShellPluginState().model_dump(mode="json") == {"jobs": {}}
     with pytest.raises(ValidationError, match="scope_id"):
         layer.State.model_validate(saved)
     layers = LayerRegistry({"shell": layer.make}, get_layers=get_layers)

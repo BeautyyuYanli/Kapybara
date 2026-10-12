@@ -5,9 +5,8 @@ from sqlmodel import col, select
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from kapy.agent_output import AgentOutputService
-from kapy.agent_runner.repository import AgentRepository
-from kapy.agent_runner.types import MessageCommitted
+from kapy.agent_history.repository import HistoryRepository
+from kapy.agent_output import AgentOutputService, MessageCommitted
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
 from kapy.lifecycle import LifecycleError
@@ -42,7 +41,7 @@ class RunnerActivities:
                 ).scalar_one_or_none()
                 if session_id is None:
                     raise LookupError(f"Session {data.session_id} does not exist")
-                accepted = await AgentRepository(db).append_history(session_id, data.messages)
+                accepted = await HistoryRepository(db).append_history(session_id, data.messages)
         except LookupError as exc:
             raise ApplicationError(str(exc), type="SessionNotFound", non_retryable=True) from exc
         except ValueError as exc:

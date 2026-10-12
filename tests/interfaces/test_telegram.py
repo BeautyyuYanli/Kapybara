@@ -26,16 +26,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from temporalio.client import WorkflowHandle
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 
-from kapy.agent_plugins import PluginOperationError
-from kapy.agent_runner import HistoryMessage, MessageCommitted, TextDelta
+from kapy.agent_history import HistoryMessage
+from kapy.agent_output import MessageCommitted, TextDelta
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
-    InputSubmission,
     SessionCreationError,
-    SessionInput,
     SessionService,
-    SubmitInput,
     UpdateSession,
 )
 from kapy.interfaces.telegram.client import TelegramClient, TelegramFailure, text_chunk
@@ -103,12 +100,7 @@ def controller(repository, tmp_path):
 
     sessions.create_session.side_effect = create
     sessions.get_session.side_effect = get
-    sessions.submit_input.return_value = InputSubmission(
-        input=SessionInput(1, "hello"),
-        should_start_runner=True,
-    )
     sessions.is_durable_runner_running.return_value = False
-    sessions.read_inputs.return_value = ()
     client = telegram_client()
     result = TelegramController(
         client=client,
@@ -120,6 +112,30 @@ def controller(repository, tmp_path):
         username="kapy_bot",
     )
     return result, sessions, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["queue text", "steer text", "cancel"])
+async def test_removed_commands_do_not_create_or_submit_execution(repository, tmp_path, command):
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, f"/{command}")])
+    assert await app.process_once()
+    sessions.create_session.assert_not_awaited()
+    sessions.start_durable_runner.assert_not_awaited()
+    assert client.send.await_args.args[-1] == "Unknown command. Use /help."
+
+
+@pytest.mark.asyncio
+async def test_saved_obsolete_action_is_reported_without_allocating_resources(repository, tmp_path):
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/queue text")])
+    item = await repository.next_inbox(42)
+    assert item is not None
+    await repository.save_action(item, {"command": "queue", "session_id": None, "text": "text"})
+    assert await app.process_once()
+    sessions.create_session.assert_not_awaited()
+    sessions.start_durable_runner.assert_not_awaited()
+    assert client.send.await_args.args[-1] == "Unknown command. Use /help."
 
 
 def test_xdg_path_resolution_is_at_construction(monkeypatch, tmp_path):
@@ -362,8 +378,6 @@ async def test_saved_model_preserves_session_template_when_creating_after_restar
         model_name="fallback-model",
         layers={"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}},
         model_settings={"temperature": 0.2},
-        compaction_threshold_tokens=5000,
-        compaction_replay_turns=3,
     )
     provider_id, model_name = uuid4(), "selected-model"
     await repository.set_default_model(42, provider_id, model_name)
@@ -465,7 +479,6 @@ async def test_inbox_dedup_topics_and_session_business_only(repository, tmp_path
         assert await app.process_once()
     assert not await app.process_once()
     sessions.create_session.assert_awaited_once()
-    sessions.submit_input.assert_not_awaited()
     sessions.start_durable_runner.assert_awaited_once_with(
         sessions.create_session.return_value.id, user_prompt="hello"
     )
@@ -491,7 +504,6 @@ async def test_retry_after_confirmation_does_not_resubmit_or_recreate(repository
     await app.process_once()
     sessions.create_session.assert_awaited_once()
     sessions.start_durable_runner.assert_awaited_once()
-    sessions.submit_input.assert_not_awaited()
     assert await repository.next_inbox(42) is None
 
 
@@ -572,20 +584,6 @@ async def test_stale_binding_is_cleared_without_recreating_session(repository, t
     await app.process_once()
     assert await repository.route(42, 123, 0) is None
     assert sessions.create_session.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_explicit_queue_commands_never_start_runner(repository, tmp_path):
-    app, sessions, _ = controller(repository, tmp_path)
-    await repository.ingest(42, [update(1, "/queue queued"), update(2, "/steer steer")])
-    await app.process_once()
-    await app.process_once()
-    assert [call.args[1].channel for call in sessions.submit_input.await_args_list] == [
-        "queued",
-        "steer",
-    ]
-    sessions.start_durable_runner.assert_not_awaited()
-    sessions.start_runner.assert_not_awaited()
 
 
 async def delivery_row(repository, *, text="", chat_type="private", chat_id=123):
@@ -1031,47 +1029,13 @@ async def test_discovery_retry_preserves_existing_followers(repository, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_bound_steer_and_cancel_use_session_business_without_rescheduling(
-    repository, tmp_path
-):
-    app, sessions, client = controller(repository, tmp_path)
-    await repository.ingest(
-        42,
-        [
-            update(1, "/new", thread=17),
-            update(2, "/steer change course", thread=17),
-            update(3, "/cancel", thread=17),
-        ],
-    )
-    await app.process_once()
-    target = await repository.route(42, 123, 17)
-    assert target is not None
-    client.send.reset_mock()
-    sessions.submit_input.return_value = InputSubmission(
-        input=SessionInput(10, "change course"),
-        should_start_runner=False,
-    )
-    await app.process_once()
-    sessions.submit_input.assert_awaited_once_with(
-        target,
-        SubmitInput(content="change course", channel="steer"),
-    )
-    await app.process_once()
-    sessions.request_cancel.assert_awaited_once_with(target)
-    client.send.assert_awaited_once_with(
-        123, 17, "Cancellation flag saved; durable execution does not consume it."
-    )
-    sessions.create_session.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_recreated_controller_retries_submission_to_durably_bound_session(
     repository, tmp_path
 ):
     app, sessions, _ = controller(repository, tmp_path)
     content = "retain this input"
     sessions.start_durable_runner.side_effect = [
-        OperationalError("submit_input", {}, Exception("temporary connection failure")),
+        OperationalError("start_durable_runner", {}, Exception("temporary connection failure")),
         Mock(spec=WorkflowHandle),
     ]
     await repository.ingest(42, [update(1, "/new " + content, thread=17)])
@@ -1173,14 +1137,14 @@ async def test_close_reports_cleanup_failure_then_user_retry_succeeds(repository
     async def close(target):
         attempts.append(target)
         if len(attempts) == 1:
-            raise PluginOperationError("p", "resource", "close session")
+            raise RetryableScopeError("resource cleanup failed")
 
     sessions.close_session.side_effect = close
     client.send.reset_mock()
     await repository.ingest(42, [update(2, "/close")])
     assert await app.process_once()
     assert await app.process_once()
-    assert client.send.await_args.args[-1] == "Plugin cleanup failed. Use /close to retry."
+    assert client.send.await_args.args[-1] == "Layer scope operation failed. Use /close to retry."
     assert await repository.next_inbox(42) is None
     await repository.ingest(42, [update(3, "/close")])
     assert await app.process_once()
@@ -1204,7 +1168,6 @@ async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp
     assert await repository.next_inbox(42) is None
     assert not await app.process_once()
     sessions.close_session.assert_awaited_once()
-    sessions.request_cancel.assert_not_awaited()
     sessions.close_session.side_effect = None
     await repository.ingest(42, [update(3, "/close")])
     assert await app.process_once()
@@ -1313,7 +1276,6 @@ async def test_durable_busy_and_ambiguous_start_are_not_retried_as_queued_input(
     # RPC errors are recorded as a reply; following attempts only send that reply.
     await app.process_once()
     assert sessions.start_durable_runner.await_count == 2
-    sessions.submit_input.assert_not_awaited()
     assert "busy" in client.send.call_args_list[0].args[2]
     assert "/status" in client.send.call_args_list[1].args[2]
     assert "secret" not in str(client.send.call_args_list)

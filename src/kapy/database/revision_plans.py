@@ -161,3 +161,74 @@ WHERE jsonb_typeof(message_metadata::jsonb->'metadata') = 'object'
     context.config.attributes["irreversible_reason"] = (
         "Immutable history conversion is irreversible"
     )
+
+
+def durable_only(context, revision, directives) -> None:
+    """Close incompatible sessions before discarding their legacy recovery data.
+
+    No snapshot is fabricated from history. Durable snapshots, versions and every
+    history row remain intact. Run offline after cleaning plugin resources with
+    the preceding release; this migration cannot execute removed business hooks.
+    """
+    script = directives[0]
+    removed_tables = {
+        "agent_states",
+        "agent_context_pages",
+        "plugin_agent_bindings",
+        "session_inputs",
+        "session_cancels",
+    }
+    detected_tables: set[str] = set()
+    detected_columns: set[str] = set()
+    for operation in script.upgrade_ops.ops:
+        if isinstance(operation, ops.DropTableOp) and operation.table_name in removed_tables:
+            detected_tables.add(operation.table_name)
+        elif isinstance(operation, ops.ModifyTableOps):
+            for change in operation.ops:
+                if (
+                    operation.table_name == "sessions"
+                    and isinstance(change, ops.DropColumnOp)
+                    and change.column_name
+                    in {"context_plugin", "compaction_threshold_tokens", "compaction_replay_turns"}
+                ):
+                    detected_columns.add(change.column_name)
+                elif operation.table_name in removed_tables and isinstance(change, ops.DropIndexOp):
+                    continue
+                else:
+                    raise ValueError("durable-only plan requires only the legacy schema removal")
+        else:
+            raise ValueError("durable-only plan requires only the legacy schema removal")
+    if detected_tables != removed_tables or detected_columns != {
+        "context_plugin",
+        "compaction_threshold_tokens",
+        "compaction_replay_turns",
+    }:
+        raise ValueError("durable-only plan requires the complete legacy schema removal")
+    constraints = sa.inspect(context.connection).get_check_constraints("sessions")
+    obsolete_checks = [
+        constraint
+        for constraint in constraints
+        if any(
+            column in constraint["sqltext"]
+            for column in ("compaction_threshold_tokens", "compaction_replay_turns")
+        )
+    ]
+    if len(obsolete_checks) != 2 or any(not check["name"] for check in obsolete_checks):
+        raise ValueError("durable-only plan requires both named legacy compaction checks")
+    for operation in script.upgrade_ops.ops:
+        if isinstance(operation, ops.ModifyTableOps) and operation.table_name == "sessions":
+            operation.ops[:0] = [
+                ops.DropConstraintOp(check["name"], "sessions", type_="check")
+                for check in obsolete_checks
+            ]
+    script.upgrade_ops.ops.insert(
+        0,
+        ops.ExecuteSQLOp("""UPDATE sessions AS s
+SET status = 'closed', updated_at = clock_timestamp()
+WHERE EXISTS (SELECT 1 FROM agent_states a WHERE a.session_id = s.id)
+    OR EXISTS (SELECT 1 FROM plugin_agent_bindings b WHERE b.session_id = s.id)"""),
+    )
+    script.downgrade_ops = ops.DowngradeOps([])
+    context.config.attributes["irreversible_reason"] = (
+        "Legacy runner recovery and plugin state removal is irreversible"
+    )

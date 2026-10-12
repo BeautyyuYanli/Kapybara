@@ -21,15 +21,12 @@ const model: ModelRecord = {
   updated_at: "",
 };
 const session: SessionRecord = {
-  context_plugin: { name: "kapy/summary", config: {} },
   status: "ready",
   id,
   title: "Demo Session",
   provider_id: id,
   model_name: model.model_name,
   model_settings: { temperature: 0.2 },
-  compaction_threshold_tokens: null,
-  compaction_replay_turns: 10,
   created_at: "",
   updated_at: "",
 };
@@ -144,16 +141,14 @@ test("model slash identity uses router encoding once and nullable context PATCH"
   expect(saved.postDataJSON()).toEqual({ name: model.name, settings: {}, context_window: null });
 });
 
-test("session create leaves threshold default to the service and permits zero replay", async ({
+test("session creation sends only model configuration without obsolete context controls", async ({
   page,
 }) => {
   await page.goto("sessions/new");
   await page.getByLabel("Provider", { exact: true }).selectOption(id);
   await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
-  await expect(
-    page.getByText("模型容量未知，创建时将保存默认摘要阈值 183500。"),
-  ).toBeVisible();
-  await page.getByLabel("参考轮数", { exact: true }).fill("0");
+  await expect(page.getByLabel("上下文插件", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("参考轮数", { exact: true })).toHaveCount(0);
   const request = page.waitForRequest((request) => request.method() === "POST");
   await page.getByRole("button", { name: "保存 Session" }).click();
   expect((await request).postDataJSON()).toEqual({
@@ -161,10 +156,7 @@ test("session create leaves threshold default to the service and permits zero re
     provider_id: id,
     model_name: model.model_name,
     model_settings: {},
-    compaction_threshold_tokens: null,
-    compaction_replay_turns: 0,
-    context_plugin: { name: "kapy/summary", config: {} },
-  });
+      });
   await expect(page.getByRole("heading", { name: "编辑 Session" })).toBeVisible();
 });
 
@@ -179,15 +171,10 @@ test("pagination uses returned count and filters reset offset", async ({ page })
   await expect(page).not.toHaveURL(/offset=/);
 });
 
-test("delete conflict keeps dialog open; escape returns focus; mobile fits", async ({ page }) => {
+test("delete dialog opens; escape returns focus; mobile fits", async ({ page }) => {
   await page.goto("providers");
   await page.getByRole("button", { name: "删除", exact: true }).click();
   await expect(page.getByRole("alertdialog")).toBeVisible();
-  await page.route(`**/api/providers/${id}`, (route) =>
-    route.fulfill({ status: 409, json: { detail: "Resource conflict" } }),
-  );
-  await page.getByRole("button", { name: "确认删除" }).click();
-  await expect(page.getByRole("alertdialog")).toContainText("仍被 Session 引用");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: "删除", exact: true })).toBeFocused();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
@@ -249,9 +236,7 @@ test("paged options keep current selection and model switch preserves JSON draft
   });
   await page.goto(`sessions/${id}`);
   await expect(page.getByLabel("Provider", { exact: true })).toHaveValue(id);
-  await expect(
-    page.getByText("模型容量未知，运行前需要设置摘要阈值。仍可保存配置。"),
-  ).toBeVisible();
+  await expect(page.getByLabel("分页阈值（可选）", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "加载更多 Provider" }).click();
   await expect(page.getByRole("option", { name: "Demo Provider", exact: true })).toHaveCount(1);
   await page.getByLabel("模型设置 JSON").fill('{"temperature":0.7}');
@@ -265,8 +250,7 @@ test("paged options keep current selection and model switch preserves JSON draft
     provider_id: secondId,
     model_name: model.model_name,
     model_settings: { temperature: 0.7 },
-    compaction_threshold_tokens: null,
-  });
+    });
   await expect(page.getByText("已保存，下次启动生效。", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Provider", { exact: true })).toHaveValue(secondId);
   await expect(page.getByLabel("Model", { exact: true })).toHaveValue(secondModel.model_name);

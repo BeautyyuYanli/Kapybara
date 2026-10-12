@@ -69,7 +69,7 @@ fences local writes and cannot revoke an already-issued external request.
 The host supplies no generic resource manager or background scope workflow.
 
 CreateSession accepts an optional fixed UUID. Duplicate creation reports that
-identity without replaying enter or initial input; callers query or close the same
+identity without replaying enter; callers query or close the same
 ID. HTTP creation errors after reservation begins include the ID, hide upstream
 details and report exhausted retryable errors as 503. Telegram saves the ID before
 creation and queries it on inbox recovery. Neither interface automatically repeats
@@ -95,16 +95,13 @@ no clients or secrets. Enter records its scope UUID without remote I/O. Every to
 reads that identity from State for remote `KAPY_SESSION_ID` ownership metadata;
 it never reads a host identity field from deps. State requires scope_id, including
 when restoring saved JSON; there is no runtime inference for older payloads.
-The legacy shell plugin shares Config and the jobs-only `JobState`, preserving
-its existing `{"jobs": {"job-id": byte_offset}}` State contract.
 
 The tools retain the existing names and parameters: `builtin_shell_run`,
 `builtin_shell_wait`, `builtin_shell_input`, and `builtin_shell_interrupt`.
 Run records a returned job ID before reading output. Wait/input resume from its
 saved byte cursor; cursors never decrease. Interrupt retains the job and its
 readable logs. Confirmed `job_not_found` removes the entry. Output limits,
-truncation, tail supplementation and redaction are shared with the legacy shell
-plugin in `agent_plugins.builtin.shell`.
+truncation, tail supplementation and redaction follow `layers.shell.output`.
 
 Each tool owns and closes its HTTP client, with bounded shielded cleanup. The
 remote job survives client close and successful runner completion. `enter_scope`

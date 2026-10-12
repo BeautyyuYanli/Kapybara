@@ -1,4 +1,4 @@
-"""Private shellctl service fixture shared by legacy and durable shell tests."""
+"""Private shellctl service fixture for durable shell layer tests."""
 
 import asyncio
 import os

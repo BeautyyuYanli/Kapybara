@@ -20,8 +20,7 @@ from pydantic_ai.usage import RunUsage
 from temporalio.converter import DataConverter
 from valkey.asyncio import Valkey
 
-from kapy.agent_output import AgentOutputService
-from kapy.agent_runner import TextDelta
+from kapy.agent_output import AgentOutputService, TextDelta
 from kapy.runner_duarable import DurableExecutionConfig, RunnerDeps
 from kapy.runner_duarable.context import RunnerActivityContext, bind_output_service
 from kapy.runner_duarable.output import handle_deltas
@@ -67,7 +66,7 @@ async def test_handler_drains_stream_and_flushes_text_with_optional_prediction(
 ):
     from pydantic import TypeAdapter
 
-    from kapy.agent_runner import OutputEvent
+    from kapy.agent_output import OutputEvent
 
     service, session_id = runner_database.outputs, runner_database.session_id
     ctx = RunnerActivityContext(deps(session_id, response_seq))

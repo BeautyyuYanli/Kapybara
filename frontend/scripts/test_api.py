@@ -2,10 +2,11 @@
 
 Run from the repository: .venv/bin/uvicorn test_api:app --app-dir frontend/scripts
 --host 127.0.0.1 --port 8001. Build frontend first. Uses the same local test database
-as tests/agent_runner; never reads .env and never schedules model requests.
+as tests/conftest.py; never reads .env and never schedules model requests.
 No schema or rows in the normal application namespace are changed.
 """
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
@@ -15,13 +16,15 @@ from fastapi import FastAPI
 from psycopg import sql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from kapy.agent_history.models import history_metadata
 from kapy.control.database import ControlTable
 from kapy.control.models import ModelService
 from kapy.control.sessions import SessionService
 from kapy.interfaces.http import create_frontend_router, create_router
+from kapy.session_lease.models import lease_metadata
 
 schema = "spa_test_" + uuid4().hex
-url = "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
+url = os.environ.get("KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy")
 engine = create_async_engine(
     url.replace("postgresql://", "postgresql+psycopg://"),
     connect_args={"options": f"-csearch_path={schema},pg_catalog"},
@@ -35,6 +38,8 @@ async def lifespan(app):
     try:
         async with engine.begin() as db:
             await db.run_sync(ControlTable.metadata.create_all)
+            await db.run_sync(history_metadata.create_all)
+            await db.run_sync(lease_metadata.create_all)
         yield
     finally:
         await engine.dispose()
@@ -44,7 +49,5 @@ async def lifespan(app):
 
 factory = async_sessionmaker(engine, expire_on_commit=False)
 app = FastAPI(lifespan=lifespan)
-app.include_router(
-    create_router(ModelService(factory), SessionService(factory))
-)
+app.include_router(create_router(ModelService(factory), SessionService(factory)))
 app.include_router(create_frontend_router(Path(__file__).resolve().parents[1] / "dist"))

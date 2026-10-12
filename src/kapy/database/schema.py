@@ -12,8 +12,7 @@ from pathlib import Path
 
 from sqlalchemy.schema import CreateSchema
 
-from kapy.agent_plugins import models as plugin_tables  # noqa: F401
-from kapy.agent_runner.models import agent_metadata
+from kapy.agent_history.models import history_metadata
 from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
 from kapy.control.database import ControlTable
@@ -49,7 +48,7 @@ async def migrate(
 ) -> None:
     if plan is not None and (
         operation != "revision"
-        or plan not in {"context-pages", "immutable-history", "shell-scope-state"}
+        or plan not in {"context-pages", "immutable-history", "shell-scope-state", "durable-only"}
     ):
         raise ValueError("plan must name a supported revision generation plan")
     async with open_core_database(settings) as engine:
@@ -63,7 +62,7 @@ async def migrate(
                 config = migration_config(
                     db,
                     directory=Path(__file__).parent / "migrations",
-                    metadata=[ControlTable.metadata, agent_metadata, lease_metadata],
+                    metadata=[ControlTable.metadata, history_metadata, lease_metadata],
                     version_table="core_schema_version",
                     owns_table=OWNED_TABLES.__contains__,
                 )
@@ -74,6 +73,7 @@ async def migrate(
                         "context-pages": revision_plans.context_pages,
                         "immutable-history": revision_plans.immutable_history,
                         "shell-scope-state": revision_plans.shell_scope_state,
+                        "durable-only": revision_plans.durable_only,
                     }[plan]
                 execute(config, operation, message=message)
 
@@ -85,7 +85,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("operation", choices=["upgrade", "current", "revision"])
     parser.add_argument("--message")
     parser.add_argument(
-        "--plan", choices=["context-pages", "immutable-history", "shell-scope-state"]
+        "--plan",
+        choices=["context-pages", "immutable-history", "shell-scope-state", "durable-only"],
     )
     args = parser.parse_args(argv)
     asyncio.run(

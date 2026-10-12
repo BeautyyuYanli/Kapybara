@@ -3,8 +3,8 @@
 `RunnerWorkflow.run(RunnerInput)` restores the supplied message history, runs
 `agent.run()`, records messages through `kapy.record_history`, saves the final
 state through `kapy.save_runner_state`, then returns its string output. Callers
-serialize executions for each session; do not run the legacy and Temporal writers
-for the same session. This runner does not acquire a lease. Callers resolve model
+serialize executions for each session through SessionService admission. The runner
+does not acquire a session scope lease. Callers resolve model
 configuration, merge settings, and read state and version together before starting:
 
 ```python
@@ -133,8 +133,9 @@ then validates and saves State
 after each hook attempt. Shell removes confirmed jobs sequentially within an attempt;
 the database save occurs at the attempt boundary. Cleanup failure retains CLOSING
 and saved layer progress for a close retry.
-New layer sessions reject legacy `plugins` and the old Python runner entry;
-existing legacy plugin sessions retain their original execution and StateStore.
+Durable is the only supported execution path. The offline legacy-removal migration
+closes checkpoint/plugin sessions while retaining their identity and history.
+These sessions remain readable; continuation uses a new session.
 
 Drain old Workflows before deploying this Agent definition. The successful tool
 payload and State transport changed; replay compatibility with previous Workflow
@@ -183,7 +184,7 @@ settings and SDK version, and let the SDK prepare them again without a new promp
 
 `RunnerActivities.record_messages(MessageBatch)` keeps the Activity name
 `kapy.record_history` and a 30-second timeout. Its transaction locks the session
-row with `SELECT id FOR UPDATE` before `AgentRepository.append_history()`.
+row with `SELECT id FOR UPDATE` before `HistoryRepository.append_history()`.
 Other direct durable writers hold the same lock through commit. Different sessions
 can write concurrently, and no lock spans publication. Missing sessions become
 non-retryable `SessionNotFound` errors.
@@ -211,8 +212,8 @@ Storage seals history but does not reconcile stale state. Callers serialize runs
 and do not restart failed executions from an older successful snapshot.
 `SessionService.start_durable_runner()` enforces this with a short session lock and
 fixed `kapy-runner:{session_id}` Workflow ID. It admits a new execution only
-initially or after COMPLETED, and rejects business plugin bindings and legacy
-checkpoints. Queues, cancel flags and compaction settings remain unused.
+initially or after COMPLETED; only READY sessions can execute. Native layer scopes
+use session leases independently of runner admission.
 
 `SessionService.live(after_seq=-1)` subscribes before reading history, then combines
 complete broadcasts, ordered backfill on numeric jumps, and periodic reads for
@@ -224,12 +225,12 @@ previews and resumes from the last fully applied complete message.
 After applying a complete message, consumers discard previews at/below its seq
 and keep later previews. Direct `AgentOutputService.subscribe()` remains available
 for consumers owning their replay policy; its buffering is described in
-[the output contract](../agent_runner/README.md). Telegram sends text responses as
+[the output contract](../agent_output/README.md). Telegram sends text responses as
 fixed formal replies, persists one pending send and chunk offset, and advances
 its cursor when that message is fully sent. It has no editable reply receipts.
 
 The module defines its own Agent at module scope. It reuses Provider/Model
-construction helpers, but does not import the legacy application Agent factory.
+construction helpers; all model/tool resources belong to the Worker.
 
 Module passthrough is centralized in the package exports: shared model helpers
 transitively import SQLModel definitions that cannot be reinitialized in the
@@ -265,8 +266,7 @@ Workflow code never reads the binding or uses network clients. The same module-l
 Agent registers the context type and `handle_deltas` for Workflow and AgentPlugin.
 
 The SDK owns the model Activity stream. `handle_deltas` consumes it completely and
-maps text/thinking events through the same `to_text_delta` function as the legacy
-OutputCapability. Tool-only streams are drained without text output. Each invocation
+maps text/thinking events through `agent_output.deltas.to_text_delta`. Tool-only streams are drained without text output. Each invocation
 owns a publisher; successful completion flushes its tail before Activity return.
 Worker shutdown finishes Activities before unbinding and closing Valkey/database
 resources. Publishers own only their buffers and tasks; the output service borrows
@@ -279,7 +279,8 @@ per `open_resources()` lifespan, available as `resources.temporal_client`; HTTP
 also exposes it through `request.app.state.resources.temporal_client`. Startup
 requires a reachable Temporal service. Client has no explicit close API; process
 owners finish their tasks before releasing resources. HTTP direct runner submissions and ordinary Telegram text use this Workflow.
-Queue submissions do not start it, and legacy Python start_runner remains available.
+Configuration creation and durable submission are separate operations; the latter
+is the only execution entry point.
 
 The resolver reads configuration from `RunnerDeps.config` and uses the existing
 Provider/Model builders to construct the real SDK

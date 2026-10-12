@@ -35,7 +35,6 @@ class CommonSettings(BaseModel):
     takeover_grace_period: float = Field(
         default=30, gt=0, validation_alias="KAPY_TAKEOVER_GRACE_PERIOD"
     )
-    realtime_output: bool = Field(default=True, validation_alias="KAPY_REALTIME_OUTPUT")
     output_flush_interval: float = Field(
         default=0.5, ge=0, validation_alias="KAPY_OUTPUT_FLUSH_INTERVAL"
     )

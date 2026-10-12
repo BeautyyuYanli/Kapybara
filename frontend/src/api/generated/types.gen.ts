@@ -9,41 +9,7 @@ export type ClientOptions = {
  *
  * A URL to an audio file.
  */
-export type AudioUrlInput = {
-    /**
-     * Url
-     */
-    url: string;
-    /**
-     * Force Download
-     */
-    force_download?: boolean | 'allow-local';
-    /**
-     * Vendor Metadata
-     */
-    vendor_metadata?: {
-        [key: string]: unknown;
-    } | null;
-    /**
-     * Media Type
-     */
-    media_type?: string | null;
-    /**
-     * Identifier
-     */
-    identifier?: string | null;
-    /**
-     * Kind
-     */
-    kind?: 'audio-url';
-};
-
-/**
- * AudioUrl
- *
- * A URL to an audio file.
- */
-export type AudioUrlOutput = {
+export type AudioUrl = {
     /**
      * Url
      */
@@ -91,37 +57,7 @@ export type AudioUrlOutput = {
  *
  * Binary content, e.g. an audio or image file.
  */
-export type BinaryContentInput = {
-    /**
-     * Data
-     */
-    data: Blob | File;
-    /**
-     * Media Type
-     */
-    media_type: 'audio/wav' | 'audio/mpeg' | 'audio/ogg' | 'audio/flac' | 'audio/aiff' | 'audio/aac' | 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' | 'application/pdf' | 'text/plain' | 'text/csv' | 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' | 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' | 'text/html' | 'text/markdown' | 'application/msword' | 'application/vnd.ms-excel' | string;
-    /**
-     * Vendor Metadata
-     */
-    vendor_metadata?: {
-        [key: string]: unknown;
-    } | null;
-    /**
-     * Identifier
-     */
-    identifier?: string | null;
-    /**
-     * Kind
-     */
-    kind?: 'binary';
-};
-
-/**
- * BinaryContent
- *
- * Binary content, e.g. an audio or image file.
- */
-export type BinaryContentOutput = {
+export type BinaryContent = {
     /**
      * Data
      */
@@ -223,17 +159,6 @@ export type CompactionPart = {
 };
 
 /**
- * ContextPluginSpec
- */
-export type ContextPluginSpec = {
-    /**
-     * Name
-     */
-    name?: string;
-    config?: JsonObject;
-};
-
-/**
  * CreateModel
  */
 export type CreateModel = {
@@ -271,24 +196,24 @@ export type CreateProvider = {
 };
 
 /**
- * CreateSessionAndSchedule
+ * CreateSession
+ *
+ * Fixed execution configuration; optional id lets callers resolve lost responses.
+ *
+ * Reusing an existing/reserved identity conflicts instead of replaying enter or
+ * business hooks. The caller queries or closes that same identity explicitly.
  */
-export type CreateSessionAndSchedule = {
+export type CreateSession = {
     /**
      * Id
      */
     id?: string | null;
-    /**
-     * Plugins
-     */
-    plugins?: Array<PluginSpec>;
     /**
      * Layers
      */
     layers?: {
         [key: string]: JsonObject;
     };
-    context_plugin?: ContextPluginSpec;
     /**
      * Provider Id
      */
@@ -299,15 +224,6 @@ export type CreateSessionAndSchedule = {
      */
     title?: string;
     model_settings?: JsonObject;
-    /**
-     * Compaction Threshold Tokens
-     */
-    compaction_threshold_tokens?: number | null;
-    /**
-     * Compaction Replay Turns
-     */
-    compaction_replay_turns?: number;
-    input?: SubmitInput | null;
 };
 
 /**
@@ -315,41 +231,7 @@ export type CreateSessionAndSchedule = {
  *
  * The URL of the document.
  */
-export type DocumentUrlInput = {
-    /**
-     * Url
-     */
-    url: string;
-    /**
-     * Force Download
-     */
-    force_download?: boolean | 'allow-local';
-    /**
-     * Vendor Metadata
-     */
-    vendor_metadata?: {
-        [key: string]: unknown;
-    } | null;
-    /**
-     * Media Type
-     */
-    media_type?: string | null;
-    /**
-     * Identifier
-     */
-    identifier?: string | null;
-    /**
-     * Kind
-     */
-    kind?: 'document-url';
-};
-
-/**
- * DocumentUrl
- *
- * The URL of the document.
- */
-export type DocumentUrlOutput = {
+export type DocumentUrl = {
     /**
      * Url
      */
@@ -444,7 +326,7 @@ export type ErrorDetails = {
  * A file response from a model.
  */
 export type FilePart = {
-    content: BinaryContentOutput;
+    content: BinaryContent;
     /**
      * Id
      */
@@ -506,41 +388,7 @@ export type HistoryMessage = {
  *
  * A URL to an image.
  */
-export type ImageUrlInput = {
-    /**
-     * Url
-     */
-    url: string;
-    /**
-     * Force Download
-     */
-    force_download?: boolean | 'allow-local';
-    /**
-     * Vendor Metadata
-     */
-    vendor_metadata?: {
-        [key: string]: unknown;
-    } | null;
-    /**
-     * Media Type
-     */
-    media_type?: string | null;
-    /**
-     * Identifier
-     */
-    identifier?: string | null;
-    /**
-     * Kind
-     */
-    kind?: 'image-url';
-};
-
-/**
- * ImageUrl
- *
- * A URL to an image.
- */
-export type ImageUrlOutput = {
+export type ImageUrl = {
     /**
      * Url
      */
@@ -582,8 +430,6 @@ export type ImageUrlOutput = {
      */
     readonly identifier: string;
 };
-
-export type InputChannel = 'steer' | 'queued';
 
 export type JsonObject = {
     [key: string]: JsonValue;
@@ -1144,17 +990,6 @@ export type PageSessionRecord = {
     has_more: boolean;
 };
 
-export type PluginName = string;
-
-/**
- * PluginSpec
- */
-export type PluginSpec = {
-    plugin_provider: PluginName;
-    plugin_name: PluginName;
-    config: JsonValue;
-};
-
 /**
  * ProviderRecord
  *
@@ -1285,17 +1120,6 @@ export type RetryPromptPart = {
 };
 
 /**
- * SessionInput
- */
-export type SessionInput = {
-    /**
-     * Id
-     */
-    id: number;
-    content: UserInputOutput;
-};
-
-/**
  * SessionRecord
  */
 export type SessionRecord = {
@@ -1305,7 +1129,6 @@ export type SessionRecord = {
     layers?: {
         [key: string]: JsonObject;
     };
-    context_plugin: ContextPluginSpec;
     status: LifecycleStatus;
     /**
      * Id
@@ -1324,14 +1147,6 @@ export type SessionRecord = {
      */
     model_name: string;
     model_settings: JsonObject;
-    /**
-     * Compaction Threshold Tokens
-     */
-    compaction_threshold_tokens: number | null;
-    /**
-     * Compaction Replay Turns
-     */
-    compaction_replay_turns: number;
     /**
      * Created At
      */
@@ -1366,7 +1181,7 @@ export type SpeechPart = {
      * Transcript
      */
     transcript?: string | null;
-    audio?: BinaryContentOutput | null;
+    audio?: BinaryContent | null;
     /**
      * Interrupted At Ms
      */
@@ -1399,14 +1214,6 @@ export type StartDurableRunner = {
      * User Prompt
      */
     user_prompt: string;
-};
-
-/**
- * SubmitInput
- */
-export type SubmitInput = {
-    content: UserInputInput;
-    channel?: InputChannel;
 };
 
 /**
@@ -1594,17 +1401,17 @@ export type ToolCallPart = {
 
 export type ToolReturnContent = string | ({
     kind: 'image-url';
-} & ImageUrlOutput) | ({
+} & ImageUrl) | ({
     kind: 'audio-url';
-} & AudioUrlOutput) | ({
+} & AudioUrl) | ({
     kind: 'document-url';
-} & DocumentUrlOutput) | ({
+} & DocumentUrl) | ({
     kind: 'video-url';
-} & VideoUrlOutput) | ({
+} & VideoUrl) | ({
     kind: 'binary';
-} & BinaryContentOutput) | ({
+} & BinaryContent) | ({
     kind: 'uploaded-file';
-} & UploadedFileOutput) | {
+} & UploadedFile) | {
     [key: string]: ToolReturnContent;
 } | Array<ToolReturnContent> | unknown;
 
@@ -1839,7 +1646,6 @@ export type UpdateProvider = {
  * UpdateSession
  */
 export type UpdateSession = {
-    context_plugin?: ContextPluginSpec | null;
     /**
      * Title
      */
@@ -1850,14 +1656,6 @@ export type UpdateSession = {
     provider_id?: string | null;
     model_name?: Name | null;
     model_settings?: JsonObject | null;
-    /**
-     * Compaction Threshold Tokens
-     */
-    compaction_threshold_tokens?: number | null;
-    /**
-     * Compaction Replay Turns
-     */
-    compaction_replay_turns?: number | null;
 };
 
 /**
@@ -1877,53 +1675,7 @@ export type UpdateSession = {
  * - [`GoogleModel`][pydantic_ai.models.google.GoogleModel] (Gemini API: [Files API](https://ai.google.dev/gemini-api/docs/files) URIs, Google Cloud: GCS `gs://` URIs)
  * - [`XaiModel`][pydantic_ai.models.xai.XaiModel]
  */
-export type UploadedFileInput = {
-    /**
-     * File Id
-     */
-    file_id: string;
-    /**
-     * Provider Name
-     */
-    provider_name: 'anthropic' | 'openai' | 'google' | 'google-cloud' | 'google-gla' | 'google-vertex' | 'bedrock' | 'xai';
-    /**
-     * Vendor Metadata
-     */
-    vendor_metadata?: {
-        [key: string]: unknown;
-    } | null;
-    /**
-     * Media Type
-     */
-    media_type?: string | null;
-    /**
-     * Identifier
-     */
-    identifier?: string | null;
-    /**
-     * Kind
-     */
-    kind?: 'uploaded-file';
-};
-
-/**
- * UploadedFile
- *
- * A reference to a file uploaded to a provider's file storage by ID.
- *
- * This allows referencing files that have been uploaded via provider-specific file APIs
- * rather than providing the file content directly.
- *
- * Supported by:
- *
- * - [`AnthropicModel`][pydantic_ai.models.anthropic.AnthropicModel]
- * - [`OpenAIChatModel`][pydantic_ai.models.openai.OpenAIChatModel]
- * - [`OpenAIResponsesModel`][pydantic_ai.models.openai.OpenAIResponsesModel]
- * - [`BedrockConverseModel`][pydantic_ai.models.bedrock.BedrockConverseModel]
- * - [`GoogleModel`][pydantic_ai.models.google.GoogleModel] (Gemini API: [Files API](https://ai.google.dev/gemini-api/docs/files) URIs, Google Cloud: GCS `gs://` URIs)
- * - [`XaiModel`][pydantic_ai.models.xai.XaiModel]
- */
-export type UploadedFileOutput = {
+export type UploadedFile = {
     /**
      * File Id
      */
@@ -1969,34 +1721,6 @@ export type UploadedFileOutput = {
     readonly identifier: string;
 };
 
-export type UserInputInput = string | Array<string | TextContent | ({
-    kind: 'image-url';
-} & ImageUrlInput) | ({
-    kind: 'audio-url';
-} & AudioUrlInput) | ({
-    kind: 'document-url';
-} & DocumentUrlInput) | ({
-    kind: 'video-url';
-} & VideoUrlInput) | ({
-    kind: 'binary';
-} & BinaryContentInput) | ({
-    kind: 'uploaded-file';
-} & UploadedFileInput) | CachePoint>;
-
-export type UserInputOutput = string | Array<string | TextContent | ({
-    kind: 'image-url';
-} & ImageUrlOutput) | ({
-    kind: 'audio-url';
-} & AudioUrlOutput) | ({
-    kind: 'document-url';
-} & DocumentUrlOutput) | ({
-    kind: 'video-url';
-} & VideoUrlOutput) | ({
-    kind: 'binary';
-} & BinaryContentOutput) | ({
-    kind: 'uploaded-file';
-} & UploadedFileOutput) | CachePoint>;
-
 /**
  * UserPromptPart
  *
@@ -2011,17 +1735,17 @@ export type UserPromptPart = {
      */
     content: string | Array<string | TextContent | ({
         kind: 'image-url';
-    } & ImageUrlOutput) | ({
+    } & ImageUrl) | ({
         kind: 'audio-url';
-    } & AudioUrlOutput) | ({
+    } & AudioUrl) | ({
         kind: 'document-url';
-    } & DocumentUrlOutput) | ({
+    } & DocumentUrl) | ({
         kind: 'video-url';
-    } & VideoUrlOutput) | ({
+    } & VideoUrl) | ({
         kind: 'binary';
-    } & BinaryContentOutput) | ({
+    } & BinaryContent) | ({
         kind: 'uploaded-file';
-    } & UploadedFileOutput) | CachePoint>;
+    } & UploadedFile) | CachePoint>;
     /**
      * Timestamp
      */
@@ -2065,41 +1789,7 @@ export type ValidationError = {
  *
  * A URL to a video.
  */
-export type VideoUrlInput = {
-    /**
-     * Url
-     */
-    url: string;
-    /**
-     * Force Download
-     */
-    force_download?: boolean | 'allow-local';
-    /**
-     * Vendor Metadata
-     */
-    vendor_metadata?: {
-        [key: string]: unknown;
-    } | null;
-    /**
-     * Media Type
-     */
-    media_type?: string | null;
-    /**
-     * Identifier
-     */
-    identifier?: string | null;
-    /**
-     * Kind
-     */
-    kind?: 'video-url';
-};
-
-/**
- * VideoUrl
- *
- * A URL to a video.
- */
-export type VideoUrlOutput = {
+export type VideoUrl = {
     /**
      * Url
      */
@@ -2165,7 +1855,7 @@ export type WorkspaceRef = {
  *
  * A URL to an audio file.
  */
-export type AudioUrlOutputWritable = {
+export type AudioUrlWritable = {
     /**
      * Url
      */
@@ -2191,7 +1881,7 @@ export type AudioUrlOutputWritable = {
  *
  * Binary content, e.g. an audio or image file.
  */
-export type BinaryContentOutputWritable = {
+export type BinaryContentWritable = {
     /**
      * Data
      */
@@ -2241,7 +1931,7 @@ export type CreateProviderWritable = {
  *
  * The URL of the document.
  */
-export type DocumentUrlOutputWritable = {
+export type DocumentUrlWritable = {
     /**
      * Url
      */
@@ -2268,7 +1958,7 @@ export type DocumentUrlOutputWritable = {
  * A file response from a model.
  */
 export type FilePartWritable = {
-    content: BinaryContentOutputWritable;
+    content: BinaryContentWritable;
     /**
      * Id
      */
@@ -2320,7 +2010,7 @@ export type HistoryMessageWritable = {
  *
  * A URL to an image.
  */
-export type ImageUrlOutputWritable = {
+export type ImageUrlWritable = {
     /**
      * Url
      */
@@ -2520,17 +2210,6 @@ export type PageHistoryMessageWritable = {
 };
 
 /**
- * SessionInput
- */
-export type SessionInputWritable = {
-    /**
-     * Id
-     */
-    id: number;
-    content: UserInputOutputWritable;
-};
-
-/**
  * SpeechPart
  *
  * Spoken audio exchanged during a realtime session, paired with its transcript.
@@ -2554,7 +2233,7 @@ export type SpeechPartWritable = {
      * Transcript
      */
     transcript?: string | null;
-    audio?: BinaryContentOutputWritable | null;
+    audio?: BinaryContentWritable | null;
     /**
      * Interrupted At Ms
      */
@@ -2581,17 +2260,17 @@ export type SpeechPartWritable = {
 
 export type ToolReturnContentWritable = string | ({
     kind: 'image-url';
-} & ImageUrlOutputWritable) | ({
+} & ImageUrlWritable) | ({
     kind: 'audio-url';
-} & AudioUrlOutputWritable) | ({
+} & AudioUrlWritable) | ({
     kind: 'document-url';
-} & DocumentUrlOutputWritable) | ({
+} & DocumentUrlWritable) | ({
     kind: 'video-url';
-} & VideoUrlOutputWritable) | ({
+} & VideoUrlWritable) | ({
     kind: 'binary';
-} & BinaryContentOutputWritable) | ({
+} & BinaryContentWritable) | ({
     kind: 'uploaded-file';
-} & UploadedFileOutputWritable) | {
+} & UploadedFileWritable) | {
     [key: string]: ToolReturnContentWritable;
 } | Array<ToolReturnContentWritable> | unknown;
 
@@ -2665,7 +2344,7 @@ export type UpdateProviderWritable = {
  * - [`GoogleModel`][pydantic_ai.models.google.GoogleModel] (Gemini API: [Files API](https://ai.google.dev/gemini-api/docs/files) URIs, Google Cloud: GCS `gs://` URIs)
  * - [`XaiModel`][pydantic_ai.models.xai.XaiModel]
  */
-export type UploadedFileOutputWritable = {
+export type UploadedFileWritable = {
     /**
      * File Id
      */
@@ -2686,20 +2365,6 @@ export type UploadedFileOutputWritable = {
     kind?: 'uploaded-file';
 };
 
-export type UserInputOutputWritable = string | Array<string | TextContent | ({
-    kind: 'image-url';
-} & ImageUrlOutputWritable) | ({
-    kind: 'audio-url';
-} & AudioUrlOutputWritable) | ({
-    kind: 'document-url';
-} & DocumentUrlOutputWritable) | ({
-    kind: 'video-url';
-} & VideoUrlOutputWritable) | ({
-    kind: 'binary';
-} & BinaryContentOutputWritable) | ({
-    kind: 'uploaded-file';
-} & UploadedFileOutputWritable) | CachePoint>;
-
 /**
  * UserPromptPart
  *
@@ -2714,17 +2379,17 @@ export type UserPromptPartWritable = {
      */
     content: string | Array<string | TextContent | ({
         kind: 'image-url';
-    } & ImageUrlOutputWritable) | ({
+    } & ImageUrlWritable) | ({
         kind: 'audio-url';
-    } & AudioUrlOutputWritable) | ({
+    } & AudioUrlWritable) | ({
         kind: 'document-url';
-    } & DocumentUrlOutputWritable) | ({
+    } & DocumentUrlWritable) | ({
         kind: 'video-url';
-    } & VideoUrlOutputWritable) | ({
+    } & VideoUrlWritable) | ({
         kind: 'binary';
-    } & BinaryContentOutputWritable) | ({
+    } & BinaryContentWritable) | ({
         kind: 'uploaded-file';
-    } & UploadedFileOutputWritable) | CachePoint>;
+    } & UploadedFileWritable) | CachePoint>;
     /**
      * Timestamp
      */
@@ -2740,7 +2405,7 @@ export type UserPromptPartWritable = {
  *
  * A URL to a video.
  */
-export type VideoUrlOutputWritable = {
+export type VideoUrlWritable = {
     /**
      * Url
      */
@@ -3149,30 +2814,30 @@ export type ListSessionsResponses = {
 
 export type ListSessionsResponse = ListSessionsResponses[keyof ListSessionsResponses];
 
-export type CreateSessionAndScheduleData = {
-    body: CreateSessionAndSchedule;
+export type CreateSessionData = {
+    body: CreateSession;
     path?: never;
     query?: never;
     url: '/api/sessions';
 };
 
-export type CreateSessionAndScheduleErrors = {
+export type CreateSessionErrors = {
     /**
      * Validation Error
      */
     422: HttpValidationError;
 };
 
-export type CreateSessionAndScheduleError = CreateSessionAndScheduleErrors[keyof CreateSessionAndScheduleErrors];
+export type CreateSessionError = CreateSessionErrors[keyof CreateSessionErrors];
 
-export type CreateSessionAndScheduleResponses = {
+export type CreateSessionResponses = {
     /**
      * Successful Response
      */
     201: SessionRecord;
 };
 
-export type CreateSessionAndScheduleResponse = CreateSessionAndScheduleResponses[keyof CreateSessionAndScheduleResponses];
+export type CreateSessionResponse = CreateSessionResponses[keyof CreateSessionResponses];
 
 export type GetSessionData = {
     body?: never;
@@ -3264,109 +2929,6 @@ export type CloseSessionResponses = {
 
 export type CloseSessionResponse = CloseSessionResponses[keyof CloseSessionResponses];
 
-export type ReadInputsData = {
-    body?: never;
-    path: {
-        /**
-         * Session Id
-         */
-        session_id: string;
-    };
-    query?: {
-        /**
-         * Channel
-         */
-        channel?: 'steer' | 'queued';
-    };
-    url: '/api/sessions/{session_id}/inputs';
-};
-
-export type ReadInputsErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type ReadInputsError = ReadInputsErrors[keyof ReadInputsErrors];
-
-export type ReadInputsResponses = {
-    /**
-     * Response Read Inputs
-     *
-     * Successful Response
-     */
-    200: Array<SessionInput>;
-};
-
-export type ReadInputsResponse = ReadInputsResponses[keyof ReadInputsResponses];
-
-export type SubmitInputAndScheduleData = {
-    body: SubmitInput;
-    path: {
-        /**
-         * Session Id
-         */
-        session_id: string;
-    };
-    query?: never;
-    url: '/api/sessions/{session_id}/inputs';
-};
-
-export type SubmitInputAndScheduleErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type SubmitInputAndScheduleError = SubmitInputAndScheduleErrors[keyof SubmitInputAndScheduleErrors];
-
-export type SubmitInputAndScheduleResponses = {
-    /**
-     * Successful Response
-     */
-    202: SessionInput;
-};
-
-export type SubmitInputAndScheduleResponse = SubmitInputAndScheduleResponses[keyof SubmitInputAndScheduleResponses];
-
-export type DeleteInputData = {
-    body?: never;
-    path: {
-        /**
-         * Session Id
-         */
-        session_id: string;
-        /**
-         * Input Id
-         */
-        input_id: number;
-    };
-    query?: never;
-    url: '/api/sessions/{session_id}/inputs/{input_id}';
-};
-
-export type DeleteInputErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type DeleteInputError = DeleteInputErrors[keyof DeleteInputErrors];
-
-export type DeleteInputResponses = {
-    /**
-     * Response Delete Input
-     *
-     * Successful Response
-     */
-    200: boolean;
-};
-
-export type DeleteInputResponse = DeleteInputResponses[keyof DeleteInputResponses];
-
 export type IsRunnerRunningData = {
     body?: never;
     path: {
@@ -3428,66 +2990,6 @@ export type StartDurableRunnerResponses = {
 };
 
 export type StartDurableRunnerResponse = StartDurableRunnerResponses[keyof StartDurableRunnerResponses];
-
-export type ReadCancelData = {
-    body?: never;
-    path: {
-        /**
-         * Session Id
-         */
-        session_id: string;
-    };
-    query?: never;
-    url: '/api/sessions/{session_id}/cancel';
-};
-
-export type ReadCancelErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type ReadCancelError = ReadCancelErrors[keyof ReadCancelErrors];
-
-export type ReadCancelResponses = {
-    /**
-     * Response Read Cancel
-     *
-     * Successful Response
-     */
-    200: boolean;
-};
-
-export type ReadCancelResponse = ReadCancelResponses[keyof ReadCancelResponses];
-
-export type RequestCancelData = {
-    body?: never;
-    path: {
-        /**
-         * Session Id
-         */
-        session_id: string;
-    };
-    query?: never;
-    url: '/api/sessions/{session_id}/cancel';
-};
-
-export type RequestCancelErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type RequestCancelError = RequestCancelErrors[keyof RequestCancelErrors];
-
-export type RequestCancelResponses = {
-    /**
-     * Successful Response
-     */
-    202: unknown;
-};
 
 export type ReadHistoryData = {
     body?: never;

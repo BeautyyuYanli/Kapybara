@@ -71,19 +71,14 @@ class Config(BaseModel):
         return value
 
 
-class JobState(BaseModel):
-    """Known session job IDs and byte cursors; no output or remote status cache."""
+class State(BaseModel):
+    """Layer inventory and scope identity initialized by enter, independent of deps.
+
+    State contains job IDs and byte cursors, not output or remote status caches.
+    Loading saved JSON requires an explicit scope_id; identity is never inferred.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     jobs: dict[NonEmpty, NonNegativeInt] = Field(default_factory=dict)
-
-
-class State(JobState):
-    """Layer inventory and scope identity initialized by enter, independent of deps.
-
-    Legacy shell plugin State remains jobs-only through JobState. The layer
-    requires an explicit scope_id; loading an old payload cannot infer identity.
-    """
-
     scope_id: UUID
