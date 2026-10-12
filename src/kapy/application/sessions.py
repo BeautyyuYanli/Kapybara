@@ -15,7 +15,4 @@ def create_session_service(resources: Resources, settings: CommonSettings) -> Se
         ),
         temporal_client=resources.temporal_client,
         temporal_task_queue=settings.temporal_task_queue,
-        heartbeat_interval=settings.heartbeat_interval,
-        heartbeat_timeout=settings.heartbeat_timeout,
-        takeover_grace_period=settings.takeover_grace_period,
     )

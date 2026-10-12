@@ -33,7 +33,7 @@ docker compose ps
 
 | 服务 | 用途 | 宿主机入口 |
 | --- | --- | --- |
-| `postgres` | durable runner_state、history、session 配置与 layer 生命周期租约 | `127.0.0.1:55432` |
+| `postgres` | durable runner_state、history、session 配置与永久操作记录 | `127.0.0.1:55432` |
 | `drizzle-gateway` | PostgreSQL 网页面板，浏览编辑数据和执行 SQL | `127.0.0.1:5050` |
 | `valkey` | 按 session 广播临时输出；无离线消息、TTL 或持久化 | `127.0.0.1:56379` |
 | `temporal` | 持久化 standalone Activity 调度；数据保存在 PostgreSQL 的独立数据库 | `127.0.0.1:7233` |
@@ -110,8 +110,10 @@ runner snapshot 与 layer State 原子保存，以及固定 history 和实时输
 
 调用方负责 engine、数据库 schema、Valkey / Temporal client 的生命周期。
 所有执行使用 `start_runner()`，模型与工具资源由独立 Worker 管理。
-`session_lease` 仅保护 session 创建、关闭和 native layer scope，不表示 runner 状态；
-执行状态从 Temporal Activity 查询；整轮最多执行一次，不恢复 Agent 的内部步骤。旧 checkpoint/plugin session 在离线迁移时封闭，历史继续保留。
+创建、运行和关闭使用调用方提供的 Activity UUID 作为永久幂等键。
+数据库 starting/running 表示执行独占，current_activity_id 与 operation phase 的
+条件写入保护进度；RPC 和 hooks 均不持有事务或显式锁。整轮最多一个 Temporal
+尝试，不恢复 Agent 内部步骤。旧非 closed session 迁移为 closing，历史继续保留。
 
 `live(session_id, after_seq=-1)` 返回历史回放并继续监听的异步 generator，
 提前结束时使用 `aclosing`。消费者以最后完整应用消息的 `seq` 作为 `after_seq`，尚无该位置时使用 -1；

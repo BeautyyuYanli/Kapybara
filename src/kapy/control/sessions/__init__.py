@@ -3,11 +3,16 @@
 from kapy.agent_history import HistoryMessage
 from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 
-from .service import RunnerConflict, SessionService
+from .service import SessionService
 from .types import (
     CreateSession,
+    OperationConflict,
+    OperationFailed,
+    OperationKind,
+    OperationPhase,
     SessionAlreadyExists,
-    SessionCreationError,
+    SessionBusy,
+    SessionOperation,
     SessionRecord,
     UpdateSession,
 )
@@ -22,6 +27,10 @@ __all__ = [
     "TextDelta",
     "SessionService",
     "SessionAlreadyExists",
-    "SessionCreationError",
-    "RunnerConflict",
+    "OperationConflict",
+    "OperationFailed",
+    "OperationKind",
+    "OperationPhase",
+    "SessionBusy",
+    "SessionOperation",
 ]

@@ -1,6 +1,7 @@
 """Immutable history in a caller-owned transaction, using the official SDK codec.
 
-Writers lock the session row through commit. This repository never acquires leases,
+Writers serialize with a conditional session-ownership write in the same transaction.
+This repository never claims operation ownership,
 commits, or manages session lifetime. Usage is normalized outside message JSON.
 """
 
@@ -114,9 +115,10 @@ class HistoryRepository:
     ) -> tuple[HistoryMessage, ...]:
         """Append above the stored maximum and return new DTOs in input order.
 
-        The caller holds the session row lock through commit. All positions in one
-        batch use the same pre-write maximum; old positions and their numeric gaps
-        are permanently sealed. JSON metadata never determines stored positions.
+        The caller serializes through its conditional session-ownership write in
+        this transaction. All positions in one batch use the same pre-write maximum;
+        old positions and their numeric gaps stay sealed. JSON metadata never
+        determines stored positions.
         Invalid, duplicate or cross-session positions reject the whole batch; an
         empty batch does nothing. Only publish returned DTOs after committing.
         """

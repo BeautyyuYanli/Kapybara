@@ -39,7 +39,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.asyncio
 async def test_telegram_model_command_updates_only_bound_session_and_new_defaults(
-    database, tmp_path
+    database, tmp_path, session_runtime
 ):
     models = ModelService(database.sessions)
     providers = []
@@ -57,7 +57,7 @@ async def test_telegram_model_command_updates_only_bound_session_and_new_default
         )
         providers.append(provider)
     old_provider, new_provider = providers
-    sessions = SessionService(database.sessions)
+    sessions = session_runtime.service(database.sessions)
     path = tmp_path / "telegram.sqlite3"
     await migrate_telegram(path, "upgrade")
     async with open_storage(path) as engine:
@@ -190,7 +190,7 @@ async def test_http_shutdown_joins_start_request_before_resources_close(
             request = asyncio.create_task(
                 client.post(
                     f"/api/sessions/{session_id}/runner",
-                    json={"user_prompt": "test"},
+                    json={"activity_id": str(uuid4()), "user_prompt": "test"},
                 )
             )
             await asyncio.wait_for(started.wait(), 2)
@@ -201,7 +201,7 @@ async def test_http_shutdown_joins_start_request_before_resources_close(
 
 @pytest.mark.asyncio
 async def test_telegram_shutdown_joins_workers_before_resources_close(
-    database, tmp_path, monkeypatch
+    database, tmp_path, monkeypatch, session_runtime
 ):
     from contextlib import asynccontextmanager
 
@@ -226,6 +226,7 @@ async def test_telegram_shutdown_joins_workers_before_resources_close(
             temporal_address=os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
             database_url=SecretStr(database.url),
             database_schema=database.schema,
+            temporal_task_queue=session_runtime.queue,
         ),
         database_path=path,
         bot_token="unused",
@@ -485,3 +486,124 @@ async def test_telegram_reconnects_after_real_subscription_setup_timeout(
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_binding", [False, True])
+async def test_failed_creation_cleanup_targets_its_uuid_and_preserves_binding(
+    database, session_runtime, tmp_path, monkeypatch, has_binding
+):
+    from uuid import UUID
+
+    from pydantic_ai.capabilities import Capability
+
+    from kapy.control.sessions import service as session_module
+    from kapy.layers.registry import get_layers
+    from kapy.lifecycle import LifecycleStatus
+    from kapy.runner import scopes
+    from pydantic_ai_layer_protocol import Layer, LayerRegistry
+    from pydantic_ai_layer_protocol.examples import echo
+
+    allocated, entered, exited = set(), [], []
+    allow_cleanup = False
+
+    async def enter(session_id, config):
+        entered.append(session_id)
+        allocated.add(session_id)
+        raise RuntimeError("partial creation")
+
+    async def exit_scope(session_id, config, state):
+        assert state is None
+        exited.append(session_id)
+        if not allow_cleanup:
+            raise RuntimeError("compensation unavailable")
+        allocated.discard(session_id)
+
+    definition = Layer(
+        config_type=echo.Config,
+        state_type=echo.State,
+        capability=Capability(id="failing"),
+        enter_scope=enter,
+        exit_scope=exit_scope,
+    )
+    registry = LayerRegistry(
+        {"failing": lambda layer_id, access: definition}, get_layers=get_layers
+    )
+    monkeypatch.setattr(session_module, "layer_registry", registry)
+    monkeypatch.setattr(scopes, "layer_registry", registry)
+    sessions = session_runtime.service(database.sessions)
+    path = tmp_path / "failed-creation.sqlite3"
+    await migrate_telegram(path, "upgrade")
+    client = AsyncMock(spec=TelegramClient)
+    client.send.return_value = 123
+    template = CreateSession(provider_id=uuid4(), model_name="test")
+    async with open_storage(path) as engine:
+        repository = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
+        controller = TelegramController(
+            client=client,
+            sessions=sessions,
+            models=ModelService(database.sessions),
+            repository=repository,
+            settings=TelegramSettings(
+                bot_token="unused",
+                allowed_chat_ids={123},
+                database_path=path,
+                session_template=template,
+            ),
+            bot_id=42,
+            username="kapy_bot",
+        )
+
+        async def send(update_id, text):
+            await repository.ingest(
+                42,
+                [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "chat": {"id": 123, "type": "private"},
+                            "from": {"id": 1, "is_bot": False},
+                            "text": text,
+                        },
+                    }
+                ],
+            )
+            assert await controller.process_once()
+
+        previous = None
+        if has_binding:
+            await send(1, "/new")
+            previous = await repository.route(42, 123, 0)
+            assert previous is not None
+        controller.settings = controller.settings.model_copy(
+            update={"session_template": template.model_copy(update={"layers": {"failing": {}}})}
+        )
+        await send(2, "/new")
+        await controller.process_once()  # Deliver the saved failure reply.
+        assert len(entered) == 1
+        failed = entered[0]
+        assert (await sessions.get_session(failed)).status == LifecycleStatus.CLOSING
+        assert await repository.route(42, 123, 0) == previous
+        reply = client.send.await_args.args[-1]
+        recovery = reply[reply.index("/close ") :].split(" to clean up", 1)[0]
+        assert recovery == f"/close {failed}"
+        allow_cleanup = True
+        original_close = sessions.close_session
+
+        async def checked_close(target, *, activity_id):
+            # Observe a separate private transaction before any core cleanup.
+            item = await repository.next_inbox(42)
+            assert item is not None and item.resolved_action is not None
+            assert item.resolved_action["session_id"] == str(failed)
+            assert UUID(item.resolved_action["close_activity_id"]) == activity_id
+            return await original_close(target, activity_id=activity_id)
+
+        monkeypatch.setattr(sessions, "close_session", checked_close)
+        await send(3, recovery)
+        assert client.send.await_args.args[-1] == "Session closed."
+        assert (await sessions.get_session(failed)).status == LifecycleStatus.CLOSED
+        assert await repository.route(42, 123, 0) == previous
+        if previous is not None:
+            assert (await sessions.get_session(previous)).status == LifecycleStatus.READY
+        assert entered == [failed] and exited == [failed, failed] and not allocated
+        assert not await controller.process_once()

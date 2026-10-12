@@ -14,10 +14,13 @@ from kapy.control.models.types import (
     ModelAlreadyExists,
     ModelDiscoveryError,
 )
-from kapy.control.sessions import RunnerConflict, SessionAlreadyExists, SessionCreationError
+from kapy.control.sessions import (
+    OperationConflict,
+    OperationFailed,
+    SessionAlreadyExists,
+    SessionBusy,
+)
 from kapy.lifecycle import LifecycleError
-from kapy.session_lease import SessionBusy
-from pydantic_ai_layer_protocol import RetryableScopeError
 
 
 class ControlRoute(APIRoute):
@@ -39,12 +42,13 @@ class ControlRoute(APIRoute):
                         "session_id": str(error.session_id),
                     },
                 )
-            except SessionCreationError as error:
+            except OperationFailed as error:
                 return JSONResponse(
-                    status_code=503 if isinstance(error.__cause__, RetryableScopeError) else 500,
+                    status_code=500,
                     content={
-                        "detail": "Session creation failed; query or close this identity",
-                        "session_id": str(error.session_id),
+                        "detail": error.operation.error,
+                        "session_id": str(error.operation.session_id),
+                        "activity_id": str(error.operation.activity_id),
                     },
                 )
             except (RequestValidationError, ValidationError) as error:
@@ -54,10 +58,10 @@ class ControlRoute(APIRoute):
                 return JSONResponse(status_code=422, content={"detail": detail})
             except SessionBusy:
                 return JSONResponse(status_code=409, content={"detail": "Session busy"})
-            except RunnerConflict:
+            except OperationConflict:
                 return JSONResponse(
                     status_code=409,
-                    content={"detail": "Previous execution is unsuccessful or unconfirmed"},
+                    content={"detail": "Activity identity conflict"},
                 )
             except RPCError:
                 return JSONResponse(
@@ -66,11 +70,6 @@ class ControlRoute(APIRoute):
             except LifecycleError:
                 return JSONResponse(
                     status_code=409, content={"detail": "Session lifecycle conflict"}
-                )
-            except RetryableScopeError:
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Layer scope operation failed; retry explicitly"},
                 )
             except ModelAlreadyExists:
                 return JSONResponse(status_code=409, content={"detail": "Resource conflict"})

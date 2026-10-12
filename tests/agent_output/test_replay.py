@@ -18,7 +18,6 @@ from kapy.agent_history.repository import HistoryRepository
 from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent, TextDelta
 from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
-from kapy.control.sessions.repository import lock_session
 from kapy.runner import Recorder, RunnerDeps
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -68,21 +67,23 @@ async def append(database, session_id, messages, start_seq):
         if await db.get(SessionRow, session_id) is None:
             db.add(SessionRow(id=session_id, provider_id=uuid4(), model_name="test"))
             await db.flush()
-        await lock_session(db, session_id)
         await HistoryRepository(db).append_history(session_id, entries)
     return entries
 
 
 async def test_live_replays_completed_activity_batches(database, valkey_client, seed_session):
     session_id = uuid4()
-    await seed_session(session_id)
+    await seed_session(session_id, running=True)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     for seq, prompt in ((0, "first"), (2, "second")):
         await Recorder().persist_messages(
             *(
                 RunnerDeps(
-                    session_id=session_id, session_factory=database.sessions, output_service=outputs
+                    session_id=session_id,
+                    session_factory=database.sessions,
+                    output_service=outputs,
+                    activity_id=session_id,
                 ),
                 [
                     HistoryMessage(session_id, seq, ModelRequest([UserPromptPart(prompt)])),
@@ -99,7 +100,7 @@ async def test_subscribe_before_history_deduplicates_overlap(
     database, valkey_client, monkeypatch, seed_session
 ):
     session_id = uuid4()
-    await seed_session(session_id)
+    await seed_session(session_id, running=True)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     initial = await append(database, session_id, [ModelRequest(parts=[UserPromptPart("go")])], 0)
@@ -138,7 +139,7 @@ async def test_missing_notifications_backfill_history_once(
     database, valkey_client, monkeypatch, seed_session, broadcast_prefix
 ):
     session_id = uuid4()
-    await seed_session(session_id)
+    await seed_session(session_id, running=True)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     await append(database, session_id, [ModelRequest(parts=[UserPromptPart("go")])], 0)
@@ -281,7 +282,7 @@ async def test_start_cursor_and_reconnect_recover_unpublished_tail(
     database, valkey_client, seed_session
 ):
     session_id = uuid4()
-    await seed_session(session_id)
+    await seed_session(session_id, running=True)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     stored = await append(
@@ -301,7 +302,7 @@ async def test_replay_releases_only_database_connection_while_yielding_and_liste
     database, valkey_client, seed_session
 ):
     session_id = uuid4()
-    await seed_session(session_id)
+    await seed_session(session_id, running=True)
     await append(database, session_id, [response()], 0)
     engine = create_async_engine(
         database.engine.url,
@@ -343,7 +344,7 @@ async def test_unstarted_session_can_follow_new_execution(
     database, valkey_client, monkeypatch, seed_session
 ):
     session_id = uuid4()
-    await seed_session(session_id)
+    await seed_session(session_id, running=True)
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs, live_poll_interval=0.05)
     replayed = asyncio.Event()
@@ -361,7 +362,10 @@ async def test_unstarted_session_can_follow_new_execution(
         await Recorder().persist_messages(
             *(
                 RunnerDeps(
-                    session_id=session_id, session_factory=database.sessions, output_service=outputs
+                    session_id=session_id,
+                    session_factory=database.sessions,
+                    output_service=outputs,
+                    activity_id=session_id,
                 ),
                 [
                     HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("go")])),
@@ -388,7 +392,7 @@ async def test_unstarted_session_can_follow_new_execution(
 
 async def test_gaps_are_valid_and_later_broadcast_backfills(database, valkey_client, seed_session):
     session_id = uuid4()
-    await seed_session(session_id)
+    await seed_session(session_id, running=True)
     sessions = SessionService(database.sessions, output_service=AgentOutputService(valkey_client))
     await append(database, session_id, [response()], 0)
     async with individual_events(sessions, session_id) as events:

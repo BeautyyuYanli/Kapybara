@@ -22,7 +22,9 @@ on `app.state.resources`. SessionService resolves configuration per direct runne
 start, and submits the standalone Agent Activity to the common Temporal task queue.
 An independent `python -m kapy.runner.worker` owns Agent/model resources;
 interfaces submit Activity execution and do not start a Worker. Session creation
-only creates configuration; execution is submitted separately.
+dispatches its scope Activity and waits for readiness; its hooks perform business
+I/O in the Worker. Closing likewise requires the Worker. Agent execution is a
+separate run operation.
 
 Common environment values (read only during command execution):
 
@@ -36,12 +38,8 @@ Common environment values (read only during command execution):
 | KAPY_TEMPORAL_NAMESPACE | default |
 | KAPY_TEMPORAL_TASK_QUEUE | kapy-runner |
 | KAPY_LOG_LEVEL | INFO |
-| KAPY_HEARTBEAT_INTERVAL / KAPY_HEARTBEAT_TIMEOUT | 10 / 60 seconds |
-| KAPY_TAKEOVER_GRACE_PERIOD | 30 seconds, after expired-token takeover |
 | KAPY_OUTPUT_FLUSH_INTERVAL | 0.5 seconds |
 
-Session/layer scope lease users sharing core tables use compatible heartbeat settings.
-The Activity Worker owns model/output policy and does not use those leases.
 No command implicitly reads `.env`; export configuration or use `uv run --env-file`.
 Private interface databases do not inherit the core URL or schema. The process manager's
 own local database retains its existing independent lifecycle.

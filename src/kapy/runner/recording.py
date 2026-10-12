@@ -17,11 +17,11 @@ from pydantic_ai.capabilities import (
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import ModelRequestContext
-from sqlmodel import col, select
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_output import MessageCommitted
-from kapy.control.sessions.models import SessionRow
+from kapy.control.sessions.operations import OperationRepository
+from kapy.lifecycle import LifecycleStatus
 
 from .types import RunnerDeps
 
@@ -84,22 +84,18 @@ class Recorder:
                 }
 
     async def persist_messages(self, deps: RunnerDeps, messages: list[HistoryMessage]) -> None:
-        """Lock the session, commit accepted messages, then publish their snapshots.
+        """Confirm the current owner, commit accepted messages, then publish snapshots.
 
         Sealed positions are discarded. A missed broadcast is recovered by the
         existing history follower; no transaction spans publisher I/O.
         """
-        async with deps.session_factory.begin() as db:
-            session_id = (
-                await db.execute(
-                    select(SessionRow.id)
-                    .where(col(SessionRow.id) == deps.session_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if session_id is None:
-                raise LookupError(f"Session {deps.session_id} does not exist")
-            accepted = await HistoryRepository(db).append_history(session_id, messages)
+        async with deps.session_factory() as db, db.begin():
+            session, _ = await OperationRepository(db).guard(
+                deps.activity_id, (LifecycleStatus.RUNNING,)
+            )
+            if session.id != deps.session_id:
+                raise ValueError("Recording identity does not match session")
+            accepted = await HistoryRepository(db).append_history(session.id, messages)
         if accepted:
             async with deps.output_service.publisher(deps.session_id) as publish:
                 for message in accepted:

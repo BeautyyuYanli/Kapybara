@@ -1,6 +1,6 @@
-"""Serializable execution input, prepared by callers rather than resolved from a session.
+"""Serializable frozen input, loaded from the operation ledger by the Worker.
 
-The complete configuration, including the API key, is stored in Temporal payloads.
+The complete configuration, including the API key, is stored in private database input.
 `repr=False` prevents accidental repr disclosure; it does not encrypt payloads.
 Settings are final values, not overrides of a Worker-local model catalogue.
 """
@@ -52,10 +52,9 @@ class ExecutionConfig(DTO):
 
 
 class RunnerInput(DTO):
-    """The caller reads state and version together and serializes runs per session."""
+    """Immutable input frozen in the transaction that claims the session."""
 
     session_id: UUID
-    runner_state_version: int = Field(ge=0, strict=True)
     runner_state: str | None
     user_prompt: str
     config: ExecutionConfig
@@ -67,6 +66,7 @@ class RunnerDeps:
     """Mutable per-run State and borrowed Worker resources, never a Temporal payload."""
 
     session_id: UUID
+    activity_id: UUID
     session_factory: async_sessionmaker[AsyncSession]
     output_service: AgentOutputService
     layers: dict[str, LayerData] = field(default_factory=dict)

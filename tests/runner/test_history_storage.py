@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -23,7 +24,11 @@ from kapy.agent_history.repository import HistoryRepository
 from kapy.agent_output import MessageCommitted
 from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
-from kapy.control.sessions.repository import SessionRepository, lock_session
+from kapy.control.sessions.operations import OperationRepository, SessionOperationRow
+from kapy.control.sessions.repository import SessionRepository
+from kapy.control.sessions.types import OperationKind, OperationPhase, OwnershipLost
+from kapy.control.types import utc_now
+from kapy.lifecycle import LifecycleStatus
 from kapy.runner import Recorder, RunnerDeps
 
 pytestmark = pytest.mark.asyncio
@@ -62,6 +67,7 @@ async def test_stored_message_is_immutable_and_broadcast_preserves_complete_inpu
                 session_id=session_id,
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
+                activity_id=session_id,
             ),
             [entry],
         )
@@ -78,6 +84,7 @@ async def test_stored_message_is_immutable_and_broadcast_preserves_complete_inpu
                     session_id=session_id,
                     session_factory=runner_database.sessions,
                     output_service=runner_database.outputs,
+                    activity_id=session_id,
                 ),
                 [replace(entry, message=ModelRequest([UserPromptPart("changed")]))],
             )
@@ -95,7 +102,7 @@ async def test_stored_message_is_immutable_and_broadcast_preserves_complete_inpu
         assert stored[0].message.usage.input_tokens == 100
         assert stored[0].message.usage.output_tokens == 20
         assert await HistoryRepository(db).read_history_entries(session_id, after_seq=10) == ()
-        assert await SessionRepository(db).read_runner_state(session_id) == (None, 0)
+        assert await SessionRepository(db).read_runner_state(session_id) is None
 
 
 @pytest.mark.integration
@@ -129,6 +136,7 @@ async def test_invalid_batch_does_not_write_or_broadcast(runner_database, monkey
             session_id=session_id,
             session_factory=runner_database.sessions,
             output_service=runner_database.outputs,
+            activity_id=session_id,
         ),
         [valid, other],
     )
@@ -153,6 +161,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_id=session_id,
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
+                activity_id=session_id,
             ),
             initial,
         )
@@ -194,6 +203,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_id=session_id,
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
+                activity_id=session_id,
             ),
             batch,
         )
@@ -211,6 +221,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_id=session_id,
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
+                activity_id=session_id,
             ),
             [
                 history(session_id, 12, "changed retry"),
@@ -224,6 +235,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_id=session_id,
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
+                activity_id=session_id,
             ),
             [],
         )
@@ -242,11 +254,11 @@ async def test_append_borrows_transaction_and_returns_accepted_inputs(runner_dat
         history(session_id, 4),
     ]
     async with runner_database.sessions.begin() as db:
-        await lock_session(db, session_id)
+        await db.get(SessionRow, session_id)
         assert await HistoryRepository(db).append_history(session_id, initial) == tuple(initial)
     with pytest.raises(RuntimeError, match="rollback"):
         async with runner_database.sessions.begin() as db:
-            await lock_session(db, session_id)
+            await db.get(SessionRow, session_id)
             entry = history(session_id, 7)
             assert await HistoryRepository(db).append_history(session_id, [entry]) == (entry,)
             assert [
@@ -270,13 +282,14 @@ async def test_record_missing_session_does_not_publish(runner_database, monkeypa
         pytest.fail("missing sessions must not publish")
 
     monkeypatch.setattr(runner_database.outputs, "publisher", unexpected_publisher)
-    with pytest.raises(LookupError):
+    with pytest.raises(OwnershipLost):
         await Recorder().persist_messages(
             *(
                 RunnerDeps(
                     session_id=session_id,
                     session_factory=runner_database.sessions,
                     output_service=runner_database.outputs,
+                    activity_id=session_id,
                 ),
                 [history(session_id, 0)],
             )
@@ -289,18 +302,36 @@ async def test_record_missing_session_does_not_publish(runner_database, monkeypa
 async def test_record_serializes_session_writes_before_reading_boundary(runner_database):
     session_id, other_id = runner_database.session_id, uuid4()
     async with runner_database.sessions.begin() as db:
-        db.add(SessionRow(id=other_id, provider_id=uuid4(), model_name="test"))
+        db.add(
+            SessionRow(
+                id=other_id,
+                provider_id=uuid4(),
+                model_name="test",
+                status=LifecycleStatus.RUNNING,
+                current_activity_id=other_id,
+            )
+        )
+        db.add(
+            SessionOperationRow(
+                activity_id=other_id,
+                session_id=other_id,
+                kind=OperationKind.RUN,
+                phase=OperationPhase.RUNNING,
+                request={},
+                deadline=utc_now() + timedelta(hours=1),
+            )
+        )
     attempted_lock = asyncio.Event()
     engine = runner_database.sessions.kw["bind"]
 
     def before_execute(connection, cursor, statement, parameters, context, executemany):
-        if "FOR UPDATE" in statement:
+        if statement.startswith("UPDATE sessions"):
             attempted_lock.set()
 
     task = None
     try:
         async with runner_database.sessions.begin() as db:
-            await lock_session(db, session_id)
+            await OperationRepository(db).guard(session_id, (LifecycleStatus.RUNNING,))
             await HistoryRepository(db).append_history(session_id, [history(session_id, 2)])
             event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
             task = asyncio.create_task(
@@ -310,6 +341,7 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
                             session_id=session_id,
                             session_factory=runner_database.sessions,
                             output_service=runner_database.outputs,
+                            activity_id=session_id,
                         ),
                         [history(session_id, 1)],
                     )
@@ -324,6 +356,7 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
                             session_id=other_id,
                             session_factory=runner_database.sessions,
                             output_service=runner_database.outputs,
+                            activity_id=other_id,
                         ),
                         [history(other_id, 1)],
                     )
@@ -356,6 +389,7 @@ async def test_commit_before_broadcast_failure_recovers_without_retry_publicatio
                 session_id=session_id,
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
+                activity_id=session_id,
             ),
             [first],
         )
@@ -366,6 +400,7 @@ async def test_commit_before_broadcast_failure_recovers_without_retry_publicatio
             session_id=session_id,
             session_factory=runner_database.sessions,
             output_service=runner_database.outputs,
+            activity_id=session_id,
         ),
         [final],
     )

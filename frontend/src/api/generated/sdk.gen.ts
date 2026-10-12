@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { CloseSessionData, CloseSessionErrors, CloseSessionResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProviderData, DeleteProviderErrors, DeleteProviderResponses, DiscoverModelsData, DiscoverModelsErrors, DiscoverModelsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProviderData, GetProviderErrors, GetProviderResponses, GetSessionData, GetSessionErrors, GetSessionResponses, IsRunnerRunningData, IsRunnerRunningErrors, IsRunnerRunningResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ReadHistoryData, ReadHistoryErrors, ReadHistoryResponses, StartRunnerData, StartRunnerErrors, StartRunnerResponses, UpdateModelData, UpdateModelErrors, UpdateModelResponses, UpdateProviderData, UpdateProviderErrors, UpdateProviderResponses, UpdateSessionData, UpdateSessionErrors, UpdateSessionResponses } from './types.gen';
+import type { CloseSessionData, CloseSessionErrors, CloseSessionResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProviderData, DeleteProviderErrors, DeleteProviderResponses, DiscoverModelsData, DiscoverModelsErrors, DiscoverModelsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProviderData, GetProviderErrors, GetProviderResponses, GetSessionData, GetSessionErrors, GetSessionOperationData, GetSessionOperationErrors, GetSessionOperationResponses, GetSessionResponses, IsRunnerRunningData, IsRunnerRunningErrors, IsRunnerRunningResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ReadHistoryData, ReadHistoryErrors, ReadHistoryResponses, StartRunnerData, StartRunnerErrors, StartRunnerResponses, UpdateModelData, UpdateModelErrors, UpdateModelResponses, UpdateProviderData, UpdateProviderErrors, UpdateProviderResponses, UpdateSessionData, UpdateSessionErrors, UpdateSessionResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -138,7 +138,14 @@ export const updateSession = <ThrowOnError extends boolean = false>(options: Opt
 /**
  * Close Session
  */
-export const closeSession = <ThrowOnError extends boolean = false>(options: Options<CloseSessionData, ThrowOnError>): RequestResult<CloseSessionResponses, CloseSessionErrors, ThrowOnError> => (options.client ?? client).post<CloseSessionResponses, CloseSessionErrors, ThrowOnError>({ url: '/api/sessions/{session_id}/close', ...options });
+export const closeSession = <ThrowOnError extends boolean = false>(options: Options<CloseSessionData, ThrowOnError>): RequestResult<CloseSessionResponses, CloseSessionErrors, ThrowOnError> => (options.client ?? client).post<CloseSessionResponses, CloseSessionErrors, ThrowOnError>({
+    url: '/api/sessions/{session_id}/close',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
 
 /**
  * Is Runner Running
@@ -156,6 +163,11 @@ export const startRunner = <ThrowOnError extends boolean = false>(options: Optio
         ...options.headers
     }
 });
+
+/**
+ * Get Session Operation
+ */
+export const getSessionOperation = <ThrowOnError extends boolean = false>(options: Options<GetSessionOperationData, ThrowOnError>): RequestResult<GetSessionOperationResponses, GetSessionOperationErrors, ThrowOnError> => (options.client ?? client).get<GetSessionOperationResponses, GetSessionOperationErrors, ThrowOnError>({ url: '/api/sessions/{session_id}/operations/{activity_id}', ...options });
 
 /**
  * Read History

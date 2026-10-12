@@ -23,58 +23,43 @@ async def enter_scope(scope_id: UUID, config: Config) -> State: ...
 async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> None: ...
 ```
 
-The layer's scope ID is the host session UUID, stable across runs and process
-restarts. Session creation validates all Config and no-enter default States, then
-acquires the session lease and commits `creating` with its identity and fixed Config.
-Only acknowledged registration permits enters, in configured order outside database
-transactions. A valid returned State
-is the initial State; its fields need not have defaults. Without enter, the host
-initializes State from `{}`. Hook parameters are validated model copies; persisted
-Config and State remain JSON objects. SDK component construction and client close
-are separate lifetimes and do not enter or exit the business scope.
+The scope ID is the host session UUID, stable across runs and process restarts.
+SessionService validates Config and no-enter default States, then atomically
+reserves creating with fixed Config and a pending create operation. Its UUID
+activity_id is the Temporal ID and permanent database key. A Worker Activity claims
+pending before enter hooks; hooks never hold a database transaction. Without enter,
+State is initialized from `{}`; returned State can require fields without defaults.
+Config and State remain JSON, while SDK component/client lifetimes stay separate.
 
-Complete State is saved atomically with `ready` under that same lease; partial
-initialization State is never saved. Failed/cancelled initialization first persists
-`closing`, then calls every configured exit in reverse order with None, including
-failed and uncalled enters. Exit must clean by scope ID and Config without State;
-None does not mean no resources. It must safely handle absent resources and repeated
-calls. One failed exit does not prevent other exits. Cleanup failure leaves durable
-`closing` for explicit close, while the original creation error remains the cause.
-After a ready COMMIT error, the original transaction ends before a new protected
-transaction resolves the authoritative row: ready is retained, creating is closed.
-Unavailable storage leaves the outcome unconfirmed and does not trigger blind exit.
+Complete State, ready and the saved creation result commit together. Failed creation
+moves to closing while retaining its running operation through compensation, exits
+all configured layers in reverse with None, including partial/uncalled enters, then
+records failed/closed or failed/closing. None does not mean no remote resources.
+An uncertain ready commit is checked before compensation; a committed success
+cannot be overwritten or cleaned up by that failed acknowledgment.
 
-Session close obtains the existing exclusive lease, checks active Activities for
-initialized sessions, and persists `closing` before calling exits outside database
-transactions. An exit may
-mutate State to record confirmed cleanup. The host validates and saves that State
-under the lease after every attempt, including error or cancellation. Storage or
-validation failures stop retrying that layer; remaining layers are still attempted.
-All cleanup must succeed before `closed`;
-failure keeps `closing` and any saved progress. A repeated close can call an earlier
-successful exit again; an already closed session returns without calling hooks.
+Close claims ready or closing whose previous operation is terminal, using a new ID.
+Exit hooks run in reverse and save validated mutable State after each attempt,
+including errors/cancellation. Ordinary failures still attempt remaining exits;
+all cleanup must succeed for closed. Failure saves progress and closing. Same-key
+terminal close returns its prior result; a new explicit close may repeat successful
+exits, so exits must always be idempotent and accept None for abandoned initialization.
 
-Only an explicit `pydantic_ai_layer_protocol.RetryableScopeError` automatically retries a hook,
-at most three attempts separated by 0.5 seconds. Use exception chaining to retain
-the underlying cause. Ordinary errors, invalid State and cancellation are not
-retried; nested causes and exception groups do not imply retryability. Every retry
-uses the same scope ID and Config. Normal close exits retain revalidated, persisted
-cleanup State; creation-failure compensation uniformly uses None. Enter need not
-be globally idempotent: throwing RetryableScopeError explicitly promises safe
-repetition of that call. Exit is always idempotent, including partial effects,
-lost acknowledgements and repeated close. A restarted host closes abandoned creating
-records rather than replaying enter. If remote creates can complete late, the service
-must terminally close scopes or the layer must reclaim late resources. The lease
-fences local writes and cannot revoke an already-issued external request.
-The host supplies no generic resource manager or background scope workflow.
+Only outer `RetryableScopeError` allows three hook attempts separated by 0.5 seconds.
+Nested causes/groups, invalid State and ordinary errors are not retry signals.
+The fixed ID/Config survives those attempts; State progress is validated and saved
+before the next exit attempt. Storage/validation failure does not retry a hook.
+This is the existing business-hook contract; Temporal itself uses one attempt and
+never restores the Agent or automatically replays enter.
 
-CreateSession accepts an optional fixed UUID. Duplicate creation reports that
-identity without replaying enter; callers query or close the same
-ID. HTTP creation errors after reservation begins include the ID, hide upstream
-details and report exhausted retryable errors as 503. Telegram saves the ID before
-creation and queries it on inbox recovery. Neither interface automatically repeats
-creation after the hook's bounded attempts.
-
+Every new scope/model/tool call checks current_activity_id, operation phase and
+fixed deadline. Progress/result writes conditionally check them in one short
+transaction, without SELECT FOR UPDATE or a lease. A stale owner cannot issue
+further calls or write back; already-issued remote I/O cannot be revoked. Layers
+must reclaim late allocations or provide terminal scope closure by ID/Config.
+Caller disconnect does not stop Worker hooks; actual Activity cancellation executes
+owned compensation/failure handling. There is no generic resource manager,
+background scope recovery or Workflow.
 
 ## Shell layer
 

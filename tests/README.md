@@ -52,9 +52,9 @@ resource cleanup. Native ownership, tool flags and deferred capability/Toolset
 instructions are checked through ordinary Agent runs. No external model API is called.
 
 Shared PostgreSQL/Valkey fixtures live in `tests/conftest.py`. `tests/control`
-covers catalog, durable admission, session state and layer lifecycle;
-`tests/session_lease` covers heartbeat/fencing independently of execution.
+covers catalog, permanent operation identity, conditional ownership, deadline
+fencing and layer lifecycle.
 `tests/agent_output` covers transport and history replay, and `tests/database`
-checks both historical revisions and the durable-only removal. History fixtures
-write through HistoryRepository under the session row lock; no legacy runner is
+checks historical revisions and the current operation migration. History fixtures
+write through HistoryRepository in isolated short transactions; no legacy runner is
 used to seed current tests.

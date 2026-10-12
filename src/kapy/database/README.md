@@ -21,8 +21,8 @@ opens its own SQLite file. Unversioned/pre-baseline databases are not silently
 stamped or converted; recreate those development databases. Stopping processes
 never drops data. The process manager's SQLite is outside these histories.
 
-Current core metadata consists of ControlTable, history_metadata and lease_metadata.
-Current tables are providers, models, sessions, agent_history and session_leases.
+Current core metadata consists of ControlTable and history_metadata.
+Current tables are providers, models, sessions, agent_history and session_operations.
 `OWNED_TABLES` also retains removed/renamed table names so autogeneration can discover
 removal. Reflection excludes unrelated tables and schemas. Core versions live in
 `database/migrations/` with `core_schema_version`; Telegram versions live in
@@ -32,16 +32,27 @@ rendering for structural changes.
 
 ## Durable snapshots, layers and history
 
-Sessions retain opaque `runner_state` TEXT and BIGINT `runner_state_version`,
-initially NULL/0. Runner owns encoding; the session repository owns versioned,
-idempotent replacement. Neither is exposed in configuration DTOs. No snapshot is
-derived from legacy history.
+Sessions retain opaque runner_state TEXT, initially NULL, fixed Config and mutable
+layer State JSON. current_activity_id identifies the operation allowed to write.
+The permanent session_operations ledger stores normalized intent, frozen input,
+phase, native run_id, fixed deadline and immutable result/safe error. Private input
+includes provider credentials and is never returned by public DTOs. Temporal input
+is only the UUID. Run final save commits snapshot, all States, ready and succeeded
+output together; cleanup saves individual State progress in owned short transactions.
+No snapshot version or session lease protocol remains.
 
-Native layer Config and internal State use separate sessions.layers/layer_states
-JSON columns. Creation fixes identity/Config with CREATING and empty State, then
-publishes complete initial State with READY. Tools mutate the Activity's per-run State directly. Final save replaces all States and messages together under the same
-version; CLOSING cleanup alone saves individual layer progress. No separate
-StateStore or layer-owned database is introduced.
+The session-operations revision moves existing nonclosed sessions to closing,
+preserving snapshots, history and State for reads/explicit cleanup. It does not
+fabricate completion evidence or call remote hooks. It adds the operation ledger
+and current ID, removes session_leases and runner_state_version, and rejects
+downgrade because earlier ownership cannot be reconstructed. Generate it against
+a disposable preceding schema with `kapy db revision --message '...' --plan
+session-operations`; revisions are generated, not edited manually.
+
+This ownership migration requires old interfaces/Workers stopped and old Activities
+drained or ended. The SQL changes ownership records; it cannot stop execution.
+New code must use the new schema and UUID-only Activity inputs together: preceding
+RunnerInput payloads and lease/version-based Workers are incompatible with it.
 
 Shell layer State requires `scope_id` alongside `jobs`; its enter hook initializes
 the UUID from the session identity. The data-only revision fills a missing field

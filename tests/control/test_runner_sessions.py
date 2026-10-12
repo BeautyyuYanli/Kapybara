@@ -1,186 +1,197 @@
-"""Durable admission uses PostgreSQL locks and actual Temporal execution identities."""
+"""Real database ownership and native Temporal identity across admission races."""
 
 import asyncio
-import os
-from contextlib import suppress
-from unittest.mock import AsyncMock, Mock
+from datetime import timedelta
+from unittest.mock import Mock
 from uuid import uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from temporalio.client import ActivityExecutionDescription, ActivityExecutionStatus, Client
-from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.control.models import ModelService
-from kapy.control.sessions import RunnerConflict, SessionService
+from kapy.control.sessions import (
+    OperationConflict,
+    OperationPhase,
+    SessionBusy,
+    SessionService,
+    UpdateSession,
+)
 from kapy.control.sessions.models import SessionRow
+from kapy.control.sessions.operations import SessionOperationRow
+from kapy.control.types import utc_now
 from kapy.interfaces.http import create_router
 from kapy.lifecycle import LifecycleError, LifecycleStatus
-from kapy.session_lease import SessionBusy, open_session_lease
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-async def client():
-    return await Client.connect(
-        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
-        data_converter=pydantic_data_converter,
-    )
-
-
-@pytest.mark.parametrize(
-    "phase", [LifecycleStatus.CREATING, LifecycleStatus.CLOSING, LifecycleStatus.CLOSED]
-)
-async def test_non_ready_session_rejects_execution_before_temporal_calls(
-    database, seed_session, phase
+async def test_queued_run_owns_session_and_reuses_original_execution(
+    database, seed_session, session_runtime
 ):
-    session_id = uuid4()
+    session_id, activity_id = uuid4(), uuid4()
     await seed_session(session_id)
-    async with database.sessions.begin() as db:
-        row = await db.get(SessionRow, session_id)
-        assert row is not None
-        row.status = phase
-    temporal = Mock(spec=Client)
+    client = session_runtime.client
     sessions = SessionService(
-        database.sessions, temporal_client=temporal, temporal_task_queue="unused"
+        database.sessions, temporal_client=client, temporal_task_queue=f"unpolled-{uuid4()}"
     )
-    with pytest.raises(LifecycleError):
-        await sessions.start_runner(session_id, user_prompt="do not execute")
-    temporal.get_activity_handle.assert_not_called()
-    temporal.start_activity.assert_not_called()
-
-
-async def test_real_temporal_admission_and_status_use_activity_without_execution_lease(
-    database, seed_session
-):
-    temporal = await client()
-    session_id = uuid4()
-    await seed_session(session_id)
-    sessions = SessionService(
-        database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
-    )
-    assert not await sessions.is_runner_running(session_id)
-    # A scope lease is not an execution dependency or evidence of a running Activity.
-    async with open_session_lease(session_id, session_factory=database.sessions):
-        handle = await sessions.start_runner(session_id, user_prompt="direct prompt")
+    first = await sessions.start_runner(session_id, activity_id=activity_id, user_prompt="original")
     try:
-        assert handle.id == f"kapy-runner:{session_id}" and handle.run_id
+        second = await sessions.start_runner(
+            session_id, activity_id=activity_id, user_prompt="original"
+        )
+        assert first == second and first.phase == OperationPhase.PENDING and first.run_id
+        assert (await sessions.get_session(session_id)).status == LifecycleStatus.STARTING
         assert await sessions.is_runner_running(session_id)
+        with pytest.raises(OperationConflict):
+            await sessions.start_runner(session_id, activity_id=activity_id, user_prompt="changed")
         with pytest.raises(SessionBusy):
-            await sessions.start_runner(session_id, user_prompt="busy")
+            await sessions.start_runner(session_id, activity_id=uuid4(), user_prompt="another")
         with pytest.raises(SessionBusy):
-            await sessions.close_session(session_id)
-        assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
+            await sessions.close_session(session_id, activity_id=uuid4())
+        with pytest.raises(LifecycleError):
+            await sessions.update_session(session_id, UpdateSession(title="busy"))
+        assert (
+            await client.get_activity_handle(str(activity_id)).describe()
+        ).activity_run_id == first.run_id
     finally:
-        await handle.terminate(reason="test cleanup")
+        await client.get_activity_handle(str(activity_id), run_id=first.run_id).terminate(
+            reason="test cleanup"
+        )
+    ended = await sessions.get_operation(session_id, activity_id)
+    assert ended.phase == OperationPhase.FAILED
+    assert (await sessions.get_session(session_id)).status == LifecycleStatus.CLOSING
     assert not await sessions.is_runner_running(session_id)
-    with pytest.raises(RunnerConflict):
-        await sessions.start_runner(session_id, user_prompt="do not restart old state")
-    await sessions.close_session(session_id)
-    with pytest.raises(LifecycleError):
-        await sessions.start_runner(session_id, user_prompt="closed")
+    cleanup = session_runtime.service(database.sessions)
+    assert (
+        await cleanup.close_session(session_id, activity_id=uuid4())
+    ).status == LifecycleStatus.CLOSED
+    assert (
+        await sessions.start_runner(session_id, activity_id=activity_id, user_prompt="original")
+        == ended
+    )
 
 
-async def test_concurrent_starts_admit_one_execution(database, seed_session):
-    temporal = await client()
-    session_id = uuid4()
+@pytest.mark.parametrize("same_key", [False, True])
+async def test_concurrent_submission_has_one_owner(
+    database, seed_session, session_runtime, same_key
+):
+    session_id, key = uuid4(), uuid4()
     await seed_session(session_id)
     sessions = SessionService(
-        database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
+        database.sessions,
+        temporal_client=session_runtime.client,
+        temporal_task_queue=f"unpolled-{uuid4()}",
     )
     results = await asyncio.gather(
-        *(sessions.start_runner(session_id, user_prompt=text) for text in ["one", "two"]),
+        *(
+            sessions.start_runner(
+                session_id, activity_id=key if same_key else uuid4(), user_prompt="same"
+            )
+            for _ in range(2)
+        ),
         return_exceptions=True,
     )
-    handles = [result for result in results if not isinstance(result, BaseException)]
+    operations = [result for result in results if not isinstance(result, BaseException)]
     try:
-        assert len(handles) == 1
-        assert sum(isinstance(result, SessionBusy) for result in results) == 1
+        assert len(operations) == (2 if same_key else 1)
+        assert len({operation.activity_id for operation in operations}) == 1
+        if same_key:
+            assert operations[0].run_id == operations[1].run_id
+        else:
+            assert sum(isinstance(result, SessionBusy) for result in results) == 1
     finally:
-        for handle in handles:
-            await handle.terminate(reason="test cleanup")
+        for key in {operation.activity_id for operation in operations}:
+            await session_runtime.client.get_activity_handle(str(key)).terminate(
+                reason="test cleanup"
+            )
 
 
-async def test_close_serializes_with_inflight_start_confirmation(database, seed_session):
-    temporal = await client()
-    session_id = uuid4()
+@pytest.mark.parametrize("failure", ["rpc", "cancelled"])
+async def test_uncertain_start_keeps_ownership_and_same_key_confirms(
+    database, seed_session, session_runtime, monkeypatch, failure
+):
+    session_id, key = uuid4(), uuid4()
     await seed_session(session_id)
+    client = session_runtime.client
+    original = client.start_activity
     accepted, release = asyncio.Event(), asyncio.Event()
-    original = temporal.start_activity
     handles = []
 
-    async def held_start(*args, **kwargs):
-        handle = await original(*args, **kwargs)
-        handles.append(handle)
+    async def uncertain(*args, **kwargs):
+        handles.append(await original(*args, **kwargs))
         accepted.set()
         await release.wait()
-        return handle
+        raise RPCError("secret confirmation failure", RPCStatusCode.DEADLINE_EXCEEDED, b"")
 
-    temporal.start_activity = held_start
+    monkeypatch.setattr(client, "start_activity", uncertain)
     sessions = SessionService(
-        database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
+        database.sessions, temporal_client=client, temporal_task_queue=f"unpolled-{uuid4()}"
     )
-    start = asyncio.create_task(sessions.start_runner(session_id, user_prompt="one"))
-    close = None
+    task = asyncio.create_task(
+        sessions.start_runner(session_id, activity_id=key, user_prompt="original")
+    )
     try:
         await asyncio.wait_for(accepted.wait(), 5)
-        close = asyncio.create_task(sessions.close_session(session_id))
-        await asyncio.sleep(0.05)
-        assert not close.done()
-        release.set()
-        await start
+        # The database connection is free while submission is awaiting RPC.
+        async with database.sessions.begin() as db:
+            assert (await db.get(SessionRow, session_id)).status == LifecycleStatus.STARTING
         with pytest.raises(SessionBusy):
-            await close
-        assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
+            await sessions.close_session(session_id, activity_id=uuid4())
+        if failure == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            with pytest.raises(RPCError):
+                await task
+        monkeypatch.setattr(client, "start_activity", original)
+        confirmed = await sessions.start_runner(session_id, activity_id=key, user_prompt="original")
+        assert confirmed.run_id == handles[0].run_id
     finally:
         release.set()
-        for task in (start, close):
-            if task is not None:
-                task.cancel()
-                with suppress(asyncio.CancelledError, SessionBusy):
-                    await task
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         for handle in handles:
             await handle.terminate(reason="test cleanup")
 
 
-@pytest.mark.parametrize("status", [RPCStatusCode.UNAVAILABLE, RPCStatusCode.DEADLINE_EXCEEDED])
-async def test_temporal_rpc_failures_are_not_idle_or_leaked_over_http(
-    database, seed_session, status
+async def test_expired_unconfirmed_operation_is_terminal_and_does_not_resubmit(
+    database, seed_session, session_runtime, monkeypatch
 ):
-    session_id = uuid4()
+    session_id, key = uuid4(), uuid4()
     await seed_session(session_id)
-    temporal = Mock(spec=Client)
-    temporal.get_activity_handle.return_value.describe = AsyncMock(
-        side_effect=RPCError("secret-provider-payload", status, b"")
-    )
-    sessions = SessionService(database.sessions, temporal_client=temporal, temporal_task_queue="q")
-    with pytest.raises(RPCError):
-        await sessions.is_runner_running(session_id)
-    with pytest.raises(RPCError):
-        await sessions.close_session(session_id)
-    assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
-    app = FastAPI()
-    app.include_router(create_router(ModelService(database.sessions), sessions))
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app), base_url="http://test"
-    ) as http:
-        for result in (
-            await http.get(f"/api/sessions/{session_id}/runner"),
-            await http.post(f"/api/sessions/{session_id}/runner", json={"user_prompt": "hello"}),
-        ):
-            assert result.status_code == 503
-            assert "secret" not in result.text
-    temporal.start_activity.assert_not_called()
-
-
-async def test_http_start_returns_temporal_run_identity_and_busy_conflicts(database, seed_session):
-    session_id = uuid4()
-    await seed_session(session_id)
-    temporal = await client()
     sessions = SessionService(
-        database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
+        database.sessions,
+        temporal_client=session_runtime.client,
+        temporal_task_queue=f"unpolled-{uuid4()}",
+    )
+    operation = await sessions.start_runner(session_id, activity_id=key, user_prompt="original")
+    await session_runtime.client.get_activity_handle(str(key)).terminate(reason="test cleanup")
+    async with database.sessions.begin() as db:
+        row = await db.get(SessionOperationRow, key)
+        row.deadline = utc_now() - timedelta(seconds=1)
+    monkeypatch.setattr(
+        session_runtime.client,
+        "start_activity",
+        Mock(side_effect=AssertionError("must not resurrect")),
+    )
+    ended = await sessions.start_runner(session_id, activity_id=key, user_prompt="original")
+    assert ended.phase == OperationPhase.FAILED and ended.run_id == operation.run_id
+    assert (await sessions.get_session(session_id)).status == LifecycleStatus.CLOSING
+
+
+async def test_http_requires_keys_returns_public_operation_and_enforces_intent(
+    database, seed_session, session_runtime
+):
+    session_id, key = uuid4(), uuid4()
+    await seed_session(session_id)
+    sessions = SessionService(
+        database.sessions,
+        temporal_client=session_runtime.client,
+        temporal_task_queue=f"unpolled-{uuid4()}",
     )
     app = FastAPI()
     app.include_router(create_router(ModelService(database.sessions), sessions))
@@ -189,97 +200,72 @@ async def test_http_start_returns_temporal_run_identity_and_busy_conflicts(datab
             transport=httpx.ASGITransport(app), base_url="http://test"
         ) as http:
             path = f"/api/sessions/{session_id}/runner"
-            assert (await http.get(path)).json() is False
-            assert (await http.post(path, json={"user_prompt": ["not text"]})).status_code == 422
-            result = await http.post(path, json={"user_prompt": "hello"})
-            assert result.status_code == 202
-            data = result.json()
-            description = await temporal.get_activity_handle(data["activity_id"]).describe()
-            assert data == {
-                "activity_id": f"kapy-runner:{session_id}",
-                "run_id": description.activity_run_id,
-            }
-            assert (await http.get(path)).json() is True
-            assert (await http.post(path, json={"user_prompt": "busy"})).status_code == 409
-            await temporal.get_activity_handle(data["activity_id"]).terminate(
-                reason="test terminal"
-            )
-            assert (await http.post(path, json={"user_prompt": "failed"})).status_code == 409
+            assert (await http.post(path, json={"user_prompt": "hello"})).status_code == 422
+            body = {"activity_id": str(key), "user_prompt": "hello"}
+            response = await http.post(path, json=body)
+            assert response.status_code == 202
+            data = response.json()
+            assert data["activity_id"] == str(key) and data["phase"] == "pending" and data["run_id"]
+            assert "input" not in data and "request" not in data and "test-key" not in response.text
+            assert (await http.post(path, json=body)).json() == data
+            assert (
+                await http.post(path, json=body | {"user_prompt": "different"})
+            ).status_code == 409
+            assert (await http.get(f"/api/sessions/{session_id}/operations/{key}")).json() == data
+            assert (await http.get(f"/api/sessions/{uuid4()}/operations/{key}")).status_code == 404
     finally:
-        handle = temporal.get_activity_handle(f"kapy-runner:{session_id}")
-        if (await handle.describe()).status == ActivityExecutionStatus.RUNNING:
-            await handle.terminate(reason="test cleanup")
+        await session_runtime.client.get_activity_handle(str(key)).terminate(reason="test cleanup")
 
 
-@pytest.mark.parametrize("failure", ["rpc", "cancelled"])
-async def test_accepted_start_survives_local_confirmation_failure(
-    database, seed_session, monkeypatch, failure
+@pytest.mark.parametrize("query_failure", ["not_found", "unavailable"])
+async def test_unknown_execution_keeps_owner_until_fixed_deadline(
+    database, seed_session, session_runtime, monkeypatch, query_failure
 ):
-    temporal = await client()
-    session_id = uuid4()
+    from unittest.mock import AsyncMock
+
+    session_id, key = uuid4(), uuid4()
     await seed_session(session_id)
-    original = temporal.start_activity
-    accepted, release = asyncio.Event(), asyncio.Event()
-    handles = []
-    attempts = 0
-    rpc_failure = RPCError("start confirmation lost", RPCStatusCode.DEADLINE_EXCEEDED, b"")
-
-    async def unconfirmed_start(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        handle = await original(*args, **kwargs)
-        handles.append(handle)
-        accepted.set()
-        await release.wait()
-        raise rpc_failure
-
-    monkeypatch.setattr(temporal, "start_activity", unconfirmed_start)
+    client = session_runtime.client
     sessions = SessionService(
-        database.sessions, temporal_client=temporal, temporal_task_queue=f"unpolled-{uuid4()}"
+        database.sessions, temporal_client=client, temporal_task_queue=f"unpolled-{uuid4()}"
     )
-    start = asyncio.create_task(sessions.start_runner(session_id, user_prompt="one"))
-    try:
-        await asyncio.wait_for(accepted.wait(), 5)
-        if failure == "cancelled":
-            start.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await start
-        else:
-            release.set()
-            with pytest.raises(RPCError) as caught:
-                await start
-            assert caught.value is rpc_failure
-        assert (await handles[0].describe()).status == ActivityExecutionStatus.RUNNING
-        assert await sessions.is_runner_running(session_id)
-        with pytest.raises(SessionBusy):
-            await sessions.start_runner(session_id, user_prompt="another prompt")
-        with pytest.raises(SessionBusy):
-            await sessions.close_session(session_id)
-        assert attempts == 1
-        assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
-    finally:
-        start.cancel()
-        await asyncio.gather(start, return_exceptions=True)
-        for handle in handles:
-            await handle.terminate(reason="test cleanup")
-
-
-async def test_paused_activity_still_owns_session_admission(database, seed_session):
-    session_id = uuid4()
-    await seed_session(session_id)
-    # Pausing is an optional server operator API. Its SDK status still represents
-    # an existing execution and must not permit closing the underlying scope.
-    temporal = Mock(spec=Client)
-    temporal.get_activity_handle.return_value.describe = AsyncMock(
-        return_value=Mock(spec=ActivityExecutionDescription, status=ActivityExecutionStatus.PAUSED)
+    # No execution is accepted, but the durable pending owner already exists.
+    start = AsyncMock(
+        side_effect=RPCError("submission unavailable", RPCStatusCode.UNAVAILABLE, b"")
     )
-    sessions = SessionService(
-        database.sessions, temporal_client=temporal, temporal_task_queue="unused"
-    )
+    monkeypatch.setattr(client, "start_activity", start)
+    with pytest.raises(RPCError):
+        await sessions.start_runner(session_id, activity_id=key, user_prompt="original")
+    handle = client.get_activity_handle(str(key))
+    with pytest.raises(RPCError) as missing:
+        await handle.describe()
+    assert missing.value.status == RPCStatusCode.NOT_FOUND
+    if query_failure == "unavailable":
+        monkeypatch.setattr(
+            handle,
+            "describe",
+            AsyncMock(side_effect=RPCError("query unavailable", RPCStatusCode.UNAVAILABLE, b"")),
+        )
+        monkeypatch.setattr(client, "get_activity_handle", lambda *args, **kwargs: handle)
+    pending = await sessions.get_operation(session_id, key)
+    assert pending.phase == OperationPhase.PENDING and pending.run_id is None
+    assert (await sessions.get_session(session_id)).status == LifecycleStatus.STARTING
     assert await sessions.is_runner_running(session_id)
     with pytest.raises(SessionBusy):
-        await sessions.start_runner(session_id, user_prompt="busy")
+        await sessions.start_runner(session_id, activity_id=uuid4(), user_prompt="other")
     with pytest.raises(SessionBusy):
-        await sessions.close_session(session_id)
-    assert (await sessions.get_session(session_id)).status == LifecycleStatus.READY
-    temporal.start_activity.assert_not_called()
+        await sessions.close_session(session_id, activity_id=uuid4())
+    async with database.sessions.begin() as db:
+        row = await db.get(SessionRow, session_id)
+        operation = await db.get(SessionOperationRow, key)
+        assert row.current_activity_id == key and operation.deadline == pending.deadline
+        operation.deadline = utc_now() - timedelta(seconds=1)
+    terminal = await sessions.get_operation(session_id, key)
+    assert terminal.phase == OperationPhase.FAILED
+    assert (await sessions.get_session(session_id)).status == LifecycleStatus.CLOSING
+    assert not await sessions.is_runner_running(session_id)
+    assert (
+        await sessions.start_runner(session_id, activity_id=key, user_prompt="original") == terminal
+    )
+    # Terminal confirmation cannot create a new native record even though none exists.
+    start.assert_awaited_once()

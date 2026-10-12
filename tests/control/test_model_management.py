@@ -86,12 +86,12 @@ async def create_provider(catalog, *, google=False, responses=False, **overrides
     return await catalog.create_provider(CreateProvider.model_validate(data | overrides))
 
 
-async def test_catalog_crud_references_and_session_settings(database, sdk_http):
+async def test_catalog_crud_references_and_session_settings(database, sdk_http, session_runtime):
     def unexpected(request):
         raise AssertionError("CRUD must not request a remote model")
 
     clients = sdk_http(unexpected)
-    catalog, sessions = ModelService(database.sessions), SessionService(database.sessions)
+    catalog, sessions = ModelService(database.sessions), session_runtime.service(database.sessions)
     provider = await create_provider(catalog)
     assert "stored-secret" not in provider.model_dump_json()
     first = await catalog.create_model(
@@ -123,7 +123,8 @@ async def test_catalog_crud_references_and_session_settings(database, sdk_http):
             provider_id=provider.id,
             model_name=first.model_name,
             model_settings={"max_tokens": 20},
-        )
+        ),
+        activity_id=uuid4(),
     )
     assert session.model_settings == {"max_tokens": 20}
     updated_session = await sessions.update_session(
@@ -156,7 +157,7 @@ async def test_catalog_crud_references_and_session_settings(database, sdk_http):
         await catalog.get_provider(provider.id)
 
 
-async def test_sdk_settings_validation_and_update_semantics(database):
+async def test_sdk_settings_validation_and_update_semantics(database, session_runtime):
     catalog = ModelService(database.sessions)
     provider = await create_provider(catalog)
     model = await catalog.create_model(
@@ -167,11 +168,12 @@ async def test_sdk_settings_validation_and_update_semantics(database):
             settings={"timeout": 10, "temperature": 0.4},
         )
     )
-    sessions = SessionService(database.sessions)
+    sessions = session_runtime.service(database.sessions)
     session = await sessions.create_session(
         CreateSession(
             provider_id=provider.id, model_name=model.model_name, model_settings={"max_tokens": 100}
-        )
+        ),
+        activity_id=uuid4(),
     )
     for invalid in ({"not_a_setting": 1}, {"temperature": {}}, {"timeout": {"read": 10}}):
         with pytest.raises(ValueError):
@@ -195,7 +197,7 @@ async def test_sdk_settings_validation_and_update_semantics(database):
     temporal = await Client.connect(os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"))
     executing = SessionService(database.sessions, temporal_client=temporal, temporal_task_queue="q")
     with pytest.raises(ValueError):
-        await executing.start_runner(session.id, user_prompt="go")
+        await executing.start_runner(session.id, user_prompt="go", activity_id=uuid4())
     assert not await executing.is_runner_running(session.id)
     changed = await catalog.update_provider(
         provider.id, UpdateProvider(api_key=SecretStr("new-secret"), base_url=None)

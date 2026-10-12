@@ -1,6 +1,6 @@
 """Independent Temporal Worker; SIGTERM drains it before the process exits.
 
-The Worker executes one standalone Activity on the configured queue.
+The Worker executes create/run/close standalone Activities on the configured queue.
 It shares the application resource factory; resources outlive all Worker tasks.
 Database and Valkey clients outlive all Activity calls.
 """
@@ -29,7 +29,7 @@ async def serve(settings: CommonSettings) -> None:
         async with Worker(
             resources.temporal_client,
             task_queue=settings.temporal_task_queue,
-            activities=[runner.run],
+            activities=[runner.create, runner.run, runner.close],
             graceful_shutdown_timeout=timedelta(seconds=15),
         ):
             await asyncio.Future()

@@ -1,70 +1,66 @@
-"""Session configuration, durable execution admission and immutable output replay.
+"""Durable session operations, configuration and immutable output replay.
 
-Short transactions own configuration. Admission holds the session row lock through
-bounded Temporal RPCs; the Worker owns model execution and resources. Native layer
-business scopes use the separate session lease for creation/close with fencing.
-Static definitions come from layers.registry.layer_registry, shared with the Worker.
-Each live call owns its subscription/read task; no transaction spans a yield.
+Database ownership is claimed before Temporal submission. Every external call is
+outside its short transaction. Same-key requests reuse frozen input and permanent
+outcomes; uncertain dispatch never releases the session. Workers own all scopes,
+model/tool resources and execution. Each live call owns its subscription/read task.
 """
 
 import asyncio
-import logging
 import math
-from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from copy import deepcopy
+from collections.abc import AsyncGenerator
 from datetime import timedelta
 from uuid import UUID, uuid4
 
-import anyio
-from pydantic import BaseModel
 from pydantic_ai.exceptions import UserError
+from sqlalchemy import or_, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import col, select
-from temporalio.client import ActivityExecutionStatus, ActivityHandle, Client
+from temporalio.client import ActivityExecutionStatus, Client
 from temporalio.common import ActivityIDConflictPolicy, ActivityIDReusePolicy, RetryPolicy
 from temporalio.exceptions import ActivityAlreadyStartedError
-from temporalio.service import RPCError, RPCStatusCode
+from temporalio.service import RPCError
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
-from kapy.agent_history.models import AgentHistoryRow
 from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent, TextDelta
 from kapy.control.models.repository import ModelRepository
 from kapy.control.models.runtime import resolve_classes, validate_settings
 from kapy.control.types import utc_now
 from kapy.layers.registry import layer_registry
-from kapy.layers.scopes import retry_scope
-from kapy.lifecycle import LifecycleError, LifecycleStatus
+from kapy.lifecycle import LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 from kapy.runner.types import ExecutionConfig, RunnerInput
-from kapy.session_lease import SessionBusy, SessionLease, open_session_lease
 from pydantic_ai_layer_protocol import dump_object
-from pydantic_ai_layer_protocol.types import JsonObject
 
-from .repository import SessionRepository, lock_session
+from .models import SessionRow
+from .operations import ACTIVE, TERMINAL, OperationRepository, SessionOperationRow, public_operation
+from .repository import SessionRepository
 from .types import (
     CreateSession,
+    OperationConflict,
+    OperationFailed,
+    OperationKind,
+    OperationPhase,
+    OwnershipLost,
     SessionAlreadyExists,
-    SessionCreationError,
+    SessionBusy,
+    SessionOperation,
     SessionRecord,
     UpdateSession,
 )
 
-
-class RunnerConflict(Exception):
-    """Prior progress cannot resume without a confirmed successful Activity record."""
-
-
 _TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
-_logger = logging.getLogger(__name__)
+_OPERATION_TIMEOUT = timedelta(hours=1)
+_ACTIVITY_NAMES = {
+    OperationKind.CREATE: "kapy.create_session",
+    OperationKind.RUN: "kapy.run_agent",
+    OperationKind.CLOSE: "kapy.close_session",
+}
 
 
 class SessionService:
-    """Borrow session/output factories and Temporal; own no model or engine.
-
-    Model configuration is fixed when admission starts an Activity. Heartbeat policy
-    belongs only to native layer scope creation/close, not runner execution.
-    """
+    """Borrow database/output/Temporal resources; keep no process-local ownership."""
 
     def __init__(
         self,
@@ -73,253 +69,334 @@ class SessionService:
         output_service: AgentOutputService | None = None,
         temporal_client: Client | None = None,
         temporal_task_queue: str | None = None,
-        heartbeat_interval: float = 10.0,
-        heartbeat_timeout: float = 60.0,
-        takeover_grace_period: float = 30.0,
         live_poll_interval: float = 5.0,
     ) -> None:
-        if not (
-            math.isfinite(heartbeat_interval)
-            and math.isfinite(heartbeat_timeout)
-            and 0 < heartbeat_interval < heartbeat_timeout
-        ):
-            raise ValueError("Require finite 0 < heartbeat_interval < heartbeat_timeout")
-        if not math.isfinite(takeover_grace_period) or takeover_grace_period <= 0:
-            raise ValueError("takeover_grace_period must be finite and positive")
         if not math.isfinite(live_poll_interval) or live_poll_interval <= 0:
             raise ValueError("live_poll_interval must be finite and positive")
+        self._session_factory = session_factory
+        self._output_service = output_service
         self._temporal_client = temporal_client
         self._temporal_task_queue = temporal_task_queue
         self._live_poll_interval = live_poll_interval
-        self._session_factory = session_factory
-        self._output_service = output_service
-        self._heartbeat_interval = heartbeat_interval
-        self._heartbeat_timeout = heartbeat_timeout
-        self._takeover_grace_period = takeover_grace_period
 
-    async def create_session(self, data: CreateSession) -> SessionRecord:
-        """Reserve identity/Config, enter under its lease, then publish complete State.
+    def _client(self) -> Client:
+        if self._temporal_client is None or not self._temporal_task_queue:
+            raise RuntimeError("Session mutations require a Temporal client and task queue")
+        return self._temporal_client
 
-        Hook I/O is outside transactions. Failed initialization closes all configured
-        scopes with None, including partial and uncalled enters. A cancelled cleanup
-        hook leaves closing and does not prevent the other scopes' compensation.
-        A ready COMMIT error is resolved only after that transaction ends:
-        confirmed ready is kept;
-        creating is closed. An unavailable database leaves an unconfirmed outcome.
-        Restarted hosts never replay enter. Callers retain the fixed ID to query/close.
-        """
-        try:
-            configs = layer_registry.prepare_configs(data.layers)
-        except UserError as exc:
-            raise ValueError(str(exc)) from exc
-        data = data.model_copy(
-            update={"layers": {name: dump_object(config) for name, config in configs.items()}}
-        )
-        session_id = data.id or uuid4()
-        registered = False
-        states: dict[str, JsonObject] = {}
-        # Validate default States before reservation; enter-backed States may have
-        # required fields and need not be constructible until the hook returns.
-        for name in configs:
-            if layer_registry.definitions[name].enter_scope is None:
-                states[name] = dump_object(
-                    layer_registry.definitions[name].state_type.model_validate({})
-                )
-        try:
-            async with self._lease(session_id) as lease:
-                # Never call enter unless registration COMMIT was acknowledged.
-                async with self._scope_transaction(lease) as db:
-                    await SessionRepository(db).register_creating(data, session_id=session_id)
-                    await db.flush()
-                registered = True
-                try:
-                    for name, config in configs.items():
-                        enter = layer_registry.definitions[name].enter_scope
-                        if enter is None:
-                            continue
-
-                        async def attempt(enter=enter, config=config):
-                            lease.check()
-                            return await enter(session_id, config.model_copy(deep=True))
-
-                        returned = await retry_scope(attempt)
-                        state_type = layer_registry.definitions[name].state_type
-                        if not isinstance(returned, state_type):
-                            raise TypeError(f"Layer {name!r} enter_scope must return its State")
-                        states[name] = dump_object(state_type.model_validate(dump_object(returned)))
-                    async with self._scope_transaction(lease) as db:
-                        record = await SessionRepository(db).publish_ready(session_id, states)
-                    return record
-                except BaseException as error:
-                    # The previous transaction's close has finished before probing
-                    # the authoritative row. Cancellation remains a cancellation,
-                    # even when this probe confirms successful creation.
-                    with anyio.CancelScope(shield=True):
-                        try:
-                            resolved = await self._close_owned(
-                                session_id, lease, failed_creation=True
-                            )
-                        except BaseException:
-                            _logger.exception(
-                                "Creation outcome/compensation failed for session %s", session_id
-                            )
-                        else:
-                            if resolved.status == LifecycleStatus.READY and isinstance(
-                                error, Exception
-                            ):
-                                return resolved
-                    raise
-        except SessionAlreadyExists as error:
-            if not registered and error.session_id == session_id:
-                raise
-            raise SessionCreationError(session_id) from error
-        except SessionBusy as error:
-            if registered:
-                raise SessionCreationError(session_id) from error
-            raise SessionAlreadyExists(session_id) from error
-        except Exception as error:
-            raise SessionCreationError(session_id) from error
-        except BaseException as error:
-            error.add_note(f"Session creation identity: {session_id}")
-            raise
-
-    def _lease(self, session_id: UUID) -> AbstractAsyncContextManager[SessionLease]:
-        return open_session_lease(
-            session_id,
-            session_factory=self._session_factory,
-            heartbeat_interval=self._heartbeat_interval,
-            heartbeat_timeout=self._heartbeat_timeout,
-            takeover_grace_period=self._takeover_grace_period,
-        )
-
-    @asynccontextmanager
-    async def _scope_transaction(
-        self, lease: SessionLease, *, budget: float = 5
-    ) -> AsyncIterator[AsyncSession]:
-        """Fence, commit and close in the owner task before its lease can be released."""
-        db = self._session_factory()
-        try:
-            with anyio.fail_after(budget):
-                await lease.lock_owned(db)
-                yield db
-                await db.commit()
-        finally:
-            with anyio.fail_after(5, shield=True):
-                await db.close()
-
-    async def close_session(self, session_id: UUID) -> SessionRecord:
-        """Acquire exclusive ownership before deciding closing; Busy changes no state.
-
-        With a Temporal Client, ready/closing sessions check remote activity under
-        the row lock before changing lifecycle. Creating skips the query so abandoned
-        scopes can be cleaned independently of Temporal; closed returns directly.
-        Query failures propagate; close never stops an Activity. Close never changes
-        execution. Failures retain the irreversible closing
-        decision and completed cleanup progress for explicit retry.
-        Registered layer scopes are cleaned under the lease;
-        fencing cannot revoke already-issued external requests from a lost owner.
-        Optional layer exits save mutated State after every attempt, even on
-        error/cancellation. Only RetryableScopeError permits an automatic retry;
-        a later close can repeat earlier successful exits, which must be idempotent.
-        Abandoned creating scopes have no saved State and exit with None. Ordinary
-        exit failures are recorded while the remaining configured exits are tried.
-        """
-        async with self._lease(session_id) as lease:
-            return await self._close_owned(session_id, lease)
-
-    async def _close_owned(
-        self, session_id: UUID, lease: SessionLease, *, failed_creation: bool = False
-    ) -> SessionRecord:
-        """Resolve abandoned creation or perform close while retaining the same lease."""
-        # Admission includes the existing ten-second Activity query; preserve that
-        # RPC budget rather than timing it out at the shorter DB-only deadline.
-        async with self._scope_transaction(
-            lease, budget=_TEMPORAL_RPC_TIMEOUT.total_seconds() + 5
-        ) as db:
-            row = await lock_session(db, session_id)
-            if row.status == LifecycleStatus.CLOSED or (
-                failed_creation and row.status == LifecycleStatus.READY
-            ):
-                return SessionRecord.model_validate(row)
+    async def _existing(
+        self,
+        activity_id: UUID,
+        kind: OperationKind,
+        request: dict,
+        session_id: UUID | None = None,
+    ) -> SessionOperation | None:
+        async with self._session_factory() as db, db.begin():
+            row = await db.get(SessionOperationRow, activity_id)
+            if row is None:
+                return None
             if (
-                not failed_creation
-                and row.status != LifecycleStatus.CREATING
-                and self._temporal_client is not None
-                and await self.is_runner_running(session_id)
+                row.kind != kind
+                or row.request != request
+                or (session_id is not None and row.session_id != session_id)
             ):
-                raise SessionBusy(f"Session {session_id} has an active Activity")
-            configs = layer_registry.prepare_configs(row.layers)
-            # READY always has a complete validated snapshot. An abandoned creating
-            # record stores no States at all; do not fabricate defaults for it.
-            states = deepcopy(row.layer_states)
-            if row.status == LifecycleStatus.READY or states:
-                if states.keys() != row.layers.keys():
-                    raise ValueError("Saved layer states must match the configured layer names")
-                states = {
-                    name: dump_object(
-                        layer_registry.definitions[name].state_type.model_validate(value)
-                    )
-                    for name, value in states.items()
-                }
-            row.status, row.updated_at = LifecycleStatus.CLOSING, utc_now()
-        error: Exception | asyncio.CancelledError | None = None
-        for name, config in reversed(configs.items()):
-            try:
-                await self._exit_layer_scope(session_id, name, config, states.get(name), lease)
-            except asyncio.CancelledError as caught:
-                if not failed_creation:
-                    raise
-                _logger.exception(
-                    "Scope compensation cancelled for session %s layer %s", session_id, name
-                )
-                error = error or caught
-            except Exception as caught:
-                _logger.exception("Scope cleanup failed for session %s layer %s", session_id, name)
-                error = error or caught
-        if error is not None:
-            raise error
-        async with self._scope_transaction(lease) as db:
-            row = await lock_session(db, session_id)
-            if row.status != LifecycleStatus.CLOSING:
-                raise LifecycleError(f"Session {session_id} is {row.status}")
-            row.status, row.updated_at = LifecycleStatus.CLOSED, utc_now()
-            return SessionRecord.model_validate(row)
+                raise OperationConflict("Activity ID belongs to different intent")
+            result = public_operation(row)
+        return await self._reconcile(result)
 
-    async def _exit_layer_scope(
+    async def create_session(self, data: CreateSession, *, activity_id: UUID) -> SessionRecord:
+        """Create once; cancellation of this await leaves the remote operation intact."""
+        self._client()
+        request = data.model_dump(mode="json")
+        existing = await self._existing(activity_id, OperationKind.CREATE, request)
+        if existing is None:
+            try:
+                configs = layer_registry.prepare_configs(request["layers"])
+                for name in configs:
+                    definition = layer_registry.definitions[name]
+                    if definition.enter_scope is None:
+                        definition.state_type.model_validate({})
+            except UserError as error:
+                raise ValueError(str(error)) from error
+            layers = {name: dump_object(config) for name, config in configs.items()}
+            session_id = data.id or uuid4()
+            now = utc_now()
+            operation = SessionOperationRow(
+                activity_id=activity_id,
+                session_id=session_id,
+                kind=OperationKind.CREATE,
+                request=request,
+                # Worker validates the same fixed request, rather than running
+                # deterministic normalizers again on already-normalized Config.
+                input={"layers": request["layers"]},
+                created_at=now,
+                deadline=now + _OPERATION_TIMEOUT,
+            )
+            async with self._session_factory() as db, db.begin():
+                row, fresh = await OperationRepository(db).insert(operation)
+                if fresh:
+                    inserted = (
+                        await db.execute(
+                            insert(SessionRow)
+                            .values(
+                                **data.model_dump(exclude={"id", "layers"}),
+                                id=session_id,
+                                layers=layers,
+                                layer_states={},
+                                status=LifecycleStatus.CREATING,
+                                current_activity_id=activity_id,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                            .on_conflict_do_nothing()
+                            .returning(col(SessionRow.id))
+                        )
+                    ).scalar_one_or_none()
+                    if inserted is None:
+                        raise SessionAlreadyExists(session_id)
+                existing = public_operation(row)
+        operation = await self._dispatch(existing)
+        return await self._wait_session(operation)
+
+    async def start_runner(
         self,
         session_id: UUID,
-        name: str,
-        config: BaseModel,
-        saved_state: JsonObject | None,
-        lease: SessionLease,
-    ) -> None:
-        """Persist valid exit progress under ownership before propagating or retrying."""
-        exit_hook = layer_registry.definitions[name].exit_scope
-        if exit_hook is None:
-            return
-        state_type = layer_registry.definitions[name].state_type
-        state = None if saved_state is None else state_type.model_validate(deepcopy(saved_state))
+        *,
+        activity_id: UUID,
+        user_prompt: str,
+    ) -> SessionOperation:
+        """Freeze input and claim STARTING; same-key confirmation never re-resolves config."""
+        self._client()
+        if not isinstance(user_prompt, str):
+            raise ValueError("user_prompt must be a string")
+        request = {"user_prompt": user_prompt}
+        existing = await self._existing(activity_id, OperationKind.RUN, request, session_id)
+        if existing is None:
+            await self._reconcile_current(session_id)
+            now = utc_now()
+            async with self._session_factory() as db, db.begin():
+                row, fresh = await OperationRepository(db).insert(
+                    SessionOperationRow(
+                        activity_id=activity_id,
+                        session_id=session_id,
+                        kind=OperationKind.RUN,
+                        request=request,
+                        created_at=now,
+                        deadline=now + _OPERATION_TIMEOUT,
+                    )
+                )
+                if fresh:
+                    session = await self._claim_session(db, session_id, activity_id, close=False)
+                    catalog = ModelRepository(db)
+                    model = await catalog.get_model(session.provider_id, session.model_name)
+                    provider = await catalog.get_provider_config(session.provider_id)
+                    _, model_class = resolve_classes(provider)
+                    settings = validate_settings(
+                        model_class, model.settings | session.model_settings
+                    )
+                    data = RunnerInput(
+                        session_id=session_id,
+                        runner_state=session.runner_state,
+                        layers=layer_registry.load(session.layers, session.layer_states),
+                        user_prompt=user_prompt,
+                        config=ExecutionConfig(
+                            provider_class=provider.provider_class,
+                            model_class=provider.model_class,
+                            model_name=model.model_name,
+                            api_key=provider.api_key.get_secret_value(),
+                            base_url=provider.base_url,
+                            provider_kwargs=provider.provider_kwargs,
+                            model_settings=settings,
+                            context_window=model.context_window,
+                        ),
+                    )
+                    row.input = data.model_dump(mode="json")
+                    await db.flush()
+                existing = public_operation(row)
+        return await self._dispatch(existing)
 
-        async def attempt() -> None:
-            lease.check()
-            await exit_hook(session_id, config.model_copy(deep=True), state)
+    async def close_session(self, session_id: UUID, *, activity_id: UUID) -> SessionRecord:
+        """Claim cleanup only when no live owner exists; repeat failed cleanup with a new ID."""
+        self._client()
+        request: dict = {}
+        existing = await self._existing(activity_id, OperationKind.CLOSE, request, session_id)
+        if existing is None:
+            await self._reconcile_current(session_id)
+            now = utc_now()
+            async with self._session_factory() as db, db.begin():
+                row, fresh = await OperationRepository(db).insert(
+                    SessionOperationRow(
+                        activity_id=activity_id,
+                        session_id=session_id,
+                        kind=OperationKind.CLOSE,
+                        request=request,
+                        created_at=now,
+                        deadline=now + _OPERATION_TIMEOUT,
+                    )
+                )
+                if fresh:
+                    session = await db.get(SessionRow, session_id)
+                    if session is None:
+                        raise LookupError(f"Session {session_id} does not exist")
+                    if session.status == LifecycleStatus.CLOSED:
+                        row.phase = OperationPhase.SUCCEEDED
+                        row.result = SessionRecord.model_validate(session).model_dump(mode="json")
+                    else:
+                        session = await self._claim_session(db, session_id, activity_id, close=True)
+                        row.input = {"layers": session.layers, "layer_states": session.layer_states}
+                    await db.flush()
+                existing = public_operation(row)
+        operation = await self._dispatch(existing)
+        return await self._wait_session(operation)
 
-        async def save_progress() -> None:
-            nonlocal state
-            if state is None:
-                return
-            # Model instances do not revalidate mutations by default. Round-trip
-            # through JSON so persisted progress and the next attempt are validated.
-            state = state_type.model_validate(dump_object(state))
-            saved = dump_object(state)
-            with anyio.CancelScope(shield=True):
-                async with self._scope_transaction(lease) as db:
-                    await SessionRepository(db).save_layer_cleanup(session_id, name, saved)
+    async def _claim_session(
+        self,
+        db: AsyncSession,
+        session_id: UUID,
+        activity_id: UUID,
+        *,
+        close: bool,
+    ) -> SessionRow:
+        statement = update(SessionRow).where(col(SessionRow.id) == session_id)
+        if close:
+            terminal = select(SessionOperationRow.activity_id).where(
+                col(SessionOperationRow.phase).in_(TERMINAL)
+            )
+            statement = statement.where(
+                or_(
+                    col(SessionRow.status) == LifecycleStatus.READY,
+                    (col(SessionRow.status) == LifecycleStatus.CLOSING)
+                    & or_(
+                        col(SessionRow.current_activity_id).is_(None),
+                        col(SessionRow.current_activity_id).in_(terminal),
+                    ),
+                )
+            )
+        else:
+            statement = statement.where(col(SessionRow.status) == LifecycleStatus.READY)
+        row = (
+            await db.execute(
+                statement.values(
+                    status=LifecycleStatus.CLOSING if close else LifecycleStatus.STARTING,
+                    current_activity_id=activity_id,
+                    updated_at=utc_now(),
+                )
+                .returning(SessionRow)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            if await db.get(SessionRow, session_id) is None:
+                raise LookupError(f"Session {session_id} does not exist")
+            raise SessionBusy(f"Session {session_id} cannot be claimed")
+        return row
 
-        await retry_scope(attempt, after_attempt=save_progress)
+    async def _dispatch(self, operation: SessionOperation) -> SessionOperation:
+        if operation.phase in TERMINAL:
+            return operation
+        if operation.phase == OperationPhase.RUNNING:
+            return await self._reconcile(operation)
+        client = self._client()
+        assert self._temporal_task_queue is not None
+        remaining = operation.deadline - utc_now()
+        if remaining <= timedelta():
+            return await self._reconcile(operation)
+        try:
+            handle = await client.start_activity(
+                _ACTIVITY_NAMES[operation.kind],
+                operation.activity_id,
+                result_type=str if operation.kind == OperationKind.RUN else SessionRecord,
+                id=str(operation.activity_id),
+                task_queue=self._temporal_task_queue,
+                id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
+                id_reuse_policy=ActivityIDReusePolicy.REJECT_DUPLICATE,
+                schedule_to_close_timeout=remaining,
+                start_to_close_timeout=remaining,
+                heartbeat_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+                rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
+            )
+        except ActivityAlreadyStartedError:
+            return await self._reconcile(operation)
+        if handle.run_id is not None:
+            async with self._session_factory() as db, db.begin():
+                await OperationRepository(db).bind_run_id(operation.activity_id, handle.run_id)
+        return await self.get_operation(operation.session_id, operation.activity_id)
+
+    async def _reconcile_current(self, session_id: UUID) -> None:
+        async with self._session_factory() as db, db.begin():
+            session = await db.get(SessionRow, session_id)
+            if session is None:
+                raise LookupError(f"Session {session_id} does not exist")
+            row = (
+                None
+                if session.current_activity_id is None
+                else await db.get(SessionOperationRow, session.current_activity_id)
+            )
+            operation = None if row is None else public_operation(row)
+        if operation is not None:
+            await self._reconcile(operation)
+
+    async def _reconcile(self, operation: SessionOperation) -> SessionOperation:
+        if operation.phase in TERMINAL:
+            return operation
+        failed = operation.deadline <= utc_now()
+        if not failed and self._temporal_client is not None:
+            try:
+                description = await self._temporal_client.get_activity_handle(
+                    str(operation.activity_id),
+                    run_id=operation.run_id,
+                ).describe(rpc_timeout=_TEMPORAL_RPC_TIMEOUT)
+            except RPCError:
+                # Unknown execution is not permission to release or re-execute.
+                pass
+            else:
+                if description.activity_run_id is not None:
+                    async with self._session_factory() as db, db.begin():
+                        await OperationRepository(db).bind_run_id(
+                            operation.activity_id, description.activity_run_id
+                        )
+                failed = description.status not in (
+                    ActivityExecutionStatus.RUNNING,
+                    ActivityExecutionStatus.PAUSED,
+                )
+        if failed:
+            try:
+                async with self._session_factory() as db, db.begin():
+                    await OperationRepository(db).fail(
+                        operation.activity_id,
+                        "Session operation ended without a committed result",
+                        expired=True,
+                    )
+            except OwnershipLost:
+                pass
+        async with self._session_factory() as db, db.begin():
+            return public_operation(await OperationRepository(db).get(operation.activity_id))
+
+    async def get_operation(self, session_id: UUID, activity_id: UUID) -> SessionOperation:
+        async with self._session_factory() as db, db.begin():
+            row = await OperationRepository(db).get(activity_id)
+            if row.session_id != session_id:
+                raise LookupError("Session operation does not exist")
+            operation = public_operation(row)
+        return await self._reconcile(operation)
+
+    async def _wait_session(self, operation: SessionOperation) -> SessionRecord:
+        while operation.phase in ACTIVE:
+            await asyncio.sleep(0.05)
+            operation = await self.get_operation(operation.session_id, operation.activity_id)
+        if operation.phase == OperationPhase.FAILED:
+            raise OperationFailed(operation)
+        assert isinstance(operation.result, SessionRecord)
+        return operation.result
+
+    async def is_runner_running(self, session_id: UUID) -> bool:
+        async with self._session_factory() as db, db.begin():
+            record = await SessionRepository(db).get_session(session_id)
+            return record.status in (LifecycleStatus.STARTING, LifecycleStatus.RUNNING)
 
     async def get_session(self, session_id: UUID) -> SessionRecord:
-        async with self._session_factory.begin() as db:
+        async with self._session_factory() as db, db.begin():
             return await SessionRepository(db).get_session(session_id)
 
     async def list_sessions(
@@ -331,127 +408,23 @@ class SessionService:
         limit: int = 100,
     ) -> Page[SessionRecord]:
         validate_pagination(offset, limit)
-        async with self._session_factory.begin() as db:
+        async with self._session_factory() as db, db.begin():
             return await SessionRepository(db).list_sessions(
                 provider_id=provider_id, model_name=model_name, offset=offset, limit=limit
             )
 
     async def update_session(self, session_id: UUID, data: UpdateSession) -> SessionRecord:
-        """Replace supplied fields; model switches supply both parts of the model identity."""
-        values = data.model_dump(exclude_unset=True)
-        async with self._session_factory.begin() as db:
-            return await SessionRepository(db).update_session(session_id, values)
-
-    async def _runner_status(self, session_id: UUID) -> ActivityExecutionStatus | None:
-        if self._temporal_client is None:
-            raise RuntimeError("Runner execution requires a Temporal client")
-        try:
-            description = await self._temporal_client.get_activity_handle(
-                f"kapy-runner:{session_id}"
-            ).describe(rpc_timeout=_TEMPORAL_RPC_TIMEOUT)
-        except RPCError as error:
-            if error.status == RPCStatusCode.NOT_FOUND:
-                return None
-            raise
-        return description.status
-
-    async def is_runner_running(self, session_id: UUID) -> bool:
-        """Observe Temporal execution; only NOT_FOUND means absent, RPC failures propagate."""
-        return await self._runner_status(session_id) in {
-            ActivityExecutionStatus.RUNNING,
-            ActivityExecutionStatus.PAUSED,
-        }
-
-    async def start_runner(self, session_id: UUID, *, user_prompt: str) -> ActivityHandle[str]:
-        """Submit one text prompt, returning after Temporal confirms the start.
-
-        Borrow the Client and serialize admission/close with a session row lock,
-        held only through bounded RPCs. A new execution may follow only COMPLETED,
-        preserving immutable history and the successful snapshot. A failed or
-        ambiguous RPC never triggers a new attempt here; callers query the fixed
-        Activity ID to discover accepted execution. When that record is missing,
-        only a session without snapshot/version progress or history can start.
-        Expired or deleted successful records also require a new session because
-        their completion can no longer be confirmed.
-        The Worker owns model resources and state saving; cancelling this await
-        does not cancel an Activity.
-        """
-        if self._temporal_client is None or not self._temporal_task_queue:
-            raise RuntimeError("Runner execution requires a Temporal client and task queue")
-        if not isinstance(user_prompt, str):
-            raise ValueError("user_prompt must be a string")
-        async with self._session_factory.begin() as db:
-            row = await lock_session(db, session_id)
-            if row.status != LifecycleStatus.READY:
-                raise LifecycleError(f"Session {session_id} is {row.status}")
-            if row.layer_states.keys() != row.layers.keys():
-                raise ValueError("Saved layer states must match the configured layer names")
-            status = await self._runner_status(session_id)
-            if status in {ActivityExecutionStatus.RUNNING, ActivityExecutionStatus.PAUSED}:
-                raise SessionBusy(f"Session {session_id} has an active Activity")
-            if status is not None and status != ActivityExecutionStatus.COMPLETED:
-                raise RunnerConflict(f"Previous Activity ended with {status.name}")
-            if status is None:
-                if row.runner_state is not None or row.runner_state_version != 0:
-                    raise RunnerConflict("Previous Activity record is missing; use a new session")
-                # NOT_FOUND includes deleted/expired terminal records. Committed
-                # history can outlive a failed run with no final snapshot.
-                has_history = (
-                    await db.execute(
-                        select(AgentHistoryRow.seq)
-                        .where(col(AgentHistoryRow.session_id) == session_id)
-                        .limit(1)
-                    )
-                ).scalar_one_or_none() is not None
-                if has_history:
-                    raise RunnerConflict("Previous Activity record is missing; use a new session")
-            repo = ModelRepository(db)
-            model = await repo.get_model(row.provider_id, row.model_name)
-            provider = await repo.get_provider_config(row.provider_id)
-            _, model_class = resolve_classes(provider)
-            settings = validate_settings(model_class, model.settings | row.model_settings)
-            state, version = await SessionRepository(db).read_runner_state(session_id)
-            data = RunnerInput(
-                session_id=session_id,
-                runner_state=state,
-                runner_state_version=version,
-                layers=layer_registry.load(row.layers, row.layer_states),
-                user_prompt=user_prompt,
-                config=ExecutionConfig(
-                    provider_class=provider.provider_class,
-                    model_class=provider.model_class,
-                    model_name=model.model_name,
-                    api_key=provider.api_key.get_secret_value(),
-                    base_url=provider.base_url,
-                    provider_kwargs=provider.provider_kwargs,
-                    model_settings=settings,
-                    context_window=model.context_window,
-                ),
+        async with self._session_factory() as db, db.begin():
+            return await SessionRepository(db).update_session(
+                session_id, data.model_dump(exclude_unset=True)
             )
-            try:
-                return await self._temporal_client.start_activity(
-                    "kapy.run_agent",
-                    data,
-                    result_type=str,
-                    id=f"kapy-runner:{session_id}",
-                    task_queue=self._temporal_task_queue,
-                    id_conflict_policy=ActivityIDConflictPolicy.FAIL,
-                    id_reuse_policy=ActivityIDReusePolicy.ALLOW_DUPLICATE,
-                    schedule_to_close_timeout=timedelta(hours=1),
-                    start_to_close_timeout=timedelta(hours=1),
-                    heartbeat_timeout=timedelta(seconds=10),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                    rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
-                )
-            except ActivityAlreadyStartedError as error:
-                raise SessionBusy(f"Session {session_id} has an active Activity") from error
 
     async def read_history(
         self, session_id: UUID, *, before_seq: int | None = None, limit: int = 100
     ) -> Page[HistoryMessage]:
         """Read the latest page before an exclusive cursor, ordered oldest to newest."""
         BeforeSeqPagination(before_seq=before_seq, limit=limit)
-        async with self._session_factory.begin() as db:
+        async with self._session_factory() as db, db.begin():
             return await HistoryRepository(db).read_history_page(
                 session_id, before_seq=before_seq, limit=limit
             )
@@ -479,7 +452,7 @@ class SessionService:
         last_seq = after_seq
 
         async def read_history() -> tuple[HistoryMessage, ...]:
-            async with self._session_factory.begin() as db:
+            async with self._session_factory() as db, db.begin():
                 return await HistoryRepository(db).read_history_entries(
                     session_id, after_seq=last_seq
                 )

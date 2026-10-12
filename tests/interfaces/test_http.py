@@ -35,9 +35,9 @@ def application(database, sessions):
 
 
 async def test_creation_is_configuration_only_and_removed_contracts_are_rejected(
-    database, seed_session, monkeypatch
+    database, seed_session, monkeypatch, session_runtime
 ):
-    sessions = SessionService(database.sessions)
+    sessions = session_runtime.service(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
     existing = await sessions.get_session(session_id)
@@ -46,7 +46,11 @@ async def test_creation_is_configuration_only_and_removed_contracts_are_rejected
         pytest.fail("configuration creation must not submit execution")
 
     monkeypatch.setattr(sessions, "start_runner", unexpected_start)
-    body = {"provider_id": str(existing.provider_id), "model_name": existing.model_name}
+    body = {
+        "activity_id": str(uuid4()),
+        "provider_id": str(existing.provider_id),
+        "model_name": existing.model_name,
+    }
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
     ) as client:
@@ -84,12 +88,14 @@ async def test_creation_is_configuration_only_and_removed_contracts_are_rejected
                 assert result.status_code == 404
 
 
-async def test_http_history_pages_and_canonical_model_paths(database, seed_history, seed_session):
+async def test_http_history_pages_and_canonical_model_paths(
+    database, seed_history, seed_session, session_runtime
+):
     session_id = await seed_history(
         [ModelRequest(parts=[UserPromptPart(str(i))]) for i in range(5)]
     )
     await seed_session(session_id)
-    sessions = SessionService(database.sessions)
+    sessions = session_runtime.service(database.sessions)
     existing = await sessions.get_session(session_id)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
@@ -141,8 +147,10 @@ async def test_http_history_pages_and_canonical_model_paths(database, seed_histo
             assert (await client.get(path)).status_code == 422
 
 
-async def test_validation_omits_raw_credentials_and_internal_errors(database, monkeypatch):
-    sessions = SessionService(database.sessions)
+async def test_validation_omits_raw_credentials_and_internal_errors(
+    database, monkeypatch, session_runtime
+):
+    sessions = session_runtime.service(database.sessions)
     app = application(database, sessions)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -186,10 +194,15 @@ async def serve(app):
                 await task
 
 
-async def test_http_waits_for_durable_start_confirmation(database, seed_session, monkeypatch):
-    from types import SimpleNamespace
+async def test_http_waits_for_durable_start_confirmation(
+    database, seed_session, monkeypatch, session_runtime
+):
+    from datetime import timedelta
 
-    sessions = SessionService(database.sessions)
+    from kapy.control.sessions import OperationKind, OperationPhase, SessionOperation
+    from kapy.control.types import utc_now
+
+    sessions = session_runtime.service(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
     started, release = asyncio.Event(), asyncio.Event()
@@ -197,14 +210,27 @@ async def test_http_waits_for_durable_start_confirmation(database, seed_session,
     async def start(session_id, **kwargs):
         started.set()
         await release.wait()
-        return SimpleNamespace(id=f"kapy-runner:{session_id}", run_id="accepted-run")
+        return SessionOperation(
+            session_id=session_id,
+            activity_id=kwargs["activity_id"],
+            kind=OperationKind.RUN,
+            phase=OperationPhase.PENDING,
+            run_id="accepted-run",
+            result=None,
+            error=None,
+            created_at=utc_now(),
+            deadline=utc_now() + timedelta(hours=1),
+        )
 
     monkeypatch.setattr(sessions, "start_runner", start)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
     ) as client:
         request = asyncio.create_task(
-            client.post(f"/api/sessions/{session_id}/runner", json={"user_prompt": "direct"})
+            client.post(
+                f"/api/sessions/{session_id}/runner",
+                json={"activity_id": str(uuid4()), "user_prompt": "direct"},
+            )
         )
         try:
             await asyncio.wait_for(started.wait(), 2)

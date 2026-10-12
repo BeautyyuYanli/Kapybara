@@ -152,6 +152,7 @@ test("session creation sends only model configuration without obsolete context c
   const request = page.waitForRequest((request) => request.method() === "POST");
   await page.getByRole("button", { name: "保存 Session" }).click();
   expect((await request).postDataJSON()).toEqual({
+    activity_id: expect.any(String),
     title: "",
     provider_id: id,
     model_name: model.model_name,
@@ -559,3 +560,29 @@ for (const key of ["provider_id", "model_name"] as const) {
     expect(reads).toBe(2);
   });
 }
+
+test("session creation keeps its Activity key after a lost response and reload", async ({ page }) => {
+  const requests: Record<string, unknown>[] = [];
+  await page.route("**/api/sessions", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    requests.push(route.request().postDataJSON());
+    if (requests.length === 1) return route.abort("failed");
+    await route.fulfill({ json: session });
+  });
+  async function fill() {
+    await page.getByLabel("标题").fill("Repeatable session");
+    await page.getByLabel("Provider").selectOption(id);
+    await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
+  }
+  await page.goto("sessions/new");
+  await fill();
+  await page.getByRole("button", { name: "保存 Session" }).click();
+  await expect(page.getByRole("alert")).toBeVisible();
+  await page.reload();
+  await fill();
+  await page.getByRole("button", { name: "保存 Session" }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${id}$`));
+  expect(requests).toHaveLength(2);
+  expect(requests[0]).toEqual(requests[1]);
+  expect(requests[0]!.activity_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+});

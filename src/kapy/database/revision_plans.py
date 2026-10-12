@@ -232,3 +232,19 @@ WHERE EXISTS (SELECT 1 FROM agent_states a WHERE a.session_id = s.id)
     context.config.attributes["irreversible_reason"] = (
         "Legacy runner recovery and plugin state removal is irreversible"
     )
+
+
+def session_operations(context, revision, directives) -> None:
+    """Fence legacy ownership before removing leases and snapshot versions."""
+    script = directives[0]
+    script.upgrade_ops.ops.insert(
+        0,
+        ops.ExecuteSQLOp(
+            "UPDATE sessions SET status = 'closing', updated_at = clock_timestamp() "
+            "WHERE status <> 'closed'"
+        ),
+    )
+    script.downgrade_ops = ops.DowngradeOps([])
+    context.config.attributes["irreversible_reason"] = (
+        "Session operation ownership migration is irreversible"
+    )

@@ -42,6 +42,7 @@ def make_deps() -> RunnerDeps:
         session_id=uuid4(),
         session_factory=Mock(spec=async_sessionmaker),
         output_service=Mock(spec=AgentOutputService),
+        activity_id=uuid4(),
     )
 
 

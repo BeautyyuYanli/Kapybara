@@ -16,7 +16,7 @@ from temporalio.worker import Worker
 
 from kapy.application.resources import connect_temporal
 from kapy.control.models.models import ModelRow, ProviderRow
-from kapy.control.sessions import CreateSession, SessionService
+from kapy.control.sessions import CreateSession, OperationFailed, SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.layers.shell import runtime
 from kapy.lifecycle import LifecycleStatus
@@ -52,9 +52,19 @@ async def worker_service(database):
     async with Worker(
         client,
         task_queue=queue,
-        activities=[runner.run],
+        activities=[runner.create, runner.run, runner.close],
     ):
-        yield SessionService(database.sessions, temporal_client=client, temporal_task_queue=queue)
+        yield (
+            SessionService(database.sessions, temporal_client=client, temporal_task_queue=queue),
+            client,
+        )
+
+
+async def start_runner(service, client, session_id, **kwargs):
+    operation = await service.start_runner(session_id, **kwargs)
+    return client.get_activity_handle(
+        str(operation.activity_id), run_id=operation.run_id, result_type=str
+    )
 
 
 async def create_shell_session(database, service, shell_server):
@@ -77,28 +87,28 @@ async def create_shell_session(database, service, shell_server):
             provider_id=provider.id,
             model_name="layer-test",
             layers={"shell": {"base_url": str(client.base_url), "cwd": str(path)}},
-        )
+        ),
+        activity_id=uuid4(),
     )
 
 
 async def state(database, session_id):
     async with database.sessions.begin() as db:
         row = await db.get(SessionRow, session_id)
-        return row.layer_states["shell"], row.runner_state_version
+        return row.layer_states["shell"]
 
 
 async def test_two_sequential_tools_resume_and_partial_close(
     runner_database, shell_server, monkeypatch
 ):
     client, _ = shell_server
-    async with worker_service(runner_database) as service:
+    async with worker_service(runner_database) as (service, temporal):
         session = await create_shell_session(runner_database, service, shell_server)
         assert "layer_states" not in session.model_dump()
-        assert (await state(runner_database, session.id)) == (
-            {"scope_id": str(session.id), "jobs": {}},
-            0,
-        )
-        first = await service.start_runner(
+        assert await state(runner_database, session.id) == {"scope_id": str(session.id), "jobs": {}}
+        first = await start_runner(
+            service,
+            temporal,
             session.id,
             user_prompt=prompt(
                 (
@@ -109,17 +119,19 @@ async def test_two_sequential_tools_resume_and_partial_close(
                     run("printf 'other\\n'; sleep 30"),
                 )
             ),
+            activity_id=uuid4(),
         )
         outputs = json.loads(await first.result())
         job_a, job_b = [metadata(output)["job_id"] for output in outputs]
-        saved, version = await state(runner_database, session.id)
+        saved = await state(runner_database, session.id)
         assert saved["scope_id"] == str(session.id)
         assert set(saved["jobs"]) == {job_a, job_b} and all(
             offset > 0 for offset in saved["jobs"].values()
         )
-        assert version == 1
         # The second run restores the committed cursors for the same remote jobs.
-        second = await service.start_runner(
+        second = await start_runner(
+            service,
+            temporal,
             session.id,
             user_prompt=prompt(
                 (
@@ -129,10 +141,11 @@ async def test_two_sequential_tools_resume_and_partial_close(
                     },
                 )
             ),
+            activity_id=uuid4(),
         )
         assert "echo:resume" in await second.result()
-        resumed, version = await state(runner_database, session.id)
-        assert resumed["scope_id"] == str(session.id) and version == 2
+        resumed = await state(runner_database, session.id)
+        assert resumed["scope_id"] == str(session.id)
         assert resumed["jobs"][job_a] > saved["jobs"][job_a]
         deleted = []
         original = runtime.delete_job
@@ -144,14 +157,16 @@ async def test_two_sequential_tools_resume_and_partial_close(
             deleted.append(job_id)
 
         monkeypatch.setattr(runtime, "delete_job", interrupted_close)
-        with pytest.raises(RuntimeError, match="cleanup failure"):
-            await service.close_session(session.id)
+        with pytest.raises(OperationFailed):
+            await service.close_session(session.id, activity_id=uuid4())
         assert (await service.get_session(session.id)).status == LifecycleStatus.CLOSING
-        remaining = (await state(runner_database, session.id))[0]["jobs"]
+        remaining = (await state(runner_database, session.id))["jobs"]
         assert len(remaining) == 1 and deleted[0] not in remaining
         monkeypatch.setattr(runtime, "delete_job", original)
-        assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
-        assert (await state(runner_database, session.id))[0] == {
+        assert (
+            await service.close_session(session.id, activity_id=uuid4())
+        ).status == LifecycleStatus.CLOSED
+        assert (await state(runner_database, session.id)) == {
             "scope_id": str(session.id),
             "jobs": {},
         }
@@ -162,20 +177,30 @@ async def test_two_sequential_tools_resume_and_partial_close(
 
 
 async def test_model_failure_preserves_previous_successful_snapshot(runner_database, shell_server):
-    async with worker_service(runner_database) as service:
+    async with worker_service(runner_database) as (service, temporal):
         session = await create_shell_session(runner_database, service, shell_server)
-        first = await service.start_runner(
-            session.id, user_prompt=prompt((run("printf 'first\\n'; sleep 30"),))
+        first = await start_runner(
+            service,
+            temporal,
+            session.id,
+            user_prompt=prompt((run("printf 'first\\n'; sleep 30"),)),
+            activity_id=uuid4(),
         )
         assert "first" in await first.result()
         before = await state(runner_database, session.id)
-        handle = await service.start_runner(
-            session.id, user_prompt=prompt((run("printf 'saved\\n'; sleep 30"),), fail=True)
+        handle = await start_runner(
+            service,
+            temporal,
+            session.id,
+            user_prompt=prompt((run("printf 'saved\\n'; sleep 30"),), fail=True),
+            activity_id=uuid4(),
         )
         with pytest.raises(ActivityFailureError):
             await handle.result()
         assert await state(runner_database, session.id) == before
-        assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
+        assert (
+            await service.close_session(session.id, activity_id=uuid4())
+        ).status == LifecycleStatus.CLOSED
 
 
 @pytest.mark.parametrize("signal", [ModelRetry, UserError])
@@ -193,26 +218,30 @@ async def test_tool_signal_keeps_mutated_local_state_until_run_outcome(
         return await original(self, result)
 
     monkeypatch.setattr(runtime.ShellOperations, "_result", retry_once)
-    async with worker_service(runner_database) as service:
+    async with worker_service(runner_database) as (service, temporal):
         session = await create_shell_session(runner_database, service, shell_server)
-        handle = await service.start_runner(
-            session.id, user_prompt=prompt((run("printf 'retry\\n'; sleep 30"),))
+        handle = await start_runner(
+            service,
+            temporal,
+            session.id,
+            user_prompt=prompt((run("printf 'retry\\n'; sleep 30"),)),
+            activity_id=uuid4(),
         )
         if signal is ModelRetry:
             assert "retry" in await handle.result()
         else:
             with pytest.raises(ActivityFailureError):
                 await handle.result()
-        saved, version = await state(runner_database, session.id)
+        saved = await state(runner_database, session.id)
         assert saved["scope_id"] == str(session.id)
         if signal is ModelRetry:
-            assert list(saved["jobs"]) == jobs and len(jobs) == 2 and version == 1
+            assert list(saved["jobs"]) == jobs and len(jobs) == 2
             assert saved["jobs"][jobs[1]] > 0
         else:
-            assert saved["jobs"] == {} and len(jobs) == 1 and version == 0
+            assert saved["jobs"] == {} and len(jobs) == 1
         # State failure does not roll back the already-created remote job.
         assert (await client.status(jobs[0])).job_id == jobs[0]
-        await service.close_session(session.id)
+        await service.close_session(session.id, activity_id=uuid4())
 
 
 async def test_cancel_after_job_registration_keeps_previous_snapshot(
@@ -249,10 +278,14 @@ async def test_cancel_after_job_registration_keeps_previous_snapshot(
 
     monkeypatch.setattr(runtime.ShellOperations, "_result", blocked_result)
     monkeypatch.setattr(ShellctlClient, "close", delayed_close)
-    async with worker_service(runner_database) as service:
+    async with worker_service(runner_database) as (service, temporal):
         session = await create_shell_session(runner_database, service, shell_server)
-        handle = await service.start_runner(
-            session.id, user_prompt=prompt((run("printf 'cancel\\n'; sleep 30"),))
+        handle = await start_runner(
+            service,
+            temporal,
+            session.id,
+            user_prompt=prompt((run("printf 'cancel\\n'; sleep 30"),)),
+            activity_id=uuid4(),
         )
         result = asyncio.create_task(handle.result())
         try:
@@ -266,11 +299,11 @@ async def test_cancel_after_job_registration_keeps_previous_snapshot(
             with pytest.raises(ActivityFailureError):
                 await asyncio.wait_for(result, 20)
             await asyncio.wait_for(cleanup_finished.wait(), 5)
-            saved, version = await state(runner_database, session.id)
-            assert saved == {"scope_id": str(session.id), "jobs": {}} and version == 0
+            saved = await state(runner_database, session.id)
+            assert saved == {"scope_id": str(session.id), "jobs": {}}
         finally:
             release_cleanup.set()
             if not result.done():
                 await handle.cancel()
             await asyncio.wait_for(asyncio.gather(result, return_exceptions=True), 20)
-            await service.close_session(session.id)
+            await service.close_session(session.id, activity_id=uuid4())

@@ -2,7 +2,6 @@
 
 import json
 from pathlib import Path
-from unittest.mock import Mock
 from uuid import uuid4
 
 import psycopg
@@ -20,18 +19,14 @@ from pydantic_ai.messages import (
 )
 from sqlalchemy import inspect, text
 from sqlalchemy.schema import CreateSchema
-from temporalio.client import Client
 
 from kapy.agent_history.models import history_metadata
 from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
 from kapy.control.database import ControlTable
-from kapy.control.sessions import SessionService
 from kapy.database.migration import migration_config
 from kapy.database.schema import OWNED_TABLES, migrate
 from kapy.layers.shell.models import Config as ShellConfig
-from kapy.lifecycle import LifecycleError, LifecycleStatus
-from kapy.session_lease.models import lease_metadata
 
 pytestmark = pytest.mark.integration
 
@@ -78,7 +73,7 @@ async def test_durable_only_closes_legacy_sessions_and_retains_history_snapshots
                     return migration_config(
                         connection,
                         directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
-                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        metadata=[ControlTable.metadata, history_metadata],
                         version_table="core_schema_version",
                         owns_table=OWNED_TABLES.__contains__,
                     )
@@ -154,9 +149,8 @@ async def test_durable_only_closes_legacy_sessions_and_retains_history_snapshots
                 ).all()
                 leases = (await db.execute(text("SELECT * FROM session_leases"))).all()
                 await db.run_sync(lambda conn: command.upgrade(config(conn), branch_revision))
-                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
-                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
-                await db.run_sync(lambda conn: command.check(config(conn)))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "5be81e905907"))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "5be81e905907"))
                 assert (
                     await db.execute(text("SELECT * FROM agent_history ORDER BY session_id, seq"))
                 ).all() == before
@@ -197,19 +191,6 @@ async def test_durable_only_closes_legacy_sessions_and_retains_history_snapshots
                 )
                 with pytest.raises(NotImplementedError, match="irreversible"):
                     await db.run_sync(lambda conn: command.downgrade(config(conn), "da2b698fbbac"))
-            from sqlalchemy.ext.asyncio import async_sessionmaker
-
-            temporal = Mock(spec=Client)
-            service = SessionService(
-                async_sessionmaker(engine, expire_on_commit=False),
-                temporal_client=temporal,
-                temporal_task_queue="unused",
-            )
-            for session_id in (checkpoint_id, plugin_id):
-                assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
-                assert [m.seq for m in (await service.read_history(session_id)).items] == [3]
-                with pytest.raises(LifecycleError):
-                    await service.start_runner(session_id, user_prompt="do not reset")
     finally:
         async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
             await db.execute(
@@ -230,9 +211,7 @@ async def test_core_migrations_own_only_core_tables(database):
                 await db.execute(text("CREATE TABLE plugin_other_state (id INTEGER)"))
                 tables = await db.run_sync(lambda conn: inspect(conn).get_table_names())
                 assert set(tables) == (
-                    set(ControlTable.metadata.tables)
-                    | set(history_metadata.tables)
-                    | set(lease_metadata.tables)
+                    set(ControlTable.metadata.tables) | set(history_metadata.tables)
                 ) | {
                     "core_schema_version",
                     "unrelated",
@@ -244,7 +223,7 @@ async def test_core_migrations_own_only_core_tables(database):
                     config = migration_config(
                         connection,
                         directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
-                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        metadata=[ControlTable.metadata, history_metadata],
                         version_table="core_schema_version",
                         owns_table=OWNED_TABLES.__contains__,
                     )
@@ -273,7 +252,7 @@ async def test_creating_revision_preserves_legacy_status_and_json(database):
                     config = migration_config(
                         connection,
                         directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
-                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        metadata=[ControlTable.metadata, history_metadata],
                         version_table="core_schema_version",
                         owns_table=OWNED_TABLES.__contains__,
                     )
@@ -350,7 +329,7 @@ async def test_shell_scope_state_revision_preserves_other_data_and_reverses_only
                     return migration_config(
                         connection,
                         directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
-                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        metadata=[ControlTable.metadata, history_metadata],
                         version_table="core_schema_version",
                         owns_table=OWNED_TABLES.__contains__,
                     )
@@ -486,7 +465,7 @@ async def test_core_migrations_preserve_pages_and_execution(database):
                     config = migration_config(
                         connection,
                         directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
-                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        metadata=[ControlTable.metadata, history_metadata],
                         version_table="core_schema_version",
                         owns_table=OWNED_TABLES.__contains__,
                     )
@@ -632,7 +611,7 @@ async def test_offline_history_migration_preserves_recorded_messages_and_unmarks
                     return migration_config(
                         connection,
                         directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
-                        metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                        metadata=[ControlTable.metadata, history_metadata],
                         version_table="core_schema_version",
                         owns_table=OWNED_TABLES.__contains__,
                     )
@@ -734,6 +713,78 @@ async def test_offline_history_migration_preserves_recorded_messages_and_unmarks
                     await db.run_sync(
                         lambda connection: command.downgrade(config(connection), "f0e75989c93b")
                     )
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_operation_migration_fences_legacy_sessions_and_preserves_stored_data(database):
+    schema = "operation_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    identities = {phase: uuid4() for phase in ("creating", "ready", "closing", "closed")}
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def config(connection):
+                    connection.dialect.default_schema_name = schema
+                    return migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "5be81e905907"))
+                for phase, session_id in identities.items():
+                    await db.execute(
+                        text("""INSERT INTO sessions
+                        (id, status, title, provider_id, model_name, model_settings, layers,
+                         layer_states, runner_state, runner_state_version, created_at, updated_at)
+                        VALUES (:id, :phase, 'retained', :provider, 'test', '{}', '{}', '{}',
+                                'opaque snapshot', 7, now(), now())"""),
+                        {"id": session_id, "phase": phase, "provider": uuid4()},
+                    )
+                    await db.execute(
+                        text("""INSERT INTO agent_history
+                        (session_id, seq, kind, message, message_metadata, created_at)
+                        VALUES (:id, 3, 'request', '{"parts":[]}', '{}', now())"""),
+                        {"id": session_id},
+                    )
+                before = (
+                    await db.execute(text("SELECT * FROM agent_history ORDER BY session_id"))
+                ).all()
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                rows = (await db.execute(text("SELECT * FROM sessions"))).all()
+                assert {row.id: row.status for row in rows} == {
+                    sid: "closed" if phase == "closed" else "closing"
+                    for phase, sid in identities.items()
+                }
+                assert all(
+                    row.runner_state == "opaque snapshot" and row.current_activity_id is None
+                    for row in rows
+                )
+                assert (
+                    await db.execute(text("SELECT * FROM agent_history ORDER BY session_id"))
+                ).all() == before
+                assert (
+                    await db.execute(text("SELECT count(*) FROM session_operations"))
+                ).scalar_one() == 0
+                assert "session_leases" not in await db.run_sync(
+                    lambda conn: inspect(conn).get_table_names()
+                )
+                assert "runner_state_version" not in {
+                    column["name"]
+                    for column in await db.run_sync(
+                        lambda conn: inspect(conn).get_columns("sessions")
+                    )
+                }
+                await db.run_sync(lambda conn: command.check(config(conn)))
     finally:
         async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
             await db.execute(
