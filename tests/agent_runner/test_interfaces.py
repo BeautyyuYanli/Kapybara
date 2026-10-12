@@ -136,7 +136,7 @@ async def test_creating_revision_preserves_legacy_status_and_json(database):
                 )
                 session = (await db.execute(text("SELECT * FROM sessions"))).one()
                 binding = (await db.execute(text("SELECT * FROM plugin_agent_bindings"))).one()
-                await db.run_sync(lambda connection: upgrade(connection, "head"))
+                await db.run_sync(lambda connection: upgrade(connection, "da2b698fbbac"))
                 assert (await db.execute(text("SELECT * FROM sessions"))).one() == session
                 assert (
                     await db.execute(text("SELECT * FROM plugin_agent_bindings"))
@@ -147,6 +147,156 @@ async def test_creating_revision_preserves_legacy_status_and_json(database):
                 assert (
                     await db.execute(text("SELECT status FROM sessions"))
                 ).scalar_one() == "creating"
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_shell_scope_state_revision_preserves_other_data_and_reverses_only_identity(database):
+    schema = "tmpv2_shell_scope_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    existing_scope = str(uuid4())
+    states = [
+        ("ready", {"shell": {"jobs": {"a": 8}}, "echo": {"calls": 2}}),
+        ("closing", {"shell": {"jobs": {"remaining": 12}}}),
+        ("closed", {"shell": {"jobs": {}}}),
+        ("ready", {"shell": {"scope_id": existing_scope, "jobs": {"kept": 3}}}),
+        ("creating", {}),
+        ("closing", {}),
+        ("ready", {"echo": {"calls": 4}}),
+        ("ready", {}),  # The legacy binding below retains its jobs-only State.
+    ]
+    session_ids = [uuid4() for _ in states]
+    messages = ModelMessagesTypeAdapter.dump_json(
+        [ModelRequest([UserPromptPart("kept")], metadata={"seq": 4})]
+    ).decode()
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def config(connection):
+                    connection.dialect.default_schema_name = schema
+                    return migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, agent_metadata, lease_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+
+                await db.run_sync(
+                    lambda connection: command.upgrade(config(connection), "da2b698fbbac")
+                )
+                for session_id, (status, layer_states) in zip(session_ids, states, strict=True):
+                    await db.execute(
+                        text(
+                            "INSERT INTO sessions (id, provider_id, model_name, title, "
+                            "model_settings, status, layers, layer_states, "
+                            "compaction_replay_turns, "
+                            "runner_state, runner_state_version, created_at, updated_at) "
+                            "VALUES (:id, :provider, 'test', 'kept', '{}', :status, "
+                            "CAST(:layers AS JSON), CAST(:states AS JSON), 10, :messages, 7, "
+                            "'2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z')"
+                        ),
+                        {
+                            "id": session_id,
+                            "provider": uuid4(),
+                            "status": status,
+                            "layers": json.dumps(
+                                {"shell": {"cwd": "/tmp"}, "echo": {}}
+                                if session_id != session_ids[-1]
+                                else {}
+                            ),
+                            "states": json.dumps(layer_states),
+                            "messages": messages,
+                        },
+                    )
+                await db.execute(
+                    text(
+                        "INSERT INTO plugin_agent_bindings (session_id, plugin_provider, "
+                        "plugin_name, data_version, config, state, revision, status, "
+                        "created_at, updated_at) VALUES (:id, 'builtin', 'shell', 1, "
+                        '\'{"cwd": "/tmp"}\', \'{"jobs": {"legacy": 5}}\', '
+                        ":revision, 'ready', now(), now())"
+                    ),
+                    {"id": session_ids[-1], "revision": uuid4()},
+                )
+                await db.execute(
+                    text(
+                        "INSERT INTO agent_history (session_id, seq, kind, message, "
+                        "message_metadata, created_at) VALUES (:id, 4, 'request', "
+                        '\'{"parts": [{"part_kind": "user-prompt", "content": "kept"}]}\', '
+                        '\'{"metadata": {"seq": 4}}\', now())'
+                    ),
+                    {"id": session_ids[0]},
+                )
+
+                async def snapshot():
+                    rows = (await db.execute(text("SELECT * FROM sessions"))).mappings().all()
+                    return {row["id"]: dict(row) for row in rows}
+
+                before = await snapshot()
+                binding = (await db.execute(text("SELECT * FROM plugin_agent_bindings"))).one()
+                history = (await db.execute(text("SELECT * FROM agent_history"))).one()
+                await db.run_sync(
+                    lambda connection: command.upgrade(config(connection), "4a86521aa2ff")
+                )
+                upgraded = await snapshot()
+                for session_id, row in before.items():
+                    expected = dict(row)
+                    if "shell" in row["layer_states"]:
+                        expected["layer_states"] = {
+                            **row["layer_states"],
+                            "shell": {
+                                "scope_id": str(session_id),
+                                **row["layer_states"]["shell"],
+                            },
+                        }
+                    assert upgraded[session_id] == expected
+                await db.run_sync(
+                    lambda connection: command.downgrade(config(connection), "da2b698fbbac")
+                )
+                downgraded = await snapshot()
+                for session_id, row in before.items():
+                    expected = dict(row)
+                    if "shell" in row["layer_states"]:
+                        expected["layer_states"] = {
+                            **row["layer_states"],
+                            "shell": {
+                                key: value
+                                for key, value in row["layer_states"]["shell"].items()
+                                if key != "scope_id"
+                            },
+                        }
+                    assert downgraded[session_id] == expected
+                assert (
+                    await db.execute(text("SELECT * FROM plugin_agent_bindings"))
+                ).one() == binding
+                assert (await db.execute(text("SELECT * FROM agent_history"))).one() == history
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as cleanup:
+            await cleanup.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_shell_scope_generation_plan_rejects_unrelated_schema_changes(database):
+    schema = "tmpv2_shell_plan_rejection_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    try:
+        await migrate(settings, "upgrade")
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(text("ALTER TABLE sessions ADD COLUMN unrelated INTEGER"))
+        with pytest.raises(ValueError, match="shell-scope-state plan requires no schema changes"):
+            await migrate(
+                settings, "revision", "Must reject structural changes", plan="shell-scope-state"
+            )
     finally:
         async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
             await db.execute(

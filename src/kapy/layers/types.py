@@ -3,7 +3,9 @@
 Every layer reads its own ``config`` and ``state`` and explicitly dumps changes
 back to ``state``. Resources and SDK component instances never enter this JSON.
 Access functions return the actual entry in current deps, never a reconstructed
-copy. Layer definitions contain no session data; the SDK owns per-run binding.
+copy. D is unbounded; layers treat deps as opaque and obtain all business data
+through injected access and their Config/State models. Layer definitions contain
+no session data; the SDK owns per-run binding.
 """
 
 from collections.abc import Awaitable, Callable

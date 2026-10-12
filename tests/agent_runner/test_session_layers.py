@@ -53,7 +53,9 @@ async def test_http_layer_validation_defaults_and_immutable_configuration(databa
         session_id = UUID(created["id"])
         async with database.sessions.begin() as db:
             row = await db.get(SessionRow, session_id)
-            assert row is not None and row.layer_states == {"shell": {"jobs": {}}}
+            assert row is not None and row.layer_states == {
+                "shell": {"scope_id": str(session_id), "jobs": {}}
+            }
         for replacement in ({"layers": {}}, {"layer_states": {}}):
             response = await client.patch(f"/api/sessions/{session_id}", json=replacement)
             assert response.status_code == 422
@@ -72,13 +74,17 @@ async def test_atomic_layer_message_save_cleanup_and_retry_identity(database, mo
             layers={"shell": {"cwd": "/tmp"}, "echo": {}},
         )
     )
+    initial: JsonObject = {"scope_id": str(session.id), "jobs": {}}
     async with database.sessions.begin() as db:
         repo = SessionRepository(db)
         assert await repo.read_runner_state(session.id) == (None, 0)
     with pytest.raises(LifecycleError):
         async with database.sessions.begin() as db:
-            await SessionRepository(db).save_layer_cleanup(session.id, "shell", {"jobs": {}})
-    final: dict[str, JsonObject] = {"shell": {"jobs": {"known": 8}}, "echo": {"calls": 2}}
+            await SessionRepository(db).save_layer_cleanup(session.id, "shell", initial)
+    final: dict[str, JsonObject] = {
+        "shell": {"scope_id": str(session.id), "jobs": {"known": 8}},
+        "echo": {"calls": 2},
+    }
     with pytest.raises(RuntimeError, match="rollback"):
         async with database.sessions.begin() as db:
             await SessionRepository(db).save_runner_state(
@@ -89,7 +95,7 @@ async def test_atomic_layer_message_save_cleanup_and_retry_identity(database, mo
         repo = SessionRepository(db)
         row = await db.get(SessionRow, session.id)
         assert row is not None and row.layer_states == {
-            "shell": {"jobs": {}},
+            "shell": initial,
             "echo": {"calls": 0},
         }
         assert await repo.read_runner_state(session.id) == (None, 0)
@@ -118,10 +124,10 @@ async def test_atomic_layer_message_save_cleanup_and_retry_identity(database, mo
         row.status = LifecycleStatus.CLOSING
     async with database.sessions.begin() as db:
         repo = SessionRepository(db)
-        await repo.save_layer_cleanup(session.id, "shell", {"jobs": {}})
+        await repo.save_layer_cleanup(session.id, "shell", initial)
         row = await db.get(SessionRow, session.id)
         assert row is not None and row.layer_states == {
-            "shell": {"jobs": {}},
+            "shell": initial,
             "echo": {"calls": 2},
         }
         assert await repo.read_runner_state(session.id) == ("messages", 1)

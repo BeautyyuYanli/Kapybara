@@ -88,11 +88,17 @@ Activity each bind their process-local static capabilities through the SDK;
 stateful SDK components use `for_run` isolation. Factories and business hooks do
 not run on reconstruction or replay. Temporal serializes only deps data, without
 Layer, hook or access-function instances; State transport performs no database I/O.
+The layer's D is unbounded: shell reads its scope identity from required State
+`scope_id`, initialized by enter, rather than RunnerDeps.session_id. Successful
+State transport and final snapshots retain that identity with the jobs inventory.
 
 On ordinary tool success, an inner native Toolset wrapper validates the called
 layer's State using its captured Layer model type and injected access rule, then
-carries it in SDK `ToolReturn.metadata`. The outer Workflow
-wrapper applies only that layer's State before business hooks, then restores the
+carries it in SDK `ToolReturn.metadata` as a dictionary encoded by the
+`LayerStateMetadata` DTO. Its required fields are `state`, the strict boolean
+`native_return`, and arbitrary original `metadata`; unknown fields are rejected.
+The outer Workflow wrapper validates this envelope, applies only that layer's
+State before business hooks, then restores the
 original ordinary value or native ToolReturn, including its content, metadata
 and tools. Transport metadata never reaches model messages. Other layers'
 pending Workflow changes survive. Temporal records the successful result and
@@ -126,7 +132,11 @@ existing legacy plugin sessions retain their original execution and StateStore.
 
 Drain old Workflows before deploying this Agent definition. The successful tool
 payload and State transport changed; replay compatibility with previous Workflow
-code is not provided.
+code is not provided. The offline `shell-scope-state` database revision fills
+missing scope_id only in existing shell State using the session UUID, leaving
+abandoned empty States unchanged. It does not rewrite Temporal's recorded
+Workflow inputs or Activity results; old payloads without scope_id fail the new
+State contract. Legacy plugin State remains jobs-only.
 
 ## Message recording and realtime output
 

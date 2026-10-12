@@ -2,6 +2,7 @@
 
 import re
 from typing import Annotated
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, NonNegativeInt, field_validator
 from shellctl.shared.constants import (
@@ -70,9 +71,19 @@ class Config(BaseModel):
         return value
 
 
-class State(BaseModel):
+class JobState(BaseModel):
     """Known session job IDs and byte cursors; no output or remote status cache."""
 
     model_config = ConfigDict(extra="forbid")
 
     jobs: dict[NonEmpty, NonNegativeInt] = Field(default_factory=dict)
+
+
+class State(JobState):
+    """Layer inventory and scope identity initialized by enter, independent of deps.
+
+    Legacy shell plugin State remains jobs-only through JobState. The layer
+    requires an explicit scope_id; loading an old payload cannot infer identity.
+    """
+
+    scope_id: UUID

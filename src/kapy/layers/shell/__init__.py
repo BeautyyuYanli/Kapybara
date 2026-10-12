@@ -1,1 +1,1 @@
-"""Borrowed shellctl service; session state owns only job IDs and byte cursors."""
+"""Borrowed shellctl service; layer State owns scope identity, job IDs and cursors."""

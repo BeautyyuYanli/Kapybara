@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.durable_exec.temporal import TemporalRunContext
@@ -23,10 +23,23 @@ from pydantic_ai.messages import ToolReturn
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
 from temporalio import workflow
 
+from kapy.control.types import DTO
 from kapy.layers.modules import dump_object
-from kapy.layers.types import Layer, LayerData
+from kapy.layers.types import JsonObject, Layer, LayerData
 
 _OWNER = "kapy_layer"
+
+
+class LayerStateMetadata(DTO):
+    """Validate the State transport while preserving arbitrary native metadata.
+
+    All fields are required; dump to a dictionary to retain the recorded wire
+    format. The Workflow validates this envelope before changing its State.
+    """
+
+    state: JsonObject
+    native_return: bool = Field(strict=True)
+    metadata: Any
 
 
 @dataclass
@@ -66,11 +79,11 @@ class _ReturnLayerStateToolset[D](WrapperToolset[D]):
             )
         )
         native_return = isinstance(result, ToolReturn)
-        metadata = {
-            "state": state,
-            "native_return": native_return,
-            "metadata": result.metadata if native_return else None,
-        }
+        metadata = LayerStateMetadata(
+            state=state,
+            native_return=native_return,
+            metadata=result.metadata if native_return else None,
+        ).model_dump()
         # Replacing the transport metadata also preserves arbitrary native
         # metadata without reserving a key in the layer's public return value.
         if native_return:
@@ -106,10 +119,10 @@ class _ApplyLayerStateToolset[D](WrapperToolset[D]):
         if not workflow.in_workflow() or owner is None:
             return result
         assert isinstance(result, ToolReturn)
-        transport = result.metadata
-        self.get_layers(ctx.deps)[owner]["state"] = transport["state"]
-        if transport["native_return"]:
-            return replace(result, metadata=transport["metadata"])
+        transport = LayerStateMetadata.model_validate(result.metadata)
+        self.get_layers(ctx.deps)[owner]["state"] = transport.state
+        if transport.native_return:
+            return replace(result, metadata=transport.metadata)
         return result.return_value
 
 

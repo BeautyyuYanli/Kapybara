@@ -855,8 +855,25 @@ async def test_workflow_restores_state_and_records_after_run_tail_once(
         ("not-json", {}),
         ('{"history": []}', {}),
         ('[{"kind": "invalid"}]', {}),
-        (None, {"shell": {"config": {"cwd": "relative"}, "state": {}}}),
-        (None, {"shell": {"config": {"cwd": "/tmp"}, "state": {"jobs": {"job": -1}}}}),
+        (
+            None,
+            {
+                "shell": {
+                    "config": {"cwd": "relative"},
+                    "state": {"scope_id": str(uuid4()), "jobs": {}},
+                }
+            },
+        ),
+        (None, {"shell": {"config": {"cwd": "/tmp"}, "state": {"jobs": {}}}}),
+        (
+            None,
+            {
+                "shell": {
+                    "config": {"cwd": "/tmp"},
+                    "state": {"scope_id": str(uuid4()), "jobs": {"job": -1}},
+                }
+            },
+        ),
         (None, {"unknown": {"config": {}, "state": {}}}),
     ],
 )

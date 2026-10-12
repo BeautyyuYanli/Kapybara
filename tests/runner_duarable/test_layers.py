@@ -103,7 +103,10 @@ async def test_two_tools_resume_replay_and_partial_close(
     async with worker_service(runner_database) as service:
         session = await create_shell_session(runner_database, service, shell_server)
         assert "layer_states" not in session.model_dump()
-        assert (await state(runner_database, session.id)) == ({"jobs": {}}, 0)
+        assert (await state(runner_database, session.id)) == (
+            {"scope_id": str(session.id), "jobs": {}},
+            0,
+        )
         first = await service.start_durable_runner(
             session.id,
             user_prompt=prompt(
@@ -119,6 +122,7 @@ async def test_two_tools_resume_replay_and_partial_close(
         outputs = json.loads(await first.result())
         job_a, job_b = [metadata(output)["job_id"] for output in outputs]
         saved, version = await state(runner_database, session.id)
+        assert saved["scope_id"] == str(session.id)
         assert set(saved["jobs"]) == {job_a, job_b} and all(
             offset > 0 for offset in saved["jobs"].values()
         )
@@ -137,7 +141,9 @@ async def test_two_tools_resume_replay_and_partial_close(
             ),
         )
         assert "echo:resume" in await second.result()
-        assert (await state(runner_database, session.id))[0]["jobs"][job_a] > saved["jobs"][job_a]
+        resumed, version = await state(runner_database, session.id)
+        assert resumed["scope_id"] == str(session.id) and version == 2
+        assert resumed["jobs"][job_a] > saved["jobs"][job_a]
         expected_activities = {
             f"agent__runner_duarable__dynamic_toolset__shell__{operation}"
             for operation in ("get_tools", "call_tool")
@@ -178,7 +184,10 @@ async def test_two_tools_resume_replay_and_partial_close(
         assert len(remaining) == 1 and deleted[0] not in remaining
         monkeypatch.setattr(runtime, "delete_job", original)
         assert (await service.close_session(session.id)).status == LifecycleStatus.CLOSED
-        assert (await state(runner_database, session.id))[0] == {"jobs": {}}
+        assert (await state(runner_database, session.id))[0] == {
+            "scope_id": str(session.id),
+            "jobs": {},
+        }
         for job_id in (job_a, job_b):
             with pytest.raises(ShellctlClientError) as caught:
                 await client.status(job_id)
@@ -228,11 +237,12 @@ async def test_tool_signal_does_not_return_local_state(
             with pytest.raises(WorkflowFailureError):
                 await handle.result()
         saved, version = await state(runner_database, session.id)
+        assert saved["scope_id"] == str(session.id)
         if signal is ModelRetry:
             assert list(saved["jobs"]) == jobs[1:] and len(jobs) == 2 and version == 1
             assert saved["jobs"][jobs[1]] > 0
         else:
-            assert saved == {"jobs": {}} and len(jobs) == 1 and version == 0
+            assert saved["jobs"] == {} and len(jobs) == 1 and version == 0
         # State failure does not roll back the already-created remote job.
         assert (await client.status(jobs[0])).job_id == jobs[0]
         await service.close_session(session.id)
@@ -290,7 +300,7 @@ async def test_cancel_after_job_registration_keeps_previous_snapshot(
                 await asyncio.wait_for(result, 20)
             await asyncio.wait_for(cleanup_finished.wait(), 5)
             saved, version = await state(runner_database, session.id)
-            assert saved == {"jobs": {}} and version == 0
+            assert saved == {"scope_id": str(session.id), "jobs": {}} and version == 0
         finally:
             release_cleanup.set()
             if not result.done():

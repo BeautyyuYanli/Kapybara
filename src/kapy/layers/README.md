@@ -6,6 +6,8 @@ optional business-scope hooks. An installed factory has the signature
 `make(layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]`.
 The concrete return annotation links the hook parameters and asynchronous return
 values to the models; exit must accept `State | None`.
+D is unbounded and opaque to the layer. Only C/S are bounded by BaseModel;
+all layer business data comes from injected access and those models.
 
 `make_layers(registry, get_layers)` assembles every installed factory once,
 without execution deps. It checks the returned Layer, model classes, native
@@ -36,14 +38,18 @@ from pydantic_ai.capabilities import Capability
 from kapy.layers import Layer, LayerAccess, LayerData, make_layers
 from kapy.layers.modules import dump_object
 
+
 class Deps(BaseModel):
     layer_data: dict[str, LayerData]
+
 
 class Config(BaseModel):
     increment: int = 1
 
+
 class State(BaseModel):
     calls: int = 0
+
 
 def make_counter(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State]:
     def count(ctx: RunContext[Deps]) -> int:
@@ -54,11 +60,14 @@ def make_counter(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config
         access(ctx.deps)["state"] = dump_object(state)
         return state.calls
 
-    return Layer(config_type=Config, state_type=State,
-                 capability=Capability(id=layer_id, tools=[count]))
+    return Layer(
+        config_type=Config, state_type=State, capability=Capability(id=layer_id, tools=[count])
+    )
+
 
 def get_layers(deps: Deps) -> dict[str, LayerData]:
     return deps.layer_data
+
 
 layers = make_layers({"counter": make_counter}, get_layers)
 ```
@@ -185,8 +194,8 @@ the final run snapshot. Failed/cancelled tool calls return no State.
 ## Shell layer
 
 `shell.layer.make` returns `Layer[D, Config, State]` with the shared shell models,
-fixed native Toolset and explicit enter/exit hooks. Its deps contract needs only
-`session_id`; injected access defines where its data lives. Create a durable session with:
+fixed native Toolset and explicit enter/exit hooks. It imposes no deps structure;
+injected access defines where its data lives. Create a durable session with:
 
 ```json
 {"layers": {"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}}
@@ -196,7 +205,13 @@ fixed native Toolset and explicit enter/exit hooks. Its deps contract needs only
 server. Config also accepts `env`, optional `token_env`, and `redact_patterns`.
 The default server is `http://127.0.0.1:8765`. The process executing a tool call
 or scope exit reads the named token environment variable only at that boundary.
-State is `{"jobs": {"job-id": byte_offset}}`; it contains no clients or secrets.
+State is `{"scope_id": "session-uuid", "jobs": {"job-id": byte_offset}}`; it contains
+no clients or secrets. Enter records its scope UUID without remote I/O. Every tool
+reads that identity from State for remote `KAPY_SESSION_ID` ownership metadata;
+it never reads a host identity field from deps. State requires scope_id, including
+when restoring saved JSON; there is no runtime inference for older payloads.
+The legacy shell plugin shares Config and the jobs-only `JobState`, preserving
+its existing `{"jobs": {"job-id": byte_offset}}` State contract.
 
 The tools retain the existing names and parameters: `builtin_shell_run`,
 `builtin_shell_wait`, `builtin_shell_input`, and `builtin_shell_interrupt`.
@@ -208,7 +223,7 @@ plugin in `agent_plugins.builtin.shell`.
 
 Each tool owns and closes its HTTP client, with bounded shielded cleanup. The
 remote job survives client close and successful runner completion. `enter_scope`
-starts an empty inventory without remote I/O. `exit_scope` deletes known jobs one
+starts an empty inventory with its scope identity. `exit_scope` deletes known jobs one
 by one, forgetting confirmed deletions and `job_not_found` results; the host saves
 that progress after each attempt. Transport/timeout and temporary availability
 failures explicitly opt into bounded retries; authentication and other errors do

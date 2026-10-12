@@ -8,6 +8,35 @@ import sqlalchemy as sa
 from alembic.operations import ops
 
 
+def shell_scope_state(context, revision, directives) -> None:
+    """Backfill only existing shell State; creating/abandoned empty State stays empty.
+
+    This data-only revision requires no schema differences. It does not rewrite
+    runner snapshots, their versions or recorded Temporal payloads.
+    """
+    script = directives[0]
+    if script.upgrade_ops.ops or script.downgrade_ops.ops:
+        raise ValueError("shell-scope-state plan requires no schema changes")
+    script.upgrade_ops = ops.UpgradeOps(
+        [
+            ops.ExecuteSQLOp("""UPDATE sessions
+SET layer_states = jsonb_set(layer_states::jsonb, '{shell,scope_id}',
+    to_jsonb(id::text))::json
+WHERE jsonb_typeof(layer_states::jsonb->'shell') = 'object'
+    AND NOT (layer_states::jsonb->'shell' ? 'scope_id')"""),
+        ]
+    )
+    script.downgrade_ops = ops.DowngradeOps(
+        [
+            ops.ExecuteSQLOp("""UPDATE sessions
+SET layer_states = jsonb_set(layer_states::jsonb, '{shell}',
+    (layer_states::jsonb->'shell') - 'scope_id')::json
+WHERE jsonb_typeof(layer_states::jsonb->'shell') = 'object'
+    AND layer_states::jsonb->'shell' ? 'scope_id'"""),
+        ]
+    )
+
+
 def context_pages(context, revision, directives) -> None:
     """Replace only the expected summary drop/page create with a data-preserving rename."""
     script = directives[0]

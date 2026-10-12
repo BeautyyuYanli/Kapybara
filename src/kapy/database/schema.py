@@ -48,7 +48,8 @@ async def migrate(
     plan: str | None = None,
 ) -> None:
     if plan is not None and (
-        operation != "revision" or plan not in {"context-pages", "immutable-history"}
+        operation != "revision"
+        or plan not in {"context-pages", "immutable-history", "shell-scope-state"}
     ):
         raise ValueError("plan must name a supported revision generation plan")
     async with open_core_database(settings) as engine:
@@ -69,11 +70,11 @@ async def migrate(
                 if plan is not None:
                     from . import revision_plans
 
-                    config.attributes["process_revision_directives"] = (
-                        revision_plans.context_pages
-                        if plan == "context-pages"
-                        else revision_plans.immutable_history
-                    )
+                    config.attributes["process_revision_directives"] = {
+                        "context-pages": revision_plans.context_pages,
+                        "immutable-history": revision_plans.immutable_history,
+                        "shell-scope-state": revision_plans.shell_scope_state,
+                    }[plan]
                 execute(config, operation, message=message)
 
             await connection.run_sync(run)
@@ -83,7 +84,9 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="kapy db")
     parser.add_argument("operation", choices=["upgrade", "current", "revision"])
     parser.add_argument("--message")
-    parser.add_argument("--plan", choices=["context-pages", "immutable-history"])
+    parser.add_argument(
+        "--plan", choices=["context-pages", "immutable-history", "shell-scope-state"]
+    )
     args = parser.parse_args(argv)
     asyncio.run(
         migrate(

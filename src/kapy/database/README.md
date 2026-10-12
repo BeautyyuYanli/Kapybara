@@ -44,6 +44,24 @@ both snapshot contents. Generate this schema change with
 disposable schema at the preceding revision. Layer State introduces no separate
 database, StateStore, or plugin-owned tables.
 
+Shell layer State requires `scope_id` alongside `jobs`; its enter hook initializes
+the UUID from the session identity. The data-only revision fills a missing field
+in an existing shell State from that row's session UUID, preserving jobs, other
+layer States, configuration, runner snapshots and their versions. Creating or
+abandoned closing rows without shell State stay empty. Downgrade removes only
+scope_id from shell State. The legacy shell plugin's binding State stays jobs-only.
+
+Generate against a disposable schema at the preceding revision:
+
+```sh
+kapy db revision --message 'Record shell scope identity in layer state' --plan shell-scope-state
+```
+
+The explicit plan requires no structural schema differences and emits fixed SQL.
+Run this migration with runners and interfaces stopped. It converts current
+database State, without rewriting Temporal Workflow inputs or Activity results;
+historical payloads missing scope_id have no runtime compatibility inference.
+
 `agent_history` stores fixed complete messages keyed by `(session_id, seq)`.
 Under the session row lock, durable writes insert only above the batch's pre-write
 maximum seq; old rows and their numeric gaps remain sealed. SDK `metadata.seq`
