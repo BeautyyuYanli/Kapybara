@@ -23,7 +23,7 @@ from valkey.exceptions import AuthenticationError, AuthorizationError
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
-from kapy.agent_runner.types import MessageCommitted, OutputCallback, OutputEvent, TextDelta
+from .types import MessageCommitted, OutputCallback, OutputEvent, TextDelta
 
 logger = logging.getLogger(__name__)
 _BATCH_ADAPTER = TypeAdapter(list[OutputEvent])

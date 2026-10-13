@@ -10,15 +10,17 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from temporalio.service import RPCError
 
-from kapy.agent_plugins import PluginOperationError
 from kapy.control.models.types import (
     ModelAlreadyExists,
     ModelDiscoveryError,
 )
-from kapy.control.sessions import DurableRunnerConflict, SessionAlreadyExists, SessionCreationError
-from kapy.layers import RetryableScopeError
+from kapy.control.sessions import (
+    OperationConflict,
+    OperationFailed,
+    SessionAlreadyExists,
+    SessionBusy,
+)
 from kapy.lifecycle import LifecycleError
-from kapy.session_lease import SessionBusy
 
 
 class ControlRoute(APIRoute):
@@ -40,12 +42,13 @@ class ControlRoute(APIRoute):
                         "session_id": str(error.session_id),
                     },
                 )
-            except SessionCreationError as error:
+            except OperationFailed as error:
                 return JSONResponse(
-                    status_code=503 if isinstance(error.__cause__, RetryableScopeError) else 500,
+                    status_code=500,
                     content={
-                        "detail": "Session creation failed; query or close this identity",
-                        "session_id": str(error.session_id),
+                        "detail": error.operation.error,
+                        "session_id": str(error.operation.session_id),
+                        "activity_id": str(error.operation.activity_id),
                     },
                 )
             except (RequestValidationError, ValidationError) as error:
@@ -55,27 +58,18 @@ class ControlRoute(APIRoute):
                 return JSONResponse(status_code=422, content={"detail": detail})
             except SessionBusy:
                 return JSONResponse(status_code=409, content={"detail": "Session busy"})
-            except DurableRunnerConflict:
+            except OperationConflict:
                 return JSONResponse(
-                    status_code=409, content={"detail": "Previous Workflow did not complete"}
+                    status_code=409,
+                    content={"detail": "Activity identity conflict"},
                 )
             except RPCError:
                 return JSONResponse(
-                    status_code=503, content={"detail": "Unable to confirm Workflow state"}
+                    status_code=503, content={"detail": "Unable to confirm Activity state"}
                 )
             except LifecycleError:
                 return JSONResponse(
                     status_code=409, content={"detail": "Session lifecycle conflict"}
-                )
-            except PluginOperationError:
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Plugin operation failed; session close can be retried"},
-                )
-            except RetryableScopeError:
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Layer scope operation failed; retry explicitly"},
                 )
             except ModelAlreadyExists:
                 return JSONResponse(status_code=409, content={"detail": "Resource conflict"})

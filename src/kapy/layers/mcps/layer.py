@@ -1,8 +1,8 @@
 """MCP tools through one run-local stdio gateway, with native SDK lifecycle and aliases.
 
 Assembly registers a stable DynamicToolset definition without launching a process.
-The SDK owns each stdio Gateway: per run for ordinary Agents, per Activity for
-Temporal discovery and tool calls. Workflow replay performs no MCP I/O.
+The SDK owns each stdio Gateway for one Agent run, including runs inside Kapy's
+standalone Activity. The complete Agent executes in that Activity's native scope.
 No definition retains config, credentials, execution deps or connected clients.
 """
 
@@ -15,7 +15,7 @@ from pydantic_ai.capabilities import Capability
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import DynamicToolset
 
-from kapy.layers.types import Layer, LayerAccess
+from pydantic_ai_layer_protocol import Layer, LayerAccess
 
 from .models import Config, State
 from .toolset import Toolset

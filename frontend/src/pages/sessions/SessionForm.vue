@@ -3,14 +3,14 @@ import { computed, onScopeDispose, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   getSession,
-  getModel,
-  createSessionAndSchedule,
+  createSession,
   updateSession,
-  type CreateSessionAndSchedule,
+  type CreateSessionRequest,
 } from "@/api/generated";
 import { useResource } from "@/composables/useResource";
 import { describeError } from "@/api/errors";
-import { parseObject, optionalInteger } from "@/forms";
+import { newActivityId } from "@/api/activityId";
+import { parseObject } from "@/forms";
 import FormField from "@/components/FormField.vue";
 import JsonObjectField from "@/components/JsonObjectField.vue";
 import ProviderSelect from "@/components/ProviderSelect.vue";
@@ -37,10 +37,6 @@ const draft = reactive({
   provider_id: "",
   model_name: "",
   model_settings: "{}",
-  context_plugin_name: "kapy/summary",
-  context_plugin_config: "{}",
-  compaction_threshold_tokens: "",
-  compaction_replay_turns: "10",
 });
 const saving = ref(false),
   message = ref(""),
@@ -56,92 +52,62 @@ watch(resource.data, (data) => {
   if (data)
     Object.assign(draft, data, {
       model_settings: JSON.stringify(data.model_settings, null, 2),
-      context_plugin_name: data.context_plugin.name,
-      context_plugin_config: JSON.stringify(data.context_plugin.config, null, 2),
-      compaction_threshold_tokens: data.compaction_threshold_tokens?.toString() ?? "",
-      compaction_replay_turns: String(data.compaction_replay_turns),
     });
 });
-const model = useResource(
-  () => [draft.provider_id, draft.model_name],
-  async (signal) =>
-    draft.provider_id && draft.model_name
-      ? (
-          await getModel({
-            path: { provider_id: draft.provider_id, model_name: draft.model_name },
-            signal,
-            throwOnError: true,
-          })
-        ).data
-      : null,
-);
 function changeProvider(value: string) {
   draft.provider_id = value;
   draft.model_name = "";
 }
 async function save() {
-  if (saving.value) return;
+  if (saving.value || !executionEditable.value) return;
   const submittedVersion = viewVersion;
   error.value = "";
   message.value = "";
   fields.value = {};
-  let body: CreateSessionAndSchedule | undefined;
-  if (executionEditable.value) {
-    let settings: CreateSessionAndSchedule["model_settings"],
-      contextConfig: CreateSessionAndSchedule["model_settings"],
-      threshold: number | null,
-      replay: number | null;
-    try {
-      settings = parseObject(draft.model_settings);
-    } catch {
-      fields.value.model_settings = "请输入 JSON 对象。";
-      error.value = "请修正 JSON。";
-      return;
-    }
-    try {
-      contextConfig = parseObject(draft.context_plugin_config);
-    } catch {
-      fields.value.context_plugin_config = "请输入 JSON 对象。";
-      error.value = "请修正 JSON。";
-      return;
-    }
-    try {
-      threshold = optionalInteger(draft.compaction_threshold_tokens);
-    } catch {
-      fields.value.compaction_threshold_tokens = "请输入正整数。";
-      return;
-    }
-    try {
-      replay = optionalInteger(draft.compaction_replay_turns, 0);
-      if (replay === null) throw new Error();
-    } catch {
-      fields.value.compaction_replay_turns = "请输入非负整数。";
-      return;
-    }
-    body = {
-      title: draft.title,
-      provider_id: draft.provider_id,
-      model_name: draft.model_name,
-      model_settings: settings,
-      context_plugin: { name: draft.context_plugin_name, config: contextConfig },
-      compaction_threshold_tokens: threshold,
-      compaction_replay_turns: replay,
-    };
+  let settings: CreateSessionRequest["model_settings"];
+  try {
+    settings = parseObject(draft.model_settings);
+  } catch {
+    fields.value.model_settings = "请输入 JSON 对象。";
+    error.value = "请修正 JSON。";
+    return;
   }
+  const body: Omit<CreateSessionRequest, "activity_id"> = {
+    title: draft.title,
+    provider_id: draft.provider_id,
+    model_name: draft.model_name,
+    model_settings: settings,
+  };
   saving.value = true;
   try {
     if (id) {
       await updateSession({
         path: { session_id: id },
-        body: body ?? { title: draft.title },
+        body,
         throwOnError: true,
       });
       if (submittedVersion !== viewVersion) return;
-      message.value = body ? "已保存，下次启动生效。" : "已保存。";
+      message.value = "已保存，下次启动生效。";
       await resource.refresh();
-    } else if (body) {
-      // Configuration only: deliberately omit the optional input field.
-      const { data } = await createSessionAndSchedule({ body, throwOnError: true });
+    } else {
+      const intent = JSON.stringify(body);
+      const storageKey = "kapy:session-create";
+      let pending: { intent: string; activity_id: string } | null = null;
+      try {
+        pending = JSON.parse(sessionStorage.getItem(storageKey) ?? "null");
+      } catch {
+        sessionStorage.removeItem(storageKey);
+      }
+      if (!pending || pending.intent !== intent) {
+        pending = { intent, activity_id: newActivityId() };
+        sessionStorage.setItem(storageKey, JSON.stringify(pending));
+      }
+      const { data } = await createSession({
+        body: { ...body, activity_id: pending.activity_id },
+        throwOnError: true,
+      });
+      const current = JSON.parse(sessionStorage.getItem(storageKey) ?? "null");
+      if (current?.activity_id === pending.activity_id) sessionStorage.removeItem(storageKey);
       if (submittedVersion !== viewVersion) return;
       await router.replace(`/sessions/${data.id}`);
     }
@@ -169,7 +135,7 @@ async function save() {
     <form v-else @submit.prevent="save">
       <p v-if="error" class="error" role="alert">{{ error }}</p>
       <p v-if="message" role="status">{{ message }}</p>
-      <fieldset :disabled="saving">
+      <fieldset :disabled="saving || !executionEditable">
         <FormField id="title" label="标题" :error="fields.title" v-slot="f"
           ><input
             v-model="draft.title"
@@ -178,107 +144,32 @@ async function save() {
             :aria-describedby="f.describedby"
             :aria-invalid="f.invalid"
         /></FormField>
-        <fieldset :disabled="!executionEditable">
-          <FormField id="provider_id" label="Provider" :error="fields.provider_id" v-slot="f"
-            ><ProviderSelect
-              :model-value="draft.provider_id"
-              @update:model-value="changeProvider"
-              :id="f.id"
-              required
-              :describedby="f.describedby"
-              :invalid="f.invalid"
-          /></FormField>
-          <FormField id="model_name" label="Model" :error="fields.model_name" v-slot="f"
-            ><ModelSelect
-              v-model="draft.model_name"
-              :provider-id="draft.provider_id"
-              :id="f.id"
-              required
-              :describedby="f.describedby"
-              :invalid="f.invalid"
-          /></FormField>
-          <p v-if="model.error.value" class="error" role="alert">
-            模型容量读取失败：{{ model.error.value }}
-            <button type="button" @click="model.refresh">重试</button>
-          </p>
-          <p
-            v-if="
-              model.data.value &&
-              model.data.value.context_window === null &&
-              !draft.compaction_threshold_tokens
-            "
-            role="status"
-          >
-            {{
-              id
-                ? "模型容量未知；摘要阈值仅用于旧 runner，当前执行无需配置。"
-                : "模型容量未知，创建时将保存默认摘要阈值 183500。"
-            }}
-          </p>
-          <JsonObjectField
-            id="model_settings"
-            v-model="draft.model_settings"
-            label="模型设置 JSON"
-            :error="fields.model_settings"
-          />
-          <FormField
-            id="context_plugin_name"
-            label="上下文插件"
-            help="创建后不能更换插件；上下文和分页配置仅用于旧 runner，当前执行不使用。"
-            :error="fields.context_plugin_name || fields.context_plugin"
-            v-slot="f"
-            ><input
-              v-model="draft.context_plugin_name"
-              :id="f.id"
-              required
-              :readonly="Boolean(id)"
-              :aria-describedby="f.describedby"
-              :aria-invalid="f.invalid"
-          /></FormField>
-          <JsonObjectField
-            id="context_plugin_config"
-            v-model="draft.context_plugin_config"
-            label="上下文插件配置 JSON"
-            :error="fields.context_plugin_config"
-          />
-          <FormField
-            id="compaction_threshold_tokens"
-            label="分页阈值（可选）"
-            :help="
-              id
-                ? '旧 runner 留空时采用模型容量的 70%；容量未知时需设置阈值。'
-                : '留空采用模型容量的 70%；创建时容量未知则保存默认阈值 183500。'
-            "
-            :error="fields.compaction_threshold_tokens"
-            v-slot="f"
-            ><input
-              v-model="draft.compaction_threshold_tokens"
-              :id="f.id"
-              type="number"
-              min="1"
-              step="1"
-              :aria-describedby="f.describedby"
-              :aria-invalid="f.invalid"
-          /></FormField>
-          <FormField
-            id="compaction_replay_turns"
-            label="参考轮数"
-            help="提供给插件的分页前原文轮数；默认摘要插件会保留这些原文。"
-            :error="fields.compaction_replay_turns"
-            v-slot="f"
-            ><input
-              v-model="draft.compaction_replay_turns"
-              :id="f.id"
-              type="number"
-              required
-              min="0"
-              step="1"
-              :aria-describedby="f.describedby"
-              :aria-invalid="f.invalid"
-          /></FormField>
-        </fieldset>
+        <FormField id="provider_id" label="Provider" :error="fields.provider_id" v-slot="f"
+          ><ProviderSelect
+            :model-value="draft.provider_id"
+            @update:model-value="changeProvider"
+            :id="f.id"
+            required
+            :describedby="f.describedby"
+            :invalid="f.invalid"
+        /></FormField>
+        <FormField id="model_name" label="Model" :error="fields.model_name" v-slot="f"
+          ><ModelSelect
+            v-model="draft.model_name"
+            :provider-id="draft.provider_id"
+            :id="f.id"
+            required
+            :describedby="f.describedby"
+            :invalid="f.invalid"
+        /></FormField>
+        <JsonObjectField
+          id="model_settings"
+          v-model="draft.model_settings"
+          label="模型设置 JSON"
+          :error="fields.model_settings"
+        />
         <small v-if="id">
-          {{ executionEditable ? "配置更新对下次启动生效。" : "当前会话只能修改标题。" }}
+          {{ executionEditable ? "配置更新对下次启动生效。" : "当前会话暂时不能修改。" }}
         </small>
         <button class="primary" type="submit">{{ saving ? "保存中…" : "保存 Session" }}</button>
       </fieldset>

@@ -2,6 +2,7 @@
 
 import re
 from typing import Annotated
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, NonNegativeInt, field_validator
 from shellctl.shared.constants import (
@@ -71,8 +72,13 @@ class Config(BaseModel):
 
 
 class State(BaseModel):
-    """Known session job IDs and byte cursors; no output or remote status cache."""
+    """Layer inventory and scope identity initialized by enter, independent of deps.
+
+    State contains job IDs and byte cursors, not output or remote status caches.
+    Loading saved JSON requires an explicit scope_id; identity is never inferred.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     jobs: dict[NonEmpty, NonNegativeInt] = Field(default_factory=dict)
+    scope_id: UUID

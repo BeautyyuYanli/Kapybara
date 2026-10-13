@@ -28,15 +28,17 @@ test("actual FastAPI supports config CRUD and slash model identity", async ({ pa
   await page.getByLabel("Provider", { exact: true }).selectOption(providerId);
   await page.getByLabel("Model", { exact: true }).selectOption("vendor/model");
   await page.getByLabel("标题", { exact: true }).fill("Configuration only");
-  await page.getByLabel("参考轮数", { exact: true }).fill("0");
   await page.getByRole("button", { name: "保存 Session" }).click();
   await expect(page.getByRole("heading", { name: "编辑 Session" })).toBeVisible();
-  await expect(page.getByLabel("参考轮数", { exact: true })).toHaveValue("0");
+  const sessionId = new URL(page.url()).pathname.split("/").at(-1)!;
   await page.goto(`${base}models?provider_id=${providerId}`);
   await page.getByRole("button", { name: "删除", exact: true }).click();
   await page.getByRole("button", { name: "确认删除" }).click();
-  await expect(page.getByRole("alertdialog")).toContainText("仍被 Session 引用");
-  await page.keyboard.press("Escape");
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  // Model references are weak: deleting configuration retains session identity/history.
+  const session = await page.request.get(`http://127.0.0.1:8001/api/sessions/${sessionId}`);
+  expect(session.ok()).toBe(true);
+  expect(await session.json()).toMatchObject({ id: sessionId, model_name: "vendor/model" });
   await page.goto(`${base}providers/new`);
   await page.getByLabel("名称", { exact: true }).fill(`${name} unused`);
   await page.getByLabel("API key", { exact: true }).fill("local-test-not-a-real-key");

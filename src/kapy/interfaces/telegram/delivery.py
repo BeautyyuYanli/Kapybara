@@ -20,7 +20,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
-from kapy.agent_runner import MessageCommitted, TextDelta
+from kapy.agent_output import MessageCommitted, TextDelta
 from kapy.control.sessions import SessionService
 
 from .client import TelegramClient, TelegramFailure, retry_delay, rich_chunk, text_chunk

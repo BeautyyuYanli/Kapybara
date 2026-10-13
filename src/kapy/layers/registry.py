@@ -1,19 +1,19 @@
-"""Kapy's installed factories and one process-local static Layer configuration.
+"""Kapy's single layer registry shared by the Agent and session lifecycle.
 
 Runner and SessionService share these definitions. Execution data lives only in
 RunnerDeps; TYPE_CHECKING keeps static assembly independent of the runner/Agent.
-Changing the installed set requires assembling a new configuration.
+Changing the installed set requires constructing a new registry.
 """
 
 from typing import TYPE_CHECKING
 
+from pydantic_ai_layer_protocol import LayerData, LayerRegistry
+
 from .mcps import layer as mcps
-from .modules import make_layers
 from .shell import layer as shell
-from .types import LayerData, LayerFactory
 
 if TYPE_CHECKING:
-    from kapy.runner_duarable.types import RunnerDeps
+    from kapy.runner.types import RunnerDeps
 
 
 def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
@@ -21,5 +21,4 @@ def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
-REGISTRY: dict[str, LayerFactory[RunnerDeps]] = {"shell": shell.make, "mcps": mcps.make}
-LAYERS = make_layers(REGISTRY, get_layers)
+layer_registry = LayerRegistry({"shell": shell.make, "mcps": mcps.make}, get_layers=get_layers)

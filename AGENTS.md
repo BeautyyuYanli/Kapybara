@@ -1,13 +1,17 @@
 # Kapy v2
 
 当前开发栈围绕 `src/kapy` 的 Python 模块：本地进程与 PTY、文件传输、
-Agent Runner、上下文压缩，以及基于 Valkey Pub/Sub 的实时输出和历史回放。
+Temporal standalone Activity Runner，以及基于 Valkey Pub/Sub 的实时输出和历史回放。
 HTTP 和 Telegram 作为独立接口进程，直接调用这些服务。HTTP 同时挂载配置前端。
 
-主实现位于 `src/kapy/`，测试位于 `tests/`，模块直接通过 `kapy.*` 导入。
+主实现位于 `src/kapy/`，测试位于 `tests/`，模块直接通过 `kapy.*` 导入。通用 layer 定义、注册与选择位于独立包 [pydantic-ai-layer-protocol](packages/pydantic-ai-layer-protocol/README.md)，
+Kapy 使用该包并保留自己的 shell layer 与会话生命周期。
 独立引入的 shellctl 位于 [packages/shellctl](packages/shellctl/README.md)，包含
 Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
 `scripts/vendor_shellctl.py` 按固定 commit 同步，勿手工编辑脚本管理的路径。
+反向 HTTP 隧道库 [Holt](packages/holt/README.md) 位于 `packages/holt/`，
+通过 Git 子模块引入 [BeautyyuYanli/holt](https://github.com/BeautyyuYanli/holt) fork，
+版本由本仓库记录的子模块 commit 固定。
 早期实现及其测试、脚本原样归档在 `prototype/`，不参与当前安装、构建和默认检查。
 `kapy` 命令提供 `interface` 与 `db` 两个入口；旧控制面 CLI 随原型一起归档。
 
@@ -15,7 +19,7 @@ Go 服务端和可直接 `import shellctl` 的 Python SDK。其上游源码由
 使用 FastMCP 聚合上游，提供 inline stdio 和 HTTP / JWE 两种入口。
 [MCPs layer](src/kapy/layers/README.md#mcps-layer) 从 session 配置创建独立 stdio
 Gateway，并供应原生 MCPToolset；这条私有管道不使用 JWE。普通 Agent 由 SDK 管理
-进程，生命周期为一次 run；当前 Temporal Runner 沿用 SDK 的 Activity 级生命周期。
+进程，生命周期为一次 run；standalone Activity 内的整个 Agent run 使用同一 SDK scope。
 也可通过 `uv run --locked --package kapy-mcp-gateway mcp-gateway` 单独运行。
 
 ## 本地启动
@@ -26,25 +30,26 @@ Gateway，并供应原生 MCPToolset；这条私有管道不使用 JWE。普通 
 镜像构建时使用 npm 生成前端产物，无需手动维护 `dist`。
 
 ```sh
+git submodule update --init --recursive
 docker compose build runtime
-docker compose up -d --wait postgres valkey temporal
+docker compose up -d --wait postgres valkey temporal-namespace
 # 首次启动：核心和 Telegram 数据库分别升级，serve 不自动迁移。
 docker compose run --rm runtime kapy db upgrade
 docker compose run --rm telegram kapy interface telegram db upgrade
 docker compose up -d runner-worker runtime telegram
-# 可选：启动本地数据库和 Workflow 面板。
+# 可选：启动本地数据库和 Temporal 面板。
 docker compose up -d drizzle-gateway temporal-ui
 docker compose ps
 ```
 
 | 服务 | 用途 | 宿主机入口 |
 | --- | --- | --- |
-| `postgres` | durable runner_state、history，以及旧 checkpoint、compaction、输入队列和取消状态 | `127.0.0.1:55432` |
+| `postgres` | durable runner_state、history、session 配置与永久操作记录 | `127.0.0.1:55432` |
 | `drizzle-gateway` | PostgreSQL 网页面板，浏览编辑数据和执行 SQL | `127.0.0.1:5050` |
 | `valkey` | 按 session 广播临时输出；无离线消息、TTL 或持久化 | `127.0.0.1:56379` |
-| `temporal` | 持久化 Workflow 调度与恢复；数据保存在 PostgreSQL 的独立数据库 | `127.0.0.1:7233` |
-| `temporal-ui` | Workflow、Activity 和事件历史网页面板 | `127.0.0.1:8080` |
-| `runner-worker` | 执行 durable Workflow 和 Activity，持有模型及输出资源 | 无入站端口 |
+| `temporal` | 持久化 standalone Activity 调度；数据保存在 PostgreSQL 的独立数据库 | `127.0.0.1:7233` |
+| `temporal-ui` | Activity 执行状态与服务数据网页面板 | `127.0.0.1:8080` |
+| `runner-worker` | 执行完整 Agent Activity，持有模型及输出资源 | 无入站端口 |
 | `runtime` | 非 root 的 HTTP 接口和配置前端 | `0.0.0.0:8000`，前端 `/app/` |
 | `telegram` | 独立 Telegram session 接口，通过 Bot API 长轮询 | 无入站端口 |
 
@@ -63,7 +68,7 @@ Temporal UI 在 `http://localhost:8080/`，直接连接 `temporal:7233`，默认
 
 HTTP 直接启动入口和 Telegram 普通文本均提交到 Temporal，需同时运行
 `runner-worker` 才会执行；接口进程不自带 Worker。详见
-[Temporal durable Runner 与 Worker](src/kapy/runner_duarable/README.md)。
+[Temporal standalone Activity Runner 与 Worker](src/kapy/runner/README.md)。
 
 源码、测试和脚本挂载为只读；更新依赖或前端后需要重新构建。
 PostgreSQL、runtime 和 Telegram 状态目录分别保存在 `postgres-data`、
@@ -71,8 +76,8 @@ PostgreSQL、runtime 和 Telegram 状态目录分别保存在 `postgres-data`、
 `/var/lib/kapy/state/kapy` 保存 SQLite 和进程输出；Telegram 使用独立卷中的
 `/var/lib/kapy/state/kapy/plugins/telegram/telegram.sqlite3`。
 
-Compose 从 `.env` 读取 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`、
-`KAPY_DATABASE_SCHEMA` 和 `KAPY_VALKEY_NAMESPACE`。容器内数据库和 Valkey URL
+Compose 从 `.env` 读取 `KAPY_DATABASE_SCHEMA` 和 `KAPY_VALKEY_NAMESPACE`。
+容器内数据库和 Valkey URL
 使用 Compose 服务名；`.env.example` 的 URL 用于宿主机直接调用模块。
 Telegram 复用 `.env` 中的 bot token 和 chat ID，
 也可用 `KAPY_TELEGRAM_ALLOWED_CHAT_IDS` JSON 列表配置多个 chat。
@@ -94,42 +99,20 @@ HTTP API、WebSocket 和前端直接访问，无需登录或访问 token。
 进程和文件测试要求在容器中运行，避免在宿主机跳过。
 
 ```sh
-docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests
+docker compose exec -T runtime python -m pytest -q -p no:cacheprovider tests packages/pydantic-ai-layer-protocol/tests
 ```
 
-使用 `.env` 的模型端点和凭据，验收保留的旧 Python runner 入口：
-
-```sh
-docker compose exec -T runtime python scripts/check_runtime.py
-```
-
-该脚本调用旧 `SessionService.start_runner()`，覆盖工具与上下文压缩；不代表
-HTTP / Telegram 的 durable 执行链路。脚本使用 OpenAI Responses 协议，会产生
-数次模型请求。运行前需按上方步骤
-执行 `kapy db upgrade` 初始化配置的 PostgreSQL schema；脚本保留一个独立
-session 供检查，每次运行使用新的 session ID。
-
-验收内容：
-
-- 模型调用工具，通过 ProcessManager 启动进程生成文件；检查输出、文件原子写入，
-  并重新打开 ProcessManager 读取保留的进程结果。
-- 旧 Python 入口开启实时输出（默认每 0.5 秒批量发送 delta）；消费端先订阅，
-  再读历史。按顺序消费事件批次并按 seq 去重，检查完整消息 DTO 与数据库一致；临时 delta
-  按 part 还原预览，完整消息替换预览。
-- 从指定 history seq 回放；手动压缩保持原始 history 不变；重启后仅用摘要恢复，
-  验证模型仍记得先前工具结果，并触发基于 usage 的自动压缩。
-- 关闭实时输出仍正常落库；重新连接补齐未广播的历史，退出后释放订阅。
-
-真实模型是否返回可见的 thinking delta 取决于提供方；脚本单独输出其数量。
-工具调用及结果从完整消息读取，不使用文本 delta 表达工具参数。
-测试套件另外覆盖竞争租约、心跳丢失、checkpoint 恢复、取消、失败清理等边界。
+测试覆盖 standalone Activity 的竞争准入、单次执行与取消、模型/工具资源关闭、
+runner snapshot 与 layer State 原子保存，以及固定 history 和实时输出的断线补读。
+模型协议通过本地 HTTP 服务验证，不调用外部模型 API。
 
 ## 模块入口
 
 - [进程管理 API](src/kapy/processes/README.md)
 - [文件传输](src/kapy/file_transfer.py)
-- [旧 Python Runner、压缩和实时输出契约](src/kapy/agent_runner/README.md)
-- [Temporal durable Runner 与 Worker](src/kapy/runner_duarable/README.md)
+- [完整消息历史](src/kapy/agent_history/README.md)
+- [实时输出契约](src/kapy/agent_output/README.md)
+- [Temporal standalone Activity Runner 与 Worker](src/kapy/runner/README.md)
 - [Valkey 输出服务](src/kapy/agent_output/service.py)
 - [SessionService：生产侧与历史回放](src/kapy/control/sessions/service.py)
 - [独立进程接口](src/kapy/interfaces/README.md)
@@ -137,17 +120,18 @@ session 供检查，每次运行使用新的 session ID。
 - [控制面 FastAPI HTTP / WebSocket API](src/kapy/interfaces/http/README.md)
 
 调用方负责 engine、数据库 schema、Valkey / Temporal client 的生命周期。
-保留的旧 Python 入口 `SessionService.start_runner(..., realtime_output=True)`
-还由调用方管理模型 Agent，并需注入 `AgentOutputService`；该入口默认关闭实时输出。
-HTTP / Telegram 的执行使用 `start_durable_runner()`，模型资源由独立 Worker 管理。
+所有执行使用 `start_runner()`，模型与工具资源由独立 Worker 管理。
+创建、运行和关闭使用调用方提供的 Activity UUID 作为永久幂等键。
+数据库 starting/running 表示执行独占，current_activity_id 与 operation phase 的
+条件写入保护进度；RPC 和 hooks 均不持有事务或显式锁。整轮最多一个 Temporal
+尝试，不恢复 Agent 内部步骤。旧非 closed session 迁移为 closing，历史继续保留。
 
 `live(session_id, after_seq=-1)` 返回历史回放并继续监听的异步 generator，
 提前结束时使用 `aclosing`。消费者以最后完整应用消息的 `seq` 作为 `after_seq`，尚无该位置时使用 -1；
 delta 不推进游标。完整消息写入后内容和位置固定，数据库中的数值缺口也保持封闭。
-Pub/Sub 是尽力广播，断线后清空临时预览并从该位置续接；旧 Python runner 使用同一
-完整消息游标契约。durable 仅在模型节点结束后记录消息，最终输出工具回执及 after-run
+Pub/Sub 是尽力广播，断线后清空临时预览并从该位置续接。执行 Activity 仅在模型节点结束后记录消息，最终输出工具回执及 after-run
 追加内容先保存在 runner_state，后续模型节点才记录。核心与 Telegram 的固定消息迁移
-需离线执行，不兼容旧 Workflow 回放。
+需离线执行，不兼容旧 Workflow 执行。
 
 ```sh
 # 停止并保留 PostgreSQL 和 runtime 数据

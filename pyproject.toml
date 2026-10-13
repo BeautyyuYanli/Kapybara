@@ -16,11 +16,13 @@ dependencies = [
     "psycopg[binary,pool]>=3.3.5",
     "pydantic>=2.13.5",
     "pydantic-ai-harness[codemode]>=0.54.0,<0.55.0",
-    "pydantic-ai-slim[google,mcp,openai,temporal]>=2.54.0",
+    "pydantic-ai-layer-protocol",
+    "pydantic-ai-slim[google,mcp,openai]>=2.54.0",
     "pydantic-settings>=2.15.0",
     "pyyaml>=6.0.3",
     "sqlglot>=30.18.0",
     "sqlmodel>=0.0.42",
+    "temporalio>=1.33.0",
     "typer>=0.27.2",
     "uvicorn[standard]>=0.52.4",
     "uvloop>=0.22.1",
@@ -46,11 +48,12 @@ extend-exclude = [
 ]
 
 [tool.uv.workspace]
-members = ["packages/shellctl", "packages/mcp_gateway"]
+members = ["packages/shellctl", "packages/mcp_gateway", "packages/pydantic-ai-layer-protocol"]
 
 [tool.uv.sources]
 kapy-mcp-gateway = { workspace = true }
 kapy-shellctl = { workspace = true }
+pydantic-ai-layer-protocol = { workspace = true }
 
 [tool.uv.build-backend]
 source-exclude = ["prototype/**"]
@@ -59,16 +62,22 @@ source-exclude = ["prototype/**"]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["kapy"]
+known-first-party = ["kapy", "pydantic_ai_layer_protocol", "layer_protocol_tests"]
 
 [tool.pyrefly]
-project-includes = ["src", "tests", "scripts"]
-search-path = ["src", "tests", "scripts"]
+project-includes = [
+    "src", "tests", "scripts",
+    "packages/pydantic-ai-layer-protocol/src", "packages/pydantic-ai-layer-protocol/tests",
+]
+search-path = [
+    "src", "tests", "scripts",
+    "packages/pydantic-ai-layer-protocol/src", "packages/pydantic-ai-layer-protocol/tests",
+]
 python-version = "3.14"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["tests"]
+testpaths = ["tests", "packages/pydantic-ai-layer-protocol/tests"]
+pythonpath = ["tests", "packages/pydantic-ai-layer-protocol/tests"]
 python_files = ["test_*.py", "docker_manager_acceptance.py"]
 markers = ["integration: requires local PostgreSQL and Valkey", "live: requires explicit live service credentials"]
 

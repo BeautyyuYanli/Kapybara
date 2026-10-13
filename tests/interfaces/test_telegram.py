@@ -6,7 +6,7 @@ import time
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 from uuid import uuid4
 
 import httpx2
@@ -23,19 +23,18 @@ from pydantic_ai.messages import (
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from temporalio.client import WorkflowHandle
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 
-from kapy.agent_plugins import PluginOperationError
-from kapy.agent_runner import HistoryMessage, MessageCommitted, TextDelta
+from kapy.agent_history import HistoryMessage
+from kapy.agent_output import MessageCommitted, TextDelta
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
-    InputSubmission,
-    SessionCreationError,
-    SessionInput,
+    OperationFailed,
+    OperationKind,
+    OperationPhase,
+    SessionOperation,
     SessionService,
-    SubmitInput,
     UpdateSession,
 )
 from kapy.interfaces.telegram.client import TelegramClient, TelegramFailure, text_chunk
@@ -46,7 +45,6 @@ from kapy.interfaces.telegram.repository import TelegramRepository, delivery_key
 from kapy.interfaces.telegram.schema import migrate
 from kapy.interfaces.telegram.settings import StorageSettings, TelegramSettings
 from kapy.interfaces.telegram.storage import open_storage
-from kapy.layers import RetryableScopeError
 from kapy.lifecycle import LifecycleStatus
 
 
@@ -90,7 +88,7 @@ def controller(repository, tmp_path):
     sessions = AsyncMock(spec=SessionService)
     existing = {}
 
-    async def create(data):
+    async def create(data, *, activity_id):
         record = SimpleNamespace(id=data.id, status=LifecycleStatus.READY)
         existing[record.id] = record
         sessions.create_session.return_value = record
@@ -103,12 +101,7 @@ def controller(repository, tmp_path):
 
     sessions.create_session.side_effect = create
     sessions.get_session.side_effect = get
-    sessions.submit_input.return_value = InputSubmission(
-        input=SessionInput(1, "hello"),
-        should_start_runner=True,
-    )
-    sessions.is_durable_runner_running.return_value = False
-    sessions.read_inputs.return_value = ()
+    sessions.is_runner_running.return_value = False
     client = telegram_client()
     result = TelegramController(
         client=client,
@@ -120,6 +113,30 @@ def controller(repository, tmp_path):
         username="kapy_bot",
     )
     return result, sessions, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["queue text", "steer text", "cancel"])
+async def test_removed_commands_do_not_create_or_submit_execution(repository, tmp_path, command):
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, f"/{command}")])
+    assert await app.process_once()
+    sessions.create_session.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
+    assert client.send.await_args.args[-1] == "Unknown command. Use /help."
+
+
+@pytest.mark.asyncio
+async def test_saved_obsolete_action_is_reported_without_allocating_resources(repository, tmp_path):
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/queue text")])
+    item = await repository.next_inbox(42)
+    assert item is not None
+    await repository.save_action(item, {"command": "queue", "session_id": None, "text": "text"})
+    assert await app.process_once()
+    sessions.create_session.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
+    assert client.send.await_args.args[-1] == "Unknown command. Use /help."
 
 
 def test_xdg_path_resolution_is_at_construction(monkeypatch, tmp_path):
@@ -313,7 +330,8 @@ async def test_model_command_without_session_only_saves_default(repository, tmp_
             id=sessions.create_session.await_args.args[0].id,
             provider_id=provider_id,
             model_name="new-model",
-        )
+        ),
+        activity_id=ANY,
     )
 
 
@@ -347,7 +365,8 @@ async def test_model_command_updates_session_and_persists_default_after_restart(
                 id=new_sessions.create_session.await_args.args[0].id,
                 provider_id=provider_id,
                 model_name=model_name,
-            )
+            ),
+            activity_id=ANY,
         )
         new_sessions.update_session.assert_not_awaited()
         assert await restored.default_model(99) is None
@@ -362,8 +381,6 @@ async def test_saved_model_preserves_session_template_when_creating_after_restar
         model_name="fallback-model",
         layers={"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}},
         model_settings={"temperature": 0.2},
-        compaction_threshold_tokens=5000,
-        compaction_replay_turns=3,
     )
     provider_id, model_name = uuid4(), "selected-model"
     await repository.set_default_model(42, provider_id, model_name)
@@ -380,7 +397,8 @@ async def test_saved_model_preserves_session_template_when_creating_after_restar
                     "provider_id": provider_id,
                     "model_name": model_name,
                 }
-            )
+            ),
+            activity_id=ANY,
         )
         assert template.model_name == "fallback-model" and template.provider_id != provider_id
 
@@ -465,9 +483,8 @@ async def test_inbox_dedup_topics_and_session_business_only(repository, tmp_path
         assert await app.process_once()
     assert not await app.process_once()
     sessions.create_session.assert_awaited_once()
-    sessions.submit_input.assert_not_awaited()
-    sessions.start_durable_runner.assert_awaited_once_with(
-        sessions.create_session.return_value.id, user_prompt="hello"
+    sessions.start_runner.assert_awaited_once_with(
+        sessions.create_session.return_value.id, user_prompt="hello", activity_id=ANY
     )
     assert await repository.route(42, 123, 0) == sessions.create_session.return_value.id
     assert await repository.route(42, 123, 1) is None
@@ -490,8 +507,7 @@ async def test_retry_after_confirmation_does_not_resubmit_or_recreate(repository
     client.send.side_effect = None
     await app.process_once()
     sessions.create_session.assert_awaited_once()
-    sessions.start_durable_runner.assert_awaited_once()
-    sessions.submit_input.assert_not_awaited()
+    sessions.start_runner.assert_awaited_once()
     assert await repository.next_inbox(42) is None
 
 
@@ -504,12 +520,12 @@ async def test_bind_failure_after_creation_recovers_saved_identity(
     original = repository.bind
     original_create = sessions.create_session.side_effect
 
-    async def create_after_saved_identity(data):
+    async def create_after_saved_identity(data, *, activity_id):
         # Read a fresh SQLite transaction before the first core-side effect.
         item = await repository.next_inbox(42)
         assert item is not None and item.resolved_action is not None
         assert item.resolved_action["creating_session_id"] == str(data.id)
-        return await original_create(data)
+        return await original_create(data, activity_id=activity_id)
 
     sessions.create_session.side_effect = create_after_saved_identity
 
@@ -525,42 +541,17 @@ async def test_bind_failure_after_creation_recovers_saved_identity(
     assert item.resolved_action["creating_session_id"] == str(created_id)
     assert item.resolved_action["session_id"] is None
     assert await repository.route(42, 123, 0) is None
-    sessions.start_durable_runner.assert_not_awaited()
+    sessions.start_runner.assert_not_awaited()
     monkeypatch.setattr(repository, "bind", original)
     restarted, _, client = controller(repository, tmp_path)
     restarted.sessions = sessions
     await restarted.process_once()
     assert await repository.route(42, 123, 0) == created_id
-    sessions.create_session.assert_awaited_once()
-    sessions.start_durable_runner.assert_awaited_once_with(created_id, user_prompt="first")
+    assert sessions.create_session.await_count == 2
+    assert sessions.create_session.await_args_list[0] == sessions.create_session.await_args_list[1]
+    sessions.start_runner.assert_awaited_once_with(created_id, user_prompt="first", activity_id=ANY)
     assert client.send.await_args.args[-1] == "New session created."
     assert await repository.next_inbox(42) is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "phase", [LifecycleStatus.CREATING, LifecycleStatus.CLOSING, LifecycleStatus.CLOSED]
-)
-async def test_inbox_recovery_reports_unfinished_scope_without_replaying_enter(
-    repository, tmp_path, phase
-):
-    app, sessions, client = controller(repository, tmp_path)
-    await repository.ingest(42, [update(1, "/new first")])
-    item = await repository.next_inbox(42)
-    assert item is not None
-    identity = uuid4()
-    action = await app.resolve(item)
-    action["creating_session_id"] = str(identity)
-    await repository.save_action(item, action)
-    sessions.get_session.side_effect = None
-    sessions.get_session.return_value = SimpleNamespace(id=identity, status=phase)
-    await app.process_once()
-    await app.process_once()
-    sessions.create_session.assert_not_awaited()
-    sessions.start_durable_runner.assert_not_awaited()
-    assert await repository.route(42, 123, 0) is None
-    assert str(identity) in client.send.await_args.args[-1]
-    assert f"Status: {phase}" in client.send.await_args.args[-1]
 
 
 @pytest.mark.asyncio
@@ -572,20 +563,6 @@ async def test_stale_binding_is_cleared_without_recreating_session(repository, t
     await app.process_once()
     assert await repository.route(42, 123, 0) is None
     assert sessions.create_session.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_explicit_queue_commands_never_start_runner(repository, tmp_path):
-    app, sessions, _ = controller(repository, tmp_path)
-    await repository.ingest(42, [update(1, "/queue queued"), update(2, "/steer steer")])
-    await app.process_once()
-    await app.process_once()
-    assert [call.args[1].channel for call in sessions.submit_input.await_args_list] == [
-        "queued",
-        "steer",
-    ]
-    sessions.start_durable_runner.assert_not_awaited()
-    sessions.start_runner.assert_not_awaited()
 
 
 async def delivery_row(repository, *, text="", chat_type="private", chat_id=123):
@@ -1031,48 +1008,14 @@ async def test_discovery_retry_preserves_existing_followers(repository, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_bound_steer_and_cancel_use_session_business_without_rescheduling(
-    repository, tmp_path
-):
-    app, sessions, client = controller(repository, tmp_path)
-    await repository.ingest(
-        42,
-        [
-            update(1, "/new", thread=17),
-            update(2, "/steer change course", thread=17),
-            update(3, "/cancel", thread=17),
-        ],
-    )
-    await app.process_once()
-    target = await repository.route(42, 123, 17)
-    assert target is not None
-    client.send.reset_mock()
-    sessions.submit_input.return_value = InputSubmission(
-        input=SessionInput(10, "change course"),
-        should_start_runner=False,
-    )
-    await app.process_once()
-    sessions.submit_input.assert_awaited_once_with(
-        target,
-        SubmitInput(content="change course", channel="steer"),
-    )
-    await app.process_once()
-    sessions.request_cancel.assert_awaited_once_with(target)
-    client.send.assert_awaited_once_with(
-        123, 17, "Cancellation flag saved; durable execution does not consume it."
-    )
-    sessions.create_session.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_recreated_controller_retries_submission_to_durably_bound_session(
     repository, tmp_path
 ):
     app, sessions, _ = controller(repository, tmp_path)
     content = "retain this input"
-    sessions.start_durable_runner.side_effect = [
-        OperationalError("submit_input", {}, Exception("temporary connection failure")),
-        Mock(spec=WorkflowHandle),
+    sessions.start_runner.side_effect = [
+        OperationalError("start_runner", {}, Exception("temporary connection failure")),
+        Mock(spec=SessionOperation, phase=OperationPhase.RUNNING),
     ]
     await repository.ingest(42, [update(1, "/new " + content, thread=17)])
     with pytest.raises(OperationalError):
@@ -1095,14 +1038,13 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
         assert await restored.route(42, 123, 17) == target
         assert await restored.next_inbox(42) is None
     sessions.create_session.assert_awaited_once()
-    # Two attempts are expected: the failed call's business effect may be ambiguous.
-    assert [call.args for call in sessions.start_durable_runner.await_args_list] == [
+    # Both attempts confirm one durable operation identity.
+    assert [call.args for call in sessions.start_runner.await_args_list] == [
         (target,),
         (target,),
     ]
     assert all(
-        call.kwargs == {"user_prompt": content}
-        for call in sessions.start_durable_runner.await_args_list
+        call.kwargs["user_prompt"] == content for call in sessions.start_runner.await_args_list
     )
 
 
@@ -1162,37 +1104,8 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
 
 
 @pytest.mark.asyncio
-async def test_close_reports_cleanup_failure_then_user_retry_succeeds(repository, tmp_path):
-    app, sessions, client = controller(repository, tmp_path)
-    await repository.ingest(42, [update(1, "/new")])
-    assert await app.process_once()
-    session_id = await repository.route(42, 123, 0)
-    assert session_id is not None
-    attempts = []
-
-    async def close(target):
-        attempts.append(target)
-        if len(attempts) == 1:
-            raise PluginOperationError("p", "resource", "close session")
-
-    sessions.close_session.side_effect = close
-    client.send.reset_mock()
-    await repository.ingest(42, [update(2, "/close")])
-    assert await app.process_once()
-    assert await app.process_once()
-    assert client.send.await_args.args[-1] == "Plugin cleanup failed. Use /close to retry."
-    assert await repository.next_inbox(42) is None
-    await repository.ingest(42, [update(3, "/close")])
-    assert await app.process_once()
-    assert client.send.await_args.args[-1] == "Session closed."
-    assert attempts == [session_id, session_id]
-    assert await repository.route(42, 123, 0) == session_id
-    sessions.create_session.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp_path):
-    from kapy.session_lease import SessionBusy
+    from kapy.control.sessions import SessionBusy
 
     app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1, "/new")])
@@ -1204,7 +1117,6 @@ async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp
     assert await repository.next_inbox(42) is None
     assert not await app.process_once()
     sessions.close_session.assert_awaited_once()
-    sessions.request_cancel.assert_not_awaited()
     sessions.close_session.side_effect = None
     await repository.ingest(42, [update(3, "/close")])
     assert await app.process_once()
@@ -1213,38 +1125,37 @@ async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["enter", "exit"])
-async def test_scope_retry_exhaustion_becomes_explicit_retry_reply(repository, tmp_path, operation):
+async def test_failed_creation_reports_saved_identity_and_explicit_cleanup(repository, tmp_path):
+    from datetime import timedelta
+
+    from kapy.control.types import utc_now
+
     app, sessions, client = controller(repository, tmp_path)
-    failure = RetryableScopeError("secret upstream information")
-    if operation == "enter":
 
-        async def fail(data):
-            raise SessionCreationError(data.id) from failure
+    async def fail(data, *, activity_id):
+        raise OperationFailed(
+            SessionOperation(
+                session_id=data.id,
+                activity_id=activity_id,
+                kind=OperationKind.CREATE,
+                phase=OperationPhase.FAILED,
+                run_id="test-run",
+                result=None,
+                error="Session creation failed",
+                created_at=utc_now(),
+                deadline=utc_now() + timedelta(hours=1),
+            )
+        )
 
-        sessions.create_session.side_effect = fail
-        await repository.ingest(42, [update(1, "/new")])
-    else:
-        await repository.ingest(42, [update(1, "/new")])
-        assert await app.process_once()
-        sessions.close_session.side_effect = failure
-        await repository.ingest(42, [update(2, "/close")])
+    sessions.create_session.side_effect = fail
+    await repository.ingest(42, [update(1, "/new")])
     assert await app.process_once()
     assert await app.process_once()
     assert await repository.next_inbox(42) is None
-    if operation == "enter":
-        identity = sessions.create_session.await_args.args[0].id
-        assert str(identity) in client.send.await_args.args[-1]
-        assert "Query or close this ID" in client.send.await_args.args[-1]
-    else:
-        assert (
-            client.send.await_args.args[-1] == "Layer scope operation failed. Use /close to retry."
-        )
-    assert "secret" not in str(client.send.await_args_list)
-    if operation == "enter":
-        sessions.create_session.assert_awaited_once()
-    else:
-        sessions.close_session.assert_awaited_once()
+    identity = sessions.create_session.await_args.args[0].id
+    assert str(identity) in client.send.await_args.args[-1]
+    assert f"/close {identity}" in client.send.await_args.args[-1]
+    sessions.create_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1295,28 +1206,35 @@ async def test_complete_reply_advances_cursor_and_restart_deduplicates(
 
 
 @pytest.mark.asyncio
-async def test_durable_busy_and_ambiguous_start_are_not_retried_as_queued_input(
-    repository, tmp_path
-):
+async def test_busy_is_not_queued_and_ambiguous_start_confirms_same_key(repository, tmp_path):
     from temporalio.service import RPCError, RPCStatusCode
 
-    from kapy.session_lease import SessionBusy
+    from kapy.control.sessions import SessionBusy
 
     app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1), update(2, "next")])
-    sessions.start_durable_runner.side_effect = [
+    sessions.start_runner.side_effect = [
         SessionBusy("busy"),
         RPCError("secret", RPCStatusCode.DEADLINE_EXCEEDED, b""),
     ]
     await app.process_once()
     await app.process_once()
-    # RPC errors are recorded as a reply; following attempts only send that reply.
+    item = await repository.next_inbox(42)
+    assert item is not None and item.resolved_action["run_activity_id"]
+    saved_key = item.resolved_action["run_activity_id"]
+    sessions.start_runner.side_effect = None
+    sessions.start_runner.return_value = Mock(spec=SessionOperation, phase=OperationPhase.RUNNING)
+    await repository.save_action(item, item.resolved_action, next_attempt_at=0)
     await app.process_once()
-    assert sessions.start_durable_runner.await_count == 2
-    sessions.submit_input.assert_not_awaited()
+    assert sessions.start_runner.await_count == 3
+    assert str(sessions.start_runner.await_args_list[-1].kwargs["activity_id"]) == saved_key
+    assert (
+        sessions.start_runner.await_args_list[-1].kwargs
+        == sessions.start_runner.await_args_list[-2].kwargs
+    )
     assert "busy" in client.send.call_args_list[0].args[2]
-    assert "/status" in client.send.call_args_list[1].args[2]
     assert "secret" not in str(client.send.call_args_list)
+    assert await repository.next_inbox(42) is None
 
 
 @pytest.mark.asyncio
@@ -1368,3 +1286,16 @@ async def test_complete_message_clears_covered_previews_and_keeps_future(
     assert [
         call.args[2] for call in client.send.call_args_list if "draft_id" not in call.kwargs
     ] == (["final"] if complete_kind == "text" else [])
+
+
+@pytest.mark.asyncio
+async def test_malformed_explicit_close_does_not_fall_back_to_current_binding(repository, tmp_path):
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/new")])
+    assert await app.process_once()
+    bound = await repository.route(42, 123, 0)
+    await repository.ingest(42, [update(2, "/close not-a-session-UUID")])
+    assert await app.process_once()
+    assert client.send.await_args.args[-1] == "Usage: /close [session UUID]"
+    sessions.close_session.assert_not_awaited()
+    assert await repository.route(42, 123, 0) == bound

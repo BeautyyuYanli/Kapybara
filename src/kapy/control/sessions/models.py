@@ -1,13 +1,13 @@
-"""Session configuration, FIFO inputs and a coalescing cancellation bit.
+"""Session configuration, lifecycle and durable runner snapshot.
 
-Sessions store the latest opaque runner snapshot and its submission version; the
+Sessions store the latest opaque runner snapshot; the
 runner owns the encoding. Fixed native layer Config and mutable internal State
-live in separate JSON columns. Tools return State to the Workflow; its final
-snapshot saves all States and messages together. CLOSING cleanup saves individual
+live in separate JSON columns. Tools mutate their run-local State; the executing
+Activity's final snapshot saves all States and messages together. CLOSING cleanup saves individual
 layer progress. CREATING stores fixed Config and empty States before enter;
 publication saves all initial States with READY, and abandoned creation keeps the
-States empty through cleanup. Model references may dangle; services use no physical FKs; input
-and agent rows use the same session identifier.
+States empty through cleanup. Model references may dangle; no physical FKs tie
+history retention to configuration.
 """
 
 from datetime import datetime
@@ -16,12 +16,9 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
-    BigInteger,
-    CheckConstraint,
     Column,
     DateTime,
     Enum,
-    Identity,
     Index,
     Text,
 )
@@ -34,11 +31,7 @@ from kapy.lifecycle import LifecycleStatus
 
 class SessionRow(ControlTable, table=True):
     __tablename__ = "sessions"  # pyrefly: ignore[bad-override]
-    __table_args__ = (
-        Index("ix_sessions_provider_model", "provider_id", "model_name"),
-        CheckConstraint("compaction_threshold_tokens > 0"),
-        CheckConstraint("compaction_replay_turns >= 0"),
-    )
+    __table_args__ = (Index("ix_sessions_provider_model", "provider_id", "model_name"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     status: LifecycleStatus = Field(
@@ -65,43 +58,11 @@ class SessionRow(ControlTable, table=True):
         default_factory=dict,
         sa_column=Column(JSON(none_as_null=True), nullable=False, server_default="{}"),
     )
-    context_plugin: dict[str, Any] = Field(
-        default_factory=lambda: {"name": "kapy/summary", "config": {}},
-        sa_column=Column(
-            JSON(none_as_null=True),
-            nullable=False,
-            server_default='{"name":"kapy/summary","config":{}}',
-        ),
-    )
-    compaction_threshold_tokens: int | None = None
-    compaction_replay_turns: int = 10
     runner_state: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
-    runner_state_version: int = Field(
-        default=0, sa_column=Column(BigInteger, nullable=False, server_default="0")
-    )
+    current_activity_id: UUID | None = Field(default=None)
     created_at: datetime = Field(
         default_factory=utc_now, sa_column=Column(DateTime(timezone=True), nullable=False)
     )
     updated_at: datetime = Field(
         default_factory=utc_now, sa_column=Column(DateTime(timezone=True), nullable=False)
     )
-
-
-class SessionInputRow(ControlTable, table=True):
-    __tablename__ = "session_inputs"  # pyrefly: ignore[bad-override]
-    __table_args__ = (
-        CheckConstraint("channel IN ('steer', 'queued')"),
-        Index("session_inputs_order", "session_id", "channel", "id"),
-    )
-
-    id: int | None = Field(default=None, sa_column=Column(BigInteger, Identity(), primary_key=True))
-    session_id: UUID
-    channel: str = Field(sa_type=Text)
-    content: Any = Field(sa_column=Column(JSON(none_as_null=True), nullable=False))
-
-
-class SessionCancelRow(ControlTable, table=True):
-    """A row's presence is the signal; consumption deletes it in the runner transaction."""
-
-    __tablename__ = "session_cancels"  # pyrefly: ignore[bad-override]
-    session_id: UUID = Field(primary_key=True)

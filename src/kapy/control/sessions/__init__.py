@@ -1,17 +1,19 @@
-"""User-side session configuration, inputs, cancellation, execution and output APIs."""
+"""User-side session configuration, durable execution and output APIs."""
 
-from kapy.agent_runner.types import HistoryMessage, MessageCommitted, OutputEvent, TextDelta
+from kapy.agent_history import HistoryMessage
+from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 
-from .service import DurableRunnerConflict, SessionService
+from .service import SessionService
 from .types import (
     CreateSession,
-    InputChannel,
-    InputSubmission,
+    OperationConflict,
+    OperationFailed,
+    OperationKind,
+    OperationPhase,
     SessionAlreadyExists,
-    SessionCreationError,
-    SessionInput,
+    SessionBusy,
+    SessionOperation,
     SessionRecord,
-    SubmitInput,
     UpdateSession,
 )
 
@@ -23,12 +25,12 @@ __all__ = [
     "MessageCommitted",
     "OutputEvent",
     "TextDelta",
-    "InputChannel",
-    "InputSubmission",
-    "SubmitInput",
-    "SessionInput",
     "SessionService",
     "SessionAlreadyExists",
-    "SessionCreationError",
-    "DurableRunnerConflict",
+    "OperationConflict",
+    "OperationFailed",
+    "OperationKind",
+    "OperationPhase",
+    "SessionBusy",
+    "SessionOperation",
 ]

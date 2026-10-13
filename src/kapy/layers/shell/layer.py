@@ -3,12 +3,12 @@
 Config validation and factory assembly are pure. Each tool call owns one
 HTTP client. Remote tasks survive runs; exit_scope releases the known jobs while
 SessionService saves cleanup progress. State owns neither the shellctl service
-nor the remote cwd/artifacts.
+nor the remote cwd/artifacts. Deps are opaque: injected access and Config/State
+supply all layer data, including the scope identity established by enter.
 """
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Protocol
 from uuid import UUID
 
 import anyio
@@ -19,34 +19,28 @@ from pydantic_ai.toolsets import FunctionToolset
 from shellctl import ShellctlClientError
 from shellctl.shared.constants import DEFAULT_TERMINATE_GRACE_SECONDS, DEFAULT_TIMEOUT_SECONDS
 
-from kapy.layers.modules import dump_object
-from kapy.layers.scopes import RetryableScopeError
-from kapy.layers.types import Layer, LayerAccess
+from pydantic_ai_layer_protocol import RetryableScopeError
+from pydantic_ai_layer_protocol.registry import dump_object
+from pydantic_ai_layer_protocol.types import Layer, LayerAccess
 
 from . import runtime
 from .models import Config, NonEmpty, RunTimeout, State, WaitTimeout
 from .output import Redactor
 
 
-class ShellDeps(Protocol):
-    session_id: UUID
-
-
-def make[DepsT: ShellDeps](
-    layer_id: str, access: LayerAccess[DepsT]
-) -> Layer[DepsT, Config, State]:
+def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
     """Build fixed native tools; each call reads and writes its current deps entry."""
 
-    def read(deps: DepsT) -> tuple[Config, State]:
+    def read(deps: D) -> tuple[Config, State]:
         entry = access(deps)
         return Config.model_validate(entry["config"]), State.model_validate(entry["state"])
 
-    def instructions(ctx: RunContext[DepsT]) -> str:
+    def instructions(ctx: RunContext[D]) -> str:
         config = Config.model_validate(access(ctx.deps)["config"])
         return runtime.instructions(config, "builtin_shell", Redactor(config.redact_patterns, ""))
 
     @asynccontextmanager
-    async def operations(ctx: RunContext[DepsT]) -> AsyncIterator[runtime.ShellOperations]:
+    async def operations(ctx: RunContext[D]) -> AsyncIterator[runtime.ShellOperations]:
         config, state = read(ctx.deps)
 
         async def known(job_id: str) -> int | None:
@@ -68,7 +62,7 @@ def make[DepsT: ShellDeps](
                 config,
                 client,
                 redact,
-                session_id=ctx.deps.session_id,
+                session_id=state.scope_id,
                 provider="builtin",
                 name="shell",
                 known=known,
@@ -77,7 +71,7 @@ def make[DepsT: ShellDeps](
             )
 
     async def run(
-        ctx: RunContext[DepsT],
+        ctx: RunContext[D],
         script: NonEmpty,
         timeout: RunTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
@@ -86,7 +80,7 @@ def make[DepsT: ShellDeps](
             return await tools.run(script, timeout)
 
     async def wait(
-        ctx: RunContext[DepsT],
+        ctx: RunContext[D],
         job_id: NonEmpty,
         timeout: WaitTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
@@ -95,7 +89,7 @@ def make[DepsT: ShellDeps](
             return await tools.wait(job_id, timeout)
 
     async def input(
-        ctx: RunContext[DepsT],
+        ctx: RunContext[D],
         job_id: NonEmpty,
         text: str,
         timeout: RunTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
@@ -105,7 +99,7 @@ def make[DepsT: ShellDeps](
             return await tools.input(job_id, text, timeout)
 
     async def interrupt(
-        ctx: RunContext[DepsT],
+        ctx: RunContext[D],
         job_id: NonEmpty,
         grace_seconds: WaitTimeout = DEFAULT_TERMINATE_GRACE_SECONDS,
     ) -> str:
@@ -119,7 +113,7 @@ def make[DepsT: ShellDeps](
         capability=Capability(
             id=layer_id,
             toolsets=[
-                FunctionToolset[DepsT](
+                FunctionToolset[D](
                     id=layer_id,
                     instructions=instructions,
                     tools=[
@@ -137,8 +131,8 @@ def make[DepsT: ShellDeps](
 
 
 async def enter_scope(scope_id: UUID, config: Config) -> State:
-    """Start an empty job inventory; entering allocates no remote resources."""
-    return State()
+    """Record scope identity with an empty inventory, without allocating resources."""
+    return State(scope_id=scope_id)
 
 
 async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> None:

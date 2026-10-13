@@ -1,35 +1,33 @@
-"""Session HTTP composition and WebSocket transport; services own all queue/history logic.
+"""Session HTTP composition and WebSocket transport; services own history/admission.
 
-Direct execution awaits Temporal start confirmation; queue/cancel APIs only persist
-legacy inputs. Borrowed services outlive requests and WebSocket subscriptions.
+Create/close dispatch Worker scope Activities and wait for database business results.
+Runner submission returns its durable operation without waiting for Agent completion.
+Borrowed services outlive requests and subscriptions.
 """
 
 import asyncio
 import logging
 from contextlib import aclosing
-from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Path, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter
 from starlette.websockets import WebSocketState
 
-from kapy.agent_runner import HistoryMessage, OutputEvent
+from kapy.agent_history import HistoryMessage
+from kapy.agent_output import OutputEvent
 from kapy.control.sessions import (
     CreateSession,
-    InputChannel,
-    SessionCreationError,
-    SessionInput,
+    SessionOperation,
     SessionRecord,
     SessionService,
-    SubmitInput,
     UpdateSession,
 )
 from kapy.pagination import Page
 
 from .dependencies import HistoryPage, LiveCursor, OffsetPage
 from .errors import ControlRoute
-from .types import CreateSessionAndSchedule, DurableRun, StartDurableRunner
+from .types import CloseSession, CreateSessionRequest, StartRunner
 
 _logger = logging.getLogger(__name__)
 _output_adapter = TypeAdapter(list[OutputEvent])
@@ -38,17 +36,12 @@ _output_adapter = TypeAdapter(list[OutputEvent])
 def create_session_router(sessions: SessionService) -> APIRouter:
     router = APIRouter(route_class=ControlRoute)
 
-    @router.post("/sessions", status_code=201, operation_id="create_session_and_schedule")
-    async def create_session_and_schedule(data: CreateSessionAndSchedule) -> SessionRecord:
-        session = await sessions.create_session(
-            CreateSession.model_validate(data.model_dump(exclude={"input"}))
+    @router.post("/sessions", status_code=201, operation_id="create_session")
+    async def create_session(data: CreateSessionRequest) -> SessionRecord:
+        return await sessions.create_session(
+            CreateSession.model_validate(data.model_dump(exclude={"activity_id"})),
+            activity_id=data.activity_id,
         )
-        if data.input is not None:
-            try:
-                await sessions.submit_input(session.id, data.input)
-            except Exception as error:
-                raise SessionCreationError(session.id) from error
-        return session
 
     @router.get("/sessions", operation_id="list_sessions")
     async def list_sessions(
@@ -67,46 +60,24 @@ def create_session_router(sessions: SessionService) -> APIRouter:
         return await sessions.update_session(session_id, data)
 
     @router.post("/sessions/{session_id}/close", operation_id="close_session")
-    async def close_session(session_id: UUID) -> SessionRecord:
-        return await sessions.close_session(session_id)
+    async def close_session(session_id: UUID, data: CloseSession) -> SessionRecord:
+        return await sessions.close_session(session_id, activity_id=data.activity_id)
 
-    @router.post(
-        "/sessions/{session_id}/inputs", status_code=202, operation_id="submit_input_and_schedule"
+    @router.post("/sessions/{session_id}/runner", status_code=202, operation_id="start_runner")
+    async def start_runner(session_id: UUID, data: StartRunner) -> SessionOperation:
+        return await sessions.start_runner(
+            session_id, activity_id=data.activity_id, user_prompt=data.user_prompt
+        )
+
+    @router.get(
+        "/sessions/{session_id}/operations/{activity_id}", operation_id="get_session_operation"
     )
-    async def submit_input_and_schedule(session_id: UUID, data: SubmitInput) -> SessionInput:
-        submission = await sessions.submit_input(session_id, data)
-        return submission.input
-
-    @router.get("/sessions/{session_id}/inputs", operation_id="read_inputs")
-    async def read_inputs(
-        session_id: UUID, channel: InputChannel = "queued"
-    ) -> tuple[SessionInput, ...]:
-        return await sessions.read_inputs(session_id, channel)
-
-    @router.delete("/sessions/{session_id}/inputs/{input_id}", operation_id="delete_input")
-    async def delete_input(session_id: UUID, input_id: Annotated[int, Path(gt=0)]) -> bool:
-        return await sessions.delete_input(session_id, input_id)
-
-    @router.post(
-        "/sessions/{session_id}/runner", status_code=202, operation_id="start_durable_runner"
-    )
-    async def start_durable_runner(session_id: UUID, data: StartDurableRunner) -> DurableRun:
-        handle = await sessions.start_durable_runner(session_id, user_prompt=data.user_prompt)
-        assert handle.result_run_id is not None
-        return DurableRun(workflow_id=handle.id, run_id=handle.result_run_id)
+    async def get_session_operation(session_id: UUID, activity_id: UUID) -> SessionOperation:
+        return await sessions.get_operation(session_id, activity_id)
 
     @router.get("/sessions/{session_id}/runner", operation_id="is_runner_running")
     async def is_runner_running(session_id: UUID) -> bool:
-        return await sessions.is_durable_runner_running(session_id)
-
-    @router.post("/sessions/{session_id}/cancel", status_code=202, operation_id="request_cancel")
-    async def request_cancel(session_id: UUID) -> Response:
-        await sessions.request_cancel(session_id)
-        return Response(status_code=202)
-
-    @router.get("/sessions/{session_id}/cancel", operation_id="read_cancel")
-    async def read_cancel(session_id: UUID) -> bool:
-        return await sessions.read_cancel(session_id)
+        return await sessions.is_runner_running(session_id)
 
     @router.get("/sessions/{session_id}/history", operation_id="read_history")
     async def read_history(session_id: UUID, page: HistoryPage) -> Page[HistoryMessage]:

@@ -13,11 +13,13 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY packages/shellctl/pyproject.toml ./packages/shellctl/pyproject.toml
 COPY packages/mcp_gateway/pyproject.toml ./packages/mcp_gateway/pyproject.toml
+COPY packages/pydantic-ai-layer-protocol/pyproject.toml ./packages/pydantic-ai-layer-protocol/pyproject.toml
 RUN uv sync --locked --no-install-workspace
 COPY packages/shellctl/src ./packages/shellctl/src
 COPY packages/shellctl/LICENSE packages/shellctl/README.md ./packages/shellctl/
 COPY packages/mcp_gateway/src ./packages/mcp_gateway/src
 COPY packages/mcp_gateway/README.md ./packages/mcp_gateway/
+COPY packages/pydantic-ai-layer-protocol ./packages/pydantic-ai-layer-protocol
 COPY src ./src
 RUN uv sync --locked
 COPY tests ./tests

@@ -12,14 +12,13 @@ from pathlib import Path
 
 from sqlalchemy.schema import CreateSchema
 
-from kapy.agent_plugins import models as plugin_tables  # noqa: F401
-from kapy.agent_runner.models import agent_metadata
+from kapy.agent_history.models import history_metadata
 from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
 from kapy.control.database import ControlTable
 from kapy.control.models import models as model_tables  # noqa: F401
 from kapy.control.sessions import models as session_tables  # noqa: F401
-from kapy.session_lease.models import lease_metadata
+from kapy.control.sessions import operations as operation_tables  # noqa: F401
 
 from .migration import execute, migration_config
 
@@ -28,6 +27,7 @@ OWNED_TABLES = frozenset(
         "providers",
         "models",
         "sessions",
+        "session_operations",
         "plugin_agent_bindings",
         "session_inputs",
         "session_cancels",
@@ -48,7 +48,15 @@ async def migrate(
     plan: str | None = None,
 ) -> None:
     if plan is not None and (
-        operation != "revision" or plan not in {"context-pages", "immutable-history"}
+        operation != "revision"
+        or plan
+        not in {
+            "context-pages",
+            "immutable-history",
+            "shell-scope-state",
+            "durable-only",
+            "session-operations",
+        }
     ):
         raise ValueError("plan must name a supported revision generation plan")
     async with open_core_database(settings) as engine:
@@ -62,18 +70,20 @@ async def migrate(
                 config = migration_config(
                     db,
                     directory=Path(__file__).parent / "migrations",
-                    metadata=[ControlTable.metadata, agent_metadata, lease_metadata],
+                    metadata=[ControlTable.metadata, history_metadata],
                     version_table="core_schema_version",
                     owns_table=OWNED_TABLES.__contains__,
                 )
                 if plan is not None:
                     from . import revision_plans
 
-                    config.attributes["process_revision_directives"] = (
-                        revision_plans.context_pages
-                        if plan == "context-pages"
-                        else revision_plans.immutable_history
-                    )
+                    config.attributes["process_revision_directives"] = {
+                        "context-pages": revision_plans.context_pages,
+                        "immutable-history": revision_plans.immutable_history,
+                        "shell-scope-state": revision_plans.shell_scope_state,
+                        "durable-only": revision_plans.durable_only,
+                        "session-operations": revision_plans.session_operations,
+                    }[plan]
                 execute(config, operation, message=message)
 
             await connection.run_sync(run)
@@ -83,7 +93,16 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="kapy db")
     parser.add_argument("operation", choices=["upgrade", "current", "revision"])
     parser.add_argument("--message")
-    parser.add_argument("--plan", choices=["context-pages", "immutable-history"])
+    parser.add_argument(
+        "--plan",
+        choices=[
+            "context-pages",
+            "immutable-history",
+            "shell-scope-state",
+            "durable-only",
+            "session-operations",
+        ],
+    )
     args = parser.parse_args(argv)
     asyncio.run(
         migrate(

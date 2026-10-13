@@ -1,1 +1,1 @@
-"""Contracts for the independent capability plugin module."""
+"""Kapy shell implementation and host scope-policy tests."""

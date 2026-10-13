@@ -86,7 +86,7 @@ def validate_provider(config: ProviderConfig) -> None:
 async def _sdk_context[ResourceT](
     resource: AbstractAsyncContextManager[ResourceT],
 ) -> AsyncGenerator[ResourceT]:
-    """Protect only Provider/Model exit; never wrap graph or plugin cancel scopes."""
+    """Protect only Provider/Model exit; never wrap Agent/layer business cancel scopes."""
 
     async def close(
         exc_type: type[BaseException] | None,

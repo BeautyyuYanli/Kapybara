@@ -15,25 +15,22 @@ from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
 
-from kapy.layers import (
+from kapy.layers.mcps import Config, make, make_toolset
+from kapy.layers.registry import layer_registry
+from pydantic_ai_layer_protocol import (
+    JsonObject,
     LayerData,
     LayerDeps,
-    layers_capability,
-    load_layers,
-    make_layers,
-    snapshot_layers,
+    LayerRegistry,
+    dump_object,
 )
-from kapy.layers.mcps import Config, make, make_toolset
-from kapy.layers.modules import dump_object
-from kapy.layers.registry import LAYERS
-from kapy.layers.types import JsonObject
 
 
 def get_layers(deps: LayerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
-LAYERS_TEST = make_layers({"mcps": make}, get_layers)
+LAYERS_TEST = LayerRegistry({"mcps": make}, get_layers=get_layers)
 
 
 def config(label: str, marker: Path, *, namespace: str = "up") -> JsonObject:
@@ -74,14 +71,14 @@ def assert_processes_closed(marker: Path) -> None:
 
 
 def test_registered_config_round_trip_retains_credentials_and_empty_state(tmp_path):
-    assert "mcps" in LAYERS and LAYERS["mcps"].id == "mcps"
+    assert "mcps" in layer_registry.definitions and layer_registry.definitions["mcps"].id == "mcps"
     cfg = Config.model_validate(config("alice", tmp_path / "pids.jsonl"))
     plain = dump_object(cfg)
     restored = Config.model_validate(plain)
     assert restored.credentials["up"].env["API_KEY"].get_secret_value() == "alice-secret"
     assert "alice-secret" not in repr(cfg)
     assert Config.model_validate_json(cfg.model_dump_json()) == cfg
-    loaded = load_layers({"mcps": plain}, {}, LAYERS_TEST)
+    loaded = LAYERS_TEST.load({"mcps": plain}, {})
     assert loaded["mcps"]["state"] == {}
     assert isinstance(make_toolset(cfg).mcp, MCPToolset)
     assert not (tmp_path / "pids.jsonl").exists()
@@ -94,15 +91,14 @@ async def test_same_agent_concurrently_uses_distinct_inline_gateways_and_disable
     agent = Agent(
         FunctionModel(model),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(LAYERS_TEST, get_layers=get_layers)],
+        capabilities=[LAYERS_TEST],
     )
     markers = [tmp_path / f"{label}.jsonl" for label in ("alice", "bob")]
     inputs = [
         LayerDeps(
-            layers=load_layers(
+            layers=LAYERS_TEST.load(
                 {"mcps": config(label, marker, namespace=label)},
                 {},
-                LAYERS_TEST,
             )
         )
         for label, marker in zip(("alice", "bob"), markers, strict=True)
@@ -115,7 +111,7 @@ async def test_same_agent_concurrently_uses_distinct_inline_gateways_and_disable
         "bob:hello:bob-secret",
         "disabled",
     ]
-    assert all(snapshot_layers(deps, LAYERS_TEST, get_layers) == {"mcps": {}} for deps in inputs)
+    assert all(LAYERS_TEST.snapshot(deps) == {"mcps": {}} for deps in inputs)
     for marker in markers:
         assert_processes_closed(marker)
     parent_sets = [
@@ -156,9 +152,9 @@ async def test_model_aliases_keep_colliding_stems_distinct_bound_length_and_rout
     agent = Agent(
         FunctionModel(alias_model),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(LAYERS_TEST, get_layers=get_layers)],
+        capabilities=[LAYERS_TEST],
     )
-    deps = LayerDeps(layers=load_layers({"mcps": config("aliases", marker)}, {}, LAYERS_TEST))
+    deps = LayerDeps(layers=LAYERS_TEST.load({"mcps": config("aliases", marker)}, {}))
     for _ in range(2):
         assert (await agent.run("aliases", deps=deps)).output == "aliases routed"
         assert_processes_closed(marker)
@@ -190,9 +186,9 @@ async def test_cancelled_run_releases_gateway_and_inflight_upstream(tmp_path):
     agent = Agent(
         FunctionModel(blocked_model),
         deps_type=LayerDeps,
-        capabilities=[layers_capability(LAYERS_TEST, get_layers=get_layers)],
+        capabilities=[LAYERS_TEST],
     )
-    deps = LayerDeps(layers=load_layers({"mcps": config("cancel", marker)}, {}, LAYERS_TEST))
+    deps = LayerDeps(layers=LAYERS_TEST.load({"mcps": config("cancel", marker)}, {}))
     task = asyncio.create_task(agent.run("block", deps=deps))
     try:
         async with asyncio.timeout(20):
@@ -224,4 +220,4 @@ async def test_cancelled_run_releases_gateway_and_inflight_upstream(tmp_path):
 )
 def test_invalid_layer_config_is_rejected_before_any_process(value):
     with pytest.raises(ValidationError):
-        load_layers({"mcps": value}, {}, LAYERS_TEST)
+        LAYERS_TEST.load({"mcps": value}, {})

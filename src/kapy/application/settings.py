@@ -1,9 +1,9 @@
 """Shared value types only; each command explicitly supplies its environment values."""
 
 import re
-from typing import Literal, Self
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 
 class CommonSettings(BaseModel):
@@ -30,12 +30,6 @@ class CommonSettings(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO", validation_alias="KAPY_LOG_LEVEL"
     )
-    heartbeat_interval: float = Field(default=10, gt=0, validation_alias="KAPY_HEARTBEAT_INTERVAL")
-    heartbeat_timeout: float = Field(default=60, gt=0, validation_alias="KAPY_HEARTBEAT_TIMEOUT")
-    takeover_grace_period: float = Field(
-        default=30, gt=0, validation_alias="KAPY_TAKEOVER_GRACE_PERIOD"
-    )
-    realtime_output: bool = Field(default=True, validation_alias="KAPY_REALTIME_OUTPUT")
     output_flush_interval: float = Field(
         default=0.5, ge=0, validation_alias="KAPY_OUTPUT_FLUSH_INTERVAL"
     )
@@ -46,9 +40,3 @@ class CommonSettings(BaseModel):
         if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value):
             raise ValueError("database_schema must be a PostgreSQL identifier")
         return value
-
-    @model_validator(mode="after")
-    def heartbeat_policy(self) -> Self:
-        if self.heartbeat_interval >= self.heartbeat_timeout:
-            raise ValueError("heartbeat_interval must be less than heartbeat_timeout")
-        return self
