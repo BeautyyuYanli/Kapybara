@@ -1,112 +1,132 @@
-"""Opaque snapshots use real row locks, borrowed transactions and exact retry identity."""
+"""Opaque snapshots and ownership outcomes commit atomically in short transactions."""
 
 import asyncio
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
 from sqlalchemy import text
 
-from kapy.control.sessions import CreateSession, SessionService
+from kapy.control.sessions import OperationKind, OperationPhase
 from kapy.control.sessions.models import SessionRow
+from kapy.control.sessions.operations import OperationRepository, SessionOperationRow
 from kapy.control.sessions.repository import SessionRepository
-from kapy.control.sessions.types import UpdateSession
+from kapy.control.sessions.types import OwnershipLost
+from kapy.control.types import utc_now
+from kapy.lifecycle import LifecycleStatus
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-async def test_state_defaults_retries_and_ordinary_session_operations(database):
-    service = SessionService(database.sessions)
-    record = await service.create_session(CreateSession(provider_id=uuid4(), model_name="test"))
-    session_id = record.id
+async def running(database, session_id):
+    key = uuid4()
     async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        assert await repo.read_runner_state(session_id) == (None, 0)
-        await repo.save_runner_state(session_id, expected_version=0, runner_state="opaque 摘要")
-        saved_at = (await repo.get_session(session_id)).updated_at
-    async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        await repo.save_runner_state(session_id, expected_version=0, runner_state="opaque 摘要")
-        assert (await repo.get_session(session_id)).updated_at == saved_at
-        assert await repo.read_runner_state(session_id) == ("opaque 摘要", 1)
-        await repo.save_runner_state(session_id, expected_version=1, runner_state="")
-    await service.update_session(session_id, UpdateSession(title="renamed"))
-    await service.close_session(session_id)
-    async with database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(session_id) == ("", 2)
-    result = (await service.get_session(session_id)).model_dump()
-    assert "runner_state" not in result and "runner_state_version" not in result
-    for dto in (CreateSession, UpdateSession):
-        with pytest.raises(ValidationError):
-            dto.model_validate({"provider_id": uuid4(), "model_name": "test", "runner_state": "x"})
-
-
-async def test_state_conflicts_missing_rows_and_rollback(database, seed_session):
-    session_id = uuid4()
-    await seed_session(session_id)
-    async with database.sessions.begin() as db:
-        await SessionRepository(db).save_runner_state(
-            session_id, expected_version=0, runner_state='{"value": 1}'
+        row = await db.get(SessionRow, session_id)
+        row.status, row.current_activity_id = LifecycleStatus.RUNNING, key
+        db.add(
+            SessionOperationRow(
+                activity_id=key,
+                session_id=session_id,
+                kind=OperationKind.RUN,
+                phase=OperationPhase.RUNNING,
+                request={},
+                deadline=utc_now() + timedelta(hours=1),
+            )
         )
-    for version, state in ((0, '{"value":1}'), (2, "future"), (-1, "invalid")):
-        with pytest.raises(ValueError):
-            async with database.sessions.begin() as db:
-                await SessionRepository(db).save_runner_state(
-                    session_id, expected_version=version, runner_state=state
-                )
-    with pytest.raises(RuntimeError, match="rollback"):
-        async with database.sessions.begin() as db:
-            await SessionRepository(db).save_runner_state(
-                session_id, expected_version=1, runner_state="rolled back"
-            )
-            raise RuntimeError("rollback")
-    async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        assert await repo.read_runner_state(session_id) == ('{"value": 1}', 1)
-        await repo.save_runner_state(session_id, expected_version=1, runner_state="new")
-    with pytest.raises(ValueError):
-        async with database.sessions.begin() as db:
-            await SessionRepository(db).save_runner_state(
-                session_id, expected_version=0, runner_state='{"value": 1}'
-            )
-    missing = uuid4()
-    async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        with pytest.raises(LookupError):
-            await repo.read_runner_state(missing)
-        with pytest.raises(LookupError):
-            await repo.save_runner_state(missing, expected_version=0, runner_state="missing")
-        assert await db.get(SessionRow, missing) is None
+    return key
 
 
-@pytest.mark.parametrize("same_state", [False, True])
-async def test_concurrent_submissions_share_one_version(
-    database, seed_session, wait_for_lock, same_state
+async def test_final_snapshot_and_result_roll_back_together_and_success_is_immutable(
+    database, seed_session
 ):
     session_id = uuid4()
     await seed_session(session_id)
-    pid_ready = asyncio.Future()
-
-    async def contender():
+    key = await running(database, session_id)
+    with pytest.raises(RuntimeError, match="rollback"):
         async with database.sessions.begin() as db:
-            # Retaining this pre-lock ORM row reproduces stale identity-map reads.
-            row = await db.get(SessionRow, session_id)
-            assert row is not None and row.runner_state_version == 0
-            pid_ready.set_result((await db.execute(text("SELECT pg_backend_pid()"))).scalar_one())
-            await SessionRepository(db).save_runner_state(
-                session_id, expected_version=0, runner_state="winner" if same_state else "loser"
+            await OperationRepository(db).complete(
+                key, LifecycleStatus.READY, "output", runner_state="opaque 摘要", layer_states={}
             )
-
+            raise RuntimeError("rollback")
     async with database.sessions.begin() as db:
-        await SessionRepository(db).save_runner_state(
-            session_id, expected_version=0, runner_state="winner"
+        assert await SessionRepository(db).read_runner_state(session_id) is None
+        assert (await OperationRepository(db).get(key)).phase == OperationPhase.RUNNING
+        await OperationRepository(db).complete(
+            key, LifecycleStatus.READY, "output", runner_state="opaque 摘要", layer_states={}
         )
-        task = asyncio.create_task(contender())
-        await wait_for_lock(await pid_ready)
-    if same_state:
-        await asyncio.wait_for(task, 5)
-    else:
-        with pytest.raises(ValueError):
-            await asyncio.wait_for(task, 5)
+    with pytest.raises(OwnershipLost):
+        async with database.sessions.begin() as db:
+            await OperationRepository(db).fail(key, "late failure", expired=True)
     async with database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(session_id) == ("winner", 1)
+        row = await db.get(SessionRow, session_id)
+        assert row.status == LifecycleStatus.READY and row.runner_state == "opaque 摘要"
+        operation = await OperationRepository(db).get(key)
+        assert operation.phase == OperationPhase.SUCCEEDED and operation.result == "output"
+        assert (
+            "runner_state" not in (await SessionRepository(db).get_session(session_id)).model_dump()
+        )
+
+
+@pytest.mark.parametrize("winner", ["complete", "fail"])
+async def test_racing_success_and_failure_publish_one_consistent_terminal_state(
+    database, seed_session, winner
+):
+    session_id = uuid4()
+    await seed_session(session_id)
+    key = await running(database, session_id)
+    entered, release = asyncio.Event(), asyncio.Event()
+    winner_pid = asyncio.get_running_loop().create_future()
+    contender_pid = asyncio.get_running_loop().create_future()
+
+    async def finish(kind, hold=False):
+        async with database.sessions.begin() as db:
+            pid = (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            (winner_pid if hold else contender_pid).set_result(pid)
+            repo = OperationRepository(db)
+            if kind == "complete":
+                await repo.complete(key, LifecycleStatus.READY, "output", runner_state="messages")
+            else:
+                await repo.fail(key, "failed", expired=True)
+            if hold:
+                entered.set()
+                await release.wait()
+
+    first = asyncio.create_task(finish(winner, True))
+    await entered.wait()
+    second = asyncio.create_task(finish("fail" if winner == "complete" else "complete"))
+    try:
+        owner, contender = await winner_pid, await contender_pid
+        async with asyncio.timeout(5):
+            while True:
+                async with database.sessions.begin() as db:
+                    blocked = (
+                        await db.execute(
+                            text("SELECT :owner = ANY(pg_blocking_pids(:contender))"),
+                            {"owner": owner, "contender": contender},
+                        )
+                    ).scalar_one()
+                if blocked:
+                    break
+                await asyncio.sleep(0.01)
+        # The contender's UPDATE began while the first terminal result was still
+        # uncommitted. Failure-first makes its allowed closing row pass EPQ while
+        # the operation subquery still sees the old running snapshot.
+        assert not second.done()
+        release.set()
+        await first
+        with pytest.raises(OwnershipLost):
+            await second
+    finally:
+        release.set()
+        await asyncio.gather(first, second, return_exceptions=True)
+    async with database.sessions.begin() as db:
+        row, operation = (
+            await db.get(SessionRow, session_id),
+            await OperationRepository(db).get(key),
+        )
+        if winner == "complete":
+            assert row.status == LifecycleStatus.READY and row.runner_state == "messages"
+            assert operation.phase == OperationPhase.SUCCEEDED and operation.result == "output"
+        else:
+            assert row.status == LifecycleStatus.CLOSING and row.runner_state is None
+            assert operation.phase == OperationPhase.FAILED and operation.result is None

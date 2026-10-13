@@ -1,8 +1,7 @@
-"""Exercise the real Temporal sandbox and SDK protocols against a local HTTP server.
+"""Real standalone Activity execution, local model protocols and storage lifecycles.
 
-Start Compose's temporal service and set KAPY_TEMPORAL_ADDRESS=temporal:7233 when
-running inside the runtime container. Every test owns a unique task queue and
-Workflow ID; no remote model credentials or API calls are used.
+Each test owns its PostgreSQL schema, Activity identity and queue. Model requests
+use deterministic local HTTP endpoints; no external model API is called.
 """
 
 import asyncio
@@ -21,7 +20,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import CapabilityOrdering, Hooks
-from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -39,27 +38,67 @@ from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings
 from sqlmodel import col, select
 from temporalio import activity
-from temporalio.client import Client
-from temporalio.worker import Replayer, Worker
+from temporalio.client import ActivityExecutionStatus, ActivityFailureError, Client
+from temporalio.common import RetryPolicy
+from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.exceptions import ApplicationError, CancelledError
+from temporalio.worker import Worker
 
+from kapy.agent_history import HistoryRepository
 from kapy.agent_history.models import AgentHistoryRow
 from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 from kapy.application.resources import connect_temporal
-from kapy.application.settings import CommonSettings
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
 from kapy.control.sessions.repository import SessionRepository
-from kapy.runner_duarable import (
-    DurableExecutionConfig,
+from kapy.runner import (
+    ExecutionConfig,
     MessageRecordCapability,
+    RunnerActivity,
     RunnerDeps,
     RunnerInput,
-    RunnerWorkflow,
     agent,
 )
-from kapy.runner_duarable.activities import RunnerActivities
-from kapy.runner_duarable.recording import Recorder
-from kapy.runner_duarable.types import MessageBatch, SaveRunnerStateInput
-from kapy.runner_duarable.worker import serve
+from kapy.runner.recording import Recorder
+from kapy.runner.worker import serve
+
+
+async def start(client, queue, data, *, database, **kwargs):
+    from kapy.control.sessions.models import SessionRow
+    from kapy.control.sessions.operations import SessionOperationRow
+    from kapy.control.sessions.types import OperationKind, OperationPhase
+    from kapy.control.types import utc_now
+    from kapy.lifecycle import LifecycleStatus
+
+    key = uuid4()
+    async with database.sessions.begin() as db:
+        session = await db.get(SessionRow, data.session_id)
+        session.status, session.current_activity_id = LifecycleStatus.STARTING, key
+        db.add(
+            SessionOperationRow(
+                activity_id=key,
+                session_id=data.session_id,
+                kind=OperationKind.RUN,
+                phase=OperationPhase.PENDING,
+                request={},
+                input=data.model_dump(mode="json"),
+                deadline=utc_now() + timedelta(seconds=35),
+            )
+        )
+    return await client.start_activity(
+        RunnerActivity.run,
+        key,
+        id=str(key),
+        task_queue=queue,
+        start_to_close_timeout=timedelta(seconds=30),
+        heartbeat_timeout=timedelta(seconds=10),
+        retry_policy=RetryPolicy(maximum_attempts=1),
+        **kwargs,
+    )
+
+
+async def execute(client, queue, data, *, database):
+    handle = await start(client, queue, data, database=database)
+    return await asyncio.wait_for(handle.result(), 35)
 
 
 @pytest.fixture
@@ -220,9 +259,9 @@ def endpoint() -> Iterator[tuple[str, list[dict[str, Any]]]]:
         thread.join()
 
 
-def make_config(base_url: str, protocol: str = "OpenAIChatModel") -> DurableExecutionConfig:
+def make_config(base_url: str, protocol: str = "OpenAIChatModel") -> ExecutionConfig:
     google = protocol == "GoogleModel"
-    return DurableExecutionConfig(
+    return ExecutionConfig(
         provider_class=(
             "pydantic_ai.providers.google:GoogleProvider"
             if google
@@ -242,23 +281,16 @@ def make_config(base_url: str, protocol: str = "OpenAIChatModel") -> DurableExec
 @pytest.mark.parametrize("model_class", [OpenAIChatModel, OpenAIResponsesModel, GoogleModel])
 @pytest.mark.parametrize("with_tools", [False, True], ids=["new-session", "tool-history"])
 async def test_database_history_reproduces_model_input(
-    endpoint, runner_database, monkeypatch, model_class, with_tools
+    endpoint, runner_database, model_class, with_tools
 ):
     """Compare complete HTTP bodies after real storage, codec and SDK normalization.
 
-    Only the Temporal Activity scheduler is replaced; recording uses the real
-    database Activity. The restored input is selected in sequence order, then
+    Recording commits directly through the real database. The restored input is
+    selected in sequence order, then
     the newly generated response is excluded from the replay input.
     """
     base_url, requests = endpoint
     config = make_config(base_url, model_class.__name__)
-    activities = RunnerActivities(runner_database.sessions, runner_database.outputs)
-
-    async def record(name, data, *, start_to_close_timeout):
-        assert name == "kapy.record_history"
-        await activities.record_messages(data)
-
-    monkeypatch.setattr("kapy.runner_duarable.recording.workflow.execute_activity", record)
 
     async def drain(ctx, events):
         async for _ in events:
@@ -322,7 +354,7 @@ async def test_database_history_reproduces_model_input(
         result = await recording_agent.run(
             "continue",
             message_history=history,
-            deps=RunnerDeps(config=config, session_id=runner_database.session_id),
+            deps=runner_database.deps(),
             model_settings=cast(ModelSettings, config.model_settings),
             event_stream_handler=drain,
         )
@@ -331,7 +363,7 @@ async def test_database_history_reproduces_model_input(
             result = await recording_agent.run(
                 "follow-up",
                 message_history=result.all_messages(),
-                deps=RunnerDeps(config=config, session_id=runner_database.session_id),
+                deps=runner_database.deps(),
                 model_settings=cast(ModelSettings, config.model_settings),
                 event_stream_handler=drain,
             )
@@ -397,7 +429,6 @@ async def test_database_history_reproduces_model_input(
 def test_input_round_trip_and_validation():
     data = RunnerInput(
         session_id=uuid4(),
-        runner_state_version=0,
         runner_state=None,
         user_prompt="hello",
         config=make_config("http://localhost:9999"),
@@ -413,334 +444,15 @@ def test_input_round_trip_and_validation():
         {"model_class": "without_separator"},
     ):
         with pytest.raises(ValidationError):
-            DurableExecutionConfig.model_validate(data.config.model_dump() | overrides)
-    for version in (-1, True, 1.0, "1"):
-        with pytest.raises(ValidationError):
-            RunnerInput.model_validate(data.model_dump() | {"runner_state_version": version})
-        with pytest.raises(ValidationError):
-            SaveRunnerStateInput.model_validate(
-                {"session_id": data.session_id, "expected_version": version, "runner_state": ""}
-            )
-    for field in ("session_id", "runner_state_version", "runner_state"):
+            ExecutionConfig.model_validate(data.config.model_dump() | overrides)
+    for field in ("session_id", "runner_state"):
         with pytest.raises(ValidationError):
             RunnerInput.model_validate(data.model_dump(exclude={field}))
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_class", [OpenAIChatModel, OpenAIResponsesModel, GoogleModel])
-async def test_workflow_protocol_and_replay(endpoint, monkeypatch, model_class, runner_database):
-    base_url, requests = endpoint
-    config = make_config(base_url, model_class.__name__)
-    original_request = model_class.request_stream
-    models = []
-
-    @asynccontextmanager
-    async def checked_request(self, *args, **kwargs):
-        assert activity.in_activity(), "Model I/O escaped the Activity boundary"
-        assert self.context_window == 12345
-        models.append(self)
-        async with original_request(self, *args, **kwargs) as stream:
-            yield stream
-
-    monkeypatch.setattr(model_class, "request_stream", checked_request)
-    broadcasts: list[OutputEvent] = []
-    publish = runner_database.outputs._publish
-
-    async def observe_publish(session_id, payload):
-        await publish(session_id, payload)
-        broadcasts.extend(TypeAdapter(list[OutputEvent]).validate_json(payload))
-
-    monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
-    client = await Client.connect(
-        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
-        plugins=[PydanticAIPlugin()],
-    )
-    queue = f"runner-test-{uuid4()}"
-    async with Worker(
-        client,
-        task_queue=queue,
-        workflows=[RunnerWorkflow],
-        activities=[
-            RunnerActivities(runner_database.sessions, runner_database.outputs).record_messages,
-            RunnerActivities(runner_database.sessions, runner_database.outputs).save_runner_state,
-        ],
-        plugins=[AgentPlugin(agent)],
-    ):
-        handle = await client.start_workflow(
-            RunnerWorkflow.run,
-            RunnerInput(
-                session_id=runner_database.session_id,
-                runner_state_version=0,
-                runner_state=None,
-                user_prompt="hello",
-                config=config,
-            ),
-            id=queue,
-            task_queue=queue,
-            execution_timeout=timedelta(seconds=30),
-        )
-        assert await asyncio.wait_for(handle.result(), 35) == "done"
-        history = await handle.fetch_history()
-    async with runner_database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        state, version = await repo.read_runner_state(runner_database.session_id)
-        saved_at = (await repo.get_session(runner_database.session_id)).updated_at
-    assert state is not None and version == 1
-    from kapy.agent_history.repository import HistoryRepository
-
-    async with runner_database.sessions.begin() as db:
-        stored = await HistoryRepository(db).read_history_entries(runner_database.session_id)
-    assert [entry.seq for entry in stored] == [0, 1]
-    assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == [0, 1]
-    assert [(e.response_seq, e.text) for e in broadcasts if isinstance(e, TextDelta)] == [
-        (1, "done")
-    ]
-    published_before_replay = list(broadcasts)
-    assert [entry.message.metadata for entry in stored] == [
-        {"seq": 0},
-        {"seq": 1},
-    ]
-    messages = ModelMessagesTypeAdapter.validate_json(state)
-    assert any(
-        isinstance(part, UserPromptPart) and part.content == "hello"
-        for message in messages
-        for part in message.parts
-    )
-    assert any(isinstance(part, TextPart) and part.content == "done" for part in messages[-1].parts)
-    assert len(requests) == 1
-    assert models and all(model.provider._own_http_client.is_closed for model in models)
-    body = requests[0]["body"]
-    if model_class is GoogleModel:
-        assert body["generationConfig"]["temperature"] == 0.25
-        assert body["contents"][0]["parts"] == [{"text": "hello"}]
-    else:
-        assert body["temperature"] == 0.25
-        assert body["model"] == "gpt-4o-mini"
-        assert requests[0]["headers"]["authorization"] == "Bearer test-secret"
-    await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
-        history
-    )
-    assert len(requests) == 1 and broadcasts == published_before_replay
-    async with runner_database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        assert await repo.read_runner_state(runner_database.session_id) == (state, 1)
-        assert (await repo.get_session(runner_database.session_id)).updated_at == saved_at
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_failed_activity_closes_model(endpoint, monkeypatch, runner_database):
-    from pydantic_ai.exceptions import UserError
-    from temporalio.client import WorkflowFailureError
-
-    from kapy.agent_history.repository import HistoryRepository
-
-    base_url, requests = endpoint
-    models = []
-    async with runner_database.sessions.begin() as db:
-        await SessionRepository(db).save_runner_state(
-            runner_database.session_id, expected_version=0, runner_state="previous"
-        )
-
-    @asynccontextmanager
-    async def fail_request(self, *args, **kwargs):
-        assert activity.in_activity()
-        async with runner_database.sessions.begin() as db:
-            assert (
-                await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
-            )
-        models.append(self)
-        raise UserError("invalid model request")
-        yield  # pragma: no cover - retain the SDK async context manager contract
-
-    monkeypatch.setattr(OpenAIChatModel, "request_stream", fail_request)
-    client = await Client.connect(
-        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
-        plugins=[PydanticAIPlugin()],
-    )
-    queue = f"runner-failure-{uuid4()}"
-    async with Worker(
-        client,
-        task_queue=queue,
-        workflows=[RunnerWorkflow],
-        activities=[
-            RunnerActivities(runner_database.sessions, runner_database.outputs).record_messages,
-            RunnerActivities(runner_database.sessions, runner_database.outputs).save_runner_state,
-        ],
-        plugins=[AgentPlugin(agent)],
-    ):
-        with pytest.raises(WorkflowFailureError):
-            await client.execute_workflow(
-                RunnerWorkflow.run,
-                RunnerInput(
-                    session_id=runner_database.session_id,
-                    runner_state_version=1,
-                    runner_state=None,
-                    user_prompt="hello",
-                    config=make_config(base_url),
-                ),
-                id=queue,
-                task_queue=queue,
-                execution_timeout=timedelta(seconds=15),
-            )
-    assert len(models) == 1  # SDK classifies UserError as non-retryable.
-    assert models[0].provider._own_http_client.is_closed
-    assert requests == []
-    async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
-            "previous",
-            1,
-        )
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_application_client_and_worker_entry(endpoint, runner_database):
-    base_url, requests = endpoint
-    settings = CommonSettings.model_validate(
-        {
-            **os.environ,
-            "KAPY_DATABASE_SCHEMA": runner_database.settings.database_schema,
-            "KAPY_TEMPORAL_TASK_QUEUE": f"entry-test-{uuid4()}",
-        }
-    )
-    client = await connect_temporal(settings)
-    worker_task = asyncio.create_task(serve(settings))
-    try:
-        result = await asyncio.wait_for(
-            client.execute_workflow(
-                RunnerWorkflow.run,
-                RunnerInput(
-                    session_id=runner_database.session_id,
-                    runner_state_version=0,
-                    runner_state=None,
-                    user_prompt="hello",
-                    config=make_config(base_url),
-                ),
-                id=settings.temporal_task_queue,
-                task_queue=settings.temporal_task_queue,
-                execution_timeout=timedelta(seconds=15),
-            ),
-            timeout=20,
-        )
-        assert result == "done"
-        assert len(requests) == 1
-        async with runner_database.sessions.begin() as db:
-            state, version = await SessionRepository(db).read_runner_state(
-                runner_database.session_id
-            )
-            assert state is not None and version == 1
-    finally:
-        worker_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await asyncio.wait_for(worker_task, timeout=20)
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_save_retries_after_commit_without_incrementing_again(endpoint, runner_database):
-    from temporalio.exceptions import ApplicationError
-
-    base_url, requests = endpoint
-    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
-    observations = []
-    inputs = []
-
-    @activity.defn(name="kapy.save_runner_state")
-    async def lose_first_ack(data: SaveRunnerStateInput) -> None:
-        inputs.append(data)
-        await saver.save_runner_state(data)
-        async with runner_database.sessions.begin() as db:
-            repo = SessionRepository(db)
-            observations.append(
-                (
-                    await repo.read_runner_state(data.session_id),
-                    (await repo.get_session(data.session_id)).updated_at,
-                )
-            )
-        if activity.info().attempt == 1:
-            raise ApplicationError("simulated lost acknowledgment after commit")
-
-    client = await connect_temporal(runner_database.settings)
-    queue = f"runner-retry-{uuid4()}"
-    async with Worker(
-        client,
-        task_queue=queue,
-        workflows=[RunnerWorkflow],
-        activities=[lose_first_ack, saver.record_messages],
-        plugins=[AgentPlugin(agent)],
-    ):
-        result = await client.execute_workflow(
-            RunnerWorkflow.run,
-            RunnerInput(
-                session_id=runner_database.session_id,
-                runner_state_version=0,
-                runner_state=None,
-                user_prompt="hello",
-                config=make_config(base_url),
-            ),
-            id=queue,
-            task_queue=queue,
-            execution_timeout=timedelta(seconds=30),
-        )
-    assert result == "done" and len(requests) == 1
-    assert len(inputs) == 2 and inputs[0] == inputs[1]
-    assert len(observations) == 2 and observations[0] == observations[1]
-    assert observations[0][0][1] == 1
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-@pytest.mark.parametrize("missing", [False, True])
-async def test_save_business_errors_fail_workflow(endpoint, runner_database, missing):
-    from temporalio.client import WorkflowFailureError
-    from temporalio.exceptions import ActivityError, ApplicationError
-
-    base_url, requests = endpoint
-    async with runner_database.sessions.begin() as db:
-        await SessionRepository(db).save_runner_state(
-            runner_database.session_id, expected_version=0, runner_state="previous"
-        )
-    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
-    client = await connect_temporal(runner_database.settings)
-    queue = f"runner-save-failure-{uuid4()}"
-    async with Worker(
-        client,
-        task_queue=queue,
-        workflows=[RunnerWorkflow],
-        activities=[saver.record_messages, saver.save_runner_state],
-        plugins=[AgentPlugin(agent)],
-    ):
-        with pytest.raises(WorkflowFailureError) as exc_info:
-            await client.execute_workflow(
-                RunnerWorkflow.run,
-                RunnerInput(
-                    session_id=uuid4() if missing else runner_database.session_id,
-                    runner_state_version=0,
-                    runner_state=None,
-                    user_prompt="hello",
-                    config=make_config(base_url),
-                ),
-                id=queue,
-                task_queue=queue,
-                execution_timeout=timedelta(seconds=15),
-            )
-    assert isinstance(exc_info.value.cause, ActivityError)
-    cause = exc_info.value.cause.cause
-    assert isinstance(cause, ApplicationError) and cause.non_retryable
-    assert cause.type == ("SessionNotFound" if missing else "RunnerStateConflict")
-    assert len(requests) == 1  # Persistence validates the session after model dispatch.
-    async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
-            "previous",
-            1,
-        )
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_workflow_restores_state_and_records_after_run_tail_once(
+async def test_activity_restores_state_and_records_after_run_tail_once(
     endpoint, runner_database, monkeypatch
 ):
     from kapy.agent_history.repository import HistoryRepository
@@ -768,49 +480,42 @@ async def test_workflow_restores_state_and_records_after_run_tail_once(
         deps_type=RunnerDeps,
         capabilities=[*agent.root_capability.capabilities, Hooks(after_run=append_tail)],
     )
-    monkeypatch.setattr(import_module("kapy.runner_duarable.agent"), "agent", tail_agent)
-    monkeypatch.setattr(import_module("kapy.runner_duarable.workflow"), "agent", tail_agent)
+    monkeypatch.setattr(import_module("kapy.runner.activities"), "agent", tail_agent)
     monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
-    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-restore-{uuid4()}"
     async with Worker(
         client,
         task_queue=queue,
-        workflows=[RunnerWorkflow],
-        activities=[saver.record_messages, saver.save_runner_state],
-        plugins=[AgentPlugin(tail_agent)],
+        activities=[runner.create, runner.run, runner.close],
     ):
         for prompt in ("first", "follow-up"):
             async with runner_database.sessions.begin() as db:
-                state, version = await SessionRepository(db).read_runner_state(
-                    runner_database.session_id
-                )
+                state = await SessionRepository(db).read_runner_state(runner_database.session_id)
             assert (
-                await client.execute_workflow(
-                    RunnerWorkflow.run,
+                await execute(
+                    client,
+                    queue,
                     RunnerInput(
                         session_id=runner_database.session_id,
-                        runner_state_version=version,
                         runner_state=state,
                         user_prompt=prompt,
                         config=make_config(base_url),
                     ),
-                    id=f"{queue}-{version}",
-                    task_queue=queue,
-                    execution_timeout=timedelta(seconds=15),
+                    database=runner_database,
                 )
                 == "done"
             )
             if prompt == "first":
                 async with runner_database.sessions.begin() as db:
-                    first_state, first_version = await SessionRepository(db).read_runner_state(
+                    first_state = await SessionRepository(db).read_runner_state(
                         runner_database.session_id
                     )
                     first_entries = await HistoryRepository(db).read_history_entries(
                         runner_database.session_id
                     )
-                assert first_state is not None and first_version == 1
+                assert first_state is not None
                 first_messages = ModelMessagesTypeAdapter.validate_json(first_state)
                 tail = first_messages[-1]
                 assert isinstance(tail, ModelRequest) and len(tail.parts) == 1
@@ -830,9 +535,9 @@ async def test_workflow_restores_state_and_records_after_run_tail_once(
         ("user", "follow-up"),
     ]
     async with runner_database.sessions.begin() as db:
-        state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
+        state = await SessionRepository(db).read_runner_state(runner_database.session_id)
         entries = await HistoryRepository(db).read_history_entries(runner_database.session_id)
-    assert state is not None and version == 2
+    assert state is not None
     messages = ModelMessagesTypeAdapter.validate_json(state)
     assert [m.metadata for m in messages] == [
         {"seq": 0},
@@ -879,122 +584,40 @@ async def test_workflow_restores_state_and_records_after_run_tail_once(
         (None, {"unknown": {"config": {}, "state": {}}}),
     ],
 )
-async def test_invalid_state_fails_workflow_before_model_call(
+async def test_invalid_state_fails_activity_before_model_call(
     endpoint, runner_database, state, layers
 ):
-    from temporalio.client import WorkflowFailureError
-    from temporalio.exceptions import ApplicationError
 
     from kapy.agent_history.repository import HistoryRepository
 
     base_url, requests = endpoint
-    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-invalid-state-{uuid4()}"
     async with Worker(
         client,
         task_queue=queue,
-        workflows=[RunnerWorkflow],
-        activities=[saver.record_messages, saver.save_runner_state],
-        plugins=[AgentPlugin(agent)],
+        activities=[runner.create, runner.run, runner.close],
     ):
-        with pytest.raises(WorkflowFailureError) as error:
-            await client.execute_workflow(
-                RunnerWorkflow.run,
+        with pytest.raises(ActivityFailureError) as error:
+            await execute(
+                client,
+                queue,
                 RunnerInput(
                     session_id=runner_database.session_id,
-                    runner_state_version=0,
                     runner_state=state,
                     layers=layers,
                     user_prompt="hello",
                     config=make_config(base_url),
                 ),
-                id=queue,
-                task_queue=queue,
-                execution_timeout=timedelta(seconds=15),
+                database=runner_database,
             )
     assert isinstance(error.value.cause, ApplicationError)
     assert error.value.cause.type == "UserError"
     assert requests == []
     async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == (
-            None,
-            0,
-        )
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
         assert await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_history_activity_lost_ack_retries_same_batch_and_replays(
-    endpoint, runner_database, monkeypatch
-):
-    from temporalio.exceptions import ApplicationError
-
-    from kapy.agent_history.repository import HistoryRepository
-
-    base_url, requests = endpoint
-    saver = RunnerActivities(runner_database.sessions, runner_database.outputs)
-    inputs = []
-    broadcasts = []
-    publish = runner_database.outputs._publish
-
-    async def observe_publish(session_id, payload):
-        await publish(session_id, payload)
-        broadcasts.extend(TypeAdapter(list[OutputEvent]).validate_json(payload))
-
-    monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
-
-    @activity.defn(name="kapy.record_history")
-    async def lose_first_ack(data: MessageBatch) -> None:
-        inputs.append(data)
-        await saver.record_messages(data)
-        if activity.info().attempt == 1:
-            raise ApplicationError("simulated history commit with lost acknowledgment")
-
-    client = await connect_temporal(runner_database.settings)
-    queue = f"runner-history-retry-{uuid4()}"
-    async with Worker(
-        client,
-        task_queue=queue,
-        workflows=[RunnerWorkflow],
-        activities=[lose_first_ack, saver.save_runner_state],
-        plugins=[AgentPlugin(agent)],
-    ):
-        handle = await client.start_workflow(
-            RunnerWorkflow.run,
-            RunnerInput(
-                session_id=runner_database.session_id,
-                runner_state_version=0,
-                runner_state=None,
-                user_prompt="hello",
-                config=make_config(base_url),
-            ),
-            id=queue,
-            task_queue=queue,
-            execution_timeout=timedelta(seconds=30),
-        )
-        assert await handle.result() == "done"
-        history = await handle.fetch_history()
-    assert len(requests) == 1
-    assert len(inputs) == 2 and inputs[0] == inputs[1]
-    assert [m.seq for m in inputs[0].messages] == [0, 1]
-    async with runner_database.sessions.begin() as db:
-        entries = await HistoryRepository(db).read_history_entries(runner_database.session_id)
-        state, version = await SessionRepository(db).read_runner_state(runner_database.session_id)
-    assert [entry.seq for entry in entries] == [0, 1]
-    assert state is not None and version == 1
-    assert [m.metadata for m in ModelMessagesTypeAdapter.validate_json(state)] == [
-        {"seq": 0},
-        {"seq": 1},
-    ]
-    assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == [0, 1]
-    published_before_replay = list(broadcasts)
-    await Replayer(workflows=[RunnerWorkflow], plugins=[PydanticAIPlugin()]).replay_workflow(
-        history
-    )
-    assert len(inputs) == 2 and len(requests) == 1
-    assert broadcasts == published_before_replay
 
 
 @pytest.mark.integration
@@ -1040,7 +663,8 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         )
     )
     temporal = await Client.connect(
-        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"), plugins=[PydanticAIPlugin()]
+        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+        data_converter=pydantic_data_converter,
     )
     queue = f"service-test-{uuid4()}"
     sessions = create_session_service(
@@ -1054,15 +678,13 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
     )
     path = tmp_path / "telegram.sqlite3"
     await migrate(path, "upgrade")
-    activities = RunnerActivities(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
     async with (
         open_storage(path) as storage,
         Worker(
             temporal,
             task_queue=queue,
-            workflows=[RunnerWorkflow],
-            activities=[activities.record_messages, activities.save_runner_state],
-            plugins=[AgentPlugin(agent)],
+            activities=[runner.create, runner.run, runner.close],
         ),
     ):
         repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
@@ -1098,7 +720,13 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         assert await controller.process_once()
         session_id = await repository.route(42, 123, 0)
         assert session_id is not None
-        first = temporal.get_workflow_handle(f"kapy-runner:{session_id}")
+        async with repository.sessions.begin() as db:
+            from kapy.interfaces.telegram.models import InboxRow
+
+            inbox = await db.get(InboxRow, (42, 1))
+            assert inbox is not None and inbox.resolved_action is not None
+            first_key = inbox.resolved_action["run_activity_id"]
+        first = temporal.get_activity_handle(first_key)
         assert await asyncio.wait_for(first.result(), 30) == "done"
         (row,) = await repository.deliveries(42)
         follower = asyncio.create_task(
@@ -1113,8 +741,13 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
             saved = await repository.get_delivery(delivery_key(row))
             assert saved.after_seq == 1
             # The first final reply is delivered without waiting for another prompt.
-            second = await sessions.start_durable_runner(session_id, user_prompt="second prompt")
-            assert await asyncio.wait_for(second.result(), 30) == "done"
+            second = await sessions.start_runner(
+                session_id, user_prompt="second prompt", activity_id=uuid4()
+            )
+            second_handle = temporal.get_activity_handle(
+                str(second.activity_id), run_id=second.run_id
+            )
+            assert await asyncio.wait_for(second_handle.result(), 30) == "done"
             assert len(requests) == 2
             assert requests[0]["headers"]["authorization"] == "Bearer local-test"
             assert requests[0]["body"]["temperature"] == 0.5
@@ -1125,9 +758,9 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
                 "second prompt",
             ]
             async with runner_database.sessions.begin() as db:
-                state, version = await SessionRepository(db).read_runner_state(session_id)
-            assert state is not None and version == 2
-            assert not await sessions.is_durable_runner_running(session_id)
+                state = await SessionRepository(db).read_runner_state(session_id)
+            assert state is not None
+            assert not await sessions.is_runner_running(session_id)
             async with asyncio.timeout(5):
                 while (  # noqa: ASYNC110
                     (await repository.get_delivery(delivery_key(row))).after_seq < 3
@@ -1150,3 +783,351 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         finally:
             follower.cancel()
             await asyncio.gather(follower, return_exceptions=True)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_class", [OpenAIChatModel, OpenAIResponsesModel, GoogleModel])
+async def test_activity_protocol_resources_and_history(
+    endpoint, monkeypatch, model_class, runner_database
+):
+    base_url, requests = endpoint
+    original_request = model_class.request_stream
+    models = []
+
+    @asynccontextmanager
+    async def checked_request(self, *args, **kwargs):
+        assert activity.in_activity()
+        assert activity.info().workflow_id is None
+        assert self.context_window == 12345
+        models.append(self)
+        async with original_request(self, *args, **kwargs) as stream:
+            yield stream
+
+    monkeypatch.setattr(model_class, "request_stream", checked_request)
+    broadcasts: list[OutputEvent] = []
+    publish = runner_database.outputs._publish
+
+    async def observe_publish(session_id, payload):
+        await publish(session_id, payload)
+        broadcasts.extend(TypeAdapter(list[OutputEvent]).validate_json(payload))
+
+    monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-protocol-{uuid4()}"
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    async with Worker(
+        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
+    ):
+        handle = await start(
+            client,
+            queue,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state=None,
+                user_prompt="hello",
+                config=make_config(base_url, model_class.__name__),
+            ),
+            database=runner_database,
+        )
+        assert await asyncio.wait_for(handle.result(), 35) == "done"
+        description = await handle.describe()
+        assert description.status == ActivityExecutionStatus.COMPLETED
+        assert description.attempt == 1
+        assert description.retry_policy.maximum_attempts == 1
+        assert description.activity_type == "kapy.run_agent"
+        assert description.heartbeat_timeout == timedelta(seconds=10)
+    async with runner_database.sessions.begin() as db:
+        state = await SessionRepository(db).read_runner_state(runner_database.session_id)
+        stored = await HistoryRepository(db).read_history_entries(runner_database.session_id)
+    assert state is not None
+    assert [entry.seq for entry in stored] == [0, 1]
+    assert [entry.message.metadata for entry in stored] == [{"seq": 0}, {"seq": 1}]
+    assert [event.message.seq for event in broadcasts if isinstance(event, MessageCommitted)] == [
+        0,
+        1,
+    ]
+    assert [
+        (event.response_seq, event.text) for event in broadcasts if isinstance(event, TextDelta)
+    ] == [(1, "done")]
+    assert len(requests) == len(models) == 1
+    assert models[0].provider._own_http_client.is_closed
+    body = requests[0]["body"]
+    if model_class is GoogleModel:
+        assert body["generationConfig"]["temperature"] == 0.25
+        assert body["contents"][0]["parts"] == [{"text": "hello"}]
+    else:
+        assert body["temperature"] == 0.25
+        assert body["model"] == "gpt-4o-mini"
+        assert requests[0]["headers"]["authorization"] == "Bearer test-secret"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError, UserError])
+async def test_model_failure_executes_once_closes_resources_and_keeps_previous_snapshot(
+    endpoint, monkeypatch, runner_database, failure
+):
+    base_url, requests = endpoint
+    models = []
+    async with runner_database.sessions.begin() as db:
+        from kapy.control.sessions.models import SessionRow
+
+        (await db.get(SessionRow, runner_database.session_id)).runner_state = "previous"
+
+    @asynccontextmanager
+    async def fail_request(self, *args, **kwargs):
+        assert activity.in_activity()
+        models.append(self)
+        raise failure("model failed")
+        yield
+
+    monkeypatch.setattr(OpenAIChatModel, "request_stream", fail_request)
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-failure-{uuid4()}"
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    async with Worker(
+        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
+    ):
+        handle = await start(
+            client,
+            queue,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state=None,
+                user_prompt="hello",
+                config=make_config(base_url),
+            ),
+            database=runner_database,
+        )
+        with pytest.raises(ActivityFailureError):
+            await asyncio.wait_for(handle.result(), 35)
+        assert (await handle.describe()).status == ActivityExecutionStatus.FAILED
+    assert len(models) == 1 and models[0].provider._own_http_client.is_closed
+    assert requests == []
+    async with runner_database.sessions.begin() as db:
+        assert (
+            await SessionRepository(db).read_runner_state(runner_database.session_id) == "previous"
+        )
+        assert await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cancellation_waits_for_model_cleanup_and_preserves_snapshot(
+    endpoint, monkeypatch, runner_database
+):
+    base_url, requests = endpoint
+    started, closed = asyncio.Event(), asyncio.Event()
+    models = []
+
+    @asynccontextmanager
+    async def blocked_request(self, *args, **kwargs):
+        models.append(self)
+        started.set()
+        try:
+            await asyncio.Future()
+            yield
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(OpenAIChatModel, "request_stream", blocked_request)
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-cancel-{uuid4()}"
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    async with Worker(
+        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
+    ):
+        handle = await start(
+            client,
+            queue,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state=None,
+                user_prompt="hello",
+                config=make_config(base_url),
+            ),
+            database=runner_database,
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 10)
+            description = await handle.describe()
+            assert description.last_heartbeat_time is not None
+            await handle.cancel()
+            with pytest.raises(ActivityFailureError) as error:
+                await asyncio.wait_for(handle.result(), 20)
+            assert isinstance(error.value.cause, CancelledError)
+            assert closed.is_set() and models[0].provider._own_http_client.is_closed
+        finally:
+            if (await handle.describe()).status == ActivityExecutionStatus.RUNNING:
+                await handle.cancel()
+    assert requests == []
+    async with runner_database.sessions.begin() as db:
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_final_save_failure_does_not_retry_agent_or_undo_history(
+    endpoint, monkeypatch, runner_database
+):
+    base_url, requests = endpoint
+    saves = []
+
+    async def fail_save(self, *args, **kwargs):
+        saves.append(kwargs)
+        raise RuntimeError("database save unavailable")
+
+    from kapy.control.sessions.operations import OperationRepository
+
+    monkeypatch.setattr(OperationRepository, "complete", fail_save)
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-save-failure-{uuid4()}"
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    async with Worker(
+        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
+    ):
+        handle = await start(
+            client,
+            queue,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state=None,
+                user_prompt="hello",
+                config=make_config(base_url),
+            ),
+            database=runner_database,
+        )
+        with pytest.raises(ActivityFailureError):
+            await asyncio.wait_for(handle.result(), 35)
+    assert len(requests) == len(saves) == 1
+    async with runner_database.sessions.begin() as db:
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
+        assert [
+            entry.seq
+            for entry in await HistoryRepository(db).read_history_entries(
+                runner_database.session_id
+            )
+        ] == [0, 1]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_application_client_and_worker_entry(endpoint, runner_database):
+    base_url, requests = endpoint
+    settings = runner_database.settings.model_copy(
+        update={"temporal_task_queue": f"entry-test-{uuid4()}"}
+    )
+    client = await connect_temporal(settings)
+    worker_task = asyncio.create_task(serve(settings))
+    try:
+        result = await execute(
+            client,
+            settings.temporal_task_queue,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state=None,
+                user_prompt="hello",
+                config=make_config(base_url),
+            ),
+            database=runner_database,
+        )
+        assert result == "done" and len(requests) == 1
+        async with runner_database.sessions.begin() as db:
+            state = await SessionRepository(db).read_runner_state(runner_database.session_id)
+        assert state is not None
+    finally:
+        worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(worker_task, 20)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_fails", [True, False], ids=["failed-save", "completed"])
+async def test_deleted_temporal_record_does_not_release_business_key(
+    endpoint, runner_database, monkeypatch, save_fails
+):
+    from pydantic import SecretStr
+    from temporalio.api.workflowservice.v1 import DeleteActivityExecutionRequest
+
+    from kapy.control.models import CreateModel, CreateProvider, ModelService
+    from kapy.control.sessions import CreateSession, OperationPhase, SessionBusy, SessionService
+    from kapy.control.sessions.operations import OperationRepository
+
+    base_url, requests = endpoint
+    catalog = ModelService(runner_database.sessions)
+    provider = await catalog.create_provider(
+        CreateProvider(
+            name="retention-test",
+            provider_class="pydantic_ai.providers.openai:OpenAIProvider",
+            model_class="pydantic_ai.models.openai:OpenAIChatModel",
+            api_key=SecretStr("local-key"),
+            base_url=base_url,
+        )
+    )
+    await catalog.create_model(
+        CreateModel(provider_id=provider.id, model_name="gpt-4o-mini", context_window=12345)
+    )
+    client = await connect_temporal(runner_database.settings)
+    queue = f"ledger-{uuid4()}"
+    service = SessionService(
+        runner_database.sessions, temporal_client=client, temporal_task_queue=queue
+    )
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    async with Worker(
+        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
+    ):
+        session = await service.create_session(
+            CreateSession(provider_id=provider.id, model_name="gpt-4o-mini"), activity_id=uuid4()
+        )
+        original = OperationRepository.complete
+        if save_fails:
+
+            async def fail_save(self, *args, **kwargs):
+                raise RuntimeError("save failed")
+
+            monkeypatch.setattr(OperationRepository, "complete", fail_save)
+        key = uuid4()
+        operation = await service.start_runner(session.id, activity_id=key, user_prompt="prompt A")
+        assert operation.run_id is not None
+        handle = client.get_activity_handle(str(key), run_id=operation.run_id, result_type=str)
+        if save_fails:
+            with pytest.raises(ActivityFailureError):
+                await handle.result()
+        else:
+            assert await handle.result() == "done"
+        terminal = await service.get_operation(session.id, key)
+        assert terminal.phase == (OperationPhase.FAILED if save_fails else OperationPhase.SUCCEEDED)
+        await client.workflow_service.delete_activity_execution(
+            DeleteActivityExecutionRequest(
+                namespace=client.namespace,
+                activity_id=str(key),
+                run_id=operation.run_id,
+            )
+        )
+        monkeypatch.setattr(OperationRepository, "complete", original)
+        assert (
+            await service.start_runner(session.id, activity_id=key, user_prompt="prompt A")
+            == terminal
+        )
+        assert len(requests) == 1
+        if save_fails:
+            with pytest.raises(SessionBusy):
+                await service.start_runner(session.id, activity_id=uuid4(), user_prompt="prompt B")
+        else:
+            continued = await service.start_runner(
+                session.id, activity_id=uuid4(), user_prompt="prompt B"
+            )
+            assert (
+                await client.get_activity_handle(
+                    str(continued.activity_id), run_id=continued.run_id, result_type=str
+                ).result()
+                == "done"
+            )
+            assert [message["content"] for message in requests[-1]["body"]["messages"]] == [
+                "prompt A",
+                "done",
+                "prompt B",
+            ]
+        assert (await service.close_session(session.id, activity_id=uuid4())).status == "closed"

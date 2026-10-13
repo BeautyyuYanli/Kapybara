@@ -51,31 +51,38 @@ Session routes are:
 | GET /sessions/{id} | get_session | SessionRecord |
 | PATCH /sessions/{id} | update_session | SessionRecord |
 | POST /sessions/{id}/close | close_session | SessionRecord |
-| POST /sessions/{id}/runner | start_durable_runner | 202 DurableRun: workflow_id, run_id |
-| GET /sessions/{id}/runner | is_runner_running | bool for an active Temporal Workflow |
+| POST /sessions/{id}/runner | start_runner | 202 SessionOperation |
+| GET /sessions/{id}/runner | is_runner_running | bool for starting/running |
+| GET /sessions/{id}/operations/{activity_id} | get_session_operation | SessionOperation |
 | GET /sessions/{id}/history | read_history | Page[HistoryMessage] |
 | WS /sessions/{id}/live?after_seq=N | live_ws | one nonempty OutputEvent[] per text frame |
 
-`POST /sessions` accepts CreateSession and only creates configuration. It does
-not submit execution. Model requests are submitted through the runner endpoint.
-There are no input queue, steer or cancellation-flag routes.
+Create, run and close requests require `activity_id: UUID`. Its string is the
+native Activity ID and permanent database idempotency key. Repeated identical
+intent returns the same operation/result; a different session/kind/request at that
+ID returns 409. Use a new key for a new operation. Creation accepts optional session
+`id`; when omitted, the operation saves its generated ID before submission.
 
-Creation accepts an optional UUID `id`; retain it across lost responses. Duplicate
-IDs return 409 with `session_id` and do not replay scope enter. Errors after reservation begins include that ID in the safe error response,
-without upstream payloads. Query GET by this ID before deciding whether to close or
-create another session. The host never automatically repeats creation.
+Creation submits a scope Activity and waits for the saved SessionRecord; it does
+not run the Agent. Close accepts `{activity_id}` and waits for its saved cleanup
+result. Run accepts `{activity_id, user_prompt}` and returns 202 SessionOperation
+without waiting for model completion. The response includes session_id, kind,
+phase, optional native run_id, saved result/safe error and fixed deadline; frozen
+input and credentials remain private. Query the operation route to observe it.
 
-`POST /sessions/{id}/runner` accepts `{user_prompt: string}`. It waits for Temporal
-start confirmation, then returns Workflow ID and actual run ID; 202 does not mean
-model completion. An active execution returns 409. Non-successful terminal execution
-also returns 409; it cannot restart from the preceding successful snapshot. Worker
-recovery and Activity retries remain in the original Workflow. Temporal RPC errors
-return 503 without upstream payloads; a failed RPC may already have started work.
-Query runner status instead of automatically resubmitting an ambiguous request.
-Direct submission is not a request-ID deduplication protocol.
+The database records starting before dispatch and running when the Worker claims
+it. Another key receives 409 while creation/execution/cleanup has an active owner.
+A failed run becomes closing and requires explicit cleanup or a new session.
+Close does not cancel an active run. READY alone permits title/model updates.
+Each Activity has one Temporal attempt and no Agent resumption. USE_EXISTING
+reuses running executions; REJECT_DUPLICATE rejects retained closed records, while
+the permanent database outcome prevents resurrection after Temporal retention.
 
-Close returns 409 while the durable Workflow or a session scope lease is active. It does
-not request Temporal cancellation. Retry explicitly when execution finishes.
+A lost RPC response may mean submission succeeded. 503 hides upstream payloads;
+confirm the same activity_id rather than choose a new one. Caller cancellation
+does not cancel Worker execution. Same-key terminal results remain unchanged after
+later session operations. Unknown status/NOT_FOUND retains ownership within the
+fixed deadline; query/repeated admission seals expired operations failed/closing.
 
 List providers/models/sessions with offset=0 and limit=100. Page contains only
 items and has_more; limit is 1..200. Fetch history without before_seq for the latest
@@ -101,8 +108,7 @@ Only complete messages advance that cursor. After application, discard previews
 at/below its seq, including numeric gaps, and keep those at later positions.
 
 Router-local error handling returns FastAPI detail objects: 422 validation,
-404 LookupError, 409 identity/lifecycle/execution conflict or busy session, 503 Temporal RPC or
-exhausted layer scope retry (retry explicitly), 502 model discovery, otherwise
+404 LookupError, 409 identity/lifecycle/execution conflict or busy session, 503 Temporal RPC, 502 model discovery, otherwise
 500. Validation details keep only loc/msg/type; upstream exception text, raw
 request data and credentials are not returned. HTTP operation IDs match endpoint
 names. The controller owns protocol adaptation; services
@@ -112,24 +118,13 @@ Mount the SPA beside the API with `app.include_router(create_frontend_router(dis
 The host supplies the explicit Vite build directory and shares its existing resource
 lifespan. Missing index.html fails setup. See the root frontend/README.md.
 
-SessionRecord includes lifecycle `status`. Creation first commits creating and
-publishes ready only with complete State. Close transitions creating or ready ->
-closing -> closed and retains the record. Direct submission and execution
-configuration changes require ready; title and read/history/live remain available
-in every phase. SDK settings/model availability are checked before execution starts.
-
-CreateSession accepts native `layers` as registered name-to-Config JSON,
-for example `{"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}`.
-Unknown names and invalid Config return 422. GET/list/create responses include normalized layer configuration;
-internal State is absent. PATCH cannot change layers or State. Durable starts
-restore the internal saved State. Optional layer `enter_scope`/`exit_scope` hooks
-initialize business State and release registered resources. Enter runs after durable
-identity/Config registration under the same lease as ready publication. Lost ready
-COMMIT responses are resolved from the authoritative row after the transaction ends;
-unconfirmed outcomes never trigger blind resource deletion. Abandoned creating exits
-all layers in reverse with None, including partial/uncalled enters, using ID/Config
-for recovery. Close retains CLOSING
-and validated cleanup progress on failure. Explicit `RetryableScopeError` gets
-three bounded hook attempts and returns 503 if exhausted; ordinary hook errors do
-not automatically retry. Enter only promises safe replay when explicitly raising
-this error; exit must always be idempotent. See [Layers](../../layers/README.md).
+SessionRecord exposes creating/ready/starting/running/closing/closed. Reads,
+history and live remain available throughout; layer Config stays public and fixed,
+while State and message snapshots stay internal. Scope Activities run hooks outside
+transactions and publish results/progress through current-operation predicates.
+Creation compensation exits every configured layer with None in reverse order;
+cleanup progress persists after each attempt. Only an outer RetryableScopeError
+allows the existing three local hook attempts. Failed scope Activities return a
+safe failed operation; explicit cleanup retry uses a new ID. See
+[control state machine](../../control/README.md#session-state-machine) and
+[layers](../../layers/README.md).

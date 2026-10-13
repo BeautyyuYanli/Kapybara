@@ -1,9 +1,11 @@
-"""Recording boundaries follow real SDK nodes; only Activity persistence is stubbed."""
+"""Recording boundaries follow real SDK nodes; only database persistence is stubbed."""
 
 import asyncio
 from copy import deepcopy
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -23,41 +25,36 @@ from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.usage import RunUsage
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from kapy.runner_duarable import (
-    DurableExecutionConfig,
+from kapy.agent_output import AgentOutputService
+from kapy.runner import (
     MessageRecordCapability,
     Recorder,
     RunnerDeps,
 )
-from kapy.runner_duarable.types import MessageBatch
 
 pytestmark = pytest.mark.asyncio
 
 
 def make_deps() -> RunnerDeps:
     return RunnerDeps(
-        config=DurableExecutionConfig(
-            provider_class="pydantic_ai.providers.openai:OpenAIProvider",
-            model_class="pydantic_ai.models.openai:OpenAIChatModel",
-            model_name="test",
-            api_key="test-secret",
-        ),
         session_id=uuid4(),
+        session_factory=Mock(spec=async_sessionmaker),
+        output_service=Mock(spec=AgentOutputService),
+        activity_id=uuid4(),
     )
 
 
 @pytest.fixture
-def recorded(monkeypatch) -> list[MessageBatch]:
+def recorded(monkeypatch) -> list[SimpleNamespace]:
     batches = []
 
-    async def record(name, data, *, start_to_close_timeout):
-        assert name == "kapy.record_history"
-        assert start_to_close_timeout.total_seconds() == 30
-        batches.append(deepcopy(data))
+    async def record(self, deps, messages):
+        batches.append(SimpleNamespace(session_id=deps.session_id, messages=deepcopy(messages)))
         await asyncio.sleep(0)
 
-    monkeypatch.setattr("kapy.runner_duarable.recording.workflow.execute_activity", record)
+    monkeypatch.setattr(Recorder, "persist_messages", record)
     return batches
 
 
@@ -266,13 +263,13 @@ async def test_recorded_positions_must_increase(recorded, seq):
 async def test_failed_recording_keeps_live_metadata_and_independent_copy(monkeypatch):
     message = ModelRequest(parts=[UserPromptPart("original")], metadata={"source": "business"})
 
-    async def fail(name, data, **kwargs):
-        assert data.messages[0].seq == 0
-        data.messages[0].message.parts.clear()
+    async def fail(self, deps, messages):
+        assert messages[0].seq == 0
+        messages[0].message.parts.clear()
         assert message.metadata == {"source": "business"} and message.parts
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr("kapy.runner_duarable.recording.workflow.execute_activity", fail)
+    monkeypatch.setattr(Recorder, "persist_messages", fail)
     with pytest.raises(RuntimeError, match="database unavailable"):
         await Recorder().record_messages(make_deps(), [message])
     assert message.metadata == {"source": "business"} and message.parts
@@ -305,15 +302,15 @@ async def test_recording_failure_occurs_after_model_dispatch(monkeypatch):
     recorder = Recorder()
     dispatched = []
 
-    async def fail(name, data, **kwargs):
-        assert [m.seq for m in data.messages] == [0, 1]
+    async def fail(self, deps, messages):
+        assert [m.seq for m in messages] == [0, 1]
         raise RuntimeError("database unavailable")
 
     async def respond(messages, info):
         dispatched.append(messages)
         return ModelResponse(parts=[TextPart("done")])
 
-    monkeypatch.setattr("kapy.runner_duarable.recording.workflow.execute_activity", fail)
+    monkeypatch.setattr(Recorder, "persist_messages", fail)
     agent = Agent(
         FunctionModel(respond),
         deps_type=RunnerDeps,

@@ -1,23 +1,25 @@
-"""Serializable execution input, prepared by callers rather than resolved from a session.
+"""Serializable frozen input, loaded from the operation ledger by the Worker.
 
-The complete configuration, including the API key, is stored in Temporal history.
+The complete configuration, including the API key, is stored in private database input.
 `repr=False` prevents accidental repr disclosure; it does not encrypt payloads.
 Settings are final values, not overrides of a Worker-local model catalogue.
 """
 
+from dataclasses import dataclass, field
 from typing import Self
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from kapy.agent_history import HistoryMessage
+from kapy.agent_output import AgentOutputService
 from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
 from kapy.control.types import DTO, JsonObject, Name
 from pydantic_ai_layer_protocol.types import LayerData
 
 
-class DurableExecutionConfig(DTO):
+class ExecutionConfig(DTO):
     provider_class: str
     model_class: str
     model_name: Name
@@ -50,40 +52,22 @@ class DurableExecutionConfig(DTO):
 
 
 class RunnerInput(DTO):
-    """The caller reads state and version together and serializes runs per session."""
+    """Immutable input frozen in the transaction that claims the session."""
 
     session_id: UUID
-    runner_state_version: int = Field(ge=0, strict=True)
     runner_state: str | None
     user_prompt: str
-    config: DurableExecutionConfig
+    config: ExecutionConfig
     layers: dict[str, LayerData] = Field(default_factory=dict)
 
 
-class RunnerDeps(DTO):
-    """Run input plus the current request's provisional response position."""
-
-    config: DurableExecutionConfig
-    session_id: UUID
-    response_seq: int | None = Field(default=None, ge=0, strict=True)
-    layers: dict[str, LayerData] = Field(default_factory=dict)
-
-
-class MessageBatch(DTO):
-    """One atomic batch with explicit positions and immutable complete SDK messages."""
-
-    # SDK usage preserves provider-specific fields. Inherited forbid would reject
-    # those fields while decoding the nested SDK dataclasses.
-    model_config = ConfigDict(extra="ignore")
+@dataclass
+class RunnerDeps:
+    """Mutable per-run State and borrowed Worker resources, never a Temporal payload."""
 
     session_id: UUID
-    messages: list[HistoryMessage]
-
-
-class SaveRunnerStateInput(DTO):
-    """Every Activity retry retains this exact version and encoded state."""
-
-    session_id: UUID
-    expected_version: int = Field(ge=0, strict=True)
-    runner_state: str
-    layer_states: dict[str, JsonObject] = Field(default_factory=dict)
+    activity_id: UUID
+    session_factory: async_sessionmaker[AsyncSession]
+    output_service: AgentOutputService
+    layers: dict[str, LayerData] = field(default_factory=dict)
+    response_seq: int | None = None

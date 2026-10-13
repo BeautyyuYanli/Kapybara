@@ -1,7 +1,8 @@
 """Session HTTP composition and WebSocket transport; services own history/admission.
 
-Execution awaits Temporal start confirmation. Borrowed services outlive requests
-and WebSocket subscriptions; session creation performs no execution.
+Create/close dispatch Worker scope Activities and wait for database business results.
+Runner submission returns its durable operation without waiting for Agent completion.
+Borrowed services outlive requests and subscriptions.
 """
 
 import asyncio
@@ -17,6 +18,7 @@ from kapy.agent_history import HistoryMessage
 from kapy.agent_output import OutputEvent
 from kapy.control.sessions import (
     CreateSession,
+    SessionOperation,
     SessionRecord,
     SessionService,
     UpdateSession,
@@ -25,7 +27,7 @@ from kapy.pagination import Page
 
 from .dependencies import HistoryPage, LiveCursor, OffsetPage
 from .errors import ControlRoute
-from .types import DurableRun, StartDurableRunner
+from .types import CloseSession, CreateSessionRequest, StartRunner
 
 _logger = logging.getLogger(__name__)
 _output_adapter = TypeAdapter(list[OutputEvent])
@@ -35,8 +37,11 @@ def create_session_router(sessions: SessionService) -> APIRouter:
     router = APIRouter(route_class=ControlRoute)
 
     @router.post("/sessions", status_code=201, operation_id="create_session")
-    async def create_session(data: CreateSession) -> SessionRecord:
-        return await sessions.create_session(data)
+    async def create_session(data: CreateSessionRequest) -> SessionRecord:
+        return await sessions.create_session(
+            CreateSession.model_validate(data.model_dump(exclude={"activity_id"})),
+            activity_id=data.activity_id,
+        )
 
     @router.get("/sessions", operation_id="list_sessions")
     async def list_sessions(
@@ -55,20 +60,24 @@ def create_session_router(sessions: SessionService) -> APIRouter:
         return await sessions.update_session(session_id, data)
 
     @router.post("/sessions/{session_id}/close", operation_id="close_session")
-    async def close_session(session_id: UUID) -> SessionRecord:
-        return await sessions.close_session(session_id)
+    async def close_session(session_id: UUID, data: CloseSession) -> SessionRecord:
+        return await sessions.close_session(session_id, activity_id=data.activity_id)
 
-    @router.post(
-        "/sessions/{session_id}/runner", status_code=202, operation_id="start_durable_runner"
+    @router.post("/sessions/{session_id}/runner", status_code=202, operation_id="start_runner")
+    async def start_runner(session_id: UUID, data: StartRunner) -> SessionOperation:
+        return await sessions.start_runner(
+            session_id, activity_id=data.activity_id, user_prompt=data.user_prompt
+        )
+
+    @router.get(
+        "/sessions/{session_id}/operations/{activity_id}", operation_id="get_session_operation"
     )
-    async def start_durable_runner(session_id: UUID, data: StartDurableRunner) -> DurableRun:
-        handle = await sessions.start_durable_runner(session_id, user_prompt=data.user_prompt)
-        assert handle.result_run_id is not None
-        return DurableRun(workflow_id=handle.id, run_id=handle.result_run_id)
+    async def get_session_operation(session_id: UUID, activity_id: UUID) -> SessionOperation:
+        return await sessions.get_operation(session_id, activity_id)
 
     @router.get("/sessions/{session_id}/runner", operation_id="is_runner_running")
     async def is_runner_running(session_id: UUID) -> bool:
-        return await sessions.is_durable_runner_running(session_id)
+        return await sessions.is_runner_running(session_id)
 
     @router.get("/sessions/{session_id}/history", operation_id="read_history")
     async def read_history(session_id: UUID, page: HistoryPage) -> Page[HistoryMessage]:

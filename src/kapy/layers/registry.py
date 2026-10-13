@@ -7,13 +7,12 @@ Changing the installed set requires constructing a new registry.
 
 from typing import TYPE_CHECKING
 
-from pydantic_ai_layer_protocol import LayerData
-from pydantic_ai_layer_protocol.temporal import TemporalLayerRegistry
+from pydantic_ai_layer_protocol import LayerData, LayerRegistry
 
 from .shell import layer as shell
 
 if TYPE_CHECKING:
-    from kapy.runner_duarable.types import RunnerDeps
+    from kapy.runner.types import RunnerDeps
 
 
 def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
@@ -21,4 +20,4 @@ def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
-layer_registry = TemporalLayerRegistry({"shell": shell.make}, get_layers=get_layers)
+layer_registry = LayerRegistry({"shell": shell.make}, get_layers=get_layers)

@@ -52,8 +52,11 @@ FastAPI routers' OpenAPI schema, including session lifecycle, close responses,
 fixed native `layers` configuration, history and durable submission. Layer Config
 is accepted by creation and returned by session DTOs; State remains internal.
 The session form edits title, model identity and model settings. Creating a session
-only saves configuration. Existing sessions permit execution configuration edits
-only while ready; other phases permit title-only saves. No provisional
+initializes scopes through a Worker Activity. The form saves its Activity UUID and
+intent in tab sessionStorage before submission; an identical retry reuses the key,
+including after reload. New input uses a new key. UUIDs use Web Crypto random bytes
+on both HTTP LAN and secure origins. Existing sessions permit title/configuration
+edits only while ready. No provisional
 schema or handwritten API DTOs are
 retained. Only TypeScript, SDK and Fetch plugins are enabled.
 
@@ -103,16 +106,19 @@ Contract fixtures test both mobile and desktop Chromium. They cover PATCH bodies
 slash model names, pagination, JSON errors, 422/500 responses and dialog focus.
 Unit tests cover GET cancellation and stale-response rejection.
 
-For actual FastAPI/PostgreSQL browser integration, build first, then from the repo:
+Actual browser integration requires PostgreSQL, Valkey and Temporal. Build first,
+start the local services (`docker compose up -d --wait postgres valkey temporal-namespace`),
+then from the repo:
 
 ```sh
-.venv/bin/uvicorn test_api:app --app-dir frontend/scripts --host 127.0.0.1 --port 8001
+KAPY_TEMPORAL_ADDRESS=127.0.0.1:7233 .venv/bin/uvicorn test_api:app --app-dir frontend/scripts --host 127.0.0.1 --port 8001
 # In frontend/, while both test API and Vite are running:
 KAPY_SPA_INTEGRATION=1 npm run test:e2e
 ```
 
-`test_api.py` uses the existing local test PostgreSQL on 55432, owns a random
-`spa_test_*` schema and drops it on graceful shutdown. It never reads `.env`.
-Tests create only configuration with fake keys and explicit model capacities;
-they make no model requests or discovery calls. Reports are in playwright-report/
-and test-results/. Backend tests are `tests/interfaces/test_frontend.py`.
+`test_api.py` defaults to local PostgreSQL on 55432, Valkey on 56379 and Temporal
+at localhost:7233; KAPY_DATABASE_URL, KAPY_VALKEY_URL and KAPY_TEMPORAL_ADDRESS
+select isolated services. It owns a random disposable schema and its embedded
+create/close Worker on a unique Temporal queue. It waits for those scope Activities,
+never registers Agent execution or calls an external model API. The Worker and
+clients close before the schema is removed; normal application data is unchanged.

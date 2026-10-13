@@ -7,26 +7,19 @@ import pytest
 from fastapi import FastAPI
 
 from kapy.control.models import ModelService
-from kapy.control.sessions import CreateSession, SessionService
-from kapy.control.sessions import service as sessions_service
 from kapy.control.sessions.models import SessionRow
-from kapy.control.sessions.repository import SessionRepository
-from kapy.control.types import JsonObject
 from kapy.interfaces.http import create_router
-from kapy.layers.registry import get_layers
-from kapy.layers.shell import layer as shell
-from kapy.lifecycle import LifecycleError, LifecycleStatus
-from pydantic_ai_layer_protocol import LayerRegistry
-from pydantic_ai_layer_protocol.examples import echo
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-async def test_http_layer_validation_defaults_and_immutable_configuration(database):
-    service = SessionService(database.sessions)
+async def test_http_layer_validation_defaults_and_immutable_configuration(
+    database, session_runtime
+):
+    service = session_runtime.service(database.sessions)
     app = FastAPI()
     app.include_router(create_router(ModelService(database.sessions), service))
-    base = {"provider_id": str(uuid4()), "model_name": "test"}
+    base = {"activity_id": str(uuid4()), "provider_id": str(uuid4()), "model_name": "test"}
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -61,76 +54,3 @@ async def test_http_layer_validation_defaults_and_immutable_configuration(databa
             response = await client.patch(f"/api/sessions/{session_id}", json=replacement)
             assert response.status_code == 422
         assert (await client.get(f"/api/sessions/{session_id}")).json() == created
-
-
-async def test_atomic_layer_message_save_cleanup_and_retry_identity(database, monkeypatch):
-    monkeypatch.setattr(
-        sessions_service,
-        "layer_registry",
-        LayerRegistry({"shell": shell.make, "echo": echo.make}, get_layers=get_layers),
-    )
-    service = SessionService(database.sessions)
-    session = await service.create_session(
-        CreateSession(
-            provider_id=uuid4(),
-            model_name="test",
-            layers={"shell": {"cwd": "/tmp"}, "echo": {}},
-        )
-    )
-    initial: JsonObject = {"scope_id": str(session.id), "jobs": {}}
-    async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        assert await repo.read_runner_state(session.id) == (None, 0)
-    with pytest.raises(LifecycleError):
-        async with database.sessions.begin() as db:
-            await SessionRepository(db).save_layer_cleanup(session.id, "shell", initial)
-    final: dict[str, JsonObject] = {
-        "shell": {"scope_id": str(session.id), "jobs": {"known": 8}},
-        "echo": {"calls": 2},
-    }
-    with pytest.raises(RuntimeError, match="rollback"):
-        async with database.sessions.begin() as db:
-            await SessionRepository(db).save_runner_state(
-                session.id, expected_version=0, runner_state="messages", layer_states=final
-            )
-            raise RuntimeError("rollback")
-    async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        row = await db.get(SessionRow, session.id)
-        assert row is not None and row.layer_states == {
-            "shell": initial,
-            "echo": {"calls": 0},
-        }
-        assert await repo.read_runner_state(session.id) == (None, 0)
-        await repo.save_runner_state(
-            session.id, expected_version=0, runner_state="messages", layer_states=final
-        )
-        saved_at = (await repo.get_session(session.id)).updated_at
-    async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        await repo.save_runner_state(
-            session.id, expected_version=0, runner_state="messages", layer_states=final
-        )
-        assert (await repo.get_session(session.id)).updated_at == saved_at
-        assert await repo.read_runner_state(session.id) == ("messages", 1)
-    changed = dict(final)
-    changed["echo"] = {"calls": 3}
-    for invalid in ({}, changed):
-        with pytest.raises(ValueError):
-            async with database.sessions.begin() as db:
-                await SessionRepository(db).save_runner_state(
-                    session.id, expected_version=0, runner_state="messages", layer_states=invalid
-                )
-    async with database.sessions.begin() as db:
-        row = await db.get(SessionRow, session.id)
-        assert row is not None and row.layer_states == final
-        row.status = LifecycleStatus.CLOSING
-    async with database.sessions.begin() as db:
-        repo = SessionRepository(db)
-        await repo.save_layer_cleanup(session.id, "shell", initial)
-        row = await db.get(SessionRow, session.id)
-        assert row is not None and row.layer_states == {
-            "shell": initial,
-            "echo": {"calls": 2},
-        }
-        assert await repo.read_runner_state(session.id) == ("messages", 1)

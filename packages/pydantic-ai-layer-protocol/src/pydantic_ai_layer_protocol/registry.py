@@ -2,8 +2,8 @@
 
 Factories return typed Layer definitions with native capabilities and explicit
 model types. Assembly happens once per process configuration, without execution
-deps. Factories and validators are deterministic and perform no I/O; Temporal
-reselects and binds the static capabilities from each current deps payload.
+deps. Factories and validators are deterministic and perform no I/O; native per-run
+selection binds the static capabilities to the current writable deps.
 
 Tools (names, collection and schemas) and instructions are static declarations,
 stable for fixed Config: never generate them from mutable State through factories.
@@ -68,8 +68,6 @@ class LayerRegistry[D](WrapperCapability[D]):
         return _snapshot(deps, self.definitions, self._get_layers)
 
     def _build_capability(self) -> AbstractCapability[D]:
-        # Keep optional integrations out of core imports. They override only this
-        # assembly step; SDK WrapperCapability still owns all lifecycle delegation.
         from .composition import _layers_capability
 
         return _layers_capability(self.definitions, get_layers=self._get_layers)

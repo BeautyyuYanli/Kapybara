@@ -5,10 +5,11 @@ import {
   getSession,
   createSession,
   updateSession,
-  type CreateSession,
+  type CreateSessionRequest,
 } from "@/api/generated";
 import { useResource } from "@/composables/useResource";
 import { describeError } from "@/api/errors";
+import { newActivityId } from "@/api/activityId";
 import { parseObject } from "@/forms";
 import FormField from "@/components/FormField.vue";
 import JsonObjectField from "@/components/JsonObjectField.vue";
@@ -58,41 +59,55 @@ function changeProvider(value: string) {
   draft.model_name = "";
 }
 async function save() {
-  if (saving.value) return;
+  if (saving.value || !executionEditable.value) return;
   const submittedVersion = viewVersion;
   error.value = "";
   message.value = "";
   fields.value = {};
-  let body: CreateSession | undefined;
-  if (executionEditable.value) {
-    let settings: CreateSession["model_settings"];
-    try {
-      settings = parseObject(draft.model_settings);
-    } catch {
-      fields.value.model_settings = "请输入 JSON 对象。";
-      error.value = "请修正 JSON。";
-      return;
-    }
-    body = {
-      title: draft.title,
-      provider_id: draft.provider_id,
-      model_name: draft.model_name,
-      model_settings: settings,
-    };
+  let settings: CreateSessionRequest["model_settings"];
+  try {
+    settings = parseObject(draft.model_settings);
+  } catch {
+    fields.value.model_settings = "请输入 JSON 对象。";
+    error.value = "请修正 JSON。";
+    return;
   }
+  const body: Omit<CreateSessionRequest, "activity_id"> = {
+    title: draft.title,
+    provider_id: draft.provider_id,
+    model_name: draft.model_name,
+    model_settings: settings,
+  };
   saving.value = true;
   try {
     if (id) {
       await updateSession({
         path: { session_id: id },
-        body: body ?? { title: draft.title },
+        body,
         throwOnError: true,
       });
       if (submittedVersion !== viewVersion) return;
-      message.value = body ? "已保存，下次启动生效。" : "已保存。";
+      message.value = "已保存，下次启动生效。";
       await resource.refresh();
-    } else if (body) {
-      const { data } = await createSession({ body, throwOnError: true });
+    } else {
+      const intent = JSON.stringify(body);
+      const storageKey = "kapy:session-create";
+      let pending: { intent: string; activity_id: string } | null = null;
+      try {
+        pending = JSON.parse(sessionStorage.getItem(storageKey) ?? "null");
+      } catch {
+        sessionStorage.removeItem(storageKey);
+      }
+      if (!pending || pending.intent !== intent) {
+        pending = { intent, activity_id: newActivityId() };
+        sessionStorage.setItem(storageKey, JSON.stringify(pending));
+      }
+      const { data } = await createSession({
+        body: { ...body, activity_id: pending.activity_id },
+        throwOnError: true,
+      });
+      const current = JSON.parse(sessionStorage.getItem(storageKey) ?? "null");
+      if (current?.activity_id === pending.activity_id) sessionStorage.removeItem(storageKey);
       if (submittedVersion !== viewVersion) return;
       await router.replace(`/sessions/${data.id}`);
     }
@@ -120,7 +135,7 @@ async function save() {
     <form v-else @submit.prevent="save">
       <p v-if="error" class="error" role="alert">{{ error }}</p>
       <p v-if="message" role="status">{{ message }}</p>
-      <fieldset :disabled="saving">
+      <fieldset :disabled="saving || !executionEditable">
         <FormField id="title" label="标题" :error="fields.title" v-slot="f"
           ><input
             v-model="draft.title"
@@ -129,34 +144,32 @@ async function save() {
             :aria-describedby="f.describedby"
             :aria-invalid="f.invalid"
         /></FormField>
-        <fieldset :disabled="!executionEditable">
-          <FormField id="provider_id" label="Provider" :error="fields.provider_id" v-slot="f"
-            ><ProviderSelect
-              :model-value="draft.provider_id"
-              @update:model-value="changeProvider"
-              :id="f.id"
-              required
-              :describedby="f.describedby"
-              :invalid="f.invalid"
-          /></FormField>
-          <FormField id="model_name" label="Model" :error="fields.model_name" v-slot="f"
-            ><ModelSelect
-              v-model="draft.model_name"
-              :provider-id="draft.provider_id"
-              :id="f.id"
-              required
-              :describedby="f.describedby"
-              :invalid="f.invalid"
-          /></FormField>
-          <JsonObjectField
-            id="model_settings"
-            v-model="draft.model_settings"
-            label="模型设置 JSON"
-            :error="fields.model_settings"
-          />
-        </fieldset>
+        <FormField id="provider_id" label="Provider" :error="fields.provider_id" v-slot="f"
+          ><ProviderSelect
+            :model-value="draft.provider_id"
+            @update:model-value="changeProvider"
+            :id="f.id"
+            required
+            :describedby="f.describedby"
+            :invalid="f.invalid"
+        /></FormField>
+        <FormField id="model_name" label="Model" :error="fields.model_name" v-slot="f"
+          ><ModelSelect
+            v-model="draft.model_name"
+            :provider-id="draft.provider_id"
+            :id="f.id"
+            required
+            :describedby="f.describedby"
+            :invalid="f.invalid"
+        /></FormField>
+        <JsonObjectField
+          id="model_settings"
+          v-model="draft.model_settings"
+          label="模型设置 JSON"
+          :error="fields.model_settings"
+        />
         <small v-if="id">
-          {{ executionEditable ? "配置更新对下次启动生效。" : "当前会话只能修改标题。" }}
+          {{ executionEditable ? "配置更新对下次启动生效。" : "当前会话暂时不能修改。" }}
         </small>
         <button class="primary" type="submit">{{ saving ? "保存中…" : "保存 Session" }}</button>
       </fieldset>

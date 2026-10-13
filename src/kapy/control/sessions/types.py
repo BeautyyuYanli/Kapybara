@@ -4,6 +4,7 @@ Execution State stays internal. Layer names/configuration are fixed on creation.
 """
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Self
 from uuid import UUID
 
@@ -16,8 +17,8 @@ from kapy.lifecycle import LifecycleStatus
 class CreateSession(DTO):
     """Fixed execution configuration; optional id lets callers resolve lost responses.
 
-    Reusing an existing/reserved identity conflicts instead of replaying enter or
-    business hooks. The caller queries or closes that same identity explicitly.
+    SessionService requires a separate activity_id. Same-key identical intent
+    returns its original result; a different key cannot reuse a reserved session ID.
     """
 
     id: UUID | None = None
@@ -61,13 +62,48 @@ class SessionAlreadyExists(RuntimeError):
         super().__init__(f"Session {session_id} already exists or is being created")
 
 
-class SessionCreationError(RuntimeError):
-    """Creation failed after reservation began; query/close this identity explicitly.
+class OperationKind(StrEnum):
+    CREATE = "create"
+    RUN = "run"
+    CLOSE = "close"
 
-    The original error remains the cause for internal diagnostics. Resource or
-    commit outcomes may be unconfirmed, so this exception does not imply rollback.
-    """
 
-    def __init__(self, session_id: UUID) -> None:
-        self.session_id = session_id
-        super().__init__(f"Unable to complete creation of session {session_id}")
+class OperationPhase(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class SessionOperation(DTO):
+    """Durable public outcome. Private frozen inputs never leave the repository."""
+
+    session_id: UUID
+    activity_id: UUID
+    kind: OperationKind
+    phase: OperationPhase
+    run_id: str | None
+    result: str | SessionRecord | None
+    error: str | None
+    created_at: datetime
+    deadline: datetime
+
+
+class SessionBusy(RuntimeError):
+    """A different operation currently owns the session."""
+
+
+class OperationConflict(RuntimeError):
+    """An Activity ID was reused for different intent."""
+
+
+class OperationFailed(RuntimeError):
+    """The immutable safe error from a failed operation."""
+
+    def __init__(self, operation: SessionOperation) -> None:
+        self.operation = operation
+        super().__init__(operation.error or "Session operation failed")
+
+
+class OwnershipLost(RuntimeError):
+    """A Worker may no longer issue calls or write progress for this operation."""

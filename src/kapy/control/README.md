@@ -3,7 +3,7 @@
 `ModelService` manages provider/model configuration. `SessionService` manages
 session configuration and native layer scopes, admits durable execution through
 Temporal, and joins immutable history with live output. The independent Worker
-owns the Agent, model and tool resources. Durable is the only supported runner.
+owns the Agent, model and tool resources. A standalone Activity is the only supported runner.
 
 Applications own engines, session factories, Valkey and Temporal clients. Services
 borrow them and never migrate schemas implicitly. Initialize with `kapy db upgrade`;
@@ -16,42 +16,64 @@ from kapy.application.resources import open_resources
 from kapy.application.sessions import create_session_service
 from kapy.application.settings import CommonSettings
 from kapy.control.sessions import CreateSession
+from uuid import uuid4
 
 
 async def run(settings: CommonSettings, provider_id, model_name: str):
     async with open_resources(settings) as resources:
         sessions = create_session_service(resources, settings)
         session = await sessions.create_session(
-            CreateSession(provider_id=provider_id, model_name=model_name)
+            CreateSession(provider_id=provider_id, model_name=model_name), activity_id=uuid4()
         )
-        handle = await sessions.start_durable_runner(session.id, user_prompt="Hello")
-        return await handle.result()  # Requires an independent runner-worker.
+        return await sessions.start_runner(session.id, activity_id=uuid4(), user_prompt="Hello")
 ```
 
-## Execution admission and state
+## Session state machine
 
-`start_durable_runner(id, user_prompt="...")` accepts a string prompt and returns
-`WorkflowHandle[RunnerWorkflow, str]` after Temporal confirms the start. The fixed
-Workflow ID is `kapy-runner:{id}`. `is_durable_runner_running(id)` observes Temporal;
-only NOT_FOUND means absent, and RPC failures propagate. RPCs have a ten-second
-budget. Session leases represent scope ownership, not runner status.
+SessionService borrows the database, output service and Temporal client. Each
+create/run/close call supplies a UUID `activity_id`; the ID is both the permanent
+operation key and native Activity ID. `start_runner` returns `SessionOperation`,
+not a native handle. `get_operation(session_id, activity_id)` returns its phase,
+optional native run_id and saved result/safe error, without private request/input.
+Create and close wait for their immutable SessionRecord result; caller cancellation
+does not cancel Worker execution. Failed operations raise OperationFailed.
 
-Admission holds a short session row lock through readiness/configuration checks,
-Workflow status, the atomic state/version read and start confirmation. Model work
-runs outside this transaction. Only an initial execution or a preceding COMPLETED
-execution admits a new run. Busy raises SessionBusy; other terminal statuses raise
-DurableRunnerConflict because starting an older successful snapshot could conflict
-with already recorded history. An ambiguous start error never retries automatically;
-query the fixed Workflow ID before resubmitting. Worker recovery continues the
-original Workflow.
+| From | To | Owner action |
+| --- | --- | --- |
+| absent | creating | Insert session and pending create operation together |
+| creating | ready | Commit all initial States and succeeded result |
+| creating | closing | Original running owner compensates failed initialization |
+| ready | starting | Claim new run and freeze configuration/messages/State |
+| starting | running | Worker claims pending before I/O |
+| running | ready | Commit messages, all States and succeeded output |
+| creating/starting/running | closing | Confirm failure or seal fixed deadline |
+| ready | closing | Claim close before exits |
+| closing | closing | New close can claim only after previous operation is terminal |
+| closing | closed | Finish all cleanup; successful close or failed-create compensation |
+| closed | closed | Read retained state; new close records the already-closed result |
 
-Provider values and merged model/session settings become DurableExecutionConfig.
-The interface validates SDK settings without opening model resources. Native layer
-Config and State are read from the locked row alongside the snapshot/version.
-The Worker saves messages and every layer State together using a versioned,
-idempotent replacement. New sessions have `(runner_state=None, version=0)`.
-These internal values are absent from SessionRecord and HTTP. See the
-[durable runner](../runner_duarable/README.md) for the complete save contract.
+Creating, starting, running and closing with a pending/running operation reject a
+different operation with SessionBusy. Same-key intent is checked first, so its
+saved result survives later session changes. A key bound to different session,
+kind or normalized intent raises OperationConflict. READY edits use conditional
+UPDATE; the run's claim returns that same row to freeze input. No transaction spans
+remote calls and no explicit SELECT FOR UPDATE or session lease remains.
+
+The Worker validates the actual native Activity identity, claims pending → running
+and loads frozen input. All history/final-state/cleanup/result writes conditionally
+check the current ID, allowed status, phase and deadline in the same transaction.
+Database-internal UPDATE exclusion lasts only through that short transaction.
+Terminal phase/result cannot change. Success commits with READY/CLOSED before
+Temporal acknowledgment and remains success after a lost acknowledgment.
+
+USE_EXISTING does not validate input and retained-ID rejection expires; therefore
+PostgreSQL stores intent, frozen input, a fixed one-hour deadline and terminal
+result permanently. RPC uncertainty leaves the owner active and same-key
+confirmation uses the original input. Queries/admission reconcile the exact native
+run_id and confirmed terminal status; expired active operations seal failed/closing.
+NOT_FOUND and RPC failures never mean READY. One Temporal attempt executes the full
+run; there is no Agent retry, enter replay, lease takeover or background sweeper.
+`is_runner_running` reads database starting/running, without a Temporal RPC.
 
 ## Configuration
 
@@ -82,49 +104,30 @@ omitted values and replace supplied JSON objects as a whole; `{}` clears an over
 Session fields cannot be explicitly null. Model switches supply both provider_id
 and model_name. Model settings merge at the top level and are validated at admission;
 updates apply to the next run. Only READY permits execution configuration changes;
-title remains editable in every phase. Layers and lifecycle cannot be patched.
+title changes also require READY. Layers and lifecycle cannot be patched.
 Lists use creation-time/identity order, offset >= 0 and limit 1..200, returning
 `Page(items, has_more)`.
 
-## Native layer scopes and session leases
+## Native layer scopes
 
-SessionService and the durable Agent share static typed `layers.registry.layer_registry.definitions`.
-Factory assembly performs no business I/O. Creation validates Config and no-enter
-default States, acquires the session lease, commits CREATING with fixed identity/
-Config and empty State, then calls optional enters outside database transactions.
-Enter can allocate resources and return required State. Without enter, State is
-validated from `{}`. Complete State and READY are published atomically under the
-same ownership. Failed initialization records CLOSING and exits every configured
-layer in reverse with None, including partial and uncalled enters. No partial
-initial State is saved. Compensation continues through hook cancellation; failed
-cleanup remains CLOSING for explicit retry. See [layer scopes](../layers/README.md#business-scopes).
+Worker create and close Activities share static definitions with the Agent.
+Creation validates configuration and default States before reservation, commits
+creating with empty State, then enters scopes outside transactions. All initial
+States publish with ready and succeeded together. Failed initialization retains its
+running owner during reverse compensation, exits every configured layer with None
+including partial/uncalled enters, and records failed after compensation completes.
+Complete compensation sets closed; otherwise closing permits a new explicit close.
+An uncertain success commit is checked before compensation; unavailable database
+leaves the outcome unconfirmed rather than issuing cleanup without ownership.
 
-Optional fixed creation `id` survives lost responses. Duplicate IDs raise
-SessionAlreadyExists without replaying enter. Errors after reservation begins raise
-SessionCreationError carrying this ID and the original cause; cancellation propagates.
-After an uncertain READY commit, the transaction ends before an owned transaction
-probes the authoritative row. READY confirms success; CREATING permits compensation.
-An unreachable database leaves the outcome unconfirmed. Query or close that same ID;
-there is no enter replay or background sweeper.
-
-`close_session(id)` first acquires the session lease. READY/CLOSING checks active
-Temporal execution under the row lock before changing lifecycle; active execution
-is busy and query failures propagate. CREATING skips Temporal so abandoned scopes
-can be cleaned; CLOSED returns directly. Close records CLOSING, calls layer exits
-in reverse, and validates/saves each hook attempt's mutated State under fencing.
-Only RetryableScopeError permits three bounded automatic attempts. Exits must be
-idempotent and support None for abandoned creation; a later explicit close may
-repeat successful exits. Ordinary failures do not prevent the remaining exits.
-The session becomes CLOSED after all cleanup succeeds; failures retain CLOSING and
-saved progress. Close and interface shutdown do not stop a Temporal Workflow.
-
-Lease heartbeat settings satisfy finite `0 < interval < timeout`; all scope users
-sharing a table use compatible policy. Expired-token takeover alone waits the
-positive grace period while renewing heartbeat. Ownership checks fence transactions;
-heartbeat failure cancels business and normal exit joins heartbeat before conditional
-release. Fencing cannot revoke an external request already issued by a lost owner.
-Shell jobs persist across successful runs. Failed execution can leave remote jobs
-outside the saved inventory, which session close cannot discover.
+Close claims ready or an unowned/terminal-owner closing session. Hooks run in reverse
+and save validated mutable State after every attempt, including errors/cancellation.
+Ordinary failures still try remaining scopes. Only outer RetryableScopeError permits
+three local attempts with a half-second delay; its promise is safe hook replay, not
+Temporal retry. Storage or validation failure does not retry a hook. Later explicit
+close uses a new key and may repeat successful exits, so exits must be idempotent and
+support None for abandoned initialization. Fencing stops future calls/writes but
+cannot revoke already-issued external requests. See [layers](../layers/README.md).
 
 ## History and live output
 

@@ -1,8 +1,9 @@
 """Session-only Telegram input adapter with durable, at-least-once business calls.
 
-The inbox consumer is serial. Resolved targets, templates and preallocated Session
-IDs survive retries; recovery queries that ID rather than repeating scope enter.
-core commits and private SQLite progress deliberately remain separate transactions.
+The inbox consumer is serial. Fixed targets/templates, preallocated session IDs and
+create/run/close Activity UUIDs survive retries. Recovery confirms the same durable
+operation without replaying scope enter. Core commits and private SQLite progress
+deliberately remain separate transactions. Explicit close targets never rebind the route.
 Polling and recovery never hold a transaction during a network or runner call.
 The model catalog is read only: /model changes the bound session's model pair and
 persists the bot's default in private storage. Session progress is saved before
@@ -22,15 +23,13 @@ from temporalio.service import RPCError
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
-    DurableRunnerConflict,
-    SessionAlreadyExists,
-    SessionCreationError,
+    OperationConflict,
+    OperationFailed,
+    SessionBusy,
     SessionService,
     UpdateSession,
 )
-from kapy.lifecycle import LifecycleError, LifecycleStatus
-from kapy.session_lease import SessionBusy
-from pydantic_ai_layer_protocol import RetryableScopeError
+from kapy.lifecycle import LifecycleError
 
 from .client import TelegramClient, TelegramFailure, retry_delay
 from .models import InboxRow
@@ -41,12 +40,13 @@ logger = logging.getLogger(__name__)
 COMMANDS = {
     "new": "Create a new session",
     "status": "Show session status",
-    "close": "Close this session and release its registered resources",
+    "close": "Close this session, or /close <session UUID> to release that session's resources",
     "model": "Set the session model and bot default, or show the default",
     "help": "Show commands",
 }
 HELP = "\n".join(f"/{command} — {description}" for command, description in COMMANDS.items())
 MODEL_USAGE = "Usage: /model <provider UUID> <model name>"
+CLOSE_USAGE = "Usage: /close [session UUID]"
 
 
 class TelegramController:
@@ -159,6 +159,14 @@ class TelegramController:
                 return {"command": "reply", "reply": "Unknown command. Use /help."}
         if command == "help":
             return {"command": "reply", "reply": HELP}
+        if command == "close" and text.strip():
+            try:
+                target = UUID(text.strip())
+            except ValueError:
+                return {"command": "reply", "reply": CLOSE_USAGE}
+            # An abandoned creation is not bound. Explicit recovery must never
+            # close or replace the chat's previous binding, even if it is stale.
+            return {"command": "close", "text": "", "session_id": str(target), "template": None}
         session_id = await self.repository.route(self.bot_id, item.chat_id, item.thread_id)
         if session_id is not None:
             try:
@@ -223,47 +231,37 @@ class TelegramController:
                     action["creating_session_id"] = str(uuid4())
                     await self.repository.save_action(item, action)
                 candidate = UUID(action["creating_session_id"])
-                try:
-                    session = await self.sessions.get_session(candidate)
-                except LookupError:
-                    try:
-                        session = await self.sessions.create_session(
-                            CreateSession.model_validate(action["template"]).model_copy(
-                                update={"id": candidate}
-                            )
-                        )
-                    except SessionAlreadyExists:
-                        # Another owner may still be registering this identity;
-                        # never choose a fresh ID or repeat enter automatically.
-                        action["completed"] = True
-                        action["reply"] = (
-                            f"Session: {candidate}\nCreation is already reserved; "
-                            "query or close this ID explicitly."
-                        )
-                        await self.repository.save_action(item, action)
-                        return
-                if session.status != LifecycleStatus.READY:
-                    action["completed"] = True
-                    action["reply"] = (
-                        f"Session: {candidate}\nStatus: {session.status}\n"
-                        "Creation was not repeated. Query or close this ID explicitly."
-                    )
+                if not action.get("create_activity_id"):
+                    action["create_activity_id"] = str(uuid4())
                     await self.repository.save_action(item, action)
-                    return
+                session = await self.sessions.create_session(
+                    CreateSession.model_validate(action["template"]).model_copy(
+                        update={"id": candidate}
+                    ),
+                    activity_id=UUID(action["create_activity_id"]),
+                )
                 await self.repository.bind(item, action, session.id)
                 action = dict(item.resolved_action or {})
             session_id = UUID(action["session_id"])
             if command in {"run", "new"}:
                 if action["text"] and not action.get("submitted"):
                     try:
-                        await self.sessions.start_durable_runner(
-                            session_id, user_prompt=action["text"]
+                        if not action.get("run_activity_id"):
+                            action["run_activity_id"] = str(uuid4())
+                            await self.repository.save_action(item, action)
+                        operation = await self.sessions.start_runner(
+                            session_id,
+                            user_prompt=action["text"],
+                            activity_id=UUID(action["run_activity_id"]),
                         )
+                        if operation.phase == "failed":
+                            raise OperationFailed(operation)
                     except SessionBusy:
                         action["reply"] = "Session is busy; this text was not submitted."
-                    except DurableRunnerConflict:
+                    except OperationConflict:
                         action["reply"] = (
-                            "Previous Workflow did not complete. Use /new to continue."
+                            "Previous execution is unsuccessful or unconfirmed. "
+                            "Use /new to continue."
                         )
                     else:
                         action["submitted"] = True
@@ -272,17 +270,22 @@ class TelegramController:
                     action["reply"] = "New session created."
             elif command == "close":
                 try:
-                    await self.sessions.close_session(session_id)
+                    if not action.get("close_activity_id"):
+                        action["close_activity_id"] = str(uuid4())
+                        await self.repository.save_action(item, action)
+                    await self.sessions.close_session(
+                        session_id, activity_id=UUID(action["close_activity_id"])
+                    )
                 except SessionBusy:
                     action["reply"] = "Session is busy; close has not started. Retry explicitly."
                 else:
                     action["reply"] = "Session closed."
             elif command == "status":
                 session = await self.sessions.get_session(session_id)
-                running = await self.sessions.is_durable_runner_running(session_id)
+                running = await self.sessions.is_runner_running(session_id)
                 action["reply"] = (
                     f"Session: {session_id}\nStatus: {session.status}\n"
-                    f"Workflow: {'running' if running else 'idle'}"
+                    f"Activity: {'running' if running else 'idle'}"
                 )
             action["completed"] = True
             await self.repository.save_action(item, action)
@@ -306,30 +309,21 @@ class TelegramController:
                 next_attempt_at=time.time() + retry_delay(error),
             )
         except RPCError:
-            # A failed start RPC may already have been accepted. Do not resubmit
-            # automatically: the next status query observes the fixed Workflow ID.
+            # Dispatch may have succeeded. Keep the resolved IDs and frozen intent
+            # so the inbox confirms the same operation after a transient outage.
             await self.repository.save_action(
-                item,
-                {"command": "reply", "reply": "Unable to confirm Workflow state. Use /status."},
+                item, item.resolved_action or {}, next_attempt_at=time.time() + 1
             )
-        except SessionCreationError as error:
+        except OperationFailed as error:
             await self.repository.save_action(
                 item,
                 {
                     "command": "reply",
                     "reply": (
-                        f"Session: {error.session_id}\nUnable to confirm successful creation. "
-                        "Query or close this ID explicitly."
+                        f"Session: {error.operation.session_id}\n"
+                        f"Operation failed. Use /close {error.operation.session_id} "
+                        "to clean up this session or /new to continue."
                     ),
-                },
-            )
-        except RetryableScopeError:
-            retry = "/close" if (item.resolved_action or {}).get("command") == "close" else "/new"
-            await self.repository.save_action(
-                item,
-                {
-                    "command": "reply",
-                    "reply": f"Layer scope operation failed. Use {retry} to retry.",
                 },
             )
         except LifecycleError:

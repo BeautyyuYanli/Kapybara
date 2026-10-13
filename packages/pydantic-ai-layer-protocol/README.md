@@ -9,11 +9,9 @@ Install from this repository:
 
 ```sh
 pip install ./packages/pydantic-ai-layer-protocol
-pip install './packages/pydantic-ai-layer-protocol[temporal]'
 ```
 
-The import name is `pydantic_ai_layer_protocol`. The core package requires no
-Temporal SDK; optional State transport lives in `pydantic_ai_layer_protocol.temporal`.
+The import name is `pydantic_ai_layer_protocol`. The package requires no Temporal SDK.
 
 ## Definitions and registry
 
@@ -109,33 +107,25 @@ copied before validation so custom validators cannot mutate caller-owned data.
 
 ## Native SDK composition
 
-The registry is a thin native `WrapperCapability` over a private selector.
-At Agent construction it exposes all installed entries so the SDK can register
-Activities. For each run it validates current Config/State and selects enabled
-definitions in the deps mapping's order; an empty selection enables zero layers.
-Unknown names or invalid data fail before capability execution. Factories are not
-rerun. Each registered leaf is wrapped in a native `DynamicCapability` whose
-Activity ID equals that leaf's stable capability ID. Missing leaf IDs fail during
-registry construction. A Wrapper over one leaf is wrapped as a whole; Combined
-containers and Wrappers containing children retain their native structure.
+The registry is a thin native `WrapperCapability` over a private selector. For
+each run it validates current Config/State and selects enabled definitions in the
+deps mapping's order; an empty selection enables zero layers. Unknown names or
+invalid data fail before capability execution. Factories are not rerun.
 
-Native Combined owns composition, instructions, hook ordering and tool ownership
-in ordinary runs and on the Temporal Workflow side. Native Dynamic rebuilds each
-leaf inside Activities, which do not receive the live capability registry.
-Successful discovery returns tool definitions for native Workflow-side ownership
-and deferral processing. Deferred loading retains both capability and Toolset
-instructions without copying SDK implementation methods.
+The original static capabilities are selected directly through native
+`CombinedCapability.for_run`; native `for_agent` performs Agent binding. Missing
+leaf IDs fail during registry construction. Wrappers and Combined containers retain
+their native structure and declared ordering. Native Combined owns composition,
+instructions, hooks, deferral and tool ownership.
 
 Leaf Toolset contributions are read after capability binding and bind through
-native `for_run` at tool resolution. Ordinary
-runs then have a finalized capability registry, while each Activity binds and
-enters its own resource instance. Stateful components return independent instances
-from native `for_run`; static definitions do no resource I/O. Capability factories
-producing unknown runtime subtrees are outside this static composition contract.
-Callable contributions and dynamic Toolsets within declared leaves remain supported.
-Layer instructions have no application ordering contract. SDK hook ordering,
-including the durable message recorder, still applies.
-
+native `for_run` at tool resolution, with the finalized capability registry.
+Stateful components return independent instances from `for_run`; static definitions
+perform no resource I/O. Callable contributions and dynamic Toolsets within declared
+leaves remain supported. Capability factories producing unknown runtime subtrees
+are outside this static composition contract. Layer instructions have no application
+ordering contract. Tools sharing mutable State must explicitly declare sequential
+behavior when required by their business semantics. Hosts own final persistence.
 
 ## Business scopes
 
@@ -159,55 +149,12 @@ safe. The host chooses retry limits. Nested causes, exception groups and cancell
 do not imply retryability. The protocol provides no storage, leases or automatic
 resource recovery.
 
-## Optional Temporal State transport
-
-Temporal serializes Activity deps independently, so Activity mutation does not
-update Workflow deps. Import the optional adapter explicitly:
-
-```python
-from pydantic_ai import Agent
-from pydantic_ai.durable_exec.temporal import TemporalDurability
-from pydantic_ai_layer_protocol.temporal import TemporalLayerRegistry
-
-layers = TemporalLayerRegistry({"counter": make_counter}, get_layers=get_layers)
-agent = Agent(..., deps_type=Deps, capabilities=[layers, TemporalDurability()])
-```
-
-This registry assembles the selector and both transport directions together using
-one access rule. Consumers supply no Toolset wrapper callback or separate State
-capability. Use the core `LayerRegistry` for ordinary runs; both expose the same
-`definitions`, `prepare_configs`, `load` and `snapshot` interfaces.
-
-The inner Toolset validates the called layer's State and carries it in
-ToolReturn.metadata. The Workflow wrapper applies only that layer's State before
-business hooks and restores the original value or native ToolReturn, including
-content, metadata and tools. Layer tools execute sequentially, so subsequent
-Activities receive the preceding returned State. Failures, cancellation and native
-ModelRetry bypass the success transport; the adapter performs no database I/O.
-
-LayerStateMetadata requires `state`, a strict boolean `native_return`, and arbitrary
-original `metadata`, and forbids unknown fields. Tool definitions identify their
-State owner under `LAYER_STATE_OWNER_KEY` (`pydantic_ai_layer`), which is reserved
-for this adapter. In ordinary Agent runs the transport wrappers pass results
-through and tools mutate the caller's
-writable deps directly. Consumers still own final persistence and failure semantics.
-
 ## Examples and checks
 
 ```sh
 python -m pydantic_ai_layer_protocol.examples.in_process
-python -m pydantic_ai_layer_protocol.examples.temporal
-```
-
-Examples use deterministic SDK models. The Temporal example needs a local Temporal
-service and uses the entry above for composition and State transport.
-
-From this package directory, core checks need only the dev dependencies:
-
-```sh
 python -m pytest -q tests/test_registry.py tests/test_types.py
 ```
 
-`tests/test_temporal.py` additionally uses the Temporal extra and a real service;
-TEMPORAL_ADDRESS defaults to localhost:7233 and TEMPORAL_NAMESPACE to default. Test
-capabilities own their resources and use unique Workflow IDs and task queues.
+Examples use deterministic SDK models. Tests cover native Agent lifecycle and
+composition without requiring a Temporal service.

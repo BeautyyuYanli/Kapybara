@@ -36,7 +36,7 @@ Adding a model to the catalog does not automatically choose a Telegram default.
 Provider credentials and catalog editing stay in the frontend; the Telegram command
 only reads an existing model identity. Optional `KAPY_TELEGRAM_API_BASE` defaults to
 `https://api.telegram.org`, and `KAPY_TELEGRAM_POLL_TIMEOUT` to 25 seconds.
-The durable Workflow owns execution recovery.
+The independent Worker runs each Agent invocation in one standalone Activity.
 
 Private SQLite defaults to
 `platformdirs.user_state_path("kapy") / "plugins/telegram/telegram.sqlite3"`, matching
@@ -59,17 +59,19 @@ storage identifiers; moving the Python package to `interfaces` does not change t
 
 | Input | Behavior |
 | --- | --- |
-| /new [text] | Create/bind a session, optionally start a durable Workflow |
-| Text | Start a durable Workflow; create a session if unbound |
-| /status | Current UUID, lifecycle and active Workflow |
-| /close | Close the session and registered layer resources; repeat to retry failures |
+| /new [text] | Create/bind a session, optionally start a durable Activity |
+| Text | Start a durable Activity; create a session if unbound |
+| /status | Current UUID, lifecycle and active Activity |
+| /close [session UUID] | Close the current or specified session and registered resources; repeat to retry failures |
 | /model [provider UUID model name] | Show the bot default; with arguments, update the bound session and save the default |
 | /help | List these session commands |
 
 Routes are keyed by bot/chat/topic (topic 0 when absent). Only allowed chats and
 non-bot senders are handled. Media receives an unsupported notice; unknown commands
-are never forwarded to the model. Status/close on an unbound route do not create
-a session. A missing session clears its route; infrastructure errors do not.
+are never forwarded to the model. Status/no-argument close on an unbound route do
+not create a session. An explicit close UUID resolves independently of the binding;
+malformed UUIDs receive usage without falling back to it. Explicit cleanup never
+changes the route. A missing bound session clears its route; infrastructure errors do not.
 
 The default is shared by all allowed chats for that bot. A model command changes
 only the current chat/topic's bound session and the bot default; other existing
@@ -87,29 +89,24 @@ completed configuration. A crash before progress is saved can repeat the same
 session update, following the inbox's existing at-least-once contract.
 
 Polling persists every batch and offset together before the next poll. Inbox
-processing records the resolved target/template and creation/submission progress.
-Before core creation it saves a fixed UUID in resolved_action. For unfinished
-creation actions, recovery queries that ID: ready binds the existing Session,
-creating/closing/closed reports the phase and queryable/closable ID without
-replaying enter, and only a missing record attempts creation with the same UUID.
-Lease and registration reject concurrent duplicate
-creation. The former route is preserved until ready is bound. A SessionCreationError
-saves a terminal reply action; subsequent attempts only retry delivering that reply.
-Its text retains the UUID for explicit queries or close requests. Core service
-commits and SQLite acknowledgements remain separate; input can still repeat after
-a crash between them. Completed submission is saved before confirmation messages,
-so a Telegram confirmation retry does not re-submit that input.
+processing saves resolved targets/templates, a fixed session ID and create/run/close
+Activity UUIDs before calling the core. Those IDs and inputs survive crashes between
+core commit and SQLite acknowledgment. Creation is confirmed with the same operation
+key before binding the route. Same-key running requests use the first frozen input;
+terminal requests return the saved result without replaying scopes or Agent work.
+Completed progress is saved before confirmation messages, so message delivery retries
+do not repeat business execution. No additional private operation table is needed.
 
-Ordinary text and `/new <text>` directly await durable start confirmation, without
-waiting for model completion. Busy submission replies explicitly and is not queued.
-A non-successful terminal Workflow requires a new session; normal Worker recovery
-continues the original Workflow. A Temporal RPC error may mean start was accepted;
-the inbox records a status-query notice instead of automatically repeating that RPC.
-A crash after acceptance but before saving inbox progress still follows the existing
-at-least-once contract. Neither process shutdown nor request cancellation stops a
-remote Workflow. No queue, steer or cancellation-flag commands are available.
-Previously persisted obsolete commands return an unknown-command reply without
-allocating a session.
+Text and `/new <text>` submit a run operation without waiting for model completion.
+Database starting/running reports an exclusive execution. Busy receives an explicit
+reply and is not queued. A Temporal RPC error preserves the resolved action and keys;
+the next inbox attempt confirms the same operation. The fixed deadline does not
+extend. Failed operation replies contain `/close <failed session UUID>` and /new
+guidance, hiding upstream details. Failed creation keeps the previous binding, so
+the UUID targets its unbound resources safely. A new command generates new operation keys.
+Caller/process cancellation does not stop Worker Activity execution. There are no
+queue, steer or cancellation-flag commands; obsolete persisted commands return an
+unknown-command reply without allocating resources.
 
 Each delivery consumes SessionService.live batches in order with its persisted
 `after_seq`. Every fully applied complete message advances this cursor. Complete ModelResponse text becomes a fixed formal
@@ -156,19 +153,13 @@ separate sessions in one topic can interleave. Reconnection drops provisional
 preview state. Cancellation unwinds the current read or send and closes the live generator. SIGINT/SIGTERM stop all input and delivery tasks before closing
 Bot API, SQLite, Valkey and core PostgreSQL resources. Existing legacy Telegram state is not imported.
 
-`/close` first acquires the session lease, then awaits each configured Layer's
-optional `exit_scope`. Normal close validates and saves
-State after each hook attempt; the route/history remains available for inspection.
-A busy lease or active durable Workflow replies that close has
-not started and completes the inbox command; it is never automatically retried
-as a future close. Retry `/close` after execution exits.
-Cleanup failure preserves closing and any saved progress. The interface records a
-retry reply for exhausted `RetryableScopeError`; uncaught
-errors propagate without guaranteeing a reply. Creation failure replies with its
-saved UUID for explicit query/close, hiding the original error; no fresh scope is
-automatically created. Failed creating scopes exit all configured layers with None
-in reverse order, including partial/uncalled enters. Exit must recover by ID/Config
-and be idempotent; enter permits retry only by throwing RetryableScopeError.
-Execution configuration updates to a creating/closing/closed session are
-rejected; `/new` creates another one.
-`/status` includes the lifecycle status. HTTP and Telegram share SessionService and the independent durable Worker. Durable runner is the only execution path.
+`/close` sends its saved target and Activity key. `/close <UUID>` also works without
+a current binding and preserves any existing binding. The Worker claims cleanup only when no active
+owner exists, runs exits in reverse outside transactions and saves validated progress
+after each attempt. Failure retains closing; a later explicit /close uses a new key
+and can repeat idempotent exits. Only outer RetryableScopeError gets three local
+attempts; Temporal itself has one attempt. Failed creation compensates all configured
+layers with None, including partial/uncalled enters, before recording its terminal
+result. /status reads database lifecycle and starting/running, independently of the
+Temporal record's retention. Configuration/title updates require ready. See the
+[control state machine](../../control/README.md#session-state-machine).

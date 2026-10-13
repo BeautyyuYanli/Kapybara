@@ -18,7 +18,7 @@ from kapy.application.settings import CommonSettings
 from kapy.control.database import ControlTable
 from kapy.control.models import models as model_tables  # noqa: F401
 from kapy.control.sessions import models as session_tables  # noqa: F401
-from kapy.session_lease.models import lease_metadata
+from kapy.control.sessions import operations as operation_tables  # noqa: F401
 
 from .migration import execute, migration_config
 
@@ -27,6 +27,7 @@ OWNED_TABLES = frozenset(
         "providers",
         "models",
         "sessions",
+        "session_operations",
         "plugin_agent_bindings",
         "session_inputs",
         "session_cancels",
@@ -48,7 +49,14 @@ async def migrate(
 ) -> None:
     if plan is not None and (
         operation != "revision"
-        or plan not in {"context-pages", "immutable-history", "shell-scope-state", "durable-only"}
+        or plan
+        not in {
+            "context-pages",
+            "immutable-history",
+            "shell-scope-state",
+            "durable-only",
+            "session-operations",
+        }
     ):
         raise ValueError("plan must name a supported revision generation plan")
     async with open_core_database(settings) as engine:
@@ -62,7 +70,7 @@ async def migrate(
                 config = migration_config(
                     db,
                     directory=Path(__file__).parent / "migrations",
-                    metadata=[ControlTable.metadata, history_metadata, lease_metadata],
+                    metadata=[ControlTable.metadata, history_metadata],
                     version_table="core_schema_version",
                     owns_table=OWNED_TABLES.__contains__,
                 )
@@ -74,6 +82,7 @@ async def migrate(
                         "immutable-history": revision_plans.immutable_history,
                         "shell-scope-state": revision_plans.shell_scope_state,
                         "durable-only": revision_plans.durable_only,
+                        "session-operations": revision_plans.session_operations,
                     }[plan]
                 execute(config, operation, message=message)
 
@@ -86,7 +95,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--message")
     parser.add_argument(
         "--plan",
-        choices=["context-pages", "immutable-history", "shell-scope-state", "durable-only"],
+        choices=[
+            "context-pages",
+            "immutable-history",
+            "shell-scope-state",
+            "durable-only",
+            "session-operations",
+        ],
     )
     args = parser.parse_args(argv)
     asyncio.run(

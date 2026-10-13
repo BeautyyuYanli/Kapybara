@@ -122,6 +122,16 @@ export type CachePoint = {
 };
 
 /**
+ * CloseSession
+ */
+export type CloseSession = {
+    /**
+     * Activity Id
+     */
+    activity_id: string;
+};
+
+/**
  * CompactionPart
  *
  * A compaction part that summarizes previous conversation history.
@@ -196,14 +206,9 @@ export type CreateProvider = {
 };
 
 /**
- * CreateSession
- *
- * Fixed execution configuration; optional id lets callers resolve lost responses.
- *
- * Reusing an existing/reserved identity conflicts instead of replaying enter or
- * business hooks. The caller queries or closes that same identity explicitly.
+ * CreateSessionRequest
  */
-export type CreateSession = {
+export type CreateSessionRequest = {
     /**
      * Id
      */
@@ -224,6 +229,10 @@ export type CreateSession = {
      */
     title?: string;
     model_settings?: JsonObject;
+    /**
+     * Activity Id
+     */
+    activity_id: string;
 };
 
 /**
@@ -272,20 +281,6 @@ export type DocumentUrl = {
      * distinguish multiple files.
      */
     readonly identifier: string;
-};
-
-/**
- * DurableRun
- */
-export type DurableRun = {
-    /**
-     * Workflow Id
-     */
-    workflow_id: string;
-    /**
-     * Run Id
-     */
-    run_id: string;
 };
 
 /**
@@ -440,7 +435,7 @@ export type JsonValue = unknown;
 /**
  * LifecycleStatus
  */
-export type LifecycleStatus = 'creating' | 'ready' | 'closing' | 'closed';
+export type LifecycleStatus = 'creating' | 'ready' | 'starting' | 'running' | 'closing' | 'closed';
 
 /**
  * LoadCapabilityArgs
@@ -935,6 +930,16 @@ export type NativeToolSearchReturnPart = {
 };
 
 /**
+ * OperationKind
+ */
+export type OperationKind = 'create' | 'run' | 'close';
+
+/**
+ * OperationPhase
+ */
+export type OperationPhase = 'pending' | 'running' | 'succeeded' | 'failed';
+
+/**
  * Page[HistoryMessage]
  */
 export type PageHistoryMessage = {
@@ -1120,6 +1125,44 @@ export type RetryPromptPart = {
 };
 
 /**
+ * SessionOperation
+ *
+ * Durable public outcome. Private frozen inputs never leave the repository.
+ */
+export type SessionOperation = {
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Activity Id
+     */
+    activity_id: string;
+    kind: OperationKind;
+    phase: OperationPhase;
+    /**
+     * Run Id
+     */
+    run_id: string | null;
+    /**
+     * Result
+     */
+    result: string | SessionRecord | null;
+    /**
+     * Error
+     */
+    error: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Deadline
+     */
+    deadline: string;
+};
+
+/**
  * SessionRecord
  */
 export type SessionRecord = {
@@ -1207,9 +1250,13 @@ export type SpeechPart = {
 };
 
 /**
- * StartDurableRunner
+ * StartRunner
  */
-export type StartDurableRunner = {
+export type StartRunner = {
+    /**
+     * Activity Id
+     */
+    activity_id: string;
     /**
      * User Prompt
      */
@@ -2815,7 +2862,7 @@ export type ListSessionsResponses = {
 export type ListSessionsResponse = ListSessionsResponses[keyof ListSessionsResponses];
 
 export type CreateSessionData = {
-    body: CreateSession;
+    body: CreateSessionRequest;
     path?: never;
     query?: never;
     url: '/api/sessions';
@@ -2900,7 +2947,7 @@ export type UpdateSessionResponses = {
 export type UpdateSessionResponse = UpdateSessionResponses[keyof UpdateSessionResponses];
 
 export type CloseSessionData = {
-    body?: never;
+    body: CloseSession;
     path: {
         /**
          * Session Id
@@ -2961,8 +3008,8 @@ export type IsRunnerRunningResponses = {
 
 export type IsRunnerRunningResponse = IsRunnerRunningResponses[keyof IsRunnerRunningResponses];
 
-export type StartDurableRunnerData = {
-    body: StartDurableRunner;
+export type StartRunnerData = {
+    body: StartRunner;
     path: {
         /**
          * Session Id
@@ -2973,23 +3020,57 @@ export type StartDurableRunnerData = {
     url: '/api/sessions/{session_id}/runner';
 };
 
-export type StartDurableRunnerErrors = {
+export type StartRunnerErrors = {
     /**
      * Validation Error
      */
     422: HttpValidationError;
 };
 
-export type StartDurableRunnerError = StartDurableRunnerErrors[keyof StartDurableRunnerErrors];
+export type StartRunnerError = StartRunnerErrors[keyof StartRunnerErrors];
 
-export type StartDurableRunnerResponses = {
+export type StartRunnerResponses = {
     /**
      * Successful Response
      */
-    202: DurableRun;
+    202: SessionOperation;
 };
 
-export type StartDurableRunnerResponse = StartDurableRunnerResponses[keyof StartDurableRunnerResponses];
+export type StartRunnerResponse = StartRunnerResponses[keyof StartRunnerResponses];
+
+export type GetSessionOperationData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+        /**
+         * Activity Id
+         */
+        activity_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/operations/{activity_id}';
+};
+
+export type GetSessionOperationErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionOperationError = GetSessionOperationErrors[keyof GetSessionOperationErrors];
+
+export type GetSessionOperationResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionOperation;
+};
+
+export type GetSessionOperationResponse = GetSessionOperationResponses[keyof GetSessionOperationResponses];
 
 export type ReadHistoryData = {
     body?: never;

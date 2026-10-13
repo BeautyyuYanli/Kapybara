@@ -17,14 +17,15 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from temporalio.client import Client
 from valkey.asyncio import Valkey
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_history.models import history_metadata
+from kapy.agent_output import AgentOutputService
 from kapy.control.database import ControlTable
 from kapy.control.sessions import models as session_models  # noqa: F401
-from kapy.session_lease import service as lease_service
-from kapy.session_lease.models import lease_metadata
+from kapy.control.sessions.operations import SessionOperationRow
 
 DATABASE_URL = os.environ.get(
     "KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
@@ -68,7 +69,6 @@ async def database() -> AsyncIterator[Database]:
     try:
         async with engine.begin() as db:
             await db.run_sync(history_metadata.create_all)
-            await db.run_sync(lease_metadata.create_all)
             await db.run_sync(ControlTable.metadata.create_all)
         yield Database(
             schema, DATABASE_URL, engine, async_sessionmaker(engine, expire_on_commit=False)
@@ -81,16 +81,14 @@ async def database() -> AsyncIterator[Database]:
 
 @pytest.fixture
 def seed_history(database):
-    """Write complete test history under a real session row lock, without a runner."""
+    """Write complete test history in an independent fixture transaction, without a runner."""
     from kapy.control.sessions.models import SessionRow
-    from kapy.control.sessions.repository import lock_session
 
     async def seed(messages):
         session_id = uuid4()
         async with database.sessions.begin() as db:
             db.add(SessionRow(id=session_id, provider_id=uuid4(), model_name="test"))
             await db.flush()
-            await lock_session(db, session_id)
             await HistoryRepository(db).append_history(
                 session_id,
                 [HistoryMessage(session_id, seq, message) for seq, message in enumerate(messages)],
@@ -101,30 +99,12 @@ def seed_history(database):
 
 
 @pytest.fixture
-def heartbeat_observation(monkeypatch):
-    tasks = set()
-    called = asyncio.Event()
-    original = lease_service._update_owned
-
-    async def observe(db, lease, *, release):
-        task = asyncio.current_task()
-        assert task is not None
-        await original(db, lease, release=release)
-        if not release:
-            tasks.add(task)
-            called.set()
-
-    monkeypatch.setattr(lease_service, "_update_owned", observe)
-    return tasks, called
-
-
-@pytest.fixture
 def seed_session(database):
     """Create catalog configuration and a session; history fixtures may already own its row."""
     from kapy.control.models.models import ModelRow, ProviderRow
     from kapy.control.sessions.models import SessionRow
 
-    async def seed(session_id):
+    async def seed(session_id, *, running=False):
         async with database.sessions.begin() as db:
             existing = await db.get(SessionRow, session_id)
             provider = ProviderRow(
@@ -141,7 +121,27 @@ def seed_session(database):
                 )
             )
             if existing is None:
-                db.add(SessionRow(id=session_id, provider_id=provider.id, model_name="test"))
+                existing = SessionRow(id=session_id, provider_id=provider.id, model_name="test")
+                db.add(existing)
+            if running:
+                from datetime import timedelta
+
+                from kapy.control.sessions.types import OperationKind, OperationPhase
+                from kapy.control.types import utc_now
+                from kapy.lifecycle import LifecycleStatus
+
+                existing.status = LifecycleStatus.RUNNING
+                existing.current_activity_id = session_id
+                db.add(
+                    SessionOperationRow(
+                        activity_id=session_id,
+                        session_id=session_id,
+                        kind=OperationKind.RUN,
+                        phase=OperationPhase.RUNNING,
+                        request={},
+                        deadline=utc_now() + timedelta(hours=1),
+                    )
+                )
 
     return seed
 
@@ -168,3 +168,42 @@ def wait_for_lock(database):
                 await asyncio.sleep(0.01)
 
     return wait
+
+
+@dataclass
+class SessionRuntime:
+    client: Client
+    queue: str
+    outputs: AgentOutputService
+
+    def service(self, factory):
+        from kapy.control.sessions import SessionService
+
+        return SessionService(
+            factory,
+            output_service=self.outputs,
+            temporal_client=self.client,
+            temporal_task_queue=self.queue,
+        )
+
+
+@pytest_asyncio.fixture
+async def session_runtime(database, valkey_client):
+    from temporalio.client import Client
+    from temporalio.contrib.pydantic import pydantic_data_converter
+    from temporalio.worker import Worker
+
+    from kapy.agent_output import AgentOutputService
+    from kapy.runner import RunnerActivity
+
+    client = await Client.connect(
+        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+        data_converter=pydantic_data_converter,
+    )
+    queue = f"session-test-{uuid4()}"
+    outputs = AgentOutputService(valkey_client, channel_prefix=f"session-test-{uuid4()}")
+    runner = RunnerActivity(database.sessions, outputs)
+    async with Worker(
+        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
+    ):
+        yield SessionRuntime(client, queue, outputs)
