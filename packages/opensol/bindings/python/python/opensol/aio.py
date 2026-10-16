@@ -1,5 +1,7 @@
 """Native Rust I/O on the caller's asyncio loop, with shared OpenSOL DTOs.
 
+Public I/O methods and network factories are coroutines: native Futures are
+created only when the coroutine runs. Configuration and local binding stay synchronous.
 Each process handle has one output subscription. Read operations are serialized;
 cancellation retains a reserved event until a Python consumer acknowledges it.
 Closing a subscription never signals the process or deletes its environment.
@@ -8,12 +10,11 @@ Closing a subscription never signals the process or deletes its environment.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncIterator, Sequence
 
 from . import _native
 from ._native import (
-    AsyncConnection as Connection,
-    AsyncLifecycle as Lifecycle,
+    ExecResult,
     ManagerInfo,
     OutputCursor,
     OutputInfo,
@@ -22,8 +23,79 @@ from ._native import (
     ProcessInfo,
     ProcessOutcome,
     ProcessRef,
+    ResourceInfo,
     ResourceRef,
 )
+
+
+class Connection:
+    """Completed commands on one target, scheduled when their coroutine runs."""
+
+    def __init__(self, native: _native.AsyncConnection) -> None:
+        self._native = native
+
+    @property
+    def backend(self) -> str:
+        return self._native.backend
+
+    def capabilities(self) -> _native.ConnectionCapabilities:
+        return self._native.capabilities()
+
+    async def exec(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        stdin: bytes = b"",
+        timeout: float | None = None,
+    ) -> ExecResult:
+        return await self._native.exec(argv, cwd=cwd, env=env, stdin=stdin, timeout=timeout)
+
+    async def shell(
+        self,
+        script: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        stdin: bytes = b"",
+        timeout: float | None = None,
+    ) -> ExecResult:
+        return await self._native.shell(script, cwd=cwd, env=env, stdin=stdin, timeout=timeout)
+
+
+class Lifecycle:
+    """Explicit native resource operations; dropping a client never deletes resources."""
+
+    def __init__(self, native: _native.AsyncLifecycle) -> None:
+        self._native = native
+
+    @property
+    def backend(self) -> str:
+        return self._native.backend
+
+    def capabilities(self) -> _native.LifecycleCapabilities:
+        return self._native.capabilities()
+
+    async def create(
+        self, *, name: str | None = None, labels: dict[str, str] | None = None,
+    ) -> ResourceRef:
+        return await self._native.create(name=name, labels=labels)
+
+    async def inspect(self, resource: ResourceRef) -> ResourceInfo:
+        return await self._native.inspect(resource)
+
+    async def start(self, resource: ResourceRef) -> None:
+        await self._native.start(resource)
+
+    async def stop(self, resource: ResourceRef) -> None:
+        await self._native.stop(resource)
+
+    async def delete(self, resource: ResourceRef) -> None:
+        await self._native.delete(resource)
+
+    async def fork(self, resource: ResourceRef) -> ResourceRef:
+        return await self._native.fork(resource)
 
 
 class ProcessHandle(AsyncIterator[ProcessEvent]):
@@ -101,11 +173,11 @@ class ProcessManager:
         """Bind a resource locally; existence is checked on its next native operation."""
         return Process(self._native.get(process))
 
-    def probe(self) -> Awaitable[ManagerInfo]:
-        return self._native.probe()
+    async def probe(self) -> ManagerInfo:
+        return await self._native.probe()
 
-    def list(self) -> Awaitable[list[ProcessInfo]]:
-        return self._native.list()
+    async def list(self) -> list[ProcessInfo]:
+        return await self._native.list()
 
     async def spawn(
         self,
@@ -135,38 +207,38 @@ class Process:
     def output(self) -> ProcessOutput:
         return ProcessOutput(self._native.output)
 
-    def inspect(self) -> Awaitable[ProcessInfo]:
-        return self._native.inspect()
+    async def inspect(self) -> ProcessInfo:
+        return await self._native.inspect()
 
-    def wait(self, *, timeout: float | None = None) -> Awaitable[ProcessOutcome]:
-        return self._native.wait(timeout=timeout)
+    async def wait(self, *, timeout: float | None = None) -> ProcessOutcome:
+        return await self._native.wait(timeout=timeout)
 
-    def pause(self) -> Awaitable[None]:
-        return self._native.pause()
+    async def pause(self) -> None:
+        await self._native.pause()
 
-    def start(self) -> Awaitable[None]:
-        return self._native.start()
+    async def start(self) -> None:
+        await self._native.start()
 
-    def restart(self) -> Awaitable[None]:
-        return self._native.restart()
+    async def restart(self) -> None:
+        await self._native.restart()
 
-    def kill(self) -> Awaitable[None]:
-        return self._native.kill()
+    async def kill(self) -> None:
+        await self._native.kill()
 
-    def remove(self) -> Awaitable[None]:
-        return self._native.remove()
+    async def remove(self) -> None:
+        await self._native.remove()
 
-    def signal(self, signal: int) -> Awaitable[None]:
-        return self._native.signal(signal)
+    async def signal(self, signal: int) -> None:
+        await self._native.signal(signal)
 
-    def send_input(self, data: bytes) -> Awaitable[None]:
-        return self._native.send_input(data)
+    async def send_input(self, data: bytes) -> None:
+        await self._native.send_input(data)
 
-    def close_stdin(self) -> Awaitable[None]:
-        return self._native.close_stdin()
+    async def close_stdin(self) -> None:
+        await self._native.close_stdin()
 
-    def resize(self, cols: int, rows: int) -> Awaitable[None]:
-        return self._native.resize(cols, rows)
+    async def resize(self, cols: int, rows: int) -> None:
+        await self._native.resize(cols, rows)
 
 
 class ProcessOutput:
@@ -175,11 +247,11 @@ class ProcessOutput:
     def __init__(self, native: _native.AsyncProcessOutput) -> None:
         self._native = native
 
-    def stat(self) -> Awaitable[OutputInfo]:
-        return self._native.stat()
+    async def stat(self) -> OutputInfo:
+        return await self._native.stat()
 
-    def read(self, *, cursor: OutputCursor | None = None, limit: int = 65536) -> Awaitable[OutputPage]:
-        return self._native.read(cursor=cursor, limit=limit)
+    async def read(self, *, cursor: OutputCursor | None = None, limit: int = 65536) -> OutputPage:
+        return await self._native.read(cursor=cursor, limit=limit)
 
     async def subscribe(self) -> ProcessHandle:
         """Open an independent native subscription; requires reconnect capability."""
@@ -194,7 +266,7 @@ class Envd:
 
     @property
     def connection(self) -> Connection:
-        return _native._async_connection(self._native.connection)
+        return Connection(_native._async_connection(self._native.connection))
 
     @property
     def processes(self) -> ProcessManager:
@@ -209,10 +281,10 @@ class Docker:
 
     @property
     def lifecycle(self) -> Lifecycle:
-        return _native._async_lifecycle(self._native.lifecycle)
+        return Lifecycle(_native._async_lifecycle(self._native.lifecycle))
 
     def connection(self, resource: ResourceRef) -> Connection:
-        return _native._async_connection(self._native.connection(resource))
+        return Connection(_native._async_connection(self._native.connection(resource)))
 
 
 class E2b:
@@ -223,7 +295,7 @@ class E2b:
 
     @property
     def lifecycle(self) -> Lifecycle:
-        return _native._async_lifecycle(self._native.lifecycle)
+        return Lifecycle(_native._async_lifecycle(self._native.lifecycle))
 
     async def envd(self, resource: ResourceRef) -> Envd:
         return Envd(await self._native._aio_envd(resource))
@@ -237,14 +309,14 @@ class OpenShell:
 
     @property
     def lifecycle(self) -> Lifecycle:
-        return _native._async_lifecycle(self._native.lifecycle)
+        return Lifecycle(_native._async_lifecycle(self._native.lifecycle))
 
     def connection(self, resource: ResourceRef) -> Connection:
-        return _native._async_connection(self._native.connection(resource))
+        return Connection(_native._async_connection(self._native.connection(resource)))
 
 
 def local() -> Connection:
-    return _native._async_connection(_native.local())
+    return Connection(_native._async_connection(_native.local()))
 
 
 def ssh(
@@ -255,9 +327,11 @@ def ssh(
     config_file: str | None = None,
     program: str = "ssh",
 ) -> Connection:
-    return _native._async_connection(
-        _native.ssh(destination, port=port, identity_file=identity_file,
-                    config_file=config_file, program=program)
+    return Connection(
+        _native._async_connection(
+            _native.ssh(destination, port=port, identity_file=identity_file,
+                        config_file=config_file, program=program)
+        )
     )
 
 
@@ -276,7 +350,7 @@ def docker(
 
 
 def docker_connection(container: str) -> Connection:
-    return _native._async_connection(_native.docker_connection(container))
+    return Connection(_native._async_connection(_native.docker_connection(container)))
 
 
 def pueue(
@@ -288,7 +362,7 @@ def pueue(
     pueue_directory: str | None = None,
     program: str = "pueue",
 ) -> ProcessManager:
-    manager = _native.pueue(connection._blocking(), config_file=config_file,
+    manager = _native.pueue(connection._native._blocking(), config_file=config_file,
                             profile=profile, group=group, pueue_directory=pueue_directory,
                             program=program)
     return ProcessManager(_native._async_processes(manager))
@@ -337,24 +411,31 @@ def agent_sandbox(
     service: bool = True,
     volume_claim_templates_json: str | None = None,
 ) -> Lifecycle:
-    return _native._async_lifecycle(_native.agent_sandbox(
-        namespace, pod_template_json, context=context, kubeconfig=kubeconfig,
-        program=program, service=service,
-        volume_claim_templates_json=volume_claim_templates_json,
-    ))
+    return Lifecycle(
+        _native._async_lifecycle(
+            _native.agent_sandbox(
+                namespace, pod_template_json, context=context, kubeconfig=kubeconfig,
+                program=program, service=service,
+                volume_claim_templates_json=volume_claim_templates_json,
+            )
+        )
+    )
 
 
-def sandboxd(
+async def sandboxd(
     endpoint: str,
     *,
     bearer_token: str | None = None,
     ca_certificate: str | None = None,
     client_certificate: str | None = None,
     client_key: str | None = None,
-) -> Awaitable[Connection]:
-    return _native._aio_sandboxd(endpoint, bearer_token=bearer_token,
-                                ca_certificate=ca_certificate,
-                                client_certificate=client_certificate, client_key=client_key)
+) -> Connection:
+    return Connection(
+        await _native._aio_sandboxd(
+            endpoint, bearer_token=bearer_token, ca_certificate=ca_certificate,
+            client_certificate=client_certificate, client_key=client_key,
+        )
+    )
 
 
 async def openshell(
@@ -368,14 +449,17 @@ async def openshell(
     client_certificate: str | None = None,
     client_key: str | None = None,
 ) -> OpenShell:
-    return OpenShell(await _native._aio_openshell(endpoint, workspace=workspace,
-                                 workload_template=workload_template,
-                                 spec_protobuf=spec_protobuf, bearer_token=bearer_token,
-                                 ca_certificate=ca_certificate,
-                                 client_certificate=client_certificate, client_key=client_key))
+    return OpenShell(
+        await _native._aio_openshell(
+            endpoint, workspace=workspace, workload_template=workload_template,
+            spec_protobuf=spec_protobuf, bearer_token=bearer_token,
+            ca_certificate=ca_certificate, client_certificate=client_certificate,
+            client_key=client_key,
+        )
+    )
 
 
-def openshell_connection(
+async def openshell_connection(
     endpoint: str,
     sandbox: str,
     *,
@@ -384,12 +468,14 @@ def openshell_connection(
     ca_certificate: str | None = None,
     client_certificate: str | None = None,
     client_key: str | None = None,
-) -> Awaitable[Connection]:
-    return _native._aio_openshell_connection(endpoint, sandbox, workspace=workspace,
-                                            bearer_token=bearer_token,
-                                            ca_certificate=ca_certificate,
-                                            client_certificate=client_certificate,
-                                            client_key=client_key)
+) -> Connection:
+    return Connection(
+        await _native._aio_openshell_connection(
+            endpoint, sandbox, workspace=workspace, bearer_token=bearer_token,
+            ca_certificate=ca_certificate, client_certificate=client_certificate,
+            client_key=client_key,
+        )
+    )
 
 
 __all__ = [

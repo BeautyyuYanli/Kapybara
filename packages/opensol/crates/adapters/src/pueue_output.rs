@@ -46,14 +46,14 @@ current_identity=$(stat -Lc '%d:%i:%W' -- "$file" 2>/dev/null) || exit 44
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Execution {
+pub(super) struct Execution {
     created: String,
     queued: Option<String>,
     start: Option<String>,
 }
 
 impl Execution {
-    fn from_task(task: &Value) -> Result<Self> {
+    pub(super) fn from_task(task: &Value, operation: &str) -> Result<Self> {
         let mut status = &task["status"];
         // Native edit locks retain the preceding status, including its execution identity.
         while let Some(previous) = status.get("Locked") {
@@ -62,26 +62,26 @@ impl Execution {
         let object = status
             .as_object()
             .filter(|object| object.len() == 1)
-            .ok_or_else(|| protocol_error("read_output"))?;
+            .ok_or_else(|| protocol_error(operation))?;
         let (state, payload) = object
             .iter()
             .next()
-            .ok_or_else(|| protocol_error("read_output"))?;
+            .ok_or_else(|| protocol_error(operation))?;
         let queued = match state.as_str() {
             "Stashed" => None,
             "Queued" | "Running" | "Paused" | "Done" => Some(
                 payload["enqueued_at"]
                     .as_str()
-                    .ok_or_else(|| protocol_error("read_output"))?
+                    .ok_or_else(|| protocol_error(operation))?
                     .into(),
             ),
-            _ => return Err(protocol_error("read_output")),
+            _ => return Err(protocol_error(operation)),
         };
         let start = match state.as_str() {
             "Running" | "Paused" | "Done" => Some(
                 payload["start"]
                     .as_str()
-                    .ok_or_else(|| protocol_error("read_output"))?
+                    .ok_or_else(|| protocol_error(operation))?
                     .into(),
             ),
             _ => None,
@@ -89,16 +89,16 @@ impl Execution {
         Ok(Self {
             created: task["created_at"]
                 .as_str()
-                .ok_or_else(|| protocol_error("read_output"))?
+                .ok_or_else(|| protocol_error(operation))?
                 .into(),
             queued,
             start,
         })
     }
 
-    // A queued cursor may attach to that same first execution after it starts. A native
-    // restart changes enqueued_at; an already-bound execution must keep its start time.
-    fn accepts(&self, current: &Self) -> bool {
+    // Cursors and subscriptions may follow the same queued execution as it starts.
+    // A native restart changes enqueued_at; once observed, start must also stay fixed.
+    pub(super) fn accepts(&self, current: &Self) -> bool {
         self == current
             || (self.start.is_none()
                 && self.queued.is_some()
@@ -340,7 +340,7 @@ impl Pueue {
             .map(|cursor| Cursor::parse(cursor, &id))
             .transpose()?;
         let before = self.task(process).await?;
-        let execution = Execution::from_task(&before)?;
+        let execution = Execution::from_task(&before, "read_output")?;
         if cursor
             .as_ref()
             .is_some_and(|cursor| !cursor.execution.accepts(&execution))
@@ -375,7 +375,7 @@ impl Pueue {
         }
         let log = self.native_read(&id, cursor.as_ref(), limit).await?;
         let after = self.task(process).await?;
-        if Execution::from_task(&after)? != execution {
+        if Execution::from_task(&after, "read_output")? != execution {
             return Err(conflict());
         }
         next.directory = Some(log.directory);

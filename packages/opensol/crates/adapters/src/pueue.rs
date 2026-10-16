@@ -1,6 +1,8 @@
 //! Official Pueue v4 CLI over any Connection. The caller runs pueued and retains its logs.
 //!
 //! Output subscriptions deliver merged bytes after completion via `pueue follow`; they are not PTYs.
+//! Each subscription binds the native execution observed when it is established. Native wait/follow
+//! still select by task ID, so execution checks bracket consumption before any events are delivered.
 //! Explicit native-log configuration also enables bounded resource reads while a task runs.
 //! Configure Pueue's `client.read_local_logs=true` and run the CLI beside its daemon for binary
 //! preservation. Pueue's remote-log protocol itself decodes text lossily. No daemon is started here.
@@ -325,6 +327,23 @@ impl Pueue {
         }
         Ok(())
     }
+
+    async fn check_execution(
+        &self,
+        process: &ProcessRef,
+        expected: &output::Execution,
+    ) -> Result<output::Execution> {
+        let current = output::Execution::from_task(&self.task(process).await?, "output")?;
+        if !expected.accepts(&current) {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "pueue",
+                "output",
+                "subscription no longer identifies the current task execution",
+            ));
+        }
+        Ok(current)
+    }
 }
 
 fn protocol_error(operation: &str) -> Error {
@@ -526,11 +545,21 @@ impl ProcessAccess for Pueue {
 
     async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
         let id = self.id(process, "output")?;
+        // Capture now, not on the first poll: even an unconsumed spawn/reconnect handle
+        // belongs to this observed execution, not a future reuse of the same task ID.
+        let execution = output::Execution::from_task(&self.task(process).await?, "output")?;
         let manager = self.clone();
         let process = process.clone();
         Ok(Box::pin(async_stream::try_stream! {
-            let outcome = manager.wait(&process, None).await?;
-            let data = manager.run(vec!["follow".into(), id], "output", None).await?;
+            let execution = manager.check_execution(&process, &execution).await?;
+            let outcome = manager.wait(&process, None).await;
+            let execution = manager.check_execution(&process, &execution).await?;
+            let outcome = outcome?;
+            let data = manager.run(vec!["follow".into(), id], "output", None).await;
+            // Recheck even failed native calls: task cleanup must remain NotFound and
+            // restart/replacement Conflict, rather than an ambiguous CLI failure.
+            manager.check_execution(&process, &execution).await?;
+            let data = data?;
             if !data.is_empty() { yield ProcessEvent::Output { channel: OutputChannel::Combined, data }; }
             yield ProcessEvent::Completed(outcome);
         }))
@@ -571,7 +600,6 @@ impl ProcessAccess for Pueue {
     }
 
     async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
-        self.status(process).await?;
         Ok(ProcessHandle {
             process: process.clone(),
             events: self.output(process).await?,

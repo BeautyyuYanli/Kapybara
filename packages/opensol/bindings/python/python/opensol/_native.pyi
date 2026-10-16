@@ -1,3 +1,9 @@
+"""Native Future bridge; public coroutine APIs are defined in opensol.aio.
+
+Native async methods return scheduled awaitables. The aio wrappers create and
+await them inside async def, so public calls remain lazy and accept create_task.
+"""
+
 import builtins
 from collections.abc import Awaitable, Sequence
 from typing import Literal, TypedDict

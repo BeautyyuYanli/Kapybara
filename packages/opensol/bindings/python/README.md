@@ -40,7 +40,7 @@ Docker HostConfig、Kubernetes PodTemplate/PVC 参数分别通过原生 JSON 字
 
 后端对象保留原始 Engine/gateway/HTTP 客户端、凭据、作用域与超时，不重复转发生命周期方法。E2B 的 envd_endpoint、sandbox_domain、request_timeout 在 `e2b()` 配置，连接资源时无需再次提供 API key 或 endpoint。工厂不隐式 create/start/probe、不恢复暂停沙盒、不启动 daemon。公共参数校验和能力检查复用 Rust 客户端，Python 仅做语言参数、awaitable 和异常转换。
 
-`aio` 的 Connection 与 Lifecycle 方法，以及 ProcessManager 的所有 I/O 方法都可 await。部分方法直接返回原生 awaitable，不能用 `inspect.iscoroutinefunction` 判断能否 await；在运行中的 asyncio loop 内调用它们。公开类型声明使用 `Awaitable[T]` 或 `async def` 准确表达返回值。
+`aio` 的 Connection、Lifecycle、ProcessManager、Process、ProcessOutput 与 ProcessHandle 的所有 I/O 方法，以及网络工厂，都是显式的 `async def`。调用只创建 coroutine；执行 coroutine 时才进行参数转换、创建并 await 现有原生 Future。coroutine 可在 loop 启动前创建，也可直接传给 `asyncio.create_task()`；在首次执行前取消 Task 不发起 I/O。公开签名标注 await 后的 DTO 或 None，原生 `_native.pyi` 的内部 Future 桥接仍标注 Awaitable。配置工厂、get/connection 本地绑定、属性和 capabilities 不需要 await。
 
 ## 原生任务和输出资源
 
@@ -102,7 +102,8 @@ from opensol import aio
 
 async def main():
     connection = aio.local()
-    result = await connection.exec(["printf", "%s", "hello"], timeout=5)
+    task = asyncio.create_task(connection.exec(["printf", "%s", "hello"], timeout=5))
+    result = await task
     print(result.stdout)
 
 asyncio.run(main())
@@ -140,6 +141,8 @@ envd 的两种公共视图独立使用。`backend.envd(resource)` 只读发现�
 
 `spawn()` 直接返回带初始输出订阅的 ProcessHandle，保留 envd Start 的原始流；`manager.get(handle.process)` 只绑定任务，不消费订阅。`.next_event()` 的等待超时只中止本次等待，保留订阅，可以继续读取。`.wait()` 消费并丢弃剩余输出，返回并缓存这次订阅的 ProcessOutcome；需要日志时先逐条读取。同一任务 ID 重启后，已有 handle 的完成缓存仍属于原来的执行，Process.wait 则查询原生管理器。`.disconnect()` 释放订阅、唤醒正在等待的读取线程，但不杀死进程。可保存 `.process`，再用 `manager.get(saved_ref).output.subscribe()` 按原生能力重新订阅。每个 handle 的事件读取串行化；并发消费应在应用层扇出。
 
+Pueue 的初始与额外订阅在原生订阅建立时记录 created/enqueued/start 执行标识，复用分页输出的规则。同一 Queued 执行开始是合法转换，无法确认同次执行的 Stashed 转换、原地重启或 task ID 替换返回 ConflictError，原生任务清理返回 NotFoundError；即使一直未消费的旧 handle 也不返回新执行的输出或结果。SDK 在消费前、wait 后和 follow 后核对，收齐并确认同次执行后才交付日志与完成事件；已交付的完成缓存不再查询当前任务。检查依赖原生可观测标识，不增加日志归档或后台监控，也不能恢复已经被原生覆盖的旧日志。aio 的绑定发生在 `await spawn()` / `await output.subscribe()` 建立原生订阅时。
+
 异步 handle 使用 `await handle.next_event(timeout=...)`、`await handle.wait()` 和 `await handle.aclose()`，并支持 `async for`。`next_event` 的 timeout 从该读取获得消费权后开始；排在其他读取后面的时间不计入其中。取消读取、取消 wait 或等待超时不会关闭订阅；Rust 已消费但 Python 尚未收到的事件仍保留，下次读取保持顺序。每个 handle 至多保留一条待交付事件，不预取或后台分发。`aclose` 可重复调用并唤醒阻塞读取；它不发信号，不删除环境。
 
 ```python
@@ -159,7 +162,7 @@ async def watch(config_file):
     # 若需主动终止仍在运行的任务：await manager.get(handle.process).signal(15)
 ```
 
-取消 exec、create、spawn 等 awaitable 仅取消客户端等待，原生清理能力由后端决定；这不证明远端未执行或已经停止。SDK 不自动重试结果不确定的副作用操作。需要终止请显式 signal，需要销毁请显式 delete；丢弃客户端或订阅不会自动删除环境。
+coroutine 开始执行后，取消 exec、create、spawn 等操作仅取消客户端等待，原生清理能力由后端决定；这不证明远端未执行或已经停止。SDK 不自动重试结果不确定的副作用操作。需要终止请显式 signal，需要销毁请显式 delete；丢弃客户端或订阅不会自动删除环境。
 
 `process.wait(timeout=...)` 超时不代表进程已终止。明确停止请用 `process.kill()` 或支持的 signal；删除环境请显式 `Lifecycle.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
 

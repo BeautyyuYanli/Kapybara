@@ -5,12 +5,15 @@ event and stream still come from the actual native client and ConnectRPC server.
 """
 
 import asyncio
+import inspect
 import json
 import os
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import grpc
 import opensol as sdk
@@ -61,10 +64,69 @@ async def cancel_before_delivery(handle):
     return observed[0]
 
 
+class CoroutineContractTests(unittest.TestCase):
+    def test_public_io_and_network_factories_are_coroutine_functions(self):
+        # Coroutine functions are the public scheduling contract, including methods
+        # that can reject unsupported operations when their coroutine is executed.
+        methods = {
+            aio.Connection: ("exec", "shell"),
+            aio.Lifecycle: ("create", "inspect", "start", "stop", "delete", "fork"),
+            aio.ProcessManager: ("probe", "list", "spawn"),
+            aio.Process: ("inspect", "wait", "pause", "start", "restart", "kill", "remove",
+                          "signal", "send_input", "close_stdin", "resize"),
+            aio.ProcessOutput: ("stat", "read", "subscribe"),
+            aio.ProcessHandle: ("next_event", "wait", "aclose", "__anext__"),
+            aio.E2b: ("envd",),
+        }
+        for owner, names in methods.items():
+            for name in names:
+                with self.subTest(owner=owner.__name__, name=name):
+                    self.assertTrue(inspect.iscoroutinefunction(getattr(owner, name)))
+        for factory in (aio.sandboxd, aio.openshell, aio.openshell_connection):
+            self.assertTrue(inspect.iscoroutinefunction(factory))
+        for factory in (aio.local, aio.ssh, aio.docker, aio.docker_connection, aio.pueue,
+                        aio.envd, aio.e2b, aio.agent_sandbox):
+            self.assertFalse(inspect.iscoroutinefunction(factory))
+
+    def test_command_coroutine_can_be_created_before_the_loop(self):
+        command = aio.local().exec(["printf", "%s", "scheduled"])
+
+        async def run():
+            return await asyncio.create_task(command)
+
+        self.assertEqual(asyncio.run(run()).stdout, b"scheduled")
+
+
 class AsyncConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_commands_wait_for_scheduling_and_cancel_before_start_has_no_effect(self):
+        connection = aio.local()
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "marker"
+            for operation in (
+                lambda: connection.exec(
+                    ["python3", "-c", "from pathlib import Path; Path('marker').write_text('ran')"],
+                    cwd=directory,
+                ),
+                lambda: connection.shell("printf ran > marker", cwd=directory),
+            ):
+                command = operation()
+                self.addCleanup(command.close)
+                self.assertTrue(inspect.iscoroutine(command))
+                await asyncio.sleep(.05)
+                self.assertFalse(marker.exists(), "calling an I/O method must not start it")
+                self.assertTrue((await asyncio.create_task(command)).success)
+                self.assertEqual(marker.read_bytes(), b"ran")
+                marker.unlink()
+                cancelled = asyncio.create_task(operation())
+                cancelled.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await cancelled
+                await asyncio.sleep(.05)
+                self.assertFalse(marker.exists(), "cancelling before execution must avoid I/O")
+
     async def test_native_exec_yields_loop_and_preserves_bytes_errors_and_timeout(self):
         connection = aio.local()
-        future = asyncio.ensure_future(
+        future = asyncio.create_task(
             connection.exec(
                 ["python3", "-c", "import sys,time; time.sleep(.15); "
                  "sys.stdout.buffer.write(sys.stdin.buffer.read()); "
@@ -84,7 +146,7 @@ class AsyncConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((caught.exception.backend, caught.exception.operation), ("local", "exec"))
         with self.assertRaises(sdk.TimeoutError):
             await connection.exec(["sleep", "2"], timeout=0.02)
-        future = asyncio.ensure_future(connection.exec(["sleep", "2"]))
+        future = asyncio.create_task(connection.exec(["sleep", "2"]))
         future.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await future
@@ -147,6 +209,37 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b"".join(data for _, data in replay_output), b"hello '$()")
         self.assertEqual(replay_outcome.exit.code, 7)
         await replay.aclose()
+
+    async def test_unconsumed_subscriptions_reject_new_execution_and_keep_completed_cache(self):
+        script = self.directory / "command.sh"
+        script.write_text("printf 7; exit 7")
+        initial = await self.manager.spawn(["sh", str(script)])
+        process = self.manager.get(initial.process)
+        self.assertEqual((await process.wait(timeout=5)).exit.code, 7)
+        replay = await process.output.subscribe()
+        cached = await process.output.subscribe()
+        output, outcome = await collect(cached)
+        self.assertEqual(b"".join(data for _, data in output), b"7")
+        self.assertEqual(outcome.exit.code, 7)
+        script.write_text("printf 9; exit 9")
+        await asyncio.create_task(process.restart())
+        self.assertEqual((await asyncio.create_task(process.wait(timeout=5))).exit.code, 9)
+        for handle in (initial, replay):
+            with self.assertRaises(sdk.ConflictError):
+                await handle.next_event(timeout=5)
+            await handle.aclose()
+        self.assertEqual((await cached.wait()).exit.code, 7)
+        await cached.aclose()
+        fresh = await process.output.subscribe()
+        output, outcome = await collect(fresh)
+        self.assertEqual(b"".join(data for _, data in output), b"9")
+        self.assertEqual(outcome.exit.code, 9)
+        await fresh.aclose()
+        removed = await process.output.subscribe()
+        await process.remove()
+        with self.assertRaises(sdk.NotFoundError):
+            await removed.next_event(timeout=5)
+        await removed.aclose()
 
     async def test_cancel_before_delivery_preserves_native_only_completion_and_cache(self):
         handle = await self.manager.spawn(["sleep", "30"])
@@ -341,7 +434,16 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
             backend = aio.e2b("secret", api_endpoint=endpoint, envd_endpoint=endpoint)
             lifecycle = backend.lifecycle
             self.assertTrue(lifecycle.capabilities()["stop_preserves_memory"])
-            resource = await lifecycle.create()
+            creation = lifecycle.create()
+            self.addCleanup(creation.close)
+            await asyncio.sleep(.03)
+            self.assertEqual(records, [], "an unscheduled create must not send a request")
+            cancelled = asyncio.create_task(lifecycle.create())
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            self.assertEqual(records, [])
+            resource = await asyncio.create_task(creation)
             self.assertEqual((await lifecycle.inspect(resource)).state, "running")
             await lifecycle.stop(resource)
             await lifecycle.start(resource)
@@ -357,7 +459,7 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
             worker.join(2)
             server.server_close()
 
-    async def test_network_factories_return_native_awaitables(self):
+    async def test_network_factories_support_coroutine_task_scheduling(self):
         # A real HTTP/2 gRPC server completes each native connection handshake.
         # Provider RPC payload/TLS contracts are covered by the Rust schema suite.
         server = grpc.server(ThreadPoolExecutor(max_workers=1))
@@ -365,10 +467,10 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
         server.start()
         endpoint = f"http://127.0.0.1:{port}"
         try:
-            sandboxd = await aio.sandboxd(endpoint)
-            backend = await aio.openshell(endpoint, workload_template="base")
+            sandboxd = await asyncio.create_task(aio.sandboxd(endpoint))
+            backend = await asyncio.create_task(aio.openshell(endpoint, workload_template="base"))
             lifecycle = backend.lifecycle
-            connection = await aio.openshell_connection(endpoint, "sandbox")
+            connection = await asyncio.create_task(aio.openshell_connection(endpoint, "sandbox"))
             self.assertIsInstance(sandboxd, aio.Connection)
             self.assertIsInstance(lifecycle, aio.Lifecycle)
             self.assertIsInstance(connection, aio.Connection)

@@ -183,7 +183,7 @@ while (event := handle.next_event(timeout=10)) is not None:
 
 `docker()`、`e2b()`、`openshell()` 返回保留配置的后端对象，通过 `.lifecycle` 操作资源。Docker/OpenShell 的 `.connection(resource)` 本地绑定公共 Connection；E2B 的 `.envd(resource)` 只读发现连接信息，复用原 API key、endpoint 和超时。同步与 aio 使用相同形状，aio 的 E2B 发现需要 await。独立端点工厂仍可连接已有资源。
 
-异步工厂在 coroutine 内使用；配置型工厂是普通函数，连接或端点发现型工厂需要 await：
+aio 的公共 I/O 方法与网络工厂都是 `async def`：调用只创建 coroutine，执行 coroutine 时才创建并 await 原生 Future，可直接交给 `asyncio.create_task()`。配置型工厂、本地绑定与属性仍同步；连接或端点发现型工厂需要 await：
 
 ```python
 import asyncio
@@ -235,7 +235,7 @@ print(process.inspect().state, next_page.at_end)
 
 `process.output.stat/read` 查询绑定任务的原生日志；`process.output.subscribe()` 是建立额外订阅的唯一公共入口，检查 reconnect 能力并调用原生重连，返回独立 ProcessHandle。订阅不要求 output_resource 能力，消费订阅不推进 cursor。共享引用校验与能力检查保留在 Rust 内部；适配器的 raw::ProcessAccess 引用接口保持独立。
 
-`process.wait()` 查询原生任务的完成状态；Python `handle.wait()` 消费并缓存该次订阅的完成结果。任务重启后，旧订阅缓存仍属于原来的执行。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
+`process.wait()` 查询原生任务的完成状态；Python `handle.wait()` 消费并缓存该次订阅的完成结果。Pueue 的初始与额外订阅在建立时绑定可观测的原生执行，延迟消费也不跟随任务 ID 的重启或替换；wait/follow 前后发现执行改变返回 Conflict，任务清理返回 NotFound。正常的同一 Queued 执行开始仍可消费，已经交付的完成缓存继续属于原来的执行；SDK 不归档被替换的旧日志。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
 
 输出页保留原始 bytes 和 channel，Pueue 只有 Combined。默认 64 KiB，允许 1 字节至 1 MiB；读取立即返回当前观测范围，不等待后续输出或终结。`at_end` 只表示读到该次观测的尾部，进程是否终结单独 inspect。`OutputInfo.version` 是后端可提供的不透明输出代次标识，None 只表示没有可报告的标识，任务状态由 ProcessInfo 表达。cursor 绑定目标、任务、执行和文件版本，不含凭据或可指定的文件路径；只把它作为不透明字符串保存。在同一版本从同一位置可重读，新增字节是否进入这一页取决于该次观测的大小。
 

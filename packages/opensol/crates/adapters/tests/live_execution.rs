@@ -12,7 +12,10 @@ use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::{Child, Command as NativeCommand, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -67,6 +70,64 @@ impl ExecAccess for LocalTarget {
         let result = Connection::new(Local).exec(request).await?;
         *self.received.lock().unwrap() += result.stdout.len() + result.stderr.len();
         Ok(result)
+    }
+}
+
+/// Change a real native task at the Connection boundary of wait/follow. Both the
+/// intercepted command and the racing control operation still use actual Pueue.
+/// A gated replacement can stay Running until the test explicitly releases stdin.
+#[derive(Clone)]
+struct PueueChangeDuringCommand {
+    process: Process,
+    command: &'static str,
+    after: bool,
+    remove: bool,
+    wait_for_completion: bool,
+    fired: Arc<AtomicBool>,
+}
+
+impl PueueChangeDuringCommand {
+    async fn change(&self) -> opensol_core::Result<()> {
+        if self.remove {
+            self.process.remove().await
+        } else {
+            self.process.restart().await?;
+            if self.wait_for_completion {
+                self.process.wait(Some(Duration::from_secs(5))).await?;
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while self.process.inspect().await?.state != ProcessState::Running {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Ok::<(), opensol_core::Error>(())
+                })
+                .await
+                .expect("gated replacement must start running")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl ExecAccess for PueueChangeDuringCommand {
+    fn backend(&self) -> &'static str {
+        "local"
+    }
+    fn capabilities(&self) -> opensol_core::ConnectionCapabilities {
+        Connection::new(Local).capabilities()
+    }
+    async fn exec(&self, request: ExecRequest) -> opensol_core::Result<opensol_core::ExecResult> {
+        let change = request.command.argv.iter().any(|arg| arg == self.command)
+            && !self.fired.swap(true, Ordering::SeqCst);
+        if change && !self.after {
+            self.change().await?;
+        }
+        let result = Connection::new(Local).exec(request).await;
+        if change && self.after {
+            self.change().await?;
+        }
+        result
     }
 }
 
@@ -374,6 +435,280 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
     request.pty = Some(PtySize { cols: 80, rows: 24 });
     assert!(
         matches!(manager.spawn(request).await, Err(error) if error.kind == ErrorKind::Unsupported)
+    );
+}
+
+#[tokio::test]
+async fn real_pueue_delayed_subscriptions_reject_restarts_and_native_cleanup() {
+    let (daemon, manager) = pueue_fixture().await;
+    let script = daemon._directory.path().join("command.sh");
+    std::fs::write(&script, "printf 7; exit 7").unwrap();
+    let initial = manager
+        .spawn(SpawnRequest::new(Command::new(
+            "sh",
+            [script.to_str().unwrap()],
+        )))
+        .await
+        .unwrap();
+    let process = manager.get(initial.process.clone());
+    assert_eq!(
+        process
+            .wait(Some(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .exit
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    let replay = process.output().subscribe().await.unwrap();
+    std::fs::write(&script, "printf 9; exit 9").unwrap();
+    process.restart().await.unwrap();
+    assert_eq!(
+        process
+            .wait(Some(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .exit
+            .unwrap()
+            .code,
+        Some(9)
+    );
+    for mut handle in [initial, replay] {
+        let error = tokio::time::timeout(Duration::from_secs(5), handle.events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Conflict);
+    }
+    let (output, outcome) = collect(process.output().subscribe().await.unwrap().events).await;
+    assert_eq!(combined_output(&output), b"9");
+    assert_eq!(outcome.exit.unwrap().code, Some(9));
+    let mut replaced = process.output().subscribe().await.unwrap();
+    // A fresh native daemon reuses ID 0. Replacing the CLI configuration must
+    // not let the old subscription accept that other task's created_at.
+    let (replacement_daemon, replacement_manager) = pueue_fixture().await;
+    let replacement = replacement_manager
+        .spawn(SpawnRequest::new(Command::new(
+            "sh",
+            [script.to_str().unwrap()],
+        )))
+        .await
+        .unwrap();
+    assert_eq!(replacement.process.id, process.reference().id);
+    std::fs::copy(
+        replacement_daemon._directory.path().join("pueue.yml"),
+        daemon._directory.path().join("pueue.yml"),
+    )
+    .unwrap();
+    process.wait(Some(Duration::from_secs(5))).await.unwrap();
+    assert_eq!(
+        replaced.events.next().await.unwrap().unwrap_err().kind,
+        ErrorKind::Conflict
+    );
+    let mut removed = process.output().subscribe().await.unwrap();
+    process.remove().await.unwrap();
+    assert_eq!(
+        removed.events.next().await.unwrap().unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    assert!(
+        matches!(process.output().subscribe().await, Err(error) if error.kind == ErrorKind::NotFound)
+    );
+}
+
+#[tokio::test]
+async fn real_pueue_subscriptions_guard_wait_and_follow_against_native_changes() {
+    let (daemon, manager) = pueue_fixture().await;
+    let script = daemon._directory.path().join("command.sh");
+    for (command, after, remove) in [
+        ("wait", true, false),
+        ("follow", false, false),
+        ("follow", true, false),
+        ("follow", false, true),
+        ("follow", true, true),
+    ] {
+        std::fs::write(&script, "printf 7; exit 7").unwrap();
+        let initial = manager
+            .spawn(SpawnRequest::new(Command::new(
+                "sh",
+                [script.to_str().unwrap()],
+            )))
+            .await
+            .unwrap();
+        let process = manager.get(initial.process.clone());
+        process.wait(Some(Duration::from_secs(5))).await.unwrap();
+        let racing = ProcessManager::new(
+            Pueue::new(
+                Connection::new(PueueChangeDuringCommand {
+                    process,
+                    command,
+                    after,
+                    remove,
+                    wait_for_completion: true,
+                    fired: Arc::new(AtomicBool::new(false)),
+                }),
+                PueueConfig {
+                    config_file: Some(
+                        daemon
+                            ._directory
+                            .path()
+                            .join("pueue.yml")
+                            .to_string_lossy()
+                            .into(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let mut subscription = racing
+            .get(initial.process)
+            .output()
+            .subscribe()
+            .await
+            .unwrap();
+        std::fs::write(&script, "printf 9; exit 9").unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), subscription.events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            if remove {
+                ErrorKind::NotFound
+            } else {
+                ErrorKind::Conflict
+            },
+            "command={command}, after={after}, remove={remove}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_pueue_old_subscriptions_conflict_while_restarted_execution_is_running() {
+    let (daemon, manager) = pueue_fixture().await;
+    let script = daemon._directory.path().join("command.sh");
+    std::fs::write(&script, "printf 7; exit 7").unwrap();
+    let mut request = SpawnRequest::new(Command::new("sh", [script.to_str().unwrap()]));
+    request.stdin = true;
+    let initial = manager.spawn(request).await.unwrap();
+    let process = manager.get(initial.process.clone());
+    assert_eq!(
+        process
+            .wait(Some(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .exit
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    let replay = process.output().subscribe().await.unwrap();
+    std::fs::write(&script, "read -r gate; printf 9; exit 9").unwrap();
+    process.restart().await.unwrap();
+    await_state(&manager, process.reference(), ProcessState::Running).await;
+
+    // Keep the replacement blocked throughout both reads. A guard deferred until
+    // native wait returns cannot pass merely because the new execution finishes.
+    let mut first_events = Vec::new();
+    for mut handle in [initial, replay] {
+        first_events.push(tokio::time::timeout(Duration::from_secs(2), handle.events.next()).await);
+    }
+    let before_release = process.inspect().await.unwrap();
+    process.send_input(b"release\n".to_vec()).await.unwrap();
+    let completed = process.wait(Some(Duration::from_secs(5))).await.unwrap();
+    process.remove().await.unwrap();
+
+    // Clean up even when a bounded read exposed a regression, then assert the
+    // observations made before releasing the gate.
+    assert_eq!(before_release.state, ProcessState::Running);
+    assert!(before_release.outcome.is_none());
+    assert_eq!(completed.exit.unwrap().code, Some(9));
+    for event in first_events {
+        assert_eq!(
+            event
+                .expect("old subscription must reject before the gate is released")
+                .expect("subscription must report an error")
+                .unwrap_err()
+                .kind,
+            ErrorKind::Conflict
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_pueue_post_wait_restart_conflicts_without_a_current_outcome() {
+    let (daemon, manager) = pueue_fixture().await;
+    let script = daemon._directory.path().join("command.sh");
+    std::fs::write(&script, "printf 7; exit 7").unwrap();
+    let mut request = SpawnRequest::new(Command::new("sh", [script.to_str().unwrap()]));
+    request.stdin = true;
+    let initial = manager.spawn(request).await.unwrap();
+    let process = manager.get(initial.process.clone());
+    assert_eq!(
+        process
+            .wait(Some(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .exit
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    let racing = ProcessManager::new(
+        Pueue::new(
+            Connection::new(PueueChangeDuringCommand {
+                process: process.clone(),
+                command: "wait",
+                after: true,
+                remove: false,
+                wait_for_completion: false,
+                fired: Arc::new(AtomicBool::new(false)),
+            }),
+            PueueConfig {
+                config_file: Some(
+                    daemon
+                        ._directory
+                        .path()
+                        .join("pueue.yml")
+                        .to_string_lossy()
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let mut subscription = racing
+        .get(initial.process)
+        .output()
+        .subscribe()
+        .await
+        .unwrap();
+    std::fs::write(&script, "read -r gate; printf 9; exit 9").unwrap();
+
+    // The original native wait has returned when the fixture starts the gated
+    // replacement. Post-wait status now has no outcome; normalize that to Conflict.
+    let first_event =
+        tokio::time::timeout(Duration::from_secs(2), subscription.events.next()).await;
+    let before_release = process.inspect().await.unwrap();
+    process.send_input(b"release\n".to_vec()).await.unwrap();
+    let completed = process.wait(Some(Duration::from_secs(5))).await.unwrap();
+    process.remove().await.unwrap();
+
+    assert_eq!(before_release.state, ProcessState::Running);
+    assert!(before_release.outcome.is_none());
+    assert_eq!(completed.exit.unwrap().code, Some(9));
+    assert_eq!(
+        first_event
+            .expect("post-wait restart must reject before the gate is released")
+            .expect("subscription must report an error")
+            .unwrap_err()
+            .kind,
+        ErrorKind::Conflict
     );
 }
 
@@ -894,6 +1229,7 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
     assert!(queued.at_end && queued.chunks.is_empty());
     let info = process.output().stat().await.unwrap();
     assert_eq!((info.size, info.version), (0, None));
+    let queued_subscription = process.output().subscribe().await.unwrap();
     process.start().await.unwrap(); // explicit native start bypasses the paused queue.
     assert_eq!(
         process.inspect().await.unwrap().state,
@@ -909,6 +1245,10 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
     let outcome = process.wait(Some(Duration::from_secs(5))).await.unwrap();
     assert!(outcome.exit.is_none());
     assert_eq!(outcome.native_result.as_deref(), Some("Killed"));
+    let (queued_output, queued_outcome) = collect(queued_subscription.events).await;
+    let queued_bytes = combined_output(&queued_output);
+    assert!(queued_bytes.is_empty() || queued_bytes == b"ready");
+    assert_eq!(queued_outcome, outcome);
     // A dependent retained task prevents removing its dependency; SDK never broadens the IDs.
     let child = NativeCommand::new("pueue")
         .args([
