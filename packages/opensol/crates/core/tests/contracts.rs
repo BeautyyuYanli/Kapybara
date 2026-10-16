@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use futures::{executor::block_on, stream};
-use opensol_core::{Command, ErrorKind, ExitStatus, OutputChannel, ProcessEvent, wait_events};
+use opensol_core::{
+    Command, Error, ErrorKind, ExitStatus, OutputChannel, ProcessEvent, ProcessOutcome, wait_events,
+};
 
 #[test]
 fn command_validation_rejects_invalid_argv_and_environment() {
@@ -49,22 +51,67 @@ fn command_debug_never_prints_arguments_or_environment_values() {
 }
 
 #[test]
-fn wait_requires_a_native_exit_event_and_preserves_nonzero_exit() {
+fn wait_requires_native_completion_and_preserves_nonzero_exit() {
     let events = stream::iter(vec![
         Ok(ProcessEvent::Output {
             channel: OutputChannel::Stdout,
             data: vec![0xff],
         }),
-        Ok(ProcessEvent::Exit(ExitStatus::code(7))),
+        Ok(ProcessEvent::Completed(ProcessOutcome {
+            exit: Some(ExitStatus::code(7)),
+            native_result: None,
+        })),
     ]);
     assert_eq!(
         block_on(wait_events(Box::pin(events), "test"))
+            .unwrap()
+            .exit
             .unwrap()
             .code,
         Some(7)
     );
     assert_eq!(
         block_on(wait_events(Box::pin(stream::empty()), "test"))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Transport
+    );
+}
+
+#[test]
+fn wait_preserves_native_completion_without_exit_and_does_not_hide_stream_errors() {
+    let outcome = ProcessOutcome {
+        exit: None,
+        native_result: Some("Killed".into()),
+    };
+    assert_eq!(
+        block_on(wait_events(
+            Box::pin(stream::iter([Ok(ProcessEvent::Completed(outcome.clone()))])),
+            "test"
+        ))
+        .unwrap(),
+        outcome
+    );
+    let error = Error::new(
+        ErrorKind::Permission,
+        "test",
+        "output",
+        "native output unavailable",
+    );
+    assert_eq!(
+        block_on(wait_events(
+            Box::pin(stream::iter([Err(error.clone())])),
+            "test"
+        ))
+        .unwrap_err(),
+        error
+    );
+    let output_only = stream::iter([Ok(ProcessEvent::Output {
+        channel: OutputChannel::Stdout,
+        data: b"partial".to_vec(),
+    })]);
+    assert_eq!(
+        block_on(wait_events(Box::pin(output_only), "test"))
             .unwrap_err()
             .kind,
         ErrorKind::Transport

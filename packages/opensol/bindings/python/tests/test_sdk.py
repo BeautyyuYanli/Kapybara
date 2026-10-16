@@ -19,10 +19,10 @@ import process_pb2 as envd_protocol
 def collect(handle):
     output = []
     while (event := handle.next_event(timeout=5)) is not None:
-        if event.exit is not None:
-            return output, event.exit
+        if event.outcome is not None:
+            return output, event.outcome
         output.append((event.channel, event.data))
-    raise AssertionError("native stream ended without an exit event")
+    raise AssertionError("native stream ended without completion")
 
 
 def combined_output(output):
@@ -173,16 +173,17 @@ class PueueTests(unittest.TestCase):
         )
         process = handle.process
         self.assertIsInstance(process, sdk.ProcessRef)
-        output, exit = collect(handle)
+        output, outcome = collect(handle)
         self.assertEqual(combined_output(output), b"\x00\xffouterr")
-        self.assertEqual(exit.code, 7)
-        self.assertEqual(handle.wait().code, 7)
+        self.assertIsInstance(outcome, sdk.ProcessOutcome)
+        self.assertEqual((outcome.exit.code, outcome.native_result), (7, "Failed"))
+        self.assertEqual(handle.wait().exit.code, 7)
         restored = sdk.ProcessRef(process.backend, process.id)
         self.assertEqual(self.manager.status(restored).state, "exited")
-        self.assertEqual(self.manager.wait(restored, timeout=2).code, 7)
-        replay, replay_exit = collect(self.manager.reconnect(restored))
+        self.assertEqual(self.manager.wait(restored, timeout=2).exit.code, 7)
+        replay, replay_outcome = collect(self.manager.reconnect(restored))
         self.assertEqual(combined_output(replay), b"\x00\xffouterr")
-        self.assertEqual(replay_exit.code, 7)
+        self.assertEqual(replay_outcome.exit.code, 7)
         capabilities = self.manager.capabilities()
         self.assertTrue(capabilities["historical_output"])
         self.assertFalse(capabilities["streaming_output"])
@@ -201,13 +202,16 @@ class PueueTests(unittest.TestCase):
         with self.assertRaises(sdk.UnsupportedError):
             self.manager.send_input(handle.process, b"\xff")
         with self.assertRaises(sdk.UnsupportedError):
+            self.manager.send_input(handle.process, b"\x00")
+        with self.assertRaises(sdk.UnsupportedError):
             self.manager.close_stdin(handle.process)
         with self.assertRaises(sdk.UnsupportedError):
             self.manager.spawn(["true"], pty=(80, 24))
-        self.manager.send_input(handle.process, b"hello '$()\n")
-        output, exit = collect(handle)
+        restored = sdk.ProcessRef("pueue", handle.process.id)
+        self.manager.get(restored).send_input(b"hello '$()\n")
+        output, outcome = collect(handle)
         self.assertEqual(combined_output(output), b"hello '$()")
-        self.assertTrue(exit.success)
+        self.assertTrue(outcome.exit.success)
 
     def test_disconnect_wakes_blocked_reader_without_killing_task(self):
         handle = self.manager.spawn(["sleep", "5"])
@@ -234,9 +238,10 @@ class PueueTests(unittest.TestCase):
         with self.assertRaises(sdk.TransportError):
             handle.wait()
         self.manager.signal(handle.process, 9)
-        with self.assertRaisesRegex(sdk.BackendError, "Killed"):
-            self.manager.wait(handle.process, timeout=3)
-        self.assertIsNone(self.manager.status(handle.process).exit)
+        outcome = self.manager.wait(handle.process, timeout=3)
+        self.assertIsNone(outcome.exit)
+        self.assertEqual(outcome.native_result, "Killed")
+        self.assertIsNone(self.manager.status(handle.process).outcome.exit)
 
 
 class EnvdBindingTests(unittest.TestCase):
@@ -395,6 +400,14 @@ class EnvdBindingTests(unittest.TestCase):
         self.endpoint = f"http://127.0.0.1:{server.server_port}"
         self.native = sdk.envd(self.endpoint)
 
+    def test_unexpected_end_does_not_cache_a_completion(self):
+        handle = self.native.processes.spawn(["disconnect"])
+        with self.assertRaises(sdk.TransportError):
+            handle.next_event(timeout=2)
+        with self.assertRaises(sdk.TransportError):
+            handle.wait()
+        handle.disconnect()
+
     def test_binary_process_stdin_and_close_stdin(self):
         manager = self.native.processes
         handle = manager.spawn(["stdin-program"], stdin=True)
@@ -402,10 +415,11 @@ class EnvdBindingTests(unittest.TestCase):
         data = b"\x00\xff\x80input\n"
         manager.send_input(handle.process, data)
         manager.close_stdin(handle.process)
-        output, exit = collect(handle)
+        output, outcome = collect(handle)
         self.assertTrue(all(channel == "stdout" for channel, _data in output))
         self.assertEqual(b"".join(data for _channel, data in output), data)
-        self.assertEqual(exit.code, 7)
+        self.assertEqual(outcome.exit.code, 7)
+        self.assertIsNone(outcome.native_result)
         start = next(message for method, message in self.records if method == "Start")
         self.assertTrue(start.stdin)
         self.assertFalse(start.HasField("pty"))
@@ -438,10 +452,10 @@ class EnvdBindingTests(unittest.TestCase):
         manager.resize(handle.process, 121, 43)
         data = b"\x00\xff\x80pty\x04"
         manager.send_input(handle.process, data)
-        output, exit = collect(handle)
+        output, outcome = collect(handle)
         self.assertTrue(all(channel == "terminal" for channel, _data in output))
         self.assertEqual(b"".join(data for _channel, data in output), data)
-        self.assertEqual(exit.code, 7)
+        self.assertEqual(outcome.exit.code, 7)
         start = next(message for method, message in self.records if method == "Start")
         self.assertEqual((start.pty.size.cols, start.pty.size.rows), (93, 27))
         sent = next(message for method, message in self.records if method == "SendInput")

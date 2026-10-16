@@ -102,15 +102,15 @@ fn start_daemon(mut command: NativeCommand, directory: TempDir) -> Daemon {
 
 async fn collect(
     mut events: opensol_core::EventStream,
-) -> (Vec<(OutputChannel, Vec<u8>)>, opensol_core::ExitStatus) {
+) -> (Vec<(OutputChannel, Vec<u8>)>, opensol_core::ProcessOutcome) {
     let mut output = Vec::new();
     while let Some(event) = events.next().await {
         match event.unwrap() {
             ProcessEvent::Output { channel, data } => output.push((channel, data)),
-            ProcessEvent::Exit(exit) => return (output, exit),
+            ProcessEvent::Completed(outcome) => return (output, outcome),
         }
     }
-    panic!("output ended without exit")
+    panic!("output ended without completion")
 }
 
 fn combined_output(output: &[(OutputChannel, Vec<u8>)]) -> Vec<u8> {
@@ -335,16 +335,17 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
         .insert("SDK_TEST".into(), "value' $()".into());
     let handle = manager.spawn(request).await.unwrap();
     let process = handle.process.clone();
-    let (output, exit) = collect(handle.events).await;
+    let (output, outcome) = collect(handle.events).await;
     assert_eq!(combined_output(&output), b"\x00\xffout\nerr\n");
-    assert_eq!(exit.code, Some(7));
+    assert_eq!(outcome.exit.unwrap().code, Some(7));
+    assert_eq!(outcome.native_result.as_deref(), Some("Failed"));
     assert_eq!(
-        manager.status(&process).await.unwrap().exit.unwrap().code,
-        Some(7)
+        manager.status(&process).await.unwrap().outcome,
+        Some(outcome.clone())
     );
-    let (again, exit) = collect(manager.reconnect(&process).await.unwrap().events).await;
+    let (again, replay_outcome) = collect(manager.reconnect(&process).await.unwrap().events).await;
     assert_eq!(combined_output(&again), b"\x00\xffout\nerr\n");
-    assert_eq!(exit.code, Some(7));
+    assert_eq!(replay_outcome, outcome);
     let missing = ProcessRef::new("pueue", "999999999", Some(false));
     assert_eq!(
         manager
@@ -706,11 +707,20 @@ async fn real_pueue_resource_reads_running_binary_pages_and_detects_log_loss() {
             .wait(Some(Duration::from_secs(5)))
             .await
             .unwrap()
+            .exit
+            .unwrap()
             .code,
         Some(7)
     );
     assert_eq!(
-        process.inspect().await.unwrap().native_result.as_deref(),
+        process
+            .inspect()
+            .await
+            .unwrap()
+            .outcome
+            .unwrap()
+            .native_result
+            .as_deref(),
         Some("Failed")
     );
     let appended = output.read(Some(&last.next_cursor), 64).await.unwrap();
@@ -757,6 +767,12 @@ async fn real_pueue_resource_reads_running_binary_pages_and_detects_log_loss() {
     );
     std::fs::remove_file(&path).unwrap();
     assert_eq!(output.stat().await.unwrap_err().kind, ErrorKind::NotFound);
+    let mut subscription = output.subscribe().await.unwrap();
+    assert_eq!(
+        subscription.events.next().await.unwrap().unwrap_err().kind,
+        ErrorKind::Backend,
+        "known completion must not hide a failure to read the retained log"
+    );
     process.remove().await.unwrap();
     assert_eq!(
         process.inspect().await.unwrap_err().kind,
@@ -799,17 +815,16 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
         ErrorKind::Conflict
     );
     process.kill().await.unwrap();
-    let error = process
-        .wait(Some(Duration::from_secs(5)))
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Backend);
-    assert!(error.message.contains("Killed"));
-    assert!(process.inspect().await.unwrap().exit.is_none());
+    let outcome = process.wait(Some(Duration::from_secs(5))).await.unwrap();
+    assert!(outcome.exit.is_none());
+    assert_eq!(outcome.native_result.as_deref(), Some("Killed"));
     assert_eq!(
-        process.inspect().await.unwrap().native_result.as_deref(),
-        Some("Killed")
+        process.inspect().await.unwrap().outcome,
+        Some(outcome.clone())
     );
+    let (retained, completed) = collect(handle.events).await;
+    assert_eq!(combined_output(&retained), b"ready");
+    assert_eq!(completed, outcome);
     let config = daemon._directory.path().join("pueue.yml");
     assert!(
         NativeCommand::new("pueue")
@@ -851,12 +866,9 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
         .unwrap();
     assert!(page_bytes(&first_run).is_empty() || page_bytes(&first_run) == b"ready");
     process.kill().await.unwrap();
-    let error = process
-        .wait(Some(Duration::from_secs(5)))
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Backend);
-    assert!(error.message.contains("Killed"));
+    let outcome = process.wait(Some(Duration::from_secs(5))).await.unwrap();
+    assert!(outcome.exit.is_none());
+    assert_eq!(outcome.native_result.as_deref(), Some("Killed"));
     // A dependent retained task prevents removing its dependency; SDK never broadens the IDs.
     let child = NativeCommand::new("pueue")
         .args([
@@ -911,23 +923,32 @@ async fn real_pueue_native_spawn_failure_has_a_result_name_without_a_fabricated_
             .success()
     );
     let cwd = TempDir::with_prefix("opensol-private-native-error-").unwrap();
-    let private_path = cwd.path().to_string_lossy().into_owned();
     let mut command = Command::new("true", Vec::<String>::new());
-    command.cwd = Some(private_path.clone());
+    command.cwd = Some(cwd.path().to_string_lossy().into_owned());
     let handle = manager.spawn(SpawnRequest::new(command)).await.unwrap();
     drop(cwd); // Native Pueue can no longer spawn in the original, valid-at-add cwd.
     manager.start(&handle.process).await.unwrap();
     await_state(&manager, &handle.process, ProcessState::Exited).await;
     let info = manager.status(&handle.process).await.unwrap();
-    assert_eq!(info.native_result.as_deref(), Some("FailedToSpawn"));
-    assert!(info.exit.is_none());
-    let error = manager
+    let outcome = info.outcome.unwrap();
+    assert_eq!(outcome.native_result.as_deref(), Some("FailedToSpawn"));
+    assert!(outcome.exit.is_none());
+    let waited = manager
         .wait(&handle.process, Some(Duration::from_secs(5)))
         .await
-        .unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Backend);
-    assert!(error.message.contains("FailedToSpawn"));
-    assert!(!error.to_string().contains(&private_path));
+        .unwrap();
+    assert_eq!(waited, outcome);
+    let retained = std::fs::read(
+        daemon
+            ._directory
+            .path()
+            .join("task_logs")
+            .join(format!("{}.log", handle.process.id)),
+    )
+    .unwrap();
+    let (output, completed) = collect(handle.events).await;
+    assert_eq!(combined_output(&output), retained);
+    assert_eq!(completed, outcome);
 }
 
 #[tokio::test]
@@ -997,9 +1018,9 @@ async fn real_pueue_task_environment_does_not_change_the_client_environment() {
         ("SDK-TEST".into(), value.into()),
     ]);
     let handle = manager.spawn(SpawnRequest::new(command)).await.unwrap();
-    let (output, exit) = collect(handle.events).await;
+    let (output, outcome) = collect(handle.events).await;
     assert_eq!(combined_output(&output), value.as_bytes());
-    assert!(exit.success());
+    assert!(outcome.exit.unwrap().success());
 }
 
 #[tokio::test]
@@ -1016,12 +1037,13 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let restored = ProcessRef::new("pueue", &handle.process.id, None);
     manager
-        .send_input(&handle.process, b"hello ' $()\n".to_vec())
+        .send_input(&restored, b"hello ' $()\n".to_vec())
         .await
         .unwrap();
-    let (output, exit) = collect(handle.events).await;
-    assert!(exit.success());
+    let (output, outcome) = collect(handle.events).await;
+    assert!(outcome.exit.unwrap().success());
     assert_eq!(combined_output(&output), b"hello ' $()");
     let handle = manager
         .spawn(SpawnRequest::new(Command::shell("sleep 30")))
@@ -1048,24 +1070,19 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
         opensol_core::ProcessState::Running
     );
     manager.signal(&handle.process, Signal::Kill).await.unwrap();
-    let error = manager
+    let outcome = manager
         .wait(&handle.process, Some(Duration::from_secs(5)))
         .await
-        .unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Backend);
-    assert!(error.message.contains("Killed"));
-    assert!(
-        manager
-            .status(&handle.process)
-            .await
-            .unwrap()
-            .exit
-            .is_none()
+        .unwrap();
+    assert_eq!(outcome.native_result.as_deref(), Some("Killed"));
+    assert!(outcome.exit.is_none());
+    assert_eq!(
+        manager.status(&handle.process).await.unwrap().outcome,
+        Some(outcome.clone())
     );
-    let mut events = manager.output(&handle.process).await.unwrap();
-    let error = events.next().await.unwrap().unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Backend);
-    assert!(error.message.contains("Killed"));
+    let (output, completed) = collect(manager.output(&handle.process).await.unwrap()).await;
+    assert!(output.is_empty());
+    assert_eq!(completed, outcome);
     assert_eq!(
         manager
             .send_input(&handle.process, vec![0xff])
@@ -1122,8 +1139,8 @@ async fn real_docker_lifecycle_exec_and_in_container_pueue() {
         let manager = Pueue::new(connection, PueueConfig { config_file: Some(config_path), pueue_directory: Some(directory.into()), ..Default::default() }).map(ProcessManager::new)?;
         manager.probe().await?;
         let handle = manager.spawn(SpawnRequest::new(Command::new("printf", ["%s", "Docker + Pueue '$()"]))).await?;
-        let (output, exit) = collect(handle.events).await;
-        assert_eq!(combined_output(&output), b"Docker + Pueue '$()"); assert!(exit.success());
+        let (output, outcome) = collect(handle.events).await;
+        assert_eq!(combined_output(&output), b"Docker + Pueue '$()"); assert!(outcome.exit.unwrap().success());
         assert_eq!(page_bytes(&manager.read_output(&handle.process, None, 8).await?), b"Docker +");
         assert_eq!(lifecycle.fork(&resource).await.unwrap_err().kind, ErrorKind::Unsupported);
         lifecycle.stop(&resource).await?; assert_eq!(lifecycle.inspect(&resource).await?.state, ResourceState::Stopped);

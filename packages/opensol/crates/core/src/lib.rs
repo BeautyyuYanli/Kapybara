@@ -397,6 +397,7 @@ impl Connection {
 
 /// Process identity is opaque and scoped to the manager's target, not necessarily an OS PID.
 /// `pty` is a mode hint, not identity: `None` means native discovery did not report the mode.
+/// Adapters decide which operations require this hint; it is not authoritative cached state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProcessRef {
     pub backend: String,
@@ -479,14 +480,22 @@ pub enum ProcessState {
     Unknown,
 }
 
+/// Confirmed native task completion, including results without an OS exit status.
+/// At least one field must be present. Neither a missing exit nor a native result implies success.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProcessOutcome {
+    pub exit: Option<ExitStatus>,
+    /// Native result name only, never the provider's error body or task environment.
+    pub native_result: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProcessInfo {
     pub process: ProcessRef,
     pub state: ProcessState,
-    pub exit: Option<ExitStatus>,
+    /// Present only for a confirmed terminal task; absent for nonterminal or unknown state.
+    pub outcome: Option<ProcessOutcome>,
     pub native_state: String,
-    /// Native result name only, never the provider's error body or task environment.
-    pub native_result: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -498,11 +507,12 @@ pub enum OutputChannel {
     Combined,
 }
 
-/// Retained native output metadata. A missing version means this execution has not started.
+/// Retained native output metadata, independent of task state (see `ProcessInfo`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputInfo {
     pub channels: Vec<OutputChannel>,
     pub size: u64,
+    /// Opaque output generation identifier; None means the backend has no identifier to report.
     pub version: Option<String>,
 }
 
@@ -555,7 +565,7 @@ pub enum ProcessEvent {
         channel: OutputChannel,
         data: Vec<u8>,
     },
-    Exit(ExitStatus),
+    Completed(ProcessOutcome),
 }
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProcessEvent>> + Send + 'static>>;
@@ -578,7 +588,7 @@ pub struct ProcessCapabilities {
     pub output_resource: bool,
     pub stdin: bool,
     pub close_stdin: bool,
-    /// False limits input to UTF-8 text without NUL, suitable for CLI transports.
+    /// True guarantees arbitrary bytes; false leaves native payload restrictions to the adapter.
     pub binary_stdin: bool,
     pub pty: bool,
     pub resize: bool,
@@ -653,7 +663,7 @@ impl ProcessManager {
         &self,
         process: &ProcessRef,
         timeout: Option<Duration>,
-    ) -> Result<ExitStatus> {
+    ) -> Result<ProcessOutcome> {
         process.validate(self.backend(), "wait")?;
         validate_timeout(timeout, self.backend(), "wait")?;
         self.access.wait(process, timeout).await
@@ -708,24 +718,20 @@ impl ProcessManager {
         self.require(self.capabilities().remove, "remove")?;
         self.access.remove(process).await
     }
-    /// Unknown mode cannot choose between ordinary stdin and terminal input.
-    /// Terminal input also requires the manager's declared PTY support.
+    /// Native mode requirements and payload restrictions are checked by the adapter.
+    /// An explicit terminal hint still requires the manager's declared PTY support.
     pub async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
         process.validate(self.backend(), "send_input")?;
         let capabilities = self.capabilities();
         self.require(capabilities.stdin, "send_input")?;
-        self.require_mode(process, "send_input")?;
         self.require(process.pty != Some(true) || capabilities.pty, "send_input")?;
-        self.require(
-            capabilities.binary_stdin || (!data.contains(&0) && std::str::from_utf8(&data).is_ok()),
-            "send_input",
-        )?;
         self.access.send_input(process, data).await
     }
     pub async fn close_stdin(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "close_stdin")?;
-        self.require(self.capabilities().close_stdin, "close_stdin")?;
-        self.require_mode(process, "close_stdin")?;
+        let capabilities = self.capabilities();
+        self.require(capabilities.close_stdin, "close_stdin")?;
+        self.require(process.pty != Some(true) || capabilities.pty, "close_stdin")?;
         self.access.close_stdin(process).await
     }
     pub async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
@@ -739,25 +745,15 @@ impl ProcessManager {
     pub async fn resize(&self, process: &ProcessRef, size: PtySize) -> Result<()> {
         process.validate(self.backend(), "resize")?;
         size.validate(self.backend(), "resize")?;
-        self.require(self.capabilities().resize, "resize")?;
-        self.require_mode(process, "resize")?;
+        let capabilities = self.capabilities();
+        self.require(capabilities.resize, "resize")?;
+        self.require(process.pty != Some(true) || capabilities.pty, "resize")?;
         self.access.resize(process, size).await
     }
     pub async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
         process.validate(self.backend(), "reconnect")?;
         self.require(self.capabilities().reconnect, "reconnect")?;
         self.access.reconnect(process).await
-    }
-    fn require_mode(&self, process: &ProcessRef, operation: &str) -> Result<()> {
-        if process.pty.is_none() {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                self.backend(),
-                operation,
-                "process PTY mode is unknown; supply a known-mode reference",
-            ));
-        }
-        Ok(())
     }
     fn require(&self, supported: bool, operation: &str) -> Result<()> {
         require(supported, self.backend(), operation)
@@ -795,7 +791,7 @@ impl Process {
     pub async fn inspect(&self) -> Result<ProcessInfo> {
         self.manager.status(&self.reference).await
     }
-    pub async fn wait(&self, timeout: Option<Duration>) -> Result<ExitStatus> {
+    pub async fn wait(&self, timeout: Option<Duration>) -> Result<ProcessOutcome> {
         self.manager.wait(&self.reference, timeout).await
     }
     pub async fn pause(&self) -> Result<()> {
@@ -855,18 +851,18 @@ impl ProcessOutput {
     }
 }
 
-/// Consumes a subscription to its exit event without inventing a successful exit on disconnection.
-pub async fn wait_events(mut events: EventStream, backend: &str) -> Result<ExitStatus> {
+/// Consumes a subscription to confirmed completion. Disconnection never invents an outcome.
+pub async fn wait_events(mut events: EventStream, backend: &str) -> Result<ProcessOutcome> {
     while let Some(event) = events.next().await {
-        if let ProcessEvent::Exit(exit) = event? {
-            return Ok(exit);
+        if let ProcessEvent::Completed(outcome) = event? {
+            return Ok(outcome);
         }
     }
     Err(Error::new(
         ErrorKind::Transport,
         backend,
         "wait",
-        "stream ended before exit status",
+        "stream ended before process completion",
     ))
 }
 

@@ -383,7 +383,7 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].process.id, "42");
     assert_eq!(listed[0].process.pty, None);
-    assert!(listed[0].exit.is_none() && listed[0].native_result.is_none());
+    assert!(listed[0].outcome.is_none());
     let process = Process::new(envd.clone(), listed[0].process.clone());
     assert_eq!(process.inspect().await.unwrap().process.id, "42");
     let handle = process.output().subscribe().await.unwrap();
@@ -392,10 +392,14 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
         opensol_core::wait_events(handle.events, "envd")
             .await
             .unwrap()
+            .exit
+            .unwrap()
             .code,
         Some(7)
     );
-    assert_eq!(process.wait(None).await.unwrap().code, Some(7));
+    let outcome = process.wait(None).await.unwrap();
+    assert_eq!(outcome.exit.unwrap().code, Some(7));
+    assert!(outcome.native_result.is_none());
     process.kill().await.unwrap();
     for error in [
         process.pause().await.unwrap_err(),
@@ -548,6 +552,8 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     assert_eq!(
         envd.wait(&process, Some(Duration::from_secs(2)))
             .await
+            .unwrap()
+            .exit
             .unwrap()
             .code,
         Some(7)

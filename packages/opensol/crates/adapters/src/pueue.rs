@@ -12,8 +12,8 @@ use std::{path::PathBuf, time::Duration};
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessRef,
-    ProcessState, Result, Signal, SpawnRequest, raw::ProcessAccess,
+    OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessOutcome,
+    ProcessRef, ProcessState, Result, Signal, SpawnRequest, raw::ProcessAccess,
 };
 use serde_json::Value;
 
@@ -203,12 +203,11 @@ impl Pueue {
             "Done" => ProcessState::Exited,
             _ => ProcessState::Unknown,
         };
-        let mut native_result = None;
-        let exit = if native_state == "Done" {
+        let outcome = if native_state == "Done" {
             let result = payload
                 .and_then(|payload| payload.get("result"))
                 .ok_or_else(|| protocol_error("status"))?;
-            native_result = Some(match result {
+            let native_result = match result {
                 Value::String(name)
                     if matches!(
                         name.as_str(),
@@ -225,8 +224,8 @@ impl Pueue {
                     object.keys().next().unwrap().clone()
                 }
                 _ => return Err(protocol_error("status")),
-            });
-            match result {
+            };
+            let exit = match result {
                 Value::String(value) if value == "Success" => Some(ExitStatus::code(0)),
                 Value::Object(value) if value.contains_key("Failed") => {
                     let code = value["Failed"]
@@ -236,16 +235,19 @@ impl Pueue {
                     Some(ExitStatus::code(code))
                 }
                 _ => None,
-            }
+            };
+            Some(ProcessOutcome {
+                exit,
+                native_result: Some(native_result),
+            })
         } else {
             None
         };
         Ok(ProcessInfo {
             process: process.clone(),
             state,
-            exit,
+            outcome,
             native_state: native_state.into(),
-            native_result,
         })
     }
 
@@ -506,24 +508,18 @@ impl ProcessAccess for Pueue {
         self.task_info(process, &self.task(process).await?)
     }
 
-    async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>) -> Result<ExitStatus> {
+    async fn wait(
+        &self,
+        process: &ProcessRef,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutcome> {
         let id = self.id(process, "wait")?;
         deadline(timeout, "pueue", "wait", async {
             self.status(process).await?;
             self.run(vec!["wait".into(), "--quiet".into(), id], "wait", None)
                 .await?;
             let info = self.status(process).await?;
-            info.exit.ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Backend,
-                    "pueue",
-                    "wait",
-                    &format!(
-                        "native result {} has no command exit status",
-                        info.native_result.as_deref().unwrap_or("unknown")
-                    ),
-                )
-            })
+            info.outcome.ok_or_else(|| protocol_error("wait"))
         })
         .await
     }
@@ -533,15 +529,19 @@ impl ProcessAccess for Pueue {
         let manager = self.clone();
         let process = process.clone();
         Ok(Box::pin(async_stream::try_stream! {
-            let exit = manager.wait(&process, None).await?;
+            let outcome = manager.wait(&process, None).await?;
             let data = manager.run(vec!["follow".into(), id], "output", None).await?;
             if !data.is_empty() { yield ProcessEvent::Output { channel: OutputChannel::Combined, data }; }
-            yield ProcessEvent::Exit(exit);
+            yield ProcessEvent::Completed(outcome);
         }))
     }
 
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
         let id = self.id(process, "send_input")?;
+        // Text travels in a CLI argument. Reject both restrictions before Connection I/O.
+        if data.contains(&0) {
+            return Err(Error::unsupported("pueue", "send_input"));
+        }
         let text =
             String::from_utf8(data).map_err(|_| Error::unsupported("pueue", "send_input"))?;
         self.run(

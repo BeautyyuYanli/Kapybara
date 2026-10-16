@@ -2,6 +2,7 @@
 
 import asyncio
 import subprocess
+import tempfile
 import unittest
 
 import opensol as sdk
@@ -36,8 +37,9 @@ class ResourceTests(unittest.TestCase):
         process = self.manager.get(handle.process)
         self.assertIsInstance(process, sdk.Process)
         self.assertEqual(process.ref.id, handle.process.id)
-        self.assertEqual(process.wait(timeout=5).code, 7)
-        self.assertEqual(process.inspect().native_result, "Failed")
+        self.assertEqual(process.wait(timeout=5).exit.code, 7)
+        self.assertEqual(process.inspect().outcome.native_result, "Failed")
+        self.assertEqual(handle.wait().native_result, "Failed")
         self.assertIn(process.ref.id, [item.process.id for item in self.manager.list()])
         output = process.output
         self.assertIsInstance(output, sdk.ProcessOutput)
@@ -57,9 +59,9 @@ class ResourceTests(unittest.TestCase):
         self.assertTrue(second.at_end)
         self.assertEqual(data(output.read(cursor=saved)), b"out")
         self.assertEqual(data(output.read(cursor=second.next_cursor)), b"")
-        replay, exit = test_sdk.collect(output.subscribe())
+        replay, outcome = test_sdk.collect(output.subscribe())
         self.assertEqual(test_sdk.combined_output(replay), b"\x00\xffout")
-        self.assertEqual(exit.code, 7)
+        self.assertEqual(outcome.exit.code, 7)
         self.assertEqual(data(output.read(cursor=saved)), b"out", "subscription must not move saved cursors")
         for limit in (0, -1, 1048577):
             with self.subTest(limit=limit), self.assertRaises(sdk.InvalidArgumentError):
@@ -70,17 +72,37 @@ class ResourceTests(unittest.TestCase):
                        check=True, capture_output=True)
         process.restart()
         self.assertEqual(process.inspect().state, "queued")
+        self.assertIsNone(process.inspect().outcome)
+        self.assertEqual(handle.wait().exit.code, 7, "completion cache belongs to the original subscription")
         with self.assertRaises(sdk.ConflictError):
             output.read(cursor=saved)
         self.assertEqual(data(output.read()), b"")
         self.assertEqual((output.stat().size, output.stat().version), (0, None))
         process.start()
-        self.assertEqual(process.wait(timeout=5).code, 7)
+        self.assertEqual(process.wait(timeout=5).exit.code, 7)
         self.assertEqual(data(output.read()), b"\x00\xffout")
         process.remove()
         self.assertEqual(self.manager.list(), [])
         with self.assertRaises(sdk.NotFoundError):
             output.read(cursor=saved)
+
+    def test_failed_to_spawn_completes_without_exit_or_private_error_text(self):
+        sdk.local().exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
+        with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
+            handle = self.manager.spawn(["true"], cwd=cwd)
+        process = self.manager.get(handle.process)
+        process.start()
+        outcome = process.wait(timeout=5)
+        self.assertIsNone(outcome.exit)
+        self.assertEqual(outcome.native_result, "FailedToSpawn")
+        self.assertEqual(process.inspect().outcome.native_result, "FailedToSpawn")
+        output, completed = test_sdk.collect(handle)
+        retained = (self.directory / "task_logs" / f"{handle.process.id}.log").read_bytes()
+        self.assertEqual(test_sdk.combined_output(output), retained)
+        self.assertIsNone(completed.exit)
+        self.assertEqual(completed.native_result, "FailedToSpawn")
+        self.assertEqual(handle.wait().native_result, "FailedToSpawn")
+        process.remove()
 
     def test_resources_bind_locally_and_native_pause_kill_remain_explicit(self):
         unavailable = sdk.pueue(sdk.local(), config_file="/no-opensol-config")
@@ -103,10 +125,14 @@ class ResourceTests(unittest.TestCase):
         handle.disconnect()
         self.assertEqual(process.inspect().state, "running")
         process.kill()
-        with self.assertRaisesRegex(sdk.BackendError, "Killed"):
-            process.wait(timeout=5)
-        self.assertIsNone(process.inspect().exit)
-        self.assertEqual(process.inspect().native_result, "Killed")
+        outcome = process.wait(timeout=5)
+        self.assertIsNone(outcome.exit)
+        self.assertEqual(outcome.native_result, "Killed")
+        self.assertIsNone(process.inspect().outcome.exit)
+        self.assertEqual(process.inspect().outcome.native_result, "Killed")
+        replay, completed = test_sdk.collect(process.output.subscribe())
+        self.assertEqual(replay, [])
+        self.assertEqual(completed.native_result, "Killed")
         process.remove()
 
 
@@ -117,6 +143,27 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         test_sdk.PueueTests.setUp(self)
         self.manager = aio.pueue(aio.local(), config_file=str(self.config),
                                  pueue_directory=str(self.directory))
+
+    async def test_failed_to_spawn_is_delivered_and_cached_as_completion(self):
+        await aio.local().exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
+        with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
+            handle = await self.manager.spawn(["true"], cwd=cwd)
+        process = self.manager.get(handle.process)
+        await process.start()
+        outcome = await process.wait(timeout=5)
+        self.assertIsNone(outcome.exit)
+        self.assertEqual(outcome.native_result, "FailedToSpawn")
+        self.assertEqual((await process.inspect()).outcome.native_result, "FailedToSpawn")
+        from test_async import collect
+        output, completed = await collect(handle)
+        retained = (self.directory / "task_logs" / f"{handle.process.id}.log").read_bytes()
+        self.assertEqual(test_sdk.combined_output(output), retained)
+        self.assertIsNone(completed.exit)
+        self.assertEqual(completed.native_result, "FailedToSpawn")
+        self.assertIsNone(await handle.next_event())
+        self.assertEqual((await handle.wait()).native_result, "FailedToSpawn")
+        await handle.aclose()
+        await process.remove()
 
     async def test_async_resources_share_dtos_and_read_running_output(self):
         self.assertIsInstance(await self.manager.probe(), sdk.ManagerInfo)
@@ -146,15 +193,15 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await process.inspect()).state, "paused")
         await process.start()
         await process.send_input(b"finish\n")
-        self.assertEqual((await process.wait(timeout=5)).code, 7)
+        self.assertEqual((await process.wait(timeout=5)).exit.code, 7)
         self.assertEqual(data(await process.output.read(cursor=tail.next_cursor)), b"last")
         replay = await process.output.subscribe()
         from test_async import collect
-        chunks, exit = await collect(replay)
+        chunks, outcome = await collect(replay)
         self.assertEqual(test_sdk.combined_output(chunks), b"\x00\xfffirstlast")
-        self.assertEqual(exit.code, 7)
+        self.assertEqual(outcome.exit.code, 7)
         await replay.aclose()
-        await handle.aclose()
+        self.assertEqual((await handle.wait()).native_result, "Failed")
         await process.restart()
         # Restarted task still waits for input; an explicit native kill ends it.
         deadline = asyncio.get_running_loop().time() + 5
@@ -162,13 +209,19 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(asyncio.get_running_loop().time(), deadline)
             await asyncio.sleep(.02)
         await process.kill()
-        with self.assertRaisesRegex(sdk.BackendError, "Killed"):
-            await process.wait(timeout=5)
-        self.assertIsNone((await process.inspect()).exit)
-        self.assertEqual((await process.inspect()).native_result, "Killed")
+        outcome = await process.wait(timeout=5)
+        self.assertIsNone(outcome.exit)
+        self.assertEqual(outcome.native_result, "Killed")
+        self.assertIsNone((await process.inspect()).outcome.exit)
+        self.assertEqual((await process.inspect()).outcome.native_result, "Killed")
+        self.assertEqual((await handle.wait()).native_result, "Failed", "cache must not follow the restarted execution")
+        await handle.aclose()
         killed_output = await process.output.subscribe()
-        with self.assertRaisesRegex(sdk.BackendError, "Killed"):
-            await killed_output.next_event()
+        chunks, completed = await collect(killed_output)
+        self.assertTrue(test_sdk.combined_output(chunks) in (b"", b"\x00\xfffirst"))
+        self.assertIsNone(completed.exit)
+        self.assertEqual(completed.native_result, "Killed")
+        self.assertEqual((await killed_output.wait()).native_result, "Killed")
         await killed_output.aclose()
         await process.remove()
 
@@ -185,14 +238,14 @@ class EnvdResourceTests(unittest.TestCase):
         process = manager.get(handle.process)
         self.assertEqual([info.process.id for info in manager.list()], [process.ref.id])
         self.assertEqual(process.inspect().state, "running")
-        self.assertIsNone(process.inspect().native_result)
+        self.assertIsNone(process.inspect().outcome)
         for operation in (process.pause, process.start, process.restart, process.remove,
                           process.output.stat, process.output.read):
             with self.subTest(operation=operation), self.assertRaises(sdk.UnsupportedError):
                 operation()
         process.send_input(b"\x00\xffinput")
         process.kill()
-        self.assertEqual(handle.wait().code, 7)
+        self.assertEqual(handle.wait().exit.code, 7)
         request = next(message for method, message in self.records if method == "SendSignal")
         self.assertEqual((request.process.pid, request.signal), (int(process.ref.id), 9))
         with self.assertRaises(sdk.NotFoundError):

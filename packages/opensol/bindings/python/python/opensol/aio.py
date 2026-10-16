@@ -14,13 +14,13 @@ from . import _native
 from ._native import (
     AsyncConnection as Connection,
     AsyncLifecycle as Lifecycle,
-    ExitStatus,
     ManagerInfo,
     OutputCursor,
     OutputInfo,
     OutputPage,
     ProcessEvent,
     ProcessInfo,
+    ProcessOutcome,
     ProcessRef,
     ResourceRef,
 )
@@ -63,12 +63,12 @@ class ProcessHandle(AsyncIterator[ProcessEvent]):
             self._native._commit()
             return event
 
-    async def wait(self) -> ExitStatus:
-        """Consume remaining output and return a confirmed native exit status."""
+    async def wait(self) -> ProcessOutcome:
+        """Consume remaining output and return this subscription's confirmed completion."""
         while (event := await self.next_event()) is not None:
-            if event.exit is not None:
-                return event.exit
-        return await self._native._exit()
+            if event.outcome is not None:
+                return event.outcome
+        return await self._native._outcome()
 
     async def aclose(self) -> None:
         """Detach and wake blocked readers; safe to call repeatedly."""
@@ -123,7 +123,7 @@ class ProcessManager:
     def status(self, process: ProcessRef) -> Awaitable[ProcessInfo]:
         return self._native.status(process)
 
-    def wait(self, process: ProcessRef, *, timeout: float | None = None) -> Awaitable[ExitStatus]:
+    def wait(self, process: ProcessRef, *, timeout: float | None = None) -> Awaitable[ProcessOutcome]:
         return self._native.wait(process, timeout=timeout)
 
     async def output(self, process: ProcessRef) -> ProcessHandle:
@@ -162,7 +162,7 @@ class Process:
     def inspect(self) -> Awaitable[ProcessInfo]:
         return self._native.inspect()
 
-    def wait(self, *, timeout: float | None = None) -> Awaitable[ExitStatus]:
+    def wait(self, *, timeout: float | None = None) -> Awaitable[ProcessOutcome]:
         return self._native.wait(timeout=timeout)
 
     def pause(self) -> Awaitable[None]:

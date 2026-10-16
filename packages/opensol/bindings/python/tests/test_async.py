@@ -21,10 +21,10 @@ import test_sdk
 async def collect(handle):
     output = []
     async for event in handle:
-        if event.exit is not None:
-            return output, event.exit
+        if event.outcome is not None:
+            return output, event.outcome
         output.append((event.channel, event.data))
-    raise AssertionError("stream ended without a native exit")
+    raise AssertionError("stream ended without native completion")
 
 
 async def cancel_before_delivery(handle):
@@ -131,20 +131,43 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
             await manager.close_stdin(handle.process)
         with self.assertRaises(sdk.UnsupportedError):
             await manager.resize(handle.process, 80, 24)
-        await manager.send_input(handle.process, b"hello '$()\n")
-        output, exit_status = await collect(handle)
+        restored = sdk.ProcessRef("pueue", handle.process.id)
+        await manager.get(restored).send_input(b"hello '$()\n")
+        output, outcome = await collect(handle)
         self.assertTrue(all(channel == "combined" for channel, _ in output))
         self.assertEqual(b"".join(data for _, data in output), b"hello '$()")
-        self.assertEqual(exit_status.code, 7)
+        self.assertIsInstance(outcome, sdk.ProcessOutcome)
+        self.assertEqual((outcome.exit.code, outcome.native_result), (7, "Failed"))
         self.assertIsNone(await handle.next_event())
-        self.assertEqual((await handle.wait()).code, 7)
-        self.assertEqual((await manager.wait(handle.process, timeout=2)).code, 7)
+        self.assertEqual((await handle.wait()).exit.code, 7)
+        self.assertEqual((await manager.wait(handle.process, timeout=2)).exit.code, 7)
         for subscribe in (manager.output, manager.reconnect):
             replay = await subscribe(sdk.ProcessRef(handle.process.backend, handle.process.id))
-            replay_output, replay_exit = await collect(replay)
+            replay_output, replay_outcome = await collect(replay)
             self.assertEqual(b"".join(data for _, data in replay_output), b"hello '$()")
-            self.assertEqual(replay_exit.code, 7)
+            self.assertEqual(replay_outcome.exit.code, 7)
             await replay.aclose()
+
+    async def test_cancel_before_delivery_preserves_native_only_completion_and_cache(self):
+        handle = await self.manager.spawn(["sleep", "30"])
+        await self.running(handle.process)
+        await self.manager.signal(handle.process, 9)
+        # Isolate delivery cancellation from the native CLI's two-second wait polling.
+        await self.manager.wait(handle.process, timeout=5)
+        observed = await cancel_before_delivery(handle)
+        self.assertIsNone(observed.outcome.exit)
+        self.assertEqual(observed.outcome.native_result, "Killed")
+        event = await handle.next_event(timeout=2)
+        self.assertIsNone(event.outcome.exit)
+        self.assertEqual(event.outcome.native_result, "Killed")
+        self.assertIsNone(event.channel)
+        self.assertEqual(event.data, b"")
+        self.assertIsNone(await handle.next_event())
+        for _ in range(2):
+            outcome = await handle.wait()
+            self.assertIsNone(outcome.exit)
+            self.assertEqual(outcome.native_result, "Killed")
+        await handle.aclose()
 
     async def test_aclose_wakes_reader_without_signalling_and_is_idempotent(self):
         handle = await self.manager.spawn(["sleep", "10"])
@@ -158,9 +181,10 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sdk.TransportError):
             await handle.wait()
         await self.manager.signal(handle.process, 9)
-        with self.assertRaisesRegex(sdk.BackendError, "Killed"):
-            await self.manager.wait(handle.process, timeout=3)
-        self.assertIsNone((await self.manager.status(handle.process)).exit)
+        outcome = await self.manager.wait(handle.process, timeout=3)
+        self.assertIsNone(outcome.exit)
+        self.assertEqual(outcome.native_result, "Killed")
+        self.assertIsNone((await self.manager.status(handle.process)).outcome.exit)
 
 
 class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
@@ -187,9 +211,10 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         plain = await manager.spawn(["stdin-program"], stdin=True)
         await manager.send_input(plain.process, data)
         await manager.close_stdin(plain.process)
-        plain_output, plain_exit = await collect(plain)
+        plain_output, plain_outcome = await collect(plain)
         self.assertEqual(b"".join(data for _, data in plain_output), data)
-        self.assertEqual(plain_exit.code, 7)
+        self.assertEqual(plain_outcome.exit.code, 7)
+        self.assertIsNone(plain_outcome.native_result)
         handle = await manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
         first = await handle.next_event(timeout=2)
         self.assertEqual((first.channel, first.data), ("terminal", b"\x00\xffterminal"))
@@ -206,10 +231,10 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sdk.UnsupportedError):
             await manager.signal(handle.process, 2)
         await manager.send_input(handle.process, data + b"\x04")
-        output, exit_status = await collect(handle)
+        output, outcome = await collect(handle)
         self.assertEqual(b"".join(data for _, data in output), data + b"\x04")
-        self.assertEqual(exit_status.code, 7)
-        self.assertEqual((await handle.wait()).code, 7)
+        self.assertEqual(outcome.exit.code, 7)
+        self.assertEqual((await handle.wait()).exit.code, 7)
 
     async def test_cancel_after_native_consumption_before_python_delivery_retains_event(self):
         manager = self.native.processes
@@ -223,13 +248,13 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         while True:
             observed = await cancel_before_delivery(handle)
             event = await handle.next_event(timeout=2)
-            if observed.exit is not None:
-                self.assertEqual((observed.exit.code, event.exit.code), (7, 7))
+            if observed.outcome is not None:
+                self.assertEqual((observed.outcome.exit.code, event.outcome.exit.code), (7, 7))
                 break
             self.assertEqual((event.channel, event.data), (observed.channel, observed.data))
             output.append(event.data)
         self.assertEqual(b"".join(output), b"second\x04")
-        self.assertEqual((await handle.wait()).code, 7)
+        self.assertEqual((await handle.wait()).exit.code, 7)
         self.assertIsNone(await handle.next_event())
 
 

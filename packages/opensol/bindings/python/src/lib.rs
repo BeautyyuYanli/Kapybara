@@ -34,7 +34,7 @@ use opensol_adapters::{
 use opensol_core::{
     Command, Connection, CreateOptions, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
     ExitStatus, Lifecycle, OutputChannel, ProcessEvent, ProcessHandle, ProcessInfo, ProcessManager,
-    ProcessRef, PtySize, ResourceInfo, ResourceRef, Result, Signal, SpawnRequest,
+    ProcessOutcome, ProcessRef, PtySize, ResourceInfo, ResourceRef, Result, Signal, SpawnRequest,
 };
 use prost::Message;
 use pyo3::{
@@ -283,6 +283,31 @@ impl PyExitStatus {
     }
 }
 
+/// Shared terminal task value; a native result need not include an OS exit status.
+#[pyclass(name = "ProcessOutcome", frozen)]
+#[derive(Clone)]
+struct PyProcessOutcome {
+    inner: ProcessOutcome,
+}
+
+#[pymethods]
+impl PyProcessOutcome {
+    #[getter]
+    fn exit(&self) -> Option<PyExitStatus> {
+        self.inner.exit.map(|inner| PyExitStatus { inner })
+    }
+    #[getter]
+    fn native_result(&self) -> Option<&str> {
+        self.inner.native_result.as_deref()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "ProcessOutcome(exit={:?}, native_result={:?})",
+            self.inner.exit, self.inner.native_result
+        )
+    }
+}
+
 #[pyclass(name = "ExecResult", frozen)]
 struct PyExecResult {
     inner: ExecResult,
@@ -371,12 +396,11 @@ impl PyProcessInfo {
         &self.inner.native_state
     }
     #[getter]
-    fn exit(&self) -> Option<PyExitStatus> {
-        self.inner.exit.map(|inner| PyExitStatus { inner })
-    }
-    #[getter]
-    fn native_result(&self) -> Option<&str> {
-        self.inner.native_result.as_deref()
+    fn outcome(&self) -> Option<PyProcessOutcome> {
+        self.inner
+            .outcome
+            .clone()
+            .map(|inner| PyProcessOutcome { inner })
     }
 }
 
@@ -545,9 +569,11 @@ impl PyProcessEvent {
         )
     }
     #[getter]
-    fn exit(&self) -> Option<PyExitStatus> {
-        match self.inner {
-            ProcessEvent::Exit(inner) => Some(PyExitStatus { inner }),
+    fn outcome(&self) -> Option<PyProcessOutcome> {
+        match &self.inner {
+            ProcessEvent::Completed(inner) => Some(PyProcessOutcome {
+                inner: inner.clone(),
+            }),
             _ => None,
         }
     }
@@ -555,7 +581,8 @@ impl PyProcessEvent {
 
 struct HandleState {
     events: Option<EventStream>,
-    exit: Option<ExitStatus>,
+    // Completion belongs to this subscription's execution, even if its task ID is restarted.
+    outcome: Option<ProcessOutcome>,
 }
 
 /// One output subscription. disconnect releases it without killing the remote process.
@@ -574,7 +601,7 @@ impl From<ProcessHandle> for PyProcessHandle {
             process: handle.process,
             state: Arc::new(Mutex::new(HandleState {
                 events: Some(Box::pin(Abortable::new(handle.events, registration))),
-                exit: None,
+                outcome: None,
             })),
             abort,
             disconnected: Arc::new(AtomicBool::new(false)),
@@ -628,8 +655,8 @@ impl PyProcessHandle {
                 })?;
             match event {
                 Some(Ok(event)) => {
-                    if let ProcessEvent::Exit(exit) = event {
-                        state.exit = Some(exit);
+                    if let ProcessEvent::Completed(outcome) = &event {
+                        state.outcome = Some(outcome.clone());
                         state.events = None;
                     }
                     Ok(Some(event))
@@ -640,12 +667,12 @@ impl PyProcessHandle {
                 }
                 None => {
                     state.events = None;
-                    if state.exit.is_none() && !disconnected.load(Ordering::Acquire) {
+                    if state.outcome.is_none() && !disconnected.load(Ordering::Acquire) {
                         Err(Error::new(
                             ErrorKind::Transport,
                             &backend,
                             "output",
-                            "subscription ended before exit status",
+                            "subscription ended before process completion",
                         ))
                     } else {
                         Ok(None)
@@ -657,29 +684,32 @@ impl PyProcessHandle {
         .map_err(exception)
     }
 
-    fn wait(&self, py: Python<'_>) -> PyResult<PyExitStatus> {
+    fn wait(&self, py: Python<'_>) -> PyResult<PyProcessOutcome> {
         loop {
             let state = self.state.clone();
             let backend = self.process.backend.clone();
-            let exit = py.detach(move || {
-                state.lock().map(|state| state.exit).map_err(|_| {
-                    exception(Error::new(
-                        ErrorKind::Backend,
-                        &backend,
-                        "wait",
-                        "output subscription lock failed",
-                    ))
-                })
+            let outcome = py.detach(move || {
+                state
+                    .lock()
+                    .map(|state| state.outcome.clone())
+                    .map_err(|_| {
+                        exception(Error::new(
+                            ErrorKind::Backend,
+                            &backend,
+                            "wait",
+                            "output subscription lock failed",
+                        ))
+                    })
             })?;
-            if let Some(exit) = exit {
-                return Ok(PyExitStatus { inner: exit });
+            if let Some(outcome) = outcome {
+                return Ok(PyProcessOutcome { inner: outcome });
             }
             if self.next_event(py, None)?.is_none() {
                 return Err(exception(Error::new(
                     ErrorKind::Transport,
                     &self.process.backend,
                     "wait",
-                    "subscription is disconnected; exit status is unknown",
+                    "subscription is disconnected; completion is unknown",
                 )));
             }
         }
@@ -786,13 +816,13 @@ impl PyProcessManager {
         py: Python<'_>,
         process: PyRef<'_, PyProcessRef>,
         timeout: Option<f64>,
-    ) -> PyResult<PyExitStatus> {
+    ) -> PyResult<PyProcessOutcome> {
         let process = process.inner.clone();
         let timeout = crate::timeout(timeout)?;
         let client = self.inner.clone();
         let runtime = runtime()?;
         py.detach(move || runtime.block_on(client.wait(&process, timeout)))
-            .map(|inner| PyExitStatus { inner })
+            .map(|inner| PyProcessOutcome { inner })
             .map_err(exception)
     }
 
@@ -1301,6 +1331,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyResourceRef>()?;
     module.add_class::<PyProcessRef>()?;
     module.add_class::<PyExitStatus>()?;
+    module.add_class::<PyProcessOutcome>()?;
     module.add_class::<PyExecResult>()?;
     module.add_class::<PyResourceInfo>()?;
     module.add_class::<PyProcessInfo>()?;

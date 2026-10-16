@@ -19,10 +19,10 @@ async def main(config_file: str | None) -> None:
     handle = await manager.spawn(["python3", "-c", "print('managed task')"])
     try:
         async for event in handle:
-            if event.exit is None:
+            if event.outcome is None:
                 print(event.channel, event.data)
             else:
-                print("exit", event.exit.code)
+                print("completed", event.outcome)
     finally:
         await handle.aclose()
 

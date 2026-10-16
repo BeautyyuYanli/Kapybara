@@ -75,16 +75,18 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 
 运行中、可重连、日志可回读、daemon 重启恢复是不同能力。对具体实例调用 `capabilities()`；不要仅根据后端名假定所有操作可用。`supported_signals` 返回明确的信号集合，Python 对应编号列表；生命周期的 `stop_preserves_memory` 仅在 E2B pause 的原生保证下为 true，Docker stop、Kubernetes Suspended 和 OpenShell 为 false。
 
+`binary_stdin=true` 保证任意字节输入；false 表示存在由适配器检查的原生载荷限制。Pueue 在 Connection I/O 前拒绝无效 UTF-8 和 NUL，返回 Unsupported；envd 原样传递 bytes。`ProcessRef.pty` 是可保存的可选模式提示，由实际操作的适配器决定是否需要；Pueue send 只需 task ID，envd 输入路由及终端控制需要已知模式。
+
 ## 命令与错误契约
 
 - 默认传显式 argv，只有 `Command::shell` / Python `.shell()` 使用 `/bin/sh -c`。SSH 和 Pueue 所需的 POSIX shell 转换逐项引用参数，不直接拼接用户命令。
 - SSH 远端和 Pueue 的 CLI/daemon 执行环境需要 `env`，以及支持 `-n 0 --` 的 `/usr/bin/nice`。该固定原生 helper 在环境覆盖后保持优先级不变，并保留包含 `=` 的可执行路径和非 POSIX 环境键；任务 PATH 不影响 helper 定位。
 - `cwd`、`env` 是请求字段，`stdin`、stdout、stderr 都使用字节。PTY、Pueue 合并输出分别标为 `Terminal`、`Combined`，不伪装成分离 stderr。
 - 第二层 `exec` 等待完成，不返回后台任务 ID。Rust 为 async I/O，Python 根入口为释放 GIL 的阻塞调用，`opensol.aio` 将同一 Rust Future 接入调用方的 asyncio loop；输出收集到内存，不适合无限输出。
-- 非零退出码属于正常 `ExecResult`，不是传输异常。信号退出可以没有数字退出码；Pueue 的 Killed 结果不包含精确退出码或信号。
+- 非零退出码属于正常 `ExecResult`，不是传输异常。信号退出可以没有数字退出码。管理任务的 wait 返回 `ProcessOutcome { exit: Option<ExitStatus>, native_result: Option<String> }`，仅用于已确认终结且至少一项可用的结果；`ProcessInfo.outcome` 在非终态为 None，事件为 `Completed(ProcessOutcome)`。`Connection.exec` 继续返回带 ExitStatus 的 ExecResult。
 - SDK 错误分为 InvalidArgument、Unsupported、NotFound、Conflict、Permission、Timeout、Transport、Backend，并带 backend/operation。普通错误不回显供应商响应正文、命令输入或凭据。
 - `ExecRequest.timeout=None` 表示不设置整条命令的 SDK deadline；连接建立和原生控制请求仍可以有适配器级超时。零超时无效。
-- 公共客户端在进入适配器前检查 argv、NUL、环境变量、正超时、PTY 尺寸、输出 limit 和引用后端，并按 capabilities 拒绝不支持的 stdin、PTY、信号和可选操作。状态竞争、已知进程模式的原生限制和 cursor 版本仍由适配器判断。
+- 公共客户端在进入适配器前检查 argv、工作目录和环境变量的 NUL 等约束、正超时、PTY 尺寸、输出 limit 和引用后端，并按 capabilities 拒绝不支持的 stdin、PTY、信号和可选操作。输入载荷、模式信息的必要性、状态竞争和 cursor 版本由适配器判断。
 - 超时/断连不等于远端进程已停止。Local 在取消时清理 Unix 进程组；SSH 只保证结束本机客户端；Docker 关闭 exec attachment，不保证终止 exec；envd 关闭订阅而不隐式发送 kill；OpenShell 的原生执行超时由服务端处理；sandboxd 取消请求的清理行为由服务端决定。
 - SDK 不自行重试 create/fork/exec/spawn 等不确定结果。HTTP 客户端禁用重试及重定向；kubectl 仍保留 client-go 对明确 `Retry-After` 响应的内置行为，创建始终使用明确的 `metadata.name`，同次重放不会产生另一个名称的 CR。调用方不得盲目重做超时的副作用操作。
 - 资源始终显式 `delete`。丢弃 Rust/Python 客户端、输出订阅或网络连接不自动销毁沙盒。
@@ -109,7 +111,7 @@ Docker exec 观察原生完成后取消未被消费的 stdin，仍读完输出�
 
 `probe()` 通过实际管理请求验证可访问性，配置日志访问时也检查目标依赖与目录。返回可确认的 CLI 版本，server_version 为 None；Pueue CLI 无法结构化区分的认证/连接失败保留为脱敏 Backend，注入 Connection 的结构化错误类别仍保留。静态能力表达配置，不缓存探测结果。
 
-`pause/start/restart/kill/remove` 始终针对明确的单个 task ID。start 使用 Pueue 的原生强制开始语义，可绕过队列限制和依赖；restart 只允许终结任务，使用 `restart --in-place` 保留 ID 并覆盖上次日志。remove 由原生状态和依赖决定是否允许，绝不暗中 kill 或删除其他任务。kill 的原生回执表示接受请求，退出由 inspect/wait 确认。`native_result` 只返回 Success、Failed、FailedToSpawn、Killed、Errored、DependencyFailed 等原生名称；没有退出码时 wait 报告 Backend，不伪造成功或数字信号。
+`pause/start/restart/kill/remove` 始终针对明确的单个 task ID。start 使用 Pueue 的原生强制开始语义，可绕过队列限制和依赖；restart 只允许终结任务，使用 `restart --in-place` 保留 ID 并覆盖上次日志。remove 由原生状态和依赖决定是否允许，绝不暗中 kill 或删除其他任务。kill 的原生回执表示接受请求，终结由 inspect/wait 确认。`ProcessOutcome.native_result` 只返回 Success、Failed、FailedToSpawn、Killed、Errored、DependencyFailed 等脱敏的原生名称；Success/Failed 保留真实退出码，Killed 等结果的 exit 为 None。订阅读取可用日志后交付 Completed；日志读取、权限、传输和协议失败仍按实际错误返回。
 
 任务 `env` 在安全引用的队列命令内应用，不修改 Pueue CLI 的 PATH、HOME 或配置环境。
 
@@ -119,11 +121,11 @@ E2B 控制面使用 v2 create/connect、inspect、full-memory pause、delete 和
 
 `E2bLifecycle.envd(resource)` 只读 inspect 发现 envd token/domain，复用原 HTTP pool 和超时配置构造 envd 客户端，不隐式 resume。也可以直接构造 `EnvdConfig` 连接独立 envd。API key 与 envd access token 分开，按请求设置；E2B 代理路由通过 Sandbox ID/port headers 传递。
 
-envd 的 `Start` / `Connect` 是 ConnectRPC，而不是假设为 gRPC。字节输出、stdin、信号和 PTY 使用固定的上游 protobuf schema。`status` 使用原生 List；进程不在 List 中时返回 NotFound，不能推断历史退出码。完成结果从 handle 的 Exit 事件获得，输出流在 Exit 前断开返回 Transport。重连遵循 envd 的保留窗口，不是持久日志系统。
+envd 的 `Start` / `Connect` 是 ConnectRPC，而不是假设为 gRPC。字节输出、stdin、信号和 PTY 使用固定的上游 protobuf schema。`status` 使用原生 List；进程不在 List 中时返回 NotFound，不能推断历史退出码。原生 End 映射为带真实 ExitStatus 的 Completed outcome；缺少完成证据的意外断流返回 Transport。重连遵循 envd 的保留窗口，不是持久日志系统。
 
 `probe/list` 同样使用原生 List，kill 使用原生 SendSignal(SIGKILL)。固定协议没有暂停、开始、重启、历史移除和分页日志 RPC，对应操作返回 Unsupported。`ProcessRef.pty` 为 `Option<bool>`：spawn 返回已知模式，List 不包含 PTY 元信息，返回 `None`。未知模式仍可 inspect、signal、kill、wait 和订阅；send_input、close_stdin、resize 显式返回 Unsupported，不猜测 RPC 通道。应用应保存 spawn 引用，或在已知模式时显式构造引用。Pueue 返回 `Some(false)`。envd 不报告客户端/服务端版本，ManagerInfo 的两项版本为 None。
 
-短命令结束后，SendInput/CloseStdin 可能因原生进程已移除而返回 NotFound；只有同时取得有效 Exit 才将其视为正常完成。等待这类竞争的完成事件受控制请求超时限制，其他输入错误仍然报错。
+短命令结束后，SendInput/CloseStdin 可能因原生进程已移除而返回 NotFound；只有同时取得含真实 ExitStatus 的完成事件才将其视为正常完成。等待这类竞争的完成事件受控制请求超时限制，其他输入错误仍然报错。
 
 ### Kubernetes SIGs agent-sandbox / sandboxd
 
@@ -174,7 +176,7 @@ assert result.stdout == b"hello\n"
 processes = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml")
 handle = processes.spawn(["python3", "-c", "print('job')"])
 while (event := handle.next_event(timeout=10)) is not None:
-    if event.exit is not None:
+    if event.outcome is not None:
         break
     print(event.channel, event.data)
 ```
@@ -195,7 +197,7 @@ async def main():
     handle = await processes.spawn(["python3", "-c", "print('job')"])
     try:
         async for event in handle:
-            if event.exit is None:
+            if event.outcome is None:
                 print(event.channel, event.data)
     finally:
         await handle.aclose()  # 只关闭订阅；终止进程需显式 signal。
@@ -225,9 +227,9 @@ print(process.inspect().state, next_page.at_end)
 
 `process.output.stat/read` 是绑定资源入口；Rust 公共 manager 的 `output_stat/read_output` 经过相同校验，再委托 raw 适配器契约。Python 只暴露绑定资源的日志查询。`output.subscribe()` 建立独立 handle，消费订阅不推进 cursor。
 
-输出页保留原始 bytes 和 channel，Pueue 只有 Combined。默认 64 KiB，允许 1 字节至 1 MiB；读取立即返回当前观测范围，不等待后续输出或退出。`at_end` 只表示读到该次观测的尾部，进程是否终结单独 inspect。cursor 绑定目标、任务、执行和文件版本，不含凭据或可指定的文件路径；只把它作为不透明字符串保存。在同一版本从同一位置可重读，新增字节是否进入这一页取决于该次观测的大小。
+输出页保留原始 bytes 和 channel，Pueue 只有 Combined。默认 64 KiB，允许 1 字节至 1 MiB；读取立即返回当前观测范围，不等待后续输出或终结。`at_end` 只表示读到该次观测的尾部，进程是否终结单独 inspect。`OutputInfo.version` 是后端可提供的不透明输出代次标识，None 只表示没有可报告的标识，任务状态由 ProcessInfo 表达。cursor 绑定目标、任务、执行和文件版本，不含凭据或可指定的文件路径；只把它作为不透明字符串保存。在同一版本从同一位置可重读，新增字节是否进入这一页取决于该次观测的大小。
 
-尚未开始的任务返回空页、size=0、version=None，不读可能残留的上次日志；同一 Queued 执行的初始空 cursor 可以在其开始后继续使用，无法确认同次执行的状态转换返回 Conflict。原地重启、可检测的文件替换/截断返回 Conflict，原生任务/日志清理返回 NotFound，非法 cursor/limit 返回 InvalidArgument；SDK 不静默回到开头。文件身份和大小检查无法提供截断后在两次请求间重新写长的完整历史保证，外部修改原生日志后应重新查询。新接口不启动后台采集或持久化存储，也不安装/启停 pueued/envd。
+Pueue 尚未开始的任务返回空页、size=0、version=None，不读可能残留的上次日志；同一 Queued 执行的初始空 cursor 可以在其开始后继续使用，无法确认同次执行的状态转换返回 Conflict。原地重启、可检测的文件替换/截断返回 Conflict，原生任务/日志清理返回 NotFound，非法 cursor/limit 返回 InvalidArgument；SDK 不静默回到开头。文件身份和大小检查无法提供截断后在两次请求间重新写长的完整历史保证，外部修改原生日志后应重新查询。新接口不启动后台采集或持久化存储，也不安装/启停 pueued/envd。
 
 ## 生成与验证
 

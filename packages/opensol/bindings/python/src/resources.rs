@@ -163,12 +163,12 @@ impl PyProcess {
             .map_err(exception)
     }
     #[pyo3(signature = (*, timeout=None))]
-    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyExitStatus> {
+    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyProcessOutcome> {
         let timeout = crate::timeout(timeout)?;
         let process = self.inner.clone();
         let runtime = runtime()?;
         py.detach(move || runtime.block_on(process.wait(timeout)))
-            .map(|inner| PyExitStatus { inner })
+            .map(|inner| PyProcessOutcome { inner })
             .map_err(exception)
     }
     fn pause(&self, py: Python<'_>) -> PyResult<()> {
@@ -302,7 +302,7 @@ impl AsyncProcess {
             process
                 .wait(timeout)
                 .await
-                .map(|inner| PyExitStatus { inner })
+                .map(|inner| PyProcessOutcome { inner })
                 .map_err(exception)
         })
     }

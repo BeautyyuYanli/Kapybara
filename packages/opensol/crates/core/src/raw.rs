@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use std::time::Duration;
 
 use crate::{
-    ConnectionCapabilities, CreateOptions, Error, EventStream, ExecRequest, ExecResult, ExitStatus,
+    ConnectionCapabilities, CreateOptions, Error, EventStream, ExecRequest, ExecResult,
     LifecycleCapabilities, ManagerInfo, OutputCursor, OutputInfo, OutputPage, ProcessCapabilities,
-    ProcessHandle, ProcessInfo, ProcessRef, PtySize, ResourceInfo, ResourceRef, Result, Signal,
-    SpawnRequest,
+    ProcessHandle, ProcessInfo, ProcessOutcome, ProcessRef, PtySize, ResourceInfo, ResourceRef,
+    Result, Signal, SpawnRequest,
 };
 
 /// Native lifecycle; provider-specific connection discovery stays on the backend object.
@@ -50,7 +50,9 @@ pub trait ProcessAccess: Send + Sync {
     }
     async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle>;
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo>;
-    async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>) -> Result<ExitStatus>;
+    /// Return a confirmed terminal outcome, even when the native task has no OS exit status.
+    async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>)
+    -> Result<ProcessOutcome>;
     async fn output(&self, process: &ProcessRef) -> Result<EventStream>;
     async fn output_stat(&self, _process: &ProcessRef) -> Result<OutputInfo> {
         Err(Error::unsupported(self.backend(), "output_stat"))

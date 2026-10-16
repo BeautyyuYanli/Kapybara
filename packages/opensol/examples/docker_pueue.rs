@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(event) = handle.events.next().await {
             match event? {
                 ProcessEvent::Output { data, .. } => std::io::stdout().write_all(&data)?,
-                ProcessEvent::Exit(exit) => eprintln!("exit: {exit:?}"),
+                ProcessEvent::Completed(outcome) => eprintln!("completed: {outcome:?}"),
             }
         }
         Ok::<_, Box<dyn std::error::Error>>(())

@@ -177,7 +177,8 @@ impl AsyncLifecycle {
 
 struct StreamState {
     events: Option<EventStream>,
-    exit: Option<ExitStatus>,
+    // This subscription's completion never becomes authoritative state for the task ID.
+    outcome: Option<ProcessOutcome>,
 }
 
 /// The Python wrapper serializes consumers, while this lock also covers a bridge
@@ -198,7 +199,7 @@ impl From<ProcessHandle> for AsyncProcessHandle {
             process: handle.process,
             state: Arc::new(tokio::sync::Mutex::new(StreamState {
                 events: Some(Box::pin(Abortable::new(handle.events, registration))),
-                exit: None,
+                outcome: None,
             })),
             pending: Arc::new(Mutex::new(None)),
             abort,
@@ -265,8 +266,8 @@ impl AsyncProcessHandle {
             };
             match event {
                 Some(Ok(event)) => {
-                    if let ProcessEvent::Exit(exit) = event {
-                        state.exit = Some(exit);
+                    if let ProcessEvent::Completed(outcome) = &event {
+                        state.outcome = Some(outcome.clone());
                         state.events = None;
                     }
                     // No await separates consuming the stream and reserving delivery.
@@ -280,12 +281,12 @@ impl AsyncProcessHandle {
                 }
                 None => {
                     state.events = None;
-                    if state.exit.is_none() && !closed.load(Ordering::Acquire) {
+                    if state.outcome.is_none() && !closed.load(Ordering::Acquire) {
                         let error = Error::new(
                             ErrorKind::Transport,
                             &backend,
                             "output",
-                            "subscription ended before exit status",
+                            "subscription ended before process completion",
                         );
                         *pending.lock().map_err(|_| delivery_lock_error())? =
                             Some(Err(error.clone()));
@@ -308,21 +309,22 @@ impl AsyncProcessHandle {
         Ok(())
     }
 
-    fn _exit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn _outcome<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
         let backend = self.process.backend.clone();
         future_into_py(py, async move {
             state
                 .lock()
                 .await
-                .exit
-                .map(|inner| PyExitStatus { inner })
+                .outcome
+                .clone()
+                .map(|inner| PyProcessOutcome { inner })
                 .ok_or_else(|| {
                     exception(Error::new(
                         ErrorKind::Transport,
                         &backend,
                         "wait",
-                        "subscription is disconnected; exit status is unknown",
+                        "subscription is disconnected; completion is unknown",
                     ))
                 })
         })
@@ -444,7 +446,7 @@ impl AsyncProcessManager {
             client
                 .wait(&process, timeout)
                 .await
-                .map(|inner| PyExitStatus { inner })
+                .map(|inner| PyProcessOutcome { inner })
                 .map_err(exception)
         })
     }

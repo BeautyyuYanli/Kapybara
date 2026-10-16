@@ -236,7 +236,10 @@ impl ProcessAccess for Backend {
                     channel: OutputChannel::Combined,
                     data: vec![0xff],
                 }),
-                Ok(ProcessEvent::Exit(ExitStatus::code(7))),
+                Ok(ProcessEvent::Completed(ProcessOutcome {
+                    exit: Some(ExitStatus::code(7)),
+                    native_result: None,
+                })),
             ])),
         })
     }
@@ -246,7 +249,11 @@ impl ProcessAccess for Backend {
     async fn status(&self, _process: &ProcessRef) -> Result<ProcessInfo> {
         self.entered("status")
     }
-    async fn wait(&self, _process: &ProcessRef, _timeout: Option<Duration>) -> Result<ExitStatus> {
+    async fn wait(
+        &self,
+        _process: &ProcessRef,
+        _timeout: Option<Duration>,
+    ) -> Result<ProcessOutcome> {
         self.entered("wait")
     }
     async fn output(&self, _process: &ProcessRef) -> Result<EventStream> {
@@ -314,6 +321,18 @@ fn terminal_input_requires_pty_support_without_changing_reference_identity() {
             bound.send_input(b"text".to_vec()).await.unwrap_err().kind,
             ErrorKind::Unsupported
         );
+        assert_eq!(
+            bound.close_stdin().await.unwrap_err().kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            bound
+                .resize(PtySize { cols: 80, rows: 24 })
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
+        );
         assert!(
             adapter.calls.lock().unwrap().is_empty(),
             "unsupported PTY input must not enter the adapter"
@@ -336,6 +355,45 @@ fn terminal_input_requires_pty_support_without_changing_reference_identity() {
 }
 
 #[test]
+fn native_input_restrictions_are_not_inferred_from_mode_or_binary_guarantees() {
+    block_on(async {
+        let adapter = Backend::default();
+        let manager = ProcessManager::new(adapter.clone());
+        assert!(!manager.capabilities().binary_stdin);
+        let process = manager.get(ProcessRef::new("extension", "task", None));
+        // This adapter needs no mode hint and may accept payloads that Pueue cannot express.
+        for data in [b"text".to_vec(), vec![0xff], vec![0]] {
+            assert_eq!(
+                process.send_input(data).await.unwrap_err().kind,
+                ErrorKind::Transport
+            );
+        }
+        assert_eq!(
+            process.close_stdin().await.unwrap_err().kind,
+            ErrorKind::Transport
+        );
+        assert_eq!(
+            process
+                .resize(PtySize { cols: 80, rows: 24 })
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Transport
+        );
+        assert_eq!(
+            *adapter.calls.lock().unwrap(),
+            [
+                "send_input",
+                "send_input",
+                "send_input",
+                "close_stdin",
+                "resize"
+            ]
+        );
+    });
+}
+
+#[test]
 fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscription() {
     block_on(async {
         let adapter = Backend::default();
@@ -346,16 +404,6 @@ fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscripti
             adapter.calls.lock().unwrap().is_empty(),
             "binding cannot perform I/O"
         );
-        for error in [
-            unknown.send_input(vec![]).await.unwrap_err(),
-            unknown.close_stdin().await.unwrap_err(),
-            unknown
-                .resize(PtySize { cols: 80, rows: 24 })
-                .await
-                .unwrap_err(),
-        ] {
-            assert_eq!(error.kind, ErrorKind::Unsupported);
-        }
         let process = manager.get(ProcessRef::new("extension", "task", Some(false)));
         for error in [
             process.pause().await.unwrap_err(),
@@ -366,8 +414,6 @@ fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscripti
             process.output().stat().await.unwrap_err(),
             process.output().read(None, 64).await.unwrap_err(),
             process.signal(Signal::Interrupt).await.unwrap_err(),
-            process.send_input(vec![0xff]).await.unwrap_err(),
-            process.send_input(vec![0]).await.unwrap_err(),
             manager.list().await.unwrap_err(),
         ] {
             assert_eq!(error.kind, ErrorKind::Unsupported);
@@ -427,7 +473,10 @@ fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscripti
         );
         assert_eq!(
             wait_events(handle.events, "extension").await.unwrap(),
-            ExitStatus::code(7)
+            ProcessOutcome {
+                exit: Some(ExitStatus::code(7)),
+                native_result: None,
+            }
         );
         assert_eq!(
             bound.inspect().await.unwrap_err().kind,

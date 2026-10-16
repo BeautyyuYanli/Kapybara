@@ -2,9 +2,10 @@
 //!
 //! Streams preserve byte stdout/stderr/PTY separately. Dropping a stream disconnects, not kills.
 //! Reconnect follows native retention and is not a promise of complete historical output. List/status
-//! only sees processes envd currently lists; use a handle's exit event for completed command results.
-//! Exec tolerates input NotFound only with a valid native Exit. Reconciliation without an Exit is
-//! bounded by the control-request timeout; other input failures remain errors even alongside Exit.
+//! only sees processes envd currently lists; completed outcomes come from the native stream.
+//! Input and terminal controls require a known mode because the RPCs cannot infer it from a PID.
+//! Exec tolerates input NotFound only with a valid native End event. Reconciliation without it is
+//! bounded by the control-request timeout; other input failures remain errors alongside completion.
 
 use std::{pin::Pin, time::Duration};
 
@@ -15,7 +16,8 @@ use futures::{Stream, StreamExt};
 use opensol_core::{
     Connection, ConnectionCapabilities, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
     ExitStatus, ManagerInfo, OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle,
-    ProcessInfo, ProcessManager, ProcessRef, ProcessState, PtySize, Result, Signal, SpawnRequest,
+    ProcessInfo, ProcessManager, ProcessOutcome, ProcessRef, ProcessState, PtySize, Result, Signal,
+    SpawnRequest,
     raw::{ExecAccess, ProcessAccess},
     wait_events,
 };
@@ -323,7 +325,10 @@ impl Envd {
                     }
                     Some(protocol::process_event::Event::End(event)) => {
                         if event.exit_code == 0 && event.error.as_ref().is_some_and(|error| !error.is_empty()) { Err(protocol_error(method))?; }
-                        yield ProcessEvent::Exit(ExitStatus::code(event.exit_code));
+                        yield ProcessEvent::Completed(ProcessOutcome {
+                            exit: Some(ExitStatus::code(event.exit_code)),
+                            native_result: None,
+                        });
                         exited = true;
                         break;
                     }
@@ -389,9 +394,8 @@ impl ProcessAccess for Envd {
                 Ok(ProcessInfo {
                     process: ProcessRef::new("envd", info.pid.to_string(), None),
                     state: ProcessState::Running,
-                    exit: None,
+                    outcome: None,
                     native_state: "listed".into(),
-                    native_result: None,
                 })
             })
             .collect()
@@ -436,9 +440,8 @@ impl ProcessAccess for Envd {
             Ok(ProcessInfo {
                 process: process.clone(),
                 state: ProcessState::Running,
-                exit: None,
+                outcome: None,
                 native_state: "listed".into(),
-                native_result: None,
             })
         } else {
             Err(Error::new(
@@ -450,7 +453,11 @@ impl ProcessAccess for Envd {
         }
     }
 
-    async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>) -> Result<ExitStatus> {
+    async fn wait(
+        &self,
+        process: &ProcessRef,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutcome> {
         deadline(timeout, "envd", "wait", async {
             wait_events(self.output(process).await?, "envd").await
         })
@@ -591,7 +598,9 @@ impl ExecAccess for Envd {
                             channel: OutputChannel::Stderr,
                             data,
                         } => stderr.extend(data),
-                        ProcessEvent::Exit(exit) => {
+                        ProcessEvent::Completed(ProcessOutcome {
+                            exit: Some(exit), ..
+                        }) => {
                             return Ok(ExecResult {
                                 stdout,
                                 stderr,
