@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.10,<2"]
+build-backend = "maturin"
+
+[project]
+name = "opensol"
+version = "0.1.0"
+description = "Composable Rust-backed sandbox lifecycle, command and process clients"
+requires-python = ">=3.12"
+
+[tool.maturin]
+python-source = "python"
+module-name = "opensol._native"
+features = ["extension-module"]

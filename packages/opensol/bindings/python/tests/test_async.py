@@ -1,0 +1,319 @@
+"""Async contracts against real runtimes and the same native protocol fixtures.
+
+The delivery-race test instruments only the Python/Rust awaitable boundary: the
+event and stream still come from the actual native client and ConnectRPC server.
+"""
+
+import asyncio
+import json
+import os
+import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import grpc
+import opensol as sdk
+from opensol import aio
+import test_sdk
+
+
+async def collect(handle):
+    output = []
+    async for event in handle:
+        if event.exit is not None:
+            return output, event.exit
+        output.append((event.channel, event.data))
+    raise AssertionError("stream ended without a native exit")
+
+
+async def cancel_before_delivery(handle):
+    """Cancel after a real Rust result is ready, before its Python await resumes."""
+    native = handle._native
+    observed = []
+    reading = None
+
+    class CancelOnDelivery:
+        def _reserve(self, **kwargs):
+            future = native._reserve(**kwargs)
+
+            def cancel_before_task_resumes(completed):
+                # Added before Task's await callback, at the binding boundary.
+                observed.append(completed.exception() or completed.result())
+                reading.cancel()
+
+            future.add_done_callback(cancel_before_task_resumes)
+            return future
+
+    handle._native = CancelOnDelivery()
+    reading = asyncio.create_task(handle.next_event())
+    try:
+        try:
+            await asyncio.wait_for(reading, 2)
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("delivery-boundary cancellation did not reach the reader")
+    finally:
+        handle._native = native
+    if len(observed) != 1:
+        raise AssertionError("the native result was not observed before cancelling")
+    return observed[0]
+
+
+class AsyncConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_exec_yields_loop_and_preserves_bytes_errors_and_timeout(self):
+        connection = aio.local()
+        future = asyncio.ensure_future(
+            connection.exec(
+                ["python3", "-c", "import sys,time; time.sleep(.15); "
+                 "sys.stdout.buffer.write(sys.stdin.buffer.read()); "
+                 "sys.stderr.buffer.write(b'\\xfferr'); sys.exit(7)"],
+                stdin=b"\x00\xffnative", timeout=3,
+            )
+        )
+        await asyncio.sleep(0.03)
+        self.assertFalse(future.done(), "native exec must let the caller's loop progress")
+        result = await future
+        self.assertIsInstance(result, sdk.ExecResult)
+        self.assertEqual((result.stdout, result.stderr, result.exit_code),
+                         (b"\x00\xffnative", b"\xfferr", 7))
+        self.assertEqual((await connection.shell("printf '%s' async")).stdout, b"async")
+        with self.assertRaises(sdk.NotFoundError) as caught:
+            await connection.exec(["/no-such-opensol-program"])
+        self.assertEqual((caught.exception.backend, caught.exception.operation), ("local", "exec"))
+        with self.assertRaises(sdk.TimeoutError):
+            await connection.exec(["sleep", "2"], timeout=0.02)
+        future = asyncio.ensure_future(connection.exec(["sleep", "2"]))
+        future.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await future
+        self.assertTrue((await connection.exec(["true"])).success)
+
+
+class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
+    stop_daemon = test_sdk.PueueTests.stop_daemon
+
+    def setUp(self):
+        test_sdk.PueueTests.setUp(self)
+        self.manager = aio.pueue(aio.local(), config_file=str(self.config))
+
+    async def running(self, process):
+        for _ in range(100):
+            if (await self.manager.status(process)).state == "running":
+                return
+            await asyncio.sleep(0.03)
+        self.fail("native Pueue task did not start")
+
+    async def test_cancelled_reads_timeouts_and_input_keep_task_and_subscription(self):
+        manager = self.manager
+        self.assertEqual(set(manager.capabilities()["supported_signals"]), {2, 9, 15})
+        handle = await manager.spawn(
+            ["/bin/sh", "-c", "read -r value; printf '%s' \"$value\"; exit 7"], stdin=True,
+        )
+        await self.running(handle.process)
+        reading = asyncio.create_task(handle.next_event())
+        await asyncio.sleep(0.03)
+        reading.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await reading
+        waiting = asyncio.create_task(handle.wait())
+        await asyncio.sleep(0.03)
+        waiting.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiting
+        with self.assertRaises(sdk.TimeoutError):
+            await handle.next_event(timeout=0.02)
+        with self.assertRaises(sdk.TimeoutError):
+            await manager.wait(handle.process, timeout=0.02)
+        self.assertEqual((await manager.status(handle.process)).state, "running")
+        with self.assertRaises(sdk.UnsupportedError):
+            await manager.close_stdin(handle.process)
+        with self.assertRaises(sdk.UnsupportedError):
+            await manager.resize(handle.process, 80, 24)
+        await manager.send_input(handle.process, b"hello '$()\n")
+        output, exit_status = await collect(handle)
+        self.assertTrue(all(channel == "combined" for channel, _ in output))
+        self.assertEqual(b"".join(data for _, data in output), b"hello '$()")
+        self.assertEqual(exit_status.code, 7)
+        self.assertIsNone(await handle.next_event())
+        self.assertEqual((await handle.wait()).code, 7)
+        self.assertEqual((await manager.wait(handle.process, timeout=2)).code, 7)
+        for subscribe in (manager.output, manager.reconnect):
+            replay = await subscribe(sdk.ProcessRef(handle.process.backend, handle.process.id))
+            replay_output, replay_exit = await collect(replay)
+            self.assertEqual(b"".join(data for _, data in replay_output), b"hello '$()")
+            self.assertEqual(replay_exit.code, 7)
+            await replay.aclose()
+
+    async def test_aclose_wakes_reader_without_signalling_and_is_idempotent(self):
+        handle = await self.manager.spawn(["sleep", "10"])
+        await self.running(handle.process)
+        reading = asyncio.create_task(handle.next_event())
+        await asyncio.sleep(0.03)
+        await handle.aclose()
+        self.assertIsNone(await asyncio.wait_for(reading, 2))
+        await handle.aclose()
+        self.assertEqual((await self.manager.status(handle.process)).state, "running")
+        with self.assertRaises(sdk.TransportError):
+            await handle.wait()
+        await self.manager.signal(handle.process, 9)
+        self.assertFalse((await self.manager.wait(handle.process, timeout=3)).success)
+
+
+class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        test_sdk.EnvdBindingTests.setUp(self)
+        self.native = aio.envd(self.endpoint)
+
+    async def test_unexpected_end_is_transport_error_and_never_success(self):
+        handle = await self.native.processes.spawn(["disconnect"])
+        observed = await cancel_before_delivery(handle)
+        self.assertIsInstance(observed, sdk.TransportError)
+        with self.assertRaises(sdk.TransportError):
+            await handle.next_event(timeout=2)
+        with self.assertRaises(sdk.TransportError):
+            await handle.wait()
+        await handle.aclose()
+
+    async def test_binary_stdin_exec_and_pty_capabilities(self):
+        manager = self.native.processes
+        self.assertEqual(set(manager.capabilities()["supported_signals"]), {9, 15})
+        data = b"\x00\xff\x80input"
+        result = await self.native.connection.exec(["stdin-program"], stdin=data, timeout=3)
+        self.assertEqual((result.stdout, result.exit_code), (data, 7))
+        plain = await manager.spawn(["stdin-program"], stdin=True)
+        await manager.send_input(plain.process, data)
+        await manager.close_stdin(plain.process)
+        plain_output, plain_exit = await collect(plain)
+        self.assertEqual(b"".join(data for _, data in plain_output), data)
+        self.assertEqual(plain_exit.code, 7)
+        handle = await manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
+        first = await handle.next_event(timeout=2)
+        self.assertEqual((first.channel, first.data), ("terminal", b"\x00\xffterminal"))
+        await manager.resize(handle.process, 121, 43)
+        with self.assertRaises(sdk.UnsupportedError):
+            await manager.signal(handle.process, 2)
+        await manager.send_input(handle.process, data + b"\x04")
+        output, exit_status = await collect(handle)
+        self.assertEqual(b"".join(data for _, data in output), data + b"\x04")
+        self.assertEqual(exit_status.code, 7)
+        self.assertEqual((await handle.wait()).code, 7)
+
+    async def test_cancel_after_native_consumption_before_python_delivery_retains_event(self):
+        manager = self.native.processes
+        handle = await manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+        observed = await cancel_before_delivery(handle)
+        self.assertEqual(observed.data, b"\x00\xffterminal")
+        event = await handle.next_event(timeout=2)
+        self.assertEqual((event.channel, event.data), ("terminal", b"\x00\xffterminal"))
+        await manager.send_input(handle.process, b"second\x04")
+        output = []
+        while True:
+            observed = await cancel_before_delivery(handle)
+            event = await handle.next_event(timeout=2)
+            if observed.exit is not None:
+                self.assertEqual((observed.exit.code, event.exit.code), (7, 7))
+                break
+            self.assertEqual((event.channel, event.data), (observed.channel, observed.data))
+            output.append(event.data)
+        self.assertEqual(b"".join(output), b"second\x04")
+        self.assertEqual((await handle.wait()).code, 7)
+        self.assertIsNone(await handle.next_event())
+
+
+class AsyncDockerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lifecycle_explicit_delete_and_shared_dto(self):
+        lifecycle = aio.docker(os.environ["OPENSOL_TEST_IMAGE"], command=["sleep", "infinity"])
+        self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
+        resource = await lifecycle.create()
+        self.assertIsInstance(resource, sdk.ResourceRef)
+        try:
+            self.assertEqual((await lifecycle.inspect(resource)).state, "stopped")
+            await lifecycle.start(resource)
+            result = await aio.docker_connection(resource.id).exec(
+                ["python3", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+                stdin=b"\x00\xffdocker", timeout=5,
+            )
+            self.assertEqual(result.stdout, b"\x00\xffdocker")
+            with self.assertRaises(sdk.UnsupportedError):
+                await lifecycle.fork(resource)
+            await lifecycle.stop(resource)
+            self.assertEqual((await lifecycle.inspect(resource)).state, "stopped")
+        finally:
+            await lifecycle.delete(resource)
+        with self.assertRaises(sdk.NotFoundError):
+            await lifecycle.inspect(resource)
+
+
+class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_e2b_lifecycle_and_readonly_envd_discovery(self):
+        records = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def handle_request(self):
+                records.append((self.command, self.path))
+                self.rfile.read(int(self.headers.get("content-length", 0)))
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                value = [{"sandbox": {"sandboxID": "child"}}] if self.path.endswith("/fork") else {
+                    "sandboxID": "parent", "state": "running", "envdAccessToken": "envd-secret",
+                }
+                data = json.dumps(value).encode()
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = do_DELETE = handle_request
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        try:
+            lifecycle = aio.e2b("secret", api_endpoint=endpoint)
+            self.assertTrue(lifecycle.capabilities()["stop_preserves_memory"])
+            resource = await lifecycle.create()
+            self.assertEqual((await lifecycle.inspect(resource)).state, "running")
+            await lifecycle.stop(resource)
+            await lifecycle.start(resource)
+            self.assertEqual((await lifecycle.fork(resource)).id, "child")
+            before = len(records)
+            native = await aio.e2b_envd("secret", resource, api_endpoint=endpoint, envd_endpoint=endpoint)
+            self.assertIsInstance(native.connection, aio.Connection)
+            self.assertIsInstance(native.processes, aio.ProcessManager)
+            self.assertEqual(records[before:], [("GET", "/sandboxes/parent")])
+            await lifecycle.delete(resource)
+        finally:
+            server.shutdown()
+            worker.join(2)
+            server.server_close()
+
+    async def test_network_factories_return_native_awaitables(self):
+        # A real HTTP/2 gRPC server completes each native connection handshake.
+        # Provider RPC payload/TLS contracts are covered by the Rust schema suite.
+        server = grpc.server(ThreadPoolExecutor(max_workers=1))
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        endpoint = f"http://127.0.0.1:{port}"
+        try:
+            sandboxd = await aio.sandboxd(endpoint)
+            lifecycle = await aio.openshell(endpoint, workload_template="base")
+            connection = await aio.openshell_connection(endpoint, "sandbox")
+            self.assertIsInstance(sandboxd, aio.Connection)
+            self.assertIsInstance(lifecycle, aio.Lifecycle)
+            self.assertIsInstance(connection, aio.Connection)
+            self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
+            with self.assertRaises(sdk.UnsupportedError):
+                await lifecycle.fork(sdk.ResourceRef("openshell", "sandbox"))
+            with self.assertRaises(sdk.UnsupportedError):
+                await sandboxd.exec(["unimplemented"])
+        finally:
+            server.stop(0).wait(2)
+
+
+if __name__ == "__main__":
+    unittest.main()
