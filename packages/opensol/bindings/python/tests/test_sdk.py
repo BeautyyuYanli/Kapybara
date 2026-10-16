@@ -153,7 +153,7 @@ class PueueTests(unittest.TestCase):
 
     def running(self, process):
         for _attempt in range(100):
-            if self.manager.status(process).state == "running":
+            if self.manager.get(process).inspect().state == "running":
                 return
             time.sleep(0.03)
         self.fail("native task did not start")
@@ -179,9 +179,9 @@ class PueueTests(unittest.TestCase):
         self.assertEqual((outcome.exit.code, outcome.native_result), (7, "Failed"))
         self.assertEqual(handle.wait().exit.code, 7)
         restored = sdk.ProcessRef(process.backend, process.id)
-        self.assertEqual(self.manager.status(restored).state, "exited")
-        self.assertEqual(self.manager.wait(restored, timeout=2).exit.code, 7)
-        replay, replay_outcome = collect(self.manager.reconnect(restored))
+        self.assertEqual(self.manager.get(restored).inspect().state, "exited")
+        self.assertEqual(self.manager.get(restored).wait(timeout=2).exit.code, 7)
+        replay, replay_outcome = collect(self.manager.get(restored).output.subscribe())
         self.assertEqual(combined_output(replay), b"\x00\xffouterr")
         self.assertEqual(replay_outcome.exit.code, 7)
         capabilities = self.manager.capabilities()
@@ -197,14 +197,14 @@ class PueueTests(unittest.TestCase):
         with self.assertRaises(sdk.TimeoutError):
             handle.next_event(timeout=0.03)
         with self.assertRaises(sdk.TimeoutError):
-            self.manager.wait(handle.process, timeout=0.03)
-        self.assertEqual(self.manager.status(handle.process).state, "running")
+            self.manager.get(handle.process).wait(timeout=0.03)
+        self.assertEqual(self.manager.get(handle.process).inspect().state, "running")
         with self.assertRaises(sdk.UnsupportedError):
-            self.manager.send_input(handle.process, b"\xff")
+            self.manager.get(handle.process).send_input(b"\xff")
         with self.assertRaises(sdk.UnsupportedError):
-            self.manager.send_input(handle.process, b"\x00")
+            self.manager.get(handle.process).send_input(b"\x00")
         with self.assertRaises(sdk.UnsupportedError):
-            self.manager.close_stdin(handle.process)
+            self.manager.get(handle.process).close_stdin()
         with self.assertRaises(sdk.UnsupportedError):
             self.manager.spawn(["true"], pty=(80, 24))
         restored = sdk.ProcessRef("pueue", handle.process.id)
@@ -234,14 +234,14 @@ class PueueTests(unittest.TestCase):
         reader.join(2)
         self.assertFalse(reader.is_alive())
         self.assertEqual(results, [None])
-        self.assertEqual(self.manager.status(handle.process).state, "running")
+        self.assertEqual(self.manager.get(handle.process).inspect().state, "running")
         with self.assertRaises(sdk.TransportError):
             handle.wait()
-        self.manager.signal(handle.process, 9)
-        outcome = self.manager.wait(handle.process, timeout=3)
+        self.manager.get(handle.process).signal(9)
+        outcome = self.manager.get(handle.process).wait(timeout=3)
         self.assertIsNone(outcome.exit)
         self.assertEqual(outcome.native_result, "Killed")
-        self.assertIsNone(self.manager.status(handle.process).outcome.exit)
+        self.assertIsNone(self.manager.get(handle.process).inspect().outcome.exit)
 
 
 class EnvdBindingTests(unittest.TestCase):
@@ -251,8 +251,8 @@ class EnvdBindingTests(unittest.TestCase):
         failures = []
         lock = threading.Lock()
 
-        def event_frame(event):
-            payload = envd_protocol.StartResponse(event=event).SerializeToString()
+        def event_frame(event, response_type):
+            payload = response_type(event=event).SerializeToString()
             return b"\x00" + len(payload).to_bytes(4, "big") + payload
 
         class Handler(BaseHTTPRequestHandler):
@@ -289,19 +289,29 @@ class EnvdBindingTests(unittest.TestCase):
                         ])
                     self.reply(200, "application/proto", response.SerializeToString())
                     return
-                if method == "Start":
+                if method in ("Start", "Connect"):
                     assert self.headers["content-type"] == "application/connect+proto"
                     assert body[0] == 0 and int.from_bytes(body[1:5], "big") == len(body) - 5
-                    message = envd_protocol.StartRequest.FromString(body[5:])
-                    with lock:
-                        pid = 42 + len(processes)
-                        process = {
-                            "pty": message.HasField("pty"),
-                            "input": bytearray(),
-                            "completed": threading.Event(),
-                        }
-                        processes[pid] = process
-                        records.append((method, message))
+                    if method == "Start":
+                        message = envd_protocol.StartRequest.FromString(body[5:])
+                        response_type = envd_protocol.StartResponse
+                        with lock:
+                            pid = 42 + len(processes)
+                            process = {
+                                "pty": message.HasField("pty"),
+                                "input": bytearray(),
+                                "completed": threading.Event(),
+                            }
+                            processes[pid] = process
+                            records.append((method, message))
+                    else:
+                        message = envd_protocol.ConnectRequest.FromString(body[5:])
+                        response_type = envd_protocol.ConnectResponse
+                        assert message.process.WhichOneof("selector") == "pid"
+                        with lock:
+                            pid = message.process.pid
+                            process = processes[pid]
+                            records.append((method, message))
                     self.send_response(200)
                     self.send_header("content-type", "application/connect+proto")
                     self.send_header("connection", "close")
@@ -310,7 +320,7 @@ class EnvdBindingTests(unittest.TestCase):
                         event_frame(
                             envd_protocol.ProcessEvent(
                                 start=envd_protocol.ProcessEvent.StartEvent(pid=pid)
-                            )
+                            ), response_type,
                         )
                     )
                     if process["pty"]:
@@ -320,11 +330,11 @@ class EnvdBindingTests(unittest.TestCase):
                                     data=envd_protocol.ProcessEvent.DataEvent(
                                         pty=b"\x00\xffterminal"
                                     )
-                                )
+                                ), response_type,
                             )
                         )
                     self.wfile.flush()
-                    if message.process.cmd == "disconnect":
+                    if method == "Start" and message.process.cmd == "disconnect":
                         self.close_connection = True
                         return
                     assert process["completed"].wait(5), "fixture process did not finish"
@@ -335,14 +345,14 @@ class EnvdBindingTests(unittest.TestCase):
                         event_frame(
                             envd_protocol.ProcessEvent(
                                 data=envd_protocol.ProcessEvent.DataEvent(**output)
-                            )
+                            ), response_type,
                         )
                         + event_frame(
                             envd_protocol.ProcessEvent(
                                 end=envd_protocol.ProcessEvent.EndEvent(
                                     exit_code=7, exited=True, status="exit status 7"
                                 )
-                            )
+                            ), response_type,
                         )
                         + b"\x02\x00\x00\x00\x02{}"
                     )
@@ -408,13 +418,39 @@ class EnvdBindingTests(unittest.TestCase):
             handle.wait()
         handle.disconnect()
 
+    def test_initial_stream_and_additional_subscription_use_start_and_connect(self):
+        manager = self.native.processes
+        initial = manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+        process = manager.get(initial.process)
+        self.assertEqual(initial.next_event(timeout=2).data, b"\x00\xffterminal")
+        self.assertEqual([method for method, _ in self.records], ["Start"])
+        # Saved references and output bindings remain local even for an unreachable endpoint.
+        restored = sdk.ProcessRef("envd", process.ref.id, pty=True)
+        offline = sdk.envd("http://127.0.0.1:1").processes.get(restored)
+        self.assertIsInstance(offline.output, sdk.ProcessOutput)
+        replay = manager.get(restored).output.subscribe()
+        self.assertEqual((replay.process.id, replay.process.pty), (restored.id, True))
+        self.assertEqual(replay.next_event(timeout=2).data, b"\x00\xffterminal")
+        process.send_input(b"\x00\xffreconnected\x04")
+        original_output, original_outcome = collect(initial)
+        replay_output, replay_outcome = collect(replay)
+        self.assertEqual(original_output, replay_output)
+        self.assertTrue(all(channel == "terminal" for channel, _ in replay_output))
+        self.assertEqual(b"".join(data for _, data in replay_output), b"\x00\xffreconnected\x04")
+        self.assertEqual((original_outcome.exit.code, replay_outcome.exit.code), (7, 7))
+        self.assertEqual(replay.wait().exit.code, 7)
+        connected = [message for method, message in self.records if method == "Connect"]
+        self.assertEqual([message.process.pid for message in connected], [int(restored.id)])
+        initial.disconnect()
+        replay.disconnect()
+
     def test_binary_process_stdin_and_close_stdin(self):
         manager = self.native.processes
         handle = manager.spawn(["stdin-program"], stdin=True)
         self.assertFalse(handle.process.pty)
         data = b"\x00\xff\x80input\n"
-        manager.send_input(handle.process, data)
-        manager.close_stdin(handle.process)
+        manager.get(handle.process).send_input(data)
+        manager.get(handle.process).close_stdin()
         output, outcome = collect(handle)
         self.assertTrue(all(channel == "stdout" for channel, _data in output))
         self.assertEqual(b"".join(data for _channel, data in output), data)
@@ -449,9 +485,9 @@ class EnvdBindingTests(unittest.TestCase):
             with self.assertRaises(sdk.UnsupportedError):
                 operation()
         self.assertEqual(len(self.records), before, "unknown mode must never guess an RPC channel")
-        manager.resize(handle.process, 121, 43)
+        manager.get(handle.process).resize(121, 43)
         data = b"\x00\xff\x80pty\x04"
-        manager.send_input(handle.process, data)
+        manager.get(handle.process).send_input(data)
         output, outcome = collect(handle)
         self.assertTrue(all(channel == "terminal" for channel, _data in output))
         self.assertEqual(b"".join(data for _channel, data in output), data)

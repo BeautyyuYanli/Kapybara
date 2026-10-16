@@ -413,7 +413,7 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
     }
     let missing = ProcessRef::new("envd", "999", Some(false));
     assert_eq!(
-        envd.status(&missing).await.unwrap_err().kind,
+        envd.get(missing.clone()).inspect().await.unwrap_err().kind,
         ErrorKind::NotFound
     );
     let records = fixture.records.lock().unwrap();
@@ -515,28 +515,36 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     assert!(
         matches!(handle.events.next().await.unwrap().unwrap(), ProcessEvent::Output { channel: OutputChannel::Terminal, data } if data == [0xff, 0, b'T'])
     );
-    envd.send_input(&handle.process, vec![0xff, 4])
+    envd.get(handle.process.clone())
+        .send_input(vec![0xff, 4])
         .await
         .unwrap();
-    envd.resize(
-        &handle.process,
-        PtySize {
+    envd.get(handle.process.clone())
+        .resize(PtySize {
             cols: 100,
             rows: 40,
-        },
-    )
-    .await
-    .unwrap();
-    envd.signal(&handle.process, Signal::Kill).await.unwrap();
-    envd.signal(&handle.process, Signal::Terminate)
+        })
+        .await
+        .unwrap();
+    envd.get(handle.process.clone())
+        .signal(Signal::Kill)
+        .await
+        .unwrap();
+    envd.get(handle.process.clone())
+        .signal(Signal::Terminate)
         .await
         .unwrap();
     assert_eq!(
-        envd.close_stdin(&handle.process).await.unwrap_err().kind,
+        envd.get(handle.process.clone())
+            .close_stdin()
+            .await
+            .unwrap_err()
+            .kind,
         ErrorKind::Unsupported
     );
     assert_eq!(
-        envd.signal(&handle.process, Signal::Interrupt)
+        envd.get(handle.process.clone())
+            .signal(Signal::Interrupt)
             .await
             .unwrap_err()
             .kind,
@@ -546,11 +554,12 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     assert!(envd.capabilities().reconnect);
     let process = ProcessRef::new("envd", "42", Some(false));
     assert_eq!(
-        envd.status(&process).await.unwrap().state,
+        envd.get(process.clone()).inspect().await.unwrap().state,
         opensol_core::ProcessState::Running
     );
     assert_eq!(
-        envd.wait(&process, Some(Duration::from_secs(2)))
+        envd.get(process.clone())
+            .wait(Some(Duration::from_secs(2)))
             .await
             .unwrap()
             .exit

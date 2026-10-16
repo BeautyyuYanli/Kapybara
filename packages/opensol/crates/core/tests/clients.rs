@@ -15,6 +15,7 @@ use opensol_core::{
 #[derive(Clone, Default)]
 struct Backend {
     calls: Arc<Mutex<Vec<&'static str>>>,
+    reconnect: bool,
 }
 
 impl Backend {
@@ -224,6 +225,7 @@ impl ProcessAccess for Backend {
             close_stdin: true,
             resize: true,
             supported_signals: &[Signal::Kill],
+            reconnect: self.reconnect,
             ..Default::default()
         }
     }
@@ -297,8 +299,17 @@ impl ProcessAccess for Backend {
     async fn resize(&self, _process: &ProcessRef, _size: PtySize) -> Result<()> {
         self.entered("resize")
     }
-    async fn reconnect(&self, _process: &ProcessRef) -> Result<ProcessHandle> {
-        self.entered("reconnect")
+    async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
+        self.calls.lock().unwrap().push("reconnect");
+        Ok(ProcessHandle {
+            process: process.clone(),
+            events: Box::pin(stream::iter([Ok(ProcessEvent::Completed(
+                ProcessOutcome {
+                    exit: None,
+                    native_result: Some("Killed".into()),
+                },
+            ))])),
+        })
     }
 }
 
@@ -309,14 +320,7 @@ fn terminal_input_requires_pty_support_without_changing_reference_identity() {
         let manager = ProcessManager::new(adapter.clone());
         let terminal = ProcessRef::new("extension", "task", Some(true));
         let bound = manager.get(terminal.clone());
-        assert_eq!(
-            manager
-                .send_input(&terminal, b"text".to_vec())
-                .await
-                .unwrap_err()
-                .kind,
-            ErrorKind::Unsupported
-        );
+        assert_eq!(bound.reference(), &terminal);
         assert_eq!(
             bound.send_input(b"text".to_vec()).await.unwrap_err().kind,
             ErrorKind::Unsupported
@@ -344,7 +348,8 @@ fn terminal_input_requires_pty_support_without_changing_reference_identity() {
         let ordinary = ProcessRef::new("extension", "task", Some(false));
         assert_eq!(
             manager
-                .send_input(&ordinary, b"text".to_vec())
+                .get(ordinary)
+                .send_input(b"text".to_vec())
                 .await
                 .unwrap_err()
                 .kind,
@@ -394,7 +399,7 @@ fn native_input_restrictions_are_not_inferred_from_mode_or_binary_guarantees() {
 }
 
 #[test]
-fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscription() {
+fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription() {
     block_on(async {
         let adapter = Backend::default();
         let manager = ProcessManager::new(adapter.clone());
@@ -419,7 +424,7 @@ fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscripti
             assert_eq!(error.kind, ErrorKind::Unsupported);
         }
         assert!(
-            matches!(manager.reconnect(&reference).await, Err(error) if error.kind == ErrorKind::Unsupported)
+            matches!(process.output().subscribe().await, Err(error) if error.kind == ErrorKind::Unsupported)
         );
         for limit in [0, MAX_OUTPUT_LIMIT + 1] {
             assert_eq!(
@@ -447,6 +452,9 @@ fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscripti
         assert_eq!(
             wrong.signal(Signal::Kill).await.unwrap_err().kind,
             ErrorKind::InvalidArgument
+        );
+        assert!(
+            matches!(wrong.output().subscribe().await, Err(error) if error.kind == ErrorKind::InvalidArgument)
         );
         let mut request = SpawnRequest::new(Command::shell("true"));
         request.pty = Some(PtySize { cols: 0, rows: 24 });
@@ -494,5 +502,30 @@ fn managed_and_bound_operations_share_validation_and_keep_the_initial_subscripti
             *adapter.calls.lock().unwrap(),
             ["spawn", "status", "send_input", "signal"]
         );
+    });
+}
+
+#[test]
+fn additional_subscriptions_use_native_reconnect_and_preserve_identity() {
+    block_on(async {
+        let adapter = Backend {
+            reconnect: true,
+            ..Default::default()
+        };
+        let manager = ProcessManager::new(adapter.clone());
+        let reference = ProcessRef::new("extension", "task", None);
+        let output = manager.get(reference.clone()).output();
+        drop(manager);
+        assert!(adapter.calls.lock().unwrap().is_empty());
+        let handle = output.subscribe().await.unwrap();
+        assert_eq!(handle.process, reference);
+        assert_eq!(
+            wait_events(handle.events, "extension").await.unwrap(),
+            ProcessOutcome {
+                exit: None,
+                native_result: Some("Killed".into()),
+            }
+        );
+        assert_eq!(*adapter.calls.lock().unwrap(), ["reconnect"]);
     });
 }

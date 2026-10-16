@@ -85,7 +85,7 @@ class ProcessHandle(AsyncIterator[ProcessEvent]):
 
 
 class ProcessManager:
-    """Native process operations; the application owns daemon configuration."""
+    """Find and spawn native tasks; use ``get`` to bind a Process for task operations."""
 
     def __init__(self, native: _native.AsyncProcessManager) -> None:
         self._native = native
@@ -119,30 +119,6 @@ class ProcessManager:
         return ProcessHandle(
             await self._native.spawn(argv, cwd=cwd, env=env, stdin=stdin, pty=pty)
         )
-
-    def status(self, process: ProcessRef) -> Awaitable[ProcessInfo]:
-        return self._native.status(process)
-
-    def wait(self, process: ProcessRef, *, timeout: float | None = None) -> Awaitable[ProcessOutcome]:
-        return self._native.wait(process, timeout=timeout)
-
-    async def output(self, process: ProcessRef) -> ProcessHandle:
-        return ProcessHandle(await self._native.output(process))
-
-    async def reconnect(self, process: ProcessRef) -> ProcessHandle:
-        return ProcessHandle(await self._native.reconnect(process))
-
-    def send_input(self, process: ProcessRef, data: bytes) -> Awaitable[None]:
-        return self._native.send_input(process, data)
-
-    def close_stdin(self, process: ProcessRef) -> Awaitable[None]:
-        return self._native.close_stdin(process)
-
-    def signal(self, process: ProcessRef, signal: int) -> Awaitable[None]:
-        return self._native.signal(process, signal)
-
-    def resize(self, process: ProcessRef, cols: int, rows: int) -> Awaitable[None]:
-        return self._native.resize(process, cols, rows)
 
 
 class Process:
@@ -194,7 +170,7 @@ class Process:
 
 
 class ProcessOutput:
-    """Independent bounded reads and subscriptions to one retained native task log."""
+    """Bound output access; subscriptions and bounded log reads have independent positions."""
 
     def __init__(self, native: _native.AsyncProcessOutput) -> None:
         self._native = native
@@ -206,6 +182,7 @@ class ProcessOutput:
         return self._native.read(cursor=cursor, limit=limit)
 
     async def subscribe(self) -> ProcessHandle:
+        """Open an independent native subscription; requires reconnect capability."""
         return ProcessHandle(await self._native.subscribe())
 
 

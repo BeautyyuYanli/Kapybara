@@ -59,7 +59,8 @@ async fn invalid_text_and_nul_are_unsupported_before_connection_io() {
     }
     assert_eq!(connection.0.load(Ordering::SeqCst), 0);
     let error = manager
-        .send_input(&ProcessRef::new("pueue", "1", None), b"valid text".to_vec())
+        .get(ProcessRef::new("pueue", "1", None))
+        .send_input(b"valid text".to_vec())
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Transport);

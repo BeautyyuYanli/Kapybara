@@ -619,7 +619,8 @@ impl Signal {
     }
 }
 
-/// Managed-process client. Output retention and state remain native to the adapter.
+/// Finds and creates native tasks; use `get` to bind a `Process` for task operations.
+/// Output retention and state remain native to the adapter.
 #[derive(Clone)]
 pub struct ProcessManager {
     access: Arc<dyn raw::ProcessAccess>,
@@ -648,6 +649,7 @@ impl ProcessManager {
         self.require(self.capabilities().list, "list")?;
         self.access.list().await
     }
+    /// Returns the native initial output subscription; binding a Process does not consume it.
     pub async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
         request.validate(self.backend())?;
         let capabilities = self.capabilities();
@@ -655,11 +657,11 @@ impl ProcessManager {
         self.require(request.pty.is_none() || capabilities.pty, "spawn")?;
         self.access.spawn(request).await
     }
-    pub async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
+    async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
         process.validate(self.backend(), "status")?;
         self.access.status(process).await
     }
-    pub async fn wait(
+    async fn wait(
         &self,
         process: &ProcessRef,
         timeout: Option<Duration>,
@@ -668,17 +670,13 @@ impl ProcessManager {
         validate_timeout(timeout, self.backend(), "wait")?;
         self.access.wait(process, timeout).await
     }
-    pub async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
-        process.validate(self.backend(), "output")?;
-        self.access.output(process).await
-    }
-    pub async fn output_stat(&self, process: &ProcessRef) -> Result<OutputInfo> {
+    async fn output_stat(&self, process: &ProcessRef) -> Result<OutputInfo> {
         process.validate(self.backend(), "output_stat")?;
         self.require(self.capabilities().output_resource, "output_stat")?;
         self.access.output_stat(process).await
     }
     /// Reads are bounded; cursor encoding, versions and retention are checked by the adapter.
-    pub async fn read_output(
+    async fn read_output(
         &self,
         process: &ProcessRef,
         cursor: Option<&OutputCursor>,
@@ -689,52 +687,46 @@ impl ProcessManager {
         self.require(self.capabilities().output_resource, "read_output")?;
         self.access.read_output(process, cursor, limit).await
     }
-    pub async fn pause(&self, process: &ProcessRef) -> Result<()> {
+    async fn pause(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "pause")?;
         self.require(self.capabilities().pause, "pause")?;
         self.access.pause(process).await
     }
-    /// Native start/resume; some managers force queued tasks past queue limits.
-    pub async fn start(&self, process: &ProcessRef) -> Result<()> {
+    async fn start(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "start")?;
         self.require(self.capabilities().start, "start")?;
         self.access.start(process).await
     }
-    /// Restarts the same task identity, replacing the previous execution and its logs.
-    pub async fn restart(&self, process: &ProcessRef) -> Result<()> {
+    async fn restart(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "restart")?;
         self.require(self.capabilities().restart, "restart")?;
         self.access.restart(process).await
     }
-    /// Acceptance does not imply that the process has exited.
-    pub async fn kill(&self, process: &ProcessRef) -> Result<()> {
+    async fn kill(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "kill")?;
         self.require(self.capabilities().kill, "kill")?;
         self.access.kill(process).await
     }
-    /// Removes retained task/logs, never implicitly killing a running task.
-    pub async fn remove(&self, process: &ProcessRef) -> Result<()> {
+    async fn remove(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "remove")?;
         self.require(self.capabilities().remove, "remove")?;
         self.access.remove(process).await
     }
-    /// Native mode requirements and payload restrictions are checked by the adapter.
-    /// An explicit terminal hint still requires the manager's declared PTY support.
-    pub async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
+    async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
         process.validate(self.backend(), "send_input")?;
         let capabilities = self.capabilities();
         self.require(capabilities.stdin, "send_input")?;
         self.require(process.pty != Some(true) || capabilities.pty, "send_input")?;
         self.access.send_input(process, data).await
     }
-    pub async fn close_stdin(&self, process: &ProcessRef) -> Result<()> {
+    async fn close_stdin(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "close_stdin")?;
         let capabilities = self.capabilities();
         self.require(capabilities.close_stdin, "close_stdin")?;
         self.require(process.pty != Some(true) || capabilities.pty, "close_stdin")?;
         self.access.close_stdin(process).await
     }
-    pub async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
+    async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
         process.validate(self.backend(), "signal")?;
         self.require(
             self.capabilities().supported_signals.contains(&signal),
@@ -742,7 +734,7 @@ impl ProcessManager {
         )?;
         self.access.signal(process, signal).await
     }
-    pub async fn resize(&self, process: &ProcessRef, size: PtySize) -> Result<()> {
+    async fn resize(&self, process: &ProcessRef, size: PtySize) -> Result<()> {
         process.validate(self.backend(), "resize")?;
         size.validate(self.backend(), "resize")?;
         let capabilities = self.capabilities();
@@ -750,7 +742,7 @@ impl ProcessManager {
         self.require(process.pty != Some(true) || capabilities.pty, "resize")?;
         self.access.resize(process, size).await
     }
-    pub async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
+    async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
         process.validate(self.backend(), "reconnect")?;
         self.require(self.capabilities().reconnect, "reconnect")?;
         self.access.reconnect(process).await
@@ -791,27 +783,34 @@ impl Process {
     pub async fn inspect(&self) -> Result<ProcessInfo> {
         self.manager.status(&self.reference).await
     }
+    /// Queries native task completion independently of any output subscription's cached outcome.
     pub async fn wait(&self, timeout: Option<Duration>) -> Result<ProcessOutcome> {
         self.manager.wait(&self.reference, timeout).await
     }
     pub async fn pause(&self) -> Result<()> {
         self.manager.pause(&self.reference).await
     }
+    /// Native start/resume; some managers force queued tasks past queue limits.
     pub async fn start(&self) -> Result<()> {
         self.manager.start(&self.reference).await
     }
+    /// Restarts the same task identity, replacing the previous execution and its logs.
     pub async fn restart(&self) -> Result<()> {
         self.manager.restart(&self.reference).await
     }
+    /// Acceptance does not imply that the process has exited.
     pub async fn kill(&self) -> Result<()> {
         self.manager.kill(&self.reference).await
     }
+    /// Removes retained task/logs, never implicitly killing a running task.
     pub async fn remove(&self) -> Result<()> {
         self.manager.remove(&self.reference).await
     }
     pub async fn signal(&self, signal: Signal) -> Result<()> {
         self.manager.signal(&self.reference, signal).await
     }
+    /// Native mode requirements and payload restrictions are checked by the adapter.
+    /// An explicit terminal hint still requires the manager's declared PTY support.
     pub async fn send_input(&self, data: Vec<u8>) -> Result<()> {
         self.manager.send_input(&self.reference, data).await
     }
@@ -823,7 +822,7 @@ impl Process {
     }
 }
 
-/// Independent access to the manager's native log; subscribing does not advance read cursors.
+/// Bound output access; subscribing does not advance read cursors or require retained logs.
 #[derive(Clone)]
 pub struct ProcessOutput {
     process: Process,
@@ -836,6 +835,7 @@ impl ProcessOutput {
             .output_stat(&self.process.reference)
             .await
     }
+    /// Reads are bounded; cursor versions and retention are checked by the adapter.
     /// Default page size is `DEFAULT_OUTPUT_LIMIT`; callers choose an explicit limit in Rust.
     pub async fn read(&self, cursor: Option<&OutputCursor>, limit: usize) -> Result<OutputPage> {
         self.process
@@ -843,11 +843,12 @@ impl ProcessOutput {
             .read_output(&self.process.reference, cursor, limit)
             .await
     }
+    /// Opens an independent subscription through native reconnect, requiring that capability.
     pub async fn subscribe(&self) -> Result<ProcessHandle> {
-        Ok(ProcessHandle {
-            process: self.process.reference.clone(),
-            events: self.process.manager.output(&self.process.reference).await?,
-        })
+        self.process
+            .manager
+            .reconnect(&self.process.reference)
+            .await
     }
 }
 

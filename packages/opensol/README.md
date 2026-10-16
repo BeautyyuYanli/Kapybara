@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | `Lifecycle` | `create/inspect/start/stop/delete/fork` | 后端名与不透明资源 ID |
 | `Connection` | `exec`，等待短命令完成 | 字节 stdout/stderr、退出状态 |
-| `ProcessManager` | 原生任务创建、查询、控制、输出资源及订阅 | 后端原生进程 ID 与轻量 `Process` 资源 |
+| `ProcessManager` | 原生任务发现与创建；绑定 `Process` 资源 | 后端原生进程 ID 与含初始订阅的 `ProcessHandle` |
 
 例如：
 
@@ -209,7 +209,15 @@ asyncio.run(main())
 
 ## 进程与输出资源
 
-`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。spawn 保留初始输出订阅，尤其不能丢弃 envd Start 的输出再尝试重连。
+公共 ProcessManager 只负责构造、后端信息、capabilities、probe、list、spawn、get。单任务操作先 `manager.get(ref)`，再使用绑定资源：
+
+| 对象 | 公共入口 |
+| --- | --- |
+| `Process` | 引用与 output、inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize |
+| `ProcessOutput` | stat、read、subscribe |
+| `ProcessHandle` | 一次输出订阅及其 ProcessRef；Rust 使用 events / wait_events，Python 使用 next_event / wait / disconnect 或 aclose |
+
+`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。spawn 返回带初始输出订阅的 ProcessHandle，尤其保留 envd Start 的原始流。绑定 Process 不消费该订阅。
 
 ```python
 manager = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml",
@@ -225,7 +233,9 @@ next_page = process.output.read(cursor=sdk.OutputCursor(saved_cursor))
 print(process.inspect().state, next_page.at_end)
 ```
 
-`process.output.stat/read` 是绑定资源入口；Rust 公共 manager 的 `output_stat/read_output` 经过相同校验，再委托 raw 适配器契约。Python 只暴露绑定资源的日志查询。`output.subscribe()` 建立独立 handle，消费订阅不推进 cursor。
+`process.output.stat/read` 查询绑定任务的原生日志；`process.output.subscribe()` 是建立额外订阅的唯一公共入口，检查 reconnect 能力并调用原生重连，返回独立 ProcessHandle。订阅不要求 output_resource 能力，消费订阅不推进 cursor。共享引用校验与能力检查保留在 Rust 内部；适配器的 raw::ProcessAccess 引用接口保持独立。
+
+`process.wait()` 查询原生任务的完成状态；Python `handle.wait()` 消费并缓存该次订阅的完成结果。任务重启后，旧订阅缓存仍属于原来的执行。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
 
 输出页保留原始 bytes 和 channel，Pueue 只有 Combined。默认 64 KiB，允许 1 字节至 1 MiB；读取立即返回当前观测范围，不等待后续输出或终结。`at_end` 只表示读到该次观测的尾部，进程是否终结单独 inspect。`OutputInfo.version` 是后端可提供的不透明输出代次标识，None 只表示没有可报告的标识，任务状态由 ProcessInfo 表达。cursor 绑定目标、任务、执行和文件版本，不含凭据或可指定的文件路径；只把它作为不透明字符串保存。在同一版本从同一位置可重读，新增字节是否进入这一页取决于该次观测的大小。
 

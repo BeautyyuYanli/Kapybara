@@ -340,16 +340,31 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
     assert_eq!(outcome.exit.unwrap().code, Some(7));
     assert_eq!(outcome.native_result.as_deref(), Some("Failed"));
     assert_eq!(
-        manager.status(&process).await.unwrap().outcome,
+        manager
+            .get(process.clone())
+            .inspect()
+            .await
+            .unwrap()
+            .outcome,
         Some(outcome.clone())
     );
-    let (again, replay_outcome) = collect(manager.reconnect(&process).await.unwrap().events).await;
+    let (again, replay_outcome) = collect(
+        manager
+            .get(process.clone())
+            .output()
+            .subscribe()
+            .await
+            .unwrap()
+            .events,
+    )
+    .await;
     assert_eq!(combined_output(&again), b"\x00\xffout\nerr\n");
     assert_eq!(replay_outcome, outcome);
     let missing = ProcessRef::new("pueue", "999999999", Some(false));
     assert_eq!(
         manager
-            .wait(&missing, Some(Duration::from_secs(2)))
+            .get(missing.clone())
+            .wait(Some(Duration::from_secs(2)))
             .await
             .unwrap_err()
             .kind,
@@ -365,7 +380,7 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
 async fn await_state(manager: &ProcessManager, process: &ProcessRef, state: ProcessState) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if manager.status(process).await.unwrap().state == state {
+            if manager.get(process.clone()).inspect().await.unwrap().state == state {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -401,7 +416,8 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
         .await
         .unwrap();
     manager
-        .wait(&handle.process, Some(Duration::from_secs(5)))
+        .get(handle.process.clone())
+        .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
     let connection = LocalTarget::default();
@@ -418,7 +434,12 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     .unwrap();
     // Allow fixed CLI/metadata overhead, orders of magnitude below the real 8 MiB native log.
     const METADATA_BUDGET: usize = 65_536;
-    let info = recorded.output_stat(&handle.process).await.unwrap();
+    let info = recorded
+        .get(handle.process.clone())
+        .output()
+        .stat()
+        .await
+        .unwrap();
     assert_eq!(info.size, 8 * 1024 * 1024);
     assert!(
         connection.take_received() <= METADATA_BUDGET,
@@ -426,7 +447,9 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     );
     let limit = 31;
     let first = recorded
-        .read_output(&handle.process, None, limit)
+        .get(handle.process.clone())
+        .output()
+        .read(None, limit)
         .await
         .unwrap();
     assert!(
@@ -437,7 +460,9 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     assert!(!first.at_end);
     let advance = METADATA_BUDGET * 2 + 1;
     let prepared = recorded
-        .read_output(&handle.process, Some(&first.next_cursor), advance)
+        .get(handle.process.clone())
+        .output()
+        .read(Some(&first.next_cursor), advance)
         .await
         .unwrap();
     assert_eq!(page_bytes(&prepared).len(), advance);
@@ -447,7 +472,9 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     // would exceed the entire metadata allowance on the small resumed read.
     let _ = connection.take_received();
     let second = recorded
-        .read_output(&handle.process, Some(&prepared.next_cursor), limit)
+        .get(handle.process.clone())
+        .output()
+        .read(Some(&prepared.next_cursor), limit)
         .await
         .unwrap();
     assert!(
@@ -481,7 +508,8 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
         .await
         .unwrap();
     manager
-        .wait(&handle.process, Some(Duration::from_secs(5)))
+        .get(handle.process.clone())
+        .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
     let config = PueueConfig {
@@ -507,7 +535,9 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
     );
     assert_eq!(
         missing_tool
-            .read_output(&handle.process, None, 32)
+            .get(handle.process.clone())
+            .output()
+            .read(None, 32)
             .await
             .unwrap_err()
             .kind,
@@ -578,7 +608,9 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
     for error in [
         denied_logs.probe().await.unwrap_err(),
         denied_logs
-            .read_output(&handle.process, None, 32)
+            .get(handle.process.clone())
+            .output()
+            .read(None, 32)
             .await
             .unwrap_err(),
     ] {
@@ -789,7 +821,15 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
         .unwrap();
     await_state(&manager, &handle.process, ProcessState::Running).await;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while manager.output_stat(&handle.process).await.unwrap().size == 0 {
+        while manager
+            .get(handle.process.clone())
+            .output()
+            .stat()
+            .await
+            .unwrap()
+            .size
+            == 0
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -890,7 +930,7 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
         String::from_utf8(child.stdout).unwrap().trim(),
         Some(false),
     );
-    manager.remove(&child).await.unwrap();
+    manager.get(child.clone()).remove().await.unwrap();
     process.remove().await.unwrap();
     assert!(manager.list().await.unwrap().is_empty());
     assert_eq!(
@@ -927,14 +967,15 @@ async fn real_pueue_native_spawn_failure_has_a_result_name_without_a_fabricated_
     command.cwd = Some(cwd.path().to_string_lossy().into_owned());
     let handle = manager.spawn(SpawnRequest::new(command)).await.unwrap();
     drop(cwd); // Native Pueue can no longer spawn in the original, valid-at-add cwd.
-    manager.start(&handle.process).await.unwrap();
+    manager.get(handle.process.clone()).start().await.unwrap();
     await_state(&manager, &handle.process, ProcessState::Exited).await;
-    let info = manager.status(&handle.process).await.unwrap();
+    let info = manager.get(handle.process.clone()).inspect().await.unwrap();
     let outcome = info.outcome.unwrap();
     assert_eq!(outcome.native_result.as_deref(), Some("FailedToSpawn"));
     assert!(outcome.exit.is_none());
     let waited = manager
-        .wait(&handle.process, Some(Duration::from_secs(5)))
+        .get(handle.process.clone())
+        .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
     assert_eq!(waited, outcome);
@@ -984,11 +1025,19 @@ async fn real_ssh_pueue_log_resources_use_the_injected_execution_target() {
         .await
         .unwrap();
     manager
-        .wait(&handle.process, Some(Duration::from_secs(5)))
+        .get(handle.process.clone())
+        .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
     assert_eq!(
-        page_bytes(&manager.read_output(&handle.process, None, 3).await.unwrap()),
+        page_bytes(
+            &manager
+                .get(handle.process.clone())
+                .output()
+                .read(None, 3)
+                .await
+                .unwrap()
+        ),
         b"\x00\xffS"
     );
 }
@@ -1030,7 +1079,12 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     request.stdin = true;
     let handle = manager.spawn(request).await.unwrap();
     for _attempt in 0..100 {
-        if manager.status(&handle.process).await.unwrap().state
+        if manager
+            .get(handle.process.clone())
+            .inspect()
+            .await
+            .unwrap()
+            .state
             == opensol_core::ProcessState::Running
         {
             break;
@@ -1039,7 +1093,8 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     }
     let restored = ProcessRef::new("pueue", &handle.process.id, None);
     manager
-        .send_input(&restored, b"hello ' $()\n".to_vec())
+        .get(restored.clone())
+        .send_input(b"hello ' $()\n".to_vec())
         .await
         .unwrap();
     let (output, outcome) = collect(handle.events).await;
@@ -1051,14 +1106,20 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
         .unwrap();
     assert_eq!(
         manager
-            .wait(&handle.process, Some(Duration::from_millis(50)))
+            .get(handle.process.clone())
+            .wait(Some(Duration::from_millis(50)))
             .await
             .unwrap_err()
             .kind,
         ErrorKind::Timeout
     );
     for _attempt in 0..150 {
-        if manager.status(&handle.process).await.unwrap().state
+        if manager
+            .get(handle.process.clone())
+            .inspect()
+            .await
+            .unwrap()
+            .state
             == opensol_core::ProcessState::Running
         {
             break;
@@ -1066,26 +1127,51 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        manager.status(&handle.process).await.unwrap().state,
+        manager
+            .get(handle.process.clone())
+            .inspect()
+            .await
+            .unwrap()
+            .state,
         opensol_core::ProcessState::Running
     );
-    manager.signal(&handle.process, Signal::Kill).await.unwrap();
+    manager
+        .get(handle.process.clone())
+        .signal(Signal::Kill)
+        .await
+        .unwrap();
     let outcome = manager
-        .wait(&handle.process, Some(Duration::from_secs(5)))
+        .get(handle.process.clone())
+        .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
     assert_eq!(outcome.native_result.as_deref(), Some("Killed"));
     assert!(outcome.exit.is_none());
     assert_eq!(
-        manager.status(&handle.process).await.unwrap().outcome,
+        manager
+            .get(handle.process.clone())
+            .inspect()
+            .await
+            .unwrap()
+            .outcome,
         Some(outcome.clone())
     );
-    let (output, completed) = collect(manager.output(&handle.process).await.unwrap()).await;
+    let (output, completed) = collect(
+        manager
+            .get(handle.process.clone())
+            .output()
+            .subscribe()
+            .await
+            .unwrap()
+            .events,
+    )
+    .await;
     assert!(output.is_empty());
     assert_eq!(completed, outcome);
     assert_eq!(
         manager
-            .send_input(&handle.process, vec![0xff])
+            .get(handle.process.clone())
+            .send_input(vec![0xff])
             .await
             .unwrap_err()
             .kind,
@@ -1141,7 +1227,7 @@ async fn real_docker_lifecycle_exec_and_in_container_pueue() {
         let handle = manager.spawn(SpawnRequest::new(Command::new("printf", ["%s", "Docker + Pueue '$()"]))).await?;
         let (output, outcome) = collect(handle.events).await;
         assert_eq!(combined_output(&output), b"Docker + Pueue '$()"); assert!(outcome.exit.unwrap().success());
-        assert_eq!(page_bytes(&manager.read_output(&handle.process, None, 8).await?), b"Docker +");
+        assert_eq!(page_bytes(&manager.get(handle.process.clone()).output().read(None, 8).await?), b"Docker +");
         assert_eq!(lifecycle.fork(&resource).await.unwrap_err().kind, ErrorKind::Unsupported);
         lifecycle.stop(&resource).await?; assert_eq!(lifecycle.inspect(&resource).await?.state, ResourceState::Stopped);
         lifecycle.start(&resource).await?; assert_eq!(lifecycle.inspect(&resource).await?.state, ResourceState::Running);

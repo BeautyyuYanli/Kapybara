@@ -19,7 +19,7 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 
 - `Lifecycle`：`create/inspect/start/stop/delete/fork`。`ResourceRef(backend, id)` 可由调用方保存并重建，不包含凭据。
 - `Connection`：`exec(argv, cwd=..., env=..., stdin=b"", timeout=...)`、显式 `.shell(script)`。返回 `ExecResult`，不返回后台任务 ID。
-- `ProcessManager`：`probe/list/get/spawn` 及引用控制入口。`get(ProcessRef(backend, id, pty=None))` 返回轻量 Process 资源，不访问管理器。
+- `ProcessManager`：除构造、backend 和 capabilities 外，只提供 `probe/list/get/spawn`。`get(ProcessRef(backend, id, pty=None))` 本地绑定轻量 Process 资源，单任务操作经由该资源执行；存在性与权限由后续 I/O 检查。
 
 每层都提供 `.backend` 和 `.capabilities()`，查询不做 I/O。能力字典除布尔项外，`ProcessCapabilities.supported_signals` 是信号编号列表；`LifecycleCapabilities.stop_preserves_memory` 表达 stop 是否保留进程内存，E2B 为 true，Docker、Kubernetes 与 OpenShell 为 false。工厂不需要全局注册：
 
@@ -69,9 +69,9 @@ async def read_pages(config_file, pueue_directory):
 
 Process 提供 inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize。这些都委托原生管理器，资源不缓存状态；handle 的 outcome 缓存仅属于原来的那次订阅。Pueue start 可强制启动 Queued/Stashed 并绕过队列限制和依赖；restart 仅用于终结任务，原地保留 ID、覆盖上次日志。remove 尊重原生状态/依赖，不暗中 kill；kill 回执不等于已经终结，仍需 inspect/wait。envd 只有原生 kill，pause/start/restart/remove 返回 Unsupported。
 
-`ProcessManager.wait()`、`Process.wait()` 和 `ProcessHandle.wait()` 返回共享的 `ProcessOutcome`，表示已确认终结的任务，至少有 exit 或 native_result 一项可用。`outcome.exit` 是 `ExitStatus | None`，`outcome.native_result` 是脱敏的原生结果名称。Pueue Success/Failed 保留真实退出码，Killed、FailedToSpawn 等可以没有退出码；任务终态通过正常值返回。`ProcessInfo.outcome` 统一表达终态，非终态为 None；envd 通过原生完成事件提供含真实 ExitStatus 的 outcome。`Connection.exec()` 的 ExecResult 和 ExitStatus 保持原有含义。
+`Process.wait()` 和 `ProcessHandle.wait()` 返回共享的 `ProcessOutcome`，表示已确认终结的任务，至少有 exit 或 native_result 一项可用。`outcome.exit` 是 `ExitStatus | None`，`outcome.native_result` 是脱敏的原生结果名称。Pueue Success/Failed 保留真实退出码，Killed、FailedToSpawn 等可以没有退出码；任务终态通过正常值返回。`ProcessInfo.outcome` 统一表达终态，非终态为 None；envd 通过原生完成事件提供含真实 ExitStatus 的 outcome。`Connection.exec()` 的 ExecResult 和 ExitStatus 保持原有含义。
 
-`process.output.stat()` 返回 channels、size、version；version 是后端可提供的不透明输出代次标识，None 只表示没有可报告的标识，任务状态由 ProcessInfo 表达。`read(cursor=None, limit=65536)` 返回 chunks、next_cursor、at_end。chunks.data 是 bytes，总量最多 limit（允许 1 至 1048576）；Pueue 只有 combined。读取立即返回当前观测的日志范围，at_end 仅为暂时读到尾部，不能代表任务结束。订阅入口是 `process.output.subscribe()`，返回原有 ProcessHandle；读取和订阅互不推进对方的位置。Rust 的公共 manager 与绑定资源委托相同 raw 契约，Python 只提供这组绑定资源查询入口。
+`process.output.stat()` 返回 channels、size、version；version 是后端可提供的不透明输出代次标识，None 只表示没有可报告的标识，任务状态由 ProcessInfo 表达。`read(cursor=None, limit=65536)` 返回 chunks、next_cursor、at_end。chunks.data 是 bytes，总量最多 limit（允许 1 至 1048576）；Pueue 只有 combined。读取立即返回当前观测的日志范围，at_end 仅为暂时读到尾部，不能代表任务结束。额外订阅只通过 `process.output.subscribe()` 建立，要求 reconnect 能力并调用原生重连，返回独立 ProcessHandle；读取和订阅互不推进对方的位置。订阅不要求 output_resource 能力，Rust/Python 均只公开这组绑定资源的输出入口。
 
 Pueue 需显式传 pueue_directory，指向注入 Connection 目标上的 daemon 数据目录，且与 config/profile 对应；要求 Linux 和 GNU stat/dd。Local、SSH、Docker 都经过同一 Connection 在目标侧读取一个已打开的原生日志，并按限定字节取得数据；不把远端路径当成本机路径。probe 和调用时检查依赖/权限，capabilities.output_resource 只表示已配置访问，不缓存探测结果。未配置及 envd 的 stat/read 返回 Unsupported。CLI 只能提供非结构化失败时保留脱敏 Backend；Connection 已确定的结构化错误种类不被改写。
 
@@ -138,7 +138,7 @@ envd 的两种公共视图独立使用。`backend.envd(resource)` 只读发现�
 
 `ProcessHandle.next_event(timeout=...)` 返回一条字节输出或完成事件；订阅结束后返回 None。正常输出事件 `.channel` 为 stdout/stderr/terminal/combined，`.data` 为 bytes，`.outcome` 为 None；完成事件 `.outcome` 是 ProcessOutcome，channel 为 None、data 为空 bytes。缺少完成证据的意外断流报告 TransportError。Pueue 在读取可用日志后交付完成事件；权限、传输、协议和日志读取失败仍返回 SDK 异常。
 
-`.next_event()` 的等待超时只中止本次等待，保留订阅，可以继续读取。`.wait()` 消费并丢弃剩余输出，返回并缓存这次订阅的 ProcessOutcome；需要日志时先逐条读取。同一任务 ID 重启后，已有 handle 的完成缓存仍属于原来的执行，Process.wait 则查询原生管理器。`.disconnect()` 释放订阅、唤醒正在等待的读取线程，但不杀死进程。可保存 `.process`，再用 `ProcessManager.reconnect()` 按原生能力重新订阅。每个 handle 的事件读取串行化；并发消费应在应用层扇出。
+`spawn()` 直接返回带初始输出订阅的 ProcessHandle，保留 envd Start 的原始流；`manager.get(handle.process)` 只绑定任务，不消费订阅。`.next_event()` 的等待超时只中止本次等待，保留订阅，可以继续读取。`.wait()` 消费并丢弃剩余输出，返回并缓存这次订阅的 ProcessOutcome；需要日志时先逐条读取。同一任务 ID 重启后，已有 handle 的完成缓存仍属于原来的执行，Process.wait 则查询原生管理器。`.disconnect()` 释放订阅、唤醒正在等待的读取线程，但不杀死进程。可保存 `.process`，再用 `manager.get(saved_ref).output.subscribe()` 按原生能力重新订阅。每个 handle 的事件读取串行化；并发消费应在应用层扇出。
 
 异步 handle 使用 `await handle.next_event(timeout=...)`、`await handle.wait()` 和 `await handle.aclose()`，并支持 `async for`。`next_event` 的 timeout 从该读取获得消费权后开始；排在其他读取后面的时间不计入其中。取消读取、取消 wait 或等待超时不会关闭订阅；Rust 已消费但 Python 尚未收到的事件仍保留，下次读取保持顺序。每个 handle 至多保留一条待交付事件，不预取或后台分发。`aclose` 可重复调用并唤醒阻塞读取；它不发信号，不删除环境。
 
@@ -156,12 +156,12 @@ async def watch(config_file):
                 print(event.channel, event.data)
     finally:
         await handle.aclose()
-    # 若需主动终止仍在运行的任务：await manager.signal(handle.process, 15)
+    # 若需主动终止仍在运行的任务：await manager.get(handle.process).signal(15)
 ```
 
 取消 exec、create、spawn 等 awaitable 仅取消客户端等待，原生清理能力由后端决定；这不证明远端未执行或已经停止。SDK 不自动重试结果不确定的副作用操作。需要终止请显式 signal，需要销毁请显式 delete；丢弃客户端或订阅不会自动删除环境。
 
-`ProcessManager.wait(process, timeout=...)` 或 `process.wait(timeout=...)` 同样不代表超时后终止进程。明确停止请用 `process.kill()` 或支持的 signal；删除环境请显式 `Lifecycle.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
+`process.wait(timeout=...)` 超时不代表进程已终止。明确停止请用 `process.kill()` 或支持的 signal；删除环境请显式 `Lifecycle.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
 
 Pueue 订阅完成后才返回合并日志，并要求 CLI 与 daemon 在同一执行环境、`client.read_local_logs: true`；独立资源查询可读取运行中的原生日志。它不支持 PTY 或关闭 stdin；输入限 UTF-8 且无 NUL，在 Connection I/O 前按 UnsupportedError 拒绝不符合的载荷。`binary_stdin=true` 保证任意 bytes，false 表示具体限制由适配器判断。envd 原样传递 bytes，可以实时输出和 PTY，但不承诺完整历史或 daemon 重启恢复。详见[能力矩阵](../../README.md#第三层的独立能力)。
 
