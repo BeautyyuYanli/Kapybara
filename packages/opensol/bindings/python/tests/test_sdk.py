@@ -423,6 +423,18 @@ class EnvdBindingTests(unittest.TestCase):
         event = handle.next_event(timeout=2)
         self.assertEqual(event.channel, "terminal")
         self.assertEqual(event.data, b"\x00\xffterminal")
+        listed = manager.list()[0].process
+        self.assertEqual(listed.id, handle.process.id)
+        self.assertIsNone(listed.pty)
+        self.assertIsNone(sdk.ProcessRef("envd", listed.id).pty)
+        unknown = manager.get(listed)
+        self.assertEqual(unknown.inspect().state, "running")
+        before = len(self.records)
+        for operation in (lambda: unknown.resize(80, 24),
+                          lambda: unknown.send_input(b"input"), unknown.close_stdin):
+            with self.assertRaises(sdk.UnsupportedError):
+                operation()
+        self.assertEqual(len(self.records), before, "unknown mode must never guess an RPC channel")
         manager.resize(handle.process, 121, 43)
         data = b"\x00\xff\x80pty\x04"
         manager.send_input(handle.process, data)
@@ -444,16 +456,18 @@ class EnvdBindingTests(unittest.TestCase):
 class DockerTests(unittest.TestCase):
     def test_lifecycle_explicit_cleanup_and_binary_exec(self):
         image = os.environ["OPENSOL_TEST_IMAGE"]
-        creator = sdk.docker(image, command=["sleep", "infinity"])
+        backend = sdk.docker(image, command=["sleep", "infinity"])
+        creator = backend.lifecycle
         resource = creator.create()
-        admin = sdk.docker(image)
+        admin = sdk.docker(image).lifecycle
         try:
             self.assertEqual(creator.inspect(resource).state, "stopped")
+            connection = backend.connection(resource)
+            self.assertEqual(creator.inspect(resource).state, "stopped", "binding must not start resources")
             creator.start(resource)
-            del creator
+            del creator, backend
             gc.collect()
             self.assertEqual(admin.inspect(resource).state, "running")
-            connection = sdk.docker_connection(resource.id)
             result = connection.exec(
                 [
                     "python3",
@@ -465,6 +479,7 @@ class DockerTests(unittest.TestCase):
             )
             self.assertEqual(result.stdout, b"\x00\xffDocker")
             self.assertEqual(result.exit_code, 7)
+            self.assertTrue(sdk.docker_connection(resource.id).exec(["true"]).success)
             with self.assertRaises(sdk.UnsupportedError):
                 admin.fork(resource)
             admin.stop(resource)
@@ -518,7 +533,8 @@ class LifecycleBindingTests(unittest.TestCase):
         worker.start()
         endpoint = f"http://127.0.0.1:{server.server_port}"
         try:
-            lifecycle = sdk.e2b("api-secret", api_endpoint=endpoint)
+            backend = sdk.e2b("api-secret", api_endpoint=endpoint, envd_endpoint=endpoint)
+            lifecycle = backend.lifecycle
             resource = lifecycle.create(name="label", labels={"owner": "test"})
             self.assertIsInstance(resource, sdk.ResourceRef)
             self.assertEqual((resource.backend, resource.id), ("e2b", "parent"))
@@ -526,9 +542,10 @@ class LifecycleBindingTests(unittest.TestCase):
             lifecycle.stop(resource)
             lifecycle.start(resource)
             self.assertEqual(lifecycle.fork(resource).id, "child")
-            native = sdk.e2b_envd(
-                "api-secret", resource, api_endpoint=endpoint, envd_endpoint=endpoint
-            )
+            before = len(records)
+            native = backend.envd(resource)
+            self.assertEqual([(method, path) for method, path, *_ in records[before:]],
+                             [("GET", "/sandboxes/parent")])
             self.assertIsInstance(native, sdk.Envd)
             self.assertIsInstance(native.connection, sdk.Connection)
             self.assertIsInstance(native.processes, sdk.ProcessManager)

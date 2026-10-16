@@ -223,8 +223,8 @@ struct PyProcessRef {
 #[pymethods]
 impl PyProcessRef {
     #[new]
-    #[pyo3(signature = (backend, id, pty=false))]
-    fn new(backend: String, id: String, pty: bool) -> Self {
+    #[pyo3(signature = (backend, id, pty=None))]
+    fn new(backend: String, id: String, pty: Option<bool>) -> Self {
         Self {
             inner: ProcessRef::new(&backend, id, pty),
         }
@@ -238,13 +238,19 @@ impl PyProcessRef {
         &self.inner.id
     }
     #[getter]
-    fn pty(&self) -> bool {
+    fn pty(&self) -> Option<bool> {
         self.inner.pty
     }
     fn __repr__(&self) -> String {
         format!(
             "ProcessRef({:?}, {:?}, pty={})",
-            self.inner.backend, self.inner.id, self.inner.pty
+            self.inner.backend,
+            self.inner.id,
+            match self.inner.pty {
+                Some(true) => "True",
+                Some(false) => "False",
+                None => "None",
+            }
         )
     }
 }
@@ -378,7 +384,7 @@ impl PyProcessInfo {
 #[pyclass(name = "Connection", frozen)]
 #[derive(Clone)]
 struct PyConnection {
-    inner: Arc<dyn Connection>,
+    inner: Connection,
 }
 
 #[pymethods]
@@ -430,7 +436,7 @@ impl PyConnection {
 /// Closing/dropping this wrapper never deletes native environments.
 #[pyclass(name = "Lifecycle", frozen)]
 struct PyLifecycle {
-    inner: Arc<dyn Lifecycle>,
+    inner: Lifecycle,
 }
 
 #[pymethods]
@@ -704,7 +710,7 @@ impl PyProcessHandle {
 #[pyclass(name = "ProcessManager", frozen)]
 #[derive(Clone)]
 struct PyProcessManager {
-    inner: Arc<dyn ProcessManager>,
+    inner: ProcessManager,
 }
 
 #[pymethods]
@@ -719,7 +725,7 @@ impl PyProcessManager {
 
     fn get(&self, process: PyRef<'_, PyProcessRef>) -> resources::PyProcess {
         resources::PyProcess {
-            inner: opensol_core::Process::new(self.inner.clone(), process.inner.clone()),
+            inner: self.inner.get(process.inner.clone()),
         }
     }
 
@@ -874,10 +880,10 @@ impl PyProcessManager {
     }
 }
 
-/// One concrete envd client implementing two independent traits.
+/// One native envd context exposing two independent public clients.
 #[pyclass(name = "Envd", frozen)]
 struct PyEnvd {
-    inner: Arc<Envd>,
+    inner: Envd,
 }
 
 #[pymethods]
@@ -885,21 +891,104 @@ impl PyEnvd {
     #[getter]
     fn connection(&self) -> PyConnection {
         PyConnection {
-            inner: self.inner.clone(),
+            inner: self.inner.connection(),
         }
     }
     #[getter]
     fn processes(&self) -> PyProcessManager {
         PyProcessManager {
-            inner: self.inner.clone(),
+            inner: self.inner.processes(),
         }
+    }
+}
+
+/// Provider context retained for lifecycle operations and local connection binding.
+#[pyclass(name = "Docker", frozen)]
+struct PyDocker {
+    inner: DockerLifecycle,
+}
+
+#[pymethods]
+impl PyDocker {
+    #[getter]
+    fn lifecycle(&self) -> PyLifecycle {
+        PyLifecycle {
+            inner: self.inner.lifecycle(),
+        }
+    }
+    fn connection(&self, resource: PyRef<'_, PyResourceRef>) -> PyResult<PyConnection> {
+        self.inner
+            .connection(&resource.inner)
+            .map(|inner| PyConnection { inner })
+            .map_err(exception)
+    }
+}
+
+/// E2B configuration and credentials are reused for read-only envd discovery.
+#[pyclass(name = "E2b", frozen)]
+struct PyE2b {
+    inner: E2bLifecycle,
+}
+
+#[pymethods]
+impl PyE2b {
+    #[getter]
+    fn lifecycle(&self) -> PyLifecycle {
+        PyLifecycle {
+            inner: self.inner.lifecycle(),
+        }
+    }
+    fn envd(&self, py: Python<'_>, resource: PyRef<'_, PyResourceRef>) -> PyResult<PyEnvd> {
+        let client = self.inner.clone();
+        let resource = resource.inner.clone();
+        let runtime = runtime()?;
+        py.detach(move || runtime.block_on(client.envd(&resource)))
+            .map(|inner| PyEnvd { inner })
+            .map_err(exception)
+    }
+    fn _aio_envd<'py>(
+        &self,
+        py: Python<'py>,
+        resource: PyRef<'_, PyResourceRef>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let resource = resource.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .envd(&resource)
+                .await
+                .map(|inner| PyEnvd { inner })
+                .map_err(exception)
+        })
+    }
+}
+
+/// Keeps the established gateway channel, credentials and workspace for child connections.
+#[pyclass(name = "OpenShell", frozen)]
+struct PyOpenShell {
+    inner: OpenShellLifecycle,
+}
+
+#[pymethods]
+impl PyOpenShell {
+    #[getter]
+    fn lifecycle(&self) -> PyLifecycle {
+        PyLifecycle {
+            inner: self.inner.lifecycle(),
+        }
+    }
+    fn connection(&self, resource: PyRef<'_, PyResourceRef>) -> PyResult<PyConnection> {
+        self.inner
+            .connection(&resource.inner)
+            .map(|inner| PyConnection { inner })
+            .map_err(exception)
     }
 }
 
 #[pyfunction]
 fn local() -> PyConnection {
     PyConnection {
-        inner: Arc::new(Local),
+        inner: Connection::new(Local),
     }
 }
 
@@ -919,7 +1008,7 @@ fn ssh(
     config.program = program.into();
     Ssh::new(config)
         .map(|inner| PyConnection {
-            inner: Arc::new(inner),
+            inner: Connection::new(inner),
         })
         .map_err(exception)
 }
@@ -944,7 +1033,7 @@ fn pueue(
     };
     Pueue::new(connection.inner.clone(), config)
         .map(|inner| PyProcessManager {
-            inner: Arc::new(inner),
+            inner: ProcessManager::new(inner),
         })
         .map_err(exception)
 }
@@ -964,9 +1053,7 @@ fn envd(
     config.sandbox_id = sandbox_id;
     config.request_timeout = timeout(Some(request_timeout))?.expect("positive timeout");
     Envd::new(config)
-        .map(|inner| PyEnvd {
-            inner: Arc::new(inner),
-        })
+        .map(|inner| PyEnvd { inner })
         .map_err(exception)
 }
 
@@ -978,7 +1065,7 @@ fn docker(
     env: Option<BTreeMap<String, String>>,
     working_dir: Option<String>,
     host_config_json: Option<String>,
-) -> PyResult<PyLifecycle> {
+) -> PyResult<PyDocker> {
     let host_config = host_config_json
         .map(|value| serde_json::from_str(&value))
         .transpose()
@@ -997,9 +1084,7 @@ fn docker(
         host_config,
     };
     DockerLifecycle::connect_defaults(config)
-        .map(|inner| PyLifecycle {
-            inner: Arc::new(inner),
-        })
+        .map(|inner| PyDocker { inner })
         .map_err(exception)
 }
 
@@ -1007,13 +1092,17 @@ fn docker(
 fn docker_connection(container: String) -> PyResult<PyConnection> {
     DockerConnection::connect_defaults(container)
         .map(|inner| PyConnection {
-            inner: Arc::new(inner),
+            inner: Connection::new(inner),
         })
         .map_err(exception)
 }
 
 #[pyfunction]
-#[pyo3(signature = (api_key, template="base", *, api_endpoint="https://api.e2b.app", sandbox_timeout=300, auto_pause=false, env=None, metadata=None))]
+#[pyo3(signature = (api_key, template="base", *, api_endpoint="https://api.e2b.app", sandbox_timeout=300, auto_pause=false, env=None, metadata=None, envd_endpoint=None, sandbox_domain="e2b.app", request_timeout=30.0))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "typed keyword-only E2B configuration"
+)]
 fn e2b(
     api_key: String,
     template: &str,
@@ -1022,39 +1111,21 @@ fn e2b(
     auto_pause: bool,
     env: Option<BTreeMap<String, String>>,
     metadata: Option<BTreeMap<String, String>>,
-) -> PyResult<PyLifecycle> {
+    envd_endpoint: Option<String>,
+    sandbox_domain: &str,
+    request_timeout: f64,
+) -> PyResult<PyE2b> {
     let mut config = E2bConfig::new(Secret::new(api_key), template);
     config.api_endpoint = api_endpoint.into();
     config.sandbox_timeout = sandbox_timeout;
     config.auto_pause = auto_pause;
     config.env = env.unwrap_or_default();
     config.metadata = metadata.unwrap_or_default();
-    E2bLifecycle::new(config)
-        .map(|inner| PyLifecycle {
-            inner: Arc::new(inner),
-        })
-        .map_err(exception)
-}
-
-#[pyfunction]
-#[pyo3(signature = (api_key, resource, *, api_endpoint="https://api.e2b.app", envd_endpoint=None))]
-fn e2b_envd(
-    py: Python<'_>,
-    api_key: String,
-    resource: PyRef<'_, PyResourceRef>,
-    api_endpoint: &str,
-    envd_endpoint: Option<String>,
-) -> PyResult<PyEnvd> {
-    let mut config = E2bConfig::new(Secret::new(api_key), "base");
-    config.api_endpoint = api_endpoint.into();
     config.envd_endpoint = envd_endpoint;
-    let client = E2bLifecycle::new(config).map_err(exception)?;
-    let resource = resource.inner.clone();
-    let runtime = runtime()?;
-    py.detach(move || runtime.block_on(client.envd(&resource)))
-        .map(|inner| PyEnvd {
-            inner: Arc::new(inner),
-        })
+    config.sandbox_domain = sandbox_domain.into();
+    config.request_timeout = timeout(Some(request_timeout))?.expect("positive timeout");
+    E2bLifecycle::new(config)
+        .map(|inner| PyE2b { inner })
         .map_err(exception)
 }
 
@@ -1092,7 +1163,7 @@ fn agent_sandbox(
     }
     AgentSandboxLifecycle::new(config)
         .map(|inner| PyLifecycle {
-            inner: Arc::new(inner),
+            inner: Lifecycle::new(inner),
         })
         .map_err(exception)
 }
@@ -1141,7 +1212,7 @@ fn sandboxd(
     let runtime = runtime()?;
     py.detach(move || runtime.block_on(Sandboxd::connect(config)))
         .map(|inner| PyConnection {
-            inner: Arc::new(inner),
+            inner: Connection::new(inner),
         })
         .map_err(exception)
 }
@@ -1162,7 +1233,7 @@ fn openshell(
     ca_certificate: Option<String>,
     client_certificate: Option<String>,
     client_key: Option<String>,
-) -> PyResult<PyLifecycle> {
+) -> PyResult<PyOpenShell> {
     let spec = spec_protobuf
         .map(openshell_protocol::v1::SandboxSpec::decode)
         .transpose()
@@ -1187,9 +1258,7 @@ fn openshell(
     )?;
     let runtime = runtime()?;
     py.detach(move || runtime.block_on(OpenShellLifecycle::connect(config, workspace, create)))
-        .map(|inner| PyLifecycle {
-            inner: Arc::new(inner),
-        })
+        .map(|inner| PyOpenShell { inner })
         .map_err(exception)
 }
 
@@ -1220,7 +1289,7 @@ fn openshell_connection(
     let runtime = runtime()?;
     py.detach(move || runtime.block_on(OpenShellConnection::connect(config, workspace, sandbox)))
         .map(|inner| PyConnection {
-            inner: Arc::new(inner),
+            inner: Connection::new(inner),
         })
         .map_err(exception)
 }
@@ -1241,6 +1310,9 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyProcessHandle>()?;
     module.add_class::<PyProcessEvent>()?;
     module.add_class::<PyEnvd>()?;
+    module.add_class::<PyDocker>()?;
+    module.add_class::<PyE2b>()?;
+    module.add_class::<PyOpenShell>()?;
     module.add_function(wrap_pyfunction!(local, module)?)?;
     module.add_function(wrap_pyfunction!(ssh, module)?)?;
     module.add_function(wrap_pyfunction!(docker, module)?)?;
@@ -1248,7 +1320,6 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(pueue, module)?)?;
     module.add_function(wrap_pyfunction!(envd, module)?)?;
     module.add_function(wrap_pyfunction!(e2b, module)?)?;
-    module.add_function(wrap_pyfunction!(e2b_envd, module)?)?;
     module.add_function(wrap_pyfunction!(agent_sandbox, module)?)?;
     module.add_function(wrap_pyfunction!(sandboxd, module)?)?;
     module.add_function(wrap_pyfunction!(openshell, module)?)?;

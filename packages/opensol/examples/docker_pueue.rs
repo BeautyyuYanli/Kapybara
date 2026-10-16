@@ -1,7 +1,7 @@
 //! The caller supplies an image with Pueue v4 and chooses pueued as the container's main command.
 //! Pueue's client must use local logs. Cleanup is explicit on both the success and error paths.
 
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{io::Write, time::Duration};
 
 use futures::StreamExt;
 use opensol_adapters::{
@@ -9,21 +9,21 @@ use opensol_adapters::{
     pueue::{Pueue, PueueConfig},
 };
 use opensol_core::{
-    Command, Connection, CreateOptions, ExecRequest, Lifecycle, ProcessEvent, ProcessManager,
-    SpawnRequest,
+    Command, CreateOptions, ExecRequest, ProcessEvent, ProcessManager, SpawnRequest,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let lifecycle = DockerLifecycle::connect_defaults(DockerConfig {
+    let backend = DockerLifecycle::connect_defaults(DockerConfig {
         image: std::env::var("PUEUE_IMAGE")?,
         command: vec!["pueued".into()],
         ..Default::default()
     })?;
+    let lifecycle = backend.lifecycle();
     let resource = lifecycle.create(CreateOptions::default()).await?;
     let execution = async {
         lifecycle.start(&resource).await?;
-        let connection = Arc::new(lifecycle.connection(&resource)?);
+        let connection = backend.connection(&resource)?;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let result = connection
@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .await??;
-        let manager = Pueue::new(connection, PueueConfig::default())?;
+        let manager = ProcessManager::new(Pueue::new(connection, PueueConfig::default())?);
         let mut handle = manager
             .spawn(SpawnRequest::new(Command::new(
                 "printf",

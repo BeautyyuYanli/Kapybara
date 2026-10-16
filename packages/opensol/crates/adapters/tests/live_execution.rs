@@ -25,19 +25,19 @@ use opensol_adapters::{
     ssh::{Ssh, SshConfig},
 };
 use opensol_core::{
-    Command, Connection, CreateOptions, ErrorKind, ExecRequest, Lifecycle, OutputChannel,
-    OutputCursor, Process, ProcessEvent, ProcessManager, ProcessRef, ProcessState, PtySize,
-    ResourceState, Signal, SpawnRequest,
+    Command, Connection, CreateOptions, ErrorKind, ExecRequest, OutputChannel, OutputCursor,
+    Process, ProcessEvent, ProcessManager, ProcessRef, ProcessState, PtySize, ResourceState,
+    Signal, SpawnRequest, raw::ExecAccess,
 };
 use tempfile::TempDir;
 
 /// Real Local execution with controlled target identity/environment. Counting all
 /// response bytes catches collect-then-slice without inspecting private scripts or cursors.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LocalTarget {
     prefix: Vec<String>,
     env: BTreeMap<String, String>,
-    received: Mutex<usize>,
+    received: Arc<Mutex<usize>>,
 }
 
 impl LocalTarget {
@@ -47,12 +47,12 @@ impl LocalTarget {
 }
 
 #[async_trait]
-impl Connection for LocalTarget {
+impl ExecAccess for LocalTarget {
     fn backend(&self) -> &'static str {
-        Local.backend()
+        Connection::new(Local).backend()
     }
     fn capabilities(&self) -> opensol_core::ConnectionCapabilities {
-        Local.capabilities()
+        Connection::new(Local).capabilities()
     }
     async fn exec(
         &self,
@@ -64,7 +64,7 @@ impl Connection for LocalTarget {
             argv.extend(request.command.argv);
             request.command.argv = argv;
         }
-        let result = Local.exec(request).await?;
+        let result = Connection::new(Local).exec(request).await?;
         *self.received.lock().unwrap() += result.stdout.len() + result.stderr.len();
         Ok(result)
     }
@@ -140,7 +140,7 @@ async fn local_preserves_bytes_argv_environment_cwd_and_nonzero_exit() {
     command.cwd = Some(directory.path().to_string_lossy().into());
     command.env.insert("SDK_TEST".into(), "'$()\n你好".into());
     let input = [0, 0xff, b'\n', 0x80].repeat(40_000);
-    let result = Local
+    let result = Connection::new(Local)
         .exec(ExecRequest {
             command,
             stdin: input.clone(),
@@ -158,7 +158,7 @@ async fn local_timeout_cancels_the_process_group_and_classifies_missing_program(
     let directory = TempDir::new().unwrap();
     let marker = directory.path().join("child-survived");
     let script = format!("(sleep 0.4; touch '{}') & wait", marker.display());
-    let result = Local
+    let result = Connection::new(Local)
         .exec(ExecRequest {
             command: Command::shell(script),
             stdin: Vec::new(),
@@ -170,7 +170,7 @@ async fn local_timeout_cancels_the_process_group_and_classifies_missing_program(
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!marker.exists());
     assert_eq!(
-        Local
+        Connection::new(Local)
             .exec(ExecRequest::new(Command::new(
                 "/no-such-sdk-program",
                 Vec::<String>::new()
@@ -180,7 +180,7 @@ async fn local_timeout_cancels_the_process_group_and_classifies_missing_program(
             .kind,
         ErrorKind::NotFound
     );
-    let result = Local
+    let result = Connection::new(Local)
         .exec(ExecRequest::new(Command::shell("kill -TERM $$")))
         .await
         .unwrap();
@@ -199,7 +199,7 @@ fn keygen(path: &Path) {
     );
 }
 
-async fn ssh_fixture() -> (Daemon, Ssh, PathBuf) {
+async fn ssh_fixture() -> (Daemon, Connection, PathBuf) {
     let directory = TempDir::new().unwrap();
     let host = directory.path().join("host");
     let identity = directory.path().join("identity");
@@ -219,7 +219,7 @@ async fn ssh_fixture() -> (Daemon, Ssh, PathBuf) {
     config.port = Some(port);
     config.identity_file = Some(identity);
     config.config_file = Some(client_config);
-    let ssh = Ssh::new(config).unwrap();
+    let ssh = Connection::new(Ssh::new(config).unwrap());
     let mut command = NativeCommand::new("/usr/sbin/sshd");
     command.args(["-D", "-e", "-f"]).arg(&server_config);
     let daemon = start_daemon(command, directory);
@@ -288,7 +288,7 @@ async fn real_ssh_preserves_executable_arguments_input_and_host_verification() {
     );
 }
 
-async fn pueue_fixture() -> (Daemon, Pueue) {
+async fn pueue_fixture() -> (Daemon, ProcessManager) {
     let directory = TempDir::with_prefix("opensol pueue ' $() ").unwrap();
     let path = directory.path().join("pueue.yml");
     std::fs::write(&path, format!("shared:\n  pueue_directory: {}\n  runtime_directory: {}\nclient:\n  read_local_logs: true\n", directory.path().display(), directory.path().display())).unwrap();
@@ -297,12 +297,14 @@ async fn pueue_fixture() -> (Daemon, Pueue) {
         pueue_directory: Some(directory.path().to_string_lossy().into()),
         ..Default::default()
     };
-    let manager = Pueue::new(Arc::new(Local), config).unwrap();
+    let manager = Pueue::new(Connection::new(Local), config)
+        .map(ProcessManager::new)
+        .unwrap();
     let mut command = NativeCommand::new("pueued");
     command.arg("--config").arg(&path);
     let daemon = start_daemon(command, directory);
     for _attempt in 0..100 {
-        let ready = Local
+        let ready = Connection::new(Local)
             .exec(ExecRequest::new(Command::new(
                 "pueue",
                 ["--config", path.to_str().unwrap(), "status", "--json"],
@@ -343,7 +345,7 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
     let (again, exit) = collect(manager.reconnect(&process).await.unwrap().events).await;
     assert_eq!(combined_output(&again), b"\x00\xffout\nerr\n");
     assert_eq!(exit.code, Some(7));
-    let missing = ProcessRef::new("pueue", "999999999", false);
+    let missing = ProcessRef::new("pueue", "999999999", Some(false));
     assert_eq!(
         manager
             .wait(&missing, Some(Duration::from_secs(2)))
@@ -359,7 +361,7 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
     );
 }
 
-async fn await_state(manager: &Pueue, process: &ProcessRef, state: ProcessState) {
+async fn await_state(manager: &ProcessManager, process: &ProcessRef, state: ProcessState) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if manager.status(process).await.unwrap().state == state {
@@ -401,16 +403,17 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
         .wait(&handle.process, Some(Duration::from_secs(5)))
         .await
         .unwrap();
-    let connection = Arc::new(LocalTarget::default());
+    let connection = LocalTarget::default();
     let directory = daemon._directory.path();
     let recorded = Pueue::new(
-        connection.clone(),
+        Connection::new(connection.clone()),
         PueueConfig {
             config_file: Some(directory.join("pueue.yml").to_string_lossy().into()),
             pueue_directory: Some(directory.to_string_lossy().into()),
             ..Default::default()
         },
     )
+    .map(ProcessManager::new)
     .unwrap();
     // Allow fixed CLI/metadata overhead, orders of magnitude below the real 8 MiB native log.
     const METADATA_BUDGET: usize = 65_536;
@@ -490,11 +493,13 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
     for tool in ["sh", "uname", "stat"] {
         std::os::unix::fs::symlink(format!("/usr/bin/{tool}"), tools.path().join(tool)).unwrap();
     }
-    let restricted_path = Arc::new(LocalTarget {
+    let restricted_path = LocalTarget {
         env: BTreeMap::from([("PATH".into(), tools.path().to_string_lossy().into())]),
         ..Default::default()
-    });
-    let missing_tool = Pueue::new(restricted_path, config.clone()).unwrap();
+    };
+    let missing_tool = Pueue::new(Connection::new(restricted_path), config.clone())
+        .map(ProcessManager::new)
+        .unwrap();
     assert_eq!(
         missing_tool.probe().await.unwrap_err().kind,
         ErrorKind::Unsupported
@@ -532,7 +537,7 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
     ] {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
-    let unprivileged = Arc::new(LocalTarget {
+    let unprivileged = LocalTarget {
         prefix: [
             "/usr/bin/setpriv",
             "--reuid",
@@ -545,27 +550,30 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
         .map(Into::into)
         .to_vec(),
         ..Default::default()
-    });
-    let uid = unprivileged
+    };
+    let uid = Connection::new(unprivileged.clone())
         .exec(ExecRequest::new(Command::new("id", ["-u"])))
         .await
         .unwrap();
     assert!(uid.exit.success());
     assert_eq!(uid.stdout, b"65534\n");
     let accessible = Pueue::new(
-        unprivileged.clone(),
+        Connection::new(unprivileged.clone()),
         PueueConfig {
             pueue_directory: None,
             ..config.clone()
         },
     )
+    .map(ProcessManager::new)
     .unwrap();
     accessible
         .probe()
         .await
         .expect("the unprivileged client must really reach the native daemon");
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o711)).unwrap();
-    let denied_logs = Pueue::new(unprivileged, config.clone()).unwrap();
+    let denied_logs = Pueue::new(Connection::new(unprivileged), config.clone())
+        .map(ProcessManager::new)
+        .unwrap();
     for error in [
         denied_logs.probe().await.unwrap_err(),
         denied_logs
@@ -587,12 +595,13 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
         (non_executable, ErrorKind::Permission),
     ] {
         let manager = Pueue::new(
-            Arc::new(Local),
+            Connection::new(Local),
             PueueConfig {
                 program: path.clone(),
                 ..config.clone()
             },
         )
+        .map(ProcessManager::new)
         .unwrap();
         let error = manager.probe().await.unwrap_err();
         assert_eq!(error.kind, kind);
@@ -644,7 +653,6 @@ async fn real_pueue_resource_reads_running_binary_pages_and_detects_log_loss() {
     assert!(manager.capabilities().output_resource);
     let handle = manager.spawn(SpawnRequest::new(Command::new("python3", ["-c", "import sys; sys.stdin.readline(); sys.stdout.buffer.write(b'\\x00\\xffA'*3000); sys.stdout.buffer.flush(); sys.stdin.readline(); sys.stdout.buffer.write(b'\\x80tail'); sys.exit(7)"]))).await.unwrap();
     await_state(&manager, &handle.process, ProcessState::Running).await;
-    let manager = Arc::new(manager);
     let process = Process::new(manager.clone(), handle.process.clone());
     drop(handle);
     assert!(
@@ -771,7 +779,6 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
     })
     .await
     .unwrap();
-    let manager: Arc<dyn ProcessManager> = Arc::new(manager);
     let process = manager.get(handle.process.clone());
     let old = process.output().read(None, 64).await.unwrap();
     assert_eq!(page_bytes(&old), b"ready");
@@ -869,7 +876,7 @@ async fn real_pueue_controls_use_native_task_states_and_restart_replaces_executi
     let child = ProcessRef::new(
         "pueue",
         String::from_utf8(child.stdout).unwrap().trim(),
-        false,
+        Some(false),
     );
     manager.remove(&child).await.unwrap();
     process.remove().await.unwrap();
@@ -934,7 +941,7 @@ async fn real_ssh_pueue_log_resources_use_the_injected_execution_target() {
         .unwrap();
     assert!(program.status.success());
     let manager = Pueue::new(
-        Arc::new(ssh),
+        ssh,
         PueueConfig {
             program: String::from_utf8(program.stdout).unwrap().trim().into(),
             config_file: Some(directory.join("pueue.yml").to_string_lossy().into()),
@@ -942,6 +949,7 @@ async fn real_ssh_pueue_log_resources_use_the_injected_execution_target() {
             ..Default::default()
         },
     )
+    .map(ProcessManager::new)
     .unwrap();
     manager.probe().await.unwrap();
     let handle = manager
@@ -1072,17 +1080,18 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
 async fn real_docker_lifecycle_exec_and_in_container_pueue() {
     let image = std::env::var("OPENSOL_TEST_IMAGE")
         .expect("run scripts/check.sh in the test container with Docker socket mounted");
-    let lifecycle = DockerLifecycle::connect_defaults(DockerConfig {
+    let backend = DockerLifecycle::connect_defaults(DockerConfig {
         image,
         command: vec!["sleep".into(), "infinity".into()],
         ..Default::default()
     })
     .unwrap();
+    let lifecycle = backend.lifecycle();
     let resource = lifecycle.create(CreateOptions::default()).await.unwrap();
     let result = AssertUnwindSafe(async {
         assert_eq!(lifecycle.inspect(&resource).await?.state, ResourceState::Stopped);
         lifecycle.start(&resource).await?;
-        let connection = Arc::new(lifecycle.connection(&resource)?);
+        let connection = backend.connection(&resource)?;
         let result = connection.exec(ExecRequest { command: Command::new("python3", ["-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()); sys.stderr.buffer.write(b'\\xff'); sys.exit(7)"]), stdin: b"\x00\xffinput".to_vec(), timeout: Some(Duration::from_secs(5)) }).await?;
         assert_eq!(result.stdout, b"\x00\xffinput"); assert_eq!(result.stderr, b"\xff"); assert_eq!(result.exit.code, Some(7));
         for (command, stdout, code) in [
@@ -1110,7 +1119,7 @@ async fn real_docker_lifecycle_exec_and_in_container_pueue() {
             if connection.exec(ExecRequest::new(Command::new("pueue", ["--config", config_path.as_str(), "status", "--json"]))).await?.exit.success() { break; }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        let manager = Pueue::new(connection, PueueConfig { config_file: Some(config_path), pueue_directory: Some(directory.into()), ..Default::default() })?;
+        let manager = Pueue::new(connection, PueueConfig { config_file: Some(config_path), pueue_directory: Some(directory.into()), ..Default::default() }).map(ProcessManager::new)?;
         manager.probe().await?;
         let handle = manager.spawn(SpawnRequest::new(Command::new("printf", ["%s", "Docker + Pueue '$()"]))).await?;
         let (output, exit) = collect(handle.events).await;

@@ -134,7 +134,6 @@ fn output_limit(limit: i64) -> PyResult<usize> {
             "limit must be between 1 and 1048576 bytes",
         ))
     })?;
-    opensol_core::validate_output_limit(limit, "python").map_err(exception)?;
     Ok(limit)
 }
 

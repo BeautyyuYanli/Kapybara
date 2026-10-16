@@ -19,28 +19,32 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 
 - `Lifecycle`：`create/inspect/start/stop/delete/fork`。`ResourceRef(backend, id)` 可由调用方保存并重建，不包含凭据。
 - `Connection`：`exec(argv, cwd=..., env=..., stdin=b"", timeout=...)`、显式 `.shell(script)`。返回 `ExecResult`，不返回后台任务 ID。
-- `ProcessManager`：`probe/list/get/spawn` 及兼容的引用控制入口。`get(ProcessRef(backend, id, pty=False))` 返回轻量 Process 资源，不访问管理器。
+- `ProcessManager`：`probe/list/get/spawn` 及引用控制入口。`get(ProcessRef(backend, id, pty=None))` 返回轻量 Process 资源，不访问管理器。
 
 每层都提供 `.backend` 和 `.capabilities()`，查询不做 I/O。能力字典除布尔项外，`ProcessCapabilities.supported_signals` 是信号编号列表；`LifecycleCapabilities.stop_preserves_memory` 表达 stop 是否保留进程内存，E2B 为 true，Docker、Kubernetes 与 OpenShell 为 false。工厂不需要全局注册：
 
 | 工厂 | 返回 |
 | --- | --- |
 | `local()`、`ssh(destination, ...)`、`docker_connection(container)` | `Connection` |
-| `docker(image, ...)`、`e2b(api_key, ...)`、`agent_sandbox(namespace, pod_template_json, ...)` | `Lifecycle` |
-| `openshell(endpoint, workspace=..., workload_template=..., ...)` | `Lifecycle` |
+| `docker(image, ...)` | `Docker`：`.lifecycle`、`.connection(resource)` |
+| `e2b(api_key, ...)` | `E2b`：`.lifecycle`、`.envd(resource)` |
+| `openshell(endpoint, workspace=..., workload_template=..., ...)` | `OpenShell`：`.lifecycle`、`.connection(resource)` |
+| `agent_sandbox(namespace, pod_template_json, ...)` | `Lifecycle` |
 | `openshell_connection(endpoint, sandbox, ...)`、`sandboxd(endpoint, ...)` | `Connection` |
 | `pueue(connection, config_file=..., ...)` | `ProcessManager`，包装注入的连接 |
-| `envd(endpoint, ...)`、`e2b_envd(api_key, resource, ...)` | 同一个原生 envd 客户端，其 `.connection` / `.processes` 提供两层接口 |
+| `envd(endpoint, ...)`、E2b 的 `.envd(resource)` | 同一个原生 envd 客户端，其 `.connection` / `.processes` 提供两层接口 |
 
 Docker HostConfig、Kubernetes PodTemplate/PVC 参数分别通过原生 JSON 字符串传递，不把供应商字段混入公共 `create()`。OpenShell 可选命名 workload template，或通过 `spec_protobuf` 传原生 SandboxSpec 编码；TLS 参数为 PEM 内容，不是文件路径。支持的信号编号为 2、9、15，具体后端仍可能返回 Unsupported。
 
-`aio` 中的配置型工厂（local、ssh、docker、docker_connection、pueue、envd、e2b、agent_sandbox）仍是普通函数；`aio.sandboxd`、`aio.openshell`、`aio.openshell_connection`、`aio.e2b_envd` 建立网络连接或发现端点，需要 await。envd 的 `.connection` / `.processes` 分别返回异步接口。同步工厂保持原来的阻塞语义。
+`aio` 中的配置型工厂（local、ssh、docker、docker_connection、pueue、envd、e2b、agent_sandbox）是普通函数；`aio.sandboxd`、`aio.openshell`、`aio.openshell_connection` 建立网络连接，需要 await。后端 `.lifecycle` 提供异步生命周期；Docker/OpenShell 的 `.connection(resource)` 是无需 I/O 的普通方法；E2b 的 `.envd(resource)` 只读发现需要 await。envd 的 `.connection` / `.processes` 分别返回异步接口。同步入口的所有 I/O 都是阻塞调用。
+
+后端对象保留原始 Engine/gateway/HTTP 客户端、凭据、作用域与超时，不重复转发生命周期方法。E2B 的 envd_endpoint、sandbox_domain、request_timeout 在 `e2b()` 配置，连接资源时无需再次提供 API key 或 endpoint。工厂不隐式 create/start/probe、不恢复暂停沙盒、不启动 daemon。公共参数校验和能力检查复用 Rust 客户端，Python 仅做语言参数、awaitable 和异常转换。
 
 `aio` 的 Connection 与 Lifecycle 方法，以及 ProcessManager 的所有 I/O 方法都可 await。部分方法直接返回原生 awaitable，不能用 `inspect.iscoroutinefunction` 判断能否 await；在运行中的 asyncio loop 内调用它们。公开类型声明使用 `Awaitable[T]` 或 `async def` 准确表达返回值。
 
 ## 原生任务和输出资源
 
-进程任务由实际的 pueued/envd 创建、持有和回收。OpenSOL 不托管 daemon，不增加执行队列或后台日志服务。`probe()` 做真实管理请求，返回 ManagerInfo；Pueue 可报告 CLI 版本，其他无法确认的版本为 None。`list()` 只返回原生当前保留的 ProcessInfo，不回传任务环境；Pueue 的 group 用于创建默认值和 list 过滤，不是权限边界。envd List 没有 PTY 信息，列举引用的 pty=false；PTY 控制需保留原始 spawn 引用。
+进程任务由实际的 pueued/envd 创建、持有和回收。OpenSOL 不托管 daemon，不增加执行队列或后台日志服务。`probe()` 做真实管理请求，返回 ManagerInfo；Pueue 可报告 CLI 版本，其他无法确认的版本为 None。`list()` 只返回原生当前保留的 ProcessInfo，不回传任务环境；Pueue 的 group 用于创建默认值和 list 过滤，不是权限边界。ProcessRef.pty 是 `bool | None` 模式提示，envd List 返回 None，spawn 返回 True/False，Pueue 返回 False。未知模式仍可 inspect、signal、kill、wait 和订阅；send_input、close_stdin、resize 返回 UnsupportedError，不发送猜测的 RPC。保存 spawn 引用，或在已知模式时显式传 pty 参数。
 
 同步资源方法是阻塞调用；异步资源的相同 I/O 方法可 await，DTO 与异常相同。get、ref、output 属性只构造绑定对象：
 
@@ -65,7 +69,7 @@ async def read_pages(config_file, pueue_directory):
 
 Process 提供 inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize。这些都委托原生管理器，资源不缓存状态；handle 的 Exit 缓存仅属于原来的那次订阅。Pueue start 可强制启动 Queued/Stashed 并绕过队列限制和依赖；restart 仅用于终结任务，原地保留 ID、覆盖上次日志。remove 尊重原生状态/依赖，不暗中 kill；kill 回执不等于已经退出，仍需 inspect/wait。envd 只有原生 kill，pause/start/restart/remove 返回 Unsupported。native_result 保留 Pueue 的原生结果名称，无实际退出码的结果由 wait 报告 Backend，不回显原始错误正文。
 
-`process.output.stat()` 返回 channels、size、version；`read(cursor=None, limit=65536)` 返回 chunks、next_cursor、at_end。chunks.data 是 bytes，总量最多 limit（允许 1 至 1048576）；Pueue 只有 combined。读取立即返回当前观测的日志范围，at_end 仅为暂时读到尾部，不能代表任务结束。订阅入口是 `process.output.subscribe()`，返回原有 ProcessHandle；读取和订阅互不推进对方的位置。Rust 的 output_stat/read_output 是后端 trait 契约，Python 只提供这组绑定资源查询入口。
+`process.output.stat()` 返回 channels、size、version；`read(cursor=None, limit=65536)` 返回 chunks、next_cursor、at_end。chunks.data 是 bytes，总量最多 limit（允许 1 至 1048576）；Pueue 只有 combined。读取立即返回当前观测的日志范围，at_end 仅为暂时读到尾部，不能代表任务结束。订阅入口是 `process.output.subscribe()`，返回原有 ProcessHandle；读取和订阅互不推进对方的位置。Rust 的公共 manager 与绑定资源委托相同 raw 契约，Python 只提供这组绑定资源查询入口。
 
 Pueue 需显式传 pueue_directory，指向注入 Connection 目标上的 daemon 数据目录，且与 config/profile 对应；要求 Linux 和 GNU stat/dd。Local、SSH、Docker 都经过同一 Connection 在目标侧读取一个已打开的原生日志，并按限定字节取得数据；不把远端路径当成本机路径。probe 和调用时检查依赖/权限，capabilities.output_resource 只表示已配置访问，不缓存探测结果。未配置及 envd 的 stat/read 返回 Unsupported。CLI 只能提供非结构化失败时保留脱敏 Backend；Connection 已确定的结构化错误种类不被改写。
 
@@ -111,10 +115,11 @@ import os
 import opensol as sdk
 
 key = os.environ["E2B_API_KEY"]
-lifecycle = sdk.e2b(key)
+backend = sdk.e2b(key)
+lifecycle = backend.lifecycle
 resource = lifecycle.create()
 try:
-    native = sdk.e2b_envd(key, resource)
+    native = backend.envd(resource)
     result = native.connection.exec(["printf", "%s", "short command"], timeout=10)
     handle = native.processes.spawn(["python3", "-c", "print('managed')"])
     while (event := handle.next_event(timeout=10)) is not None:
@@ -125,7 +130,7 @@ finally:
     lifecycle.delete(resource)
 ```
 
-这不是三层串行包装：envd 直接实现两种独立接口。`e2b_envd` 只读发现连接配置，不隐式恢复暂停沙盒。直接 `envd(endpoint, access_token=...)` 不需要 E2B 生命周期。
+envd 的两种公共视图独立使用。`backend.envd(resource)` 只读发现连接配置，不隐式恢复暂停沙盒；aio 对应 `await backend.envd(resource)`。直接 `envd(endpoint, access_token=...)` 不需要 E2B 生命周期。
 
 ## 输出订阅与取消
 

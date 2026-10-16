@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use opensol_core::{
     Connection, ConnectionCapabilities, CreateOptions, Error, ErrorKind, ExecRequest, ExecResult,
     ExitStatus, Lifecycle, LifecycleCapabilities, ResourceInfo, ResourceRef, ResourceState, Result,
+    raw::{ExecAccess, LifecycleAccess},
 };
 use tonic::transport::Channel;
 
@@ -97,14 +98,19 @@ impl OpenShellLifecycle {
         })
     }
 
-    pub fn connection(&self, resource: &ResourceRef) -> Result<OpenShellConnection> {
+    pub fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::new(self.clone())
+    }
+
+    /// Bind the same gateway/workspace/TLS context, without starting the resource.
+    pub fn connection(&self, resource: &ResourceRef) -> Result<Connection> {
         resource.validate("openshell", "connect")?;
-        Ok(OpenShellConnection {
+        Ok(Connection::new(OpenShellConnection {
             client: self.client.clone(),
             config: self.config.clone(),
             workspace: self.workspace.clone(),
             sandbox: resource.id.clone(),
-        })
+        }))
     }
 }
 
@@ -118,7 +124,7 @@ fn response_error(operation: &str) -> Error {
 }
 
 #[async_trait]
-impl Lifecycle for OpenShellLifecycle {
+impl LifecycleAccess for OpenShellLifecycle {
     fn backend(&self) -> &'static str {
         "openshell"
     }
@@ -152,7 +158,6 @@ impl Lifecycle for OpenShellLifecycle {
     }
 
     async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
-        resource.validate("openshell", "inspect")?;
         let response = self
             .client
             .clone()
@@ -191,7 +196,6 @@ impl Lifecycle for OpenShellLifecycle {
     }
 
     async fn start(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("openshell", "start")?;
         self.client
             .clone()
             .start_sandbox(self.config.request(
@@ -208,7 +212,6 @@ impl Lifecycle for OpenShellLifecycle {
     }
 
     async fn stop(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("openshell", "stop")?;
         self.client
             .clone()
             .stop_sandbox(self.config.request(
@@ -225,7 +228,6 @@ impl Lifecycle for OpenShellLifecycle {
     }
 
     async fn delete(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("openshell", "delete")?;
         self.client
             .clone()
             .delete_sandbox(self.config.request(
@@ -277,7 +279,7 @@ impl OpenShellConnection {
 }
 
 #[async_trait]
-impl Connection for OpenShellConnection {
+impl ExecAccess for OpenShellConnection {
     fn backend(&self) -> &'static str {
         "openshell"
     }
@@ -290,7 +292,6 @@ impl Connection for OpenShellConnection {
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
-        request.validate("openshell")?;
         deadline(request.timeout, "openshell", "exec", async {
             let mut lookup = self.config.request(
                 native::GetSandboxRequest {

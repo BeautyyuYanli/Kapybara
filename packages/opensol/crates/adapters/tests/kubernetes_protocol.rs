@@ -134,13 +134,16 @@ impl Fixture {
         resource["status"]["conditions"] = json!([{ "type": condition, "status": "True", "reason": reason, "observedGeneration": generation }]);
     }
 
-    fn lifecycle(&self, template: Value) -> (TempDir, AgentSandboxLifecycle) {
+    fn lifecycle(&self, template: Value) -> (TempDir, Lifecycle) {
         let directory = TempDir::new().unwrap();
         let kubeconfig = directory.path().join("config");
         std::fs::write(&kubeconfig, format!("apiVersion: v1\nkind: Config\nclusters:\n- name: fixture\n  cluster:\n    server: {}\ncontexts:\n- name: fixture\n  context:\n    cluster: fixture\n    user: fixture\ncurrent-context: fixture\nusers:\n- name: fixture\n  user: {{}}\n", self.endpoint)).unwrap();
         let mut config = AgentSandboxConfig::new("work", template);
         config.kubeconfig = Some(kubeconfig);
-        (directory, AgentSandboxLifecycle::new(config).unwrap())
+        (
+            directory,
+            Lifecycle::new(AgentSandboxLifecycle::new(config).unwrap()),
+        )
     }
 }
 

@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use opensol_core::{
-    Connection, ConnectionCapabilities, Error, ExecRequest, ExecResult, ExitStatus, Result,
+    ConnectionCapabilities, ExecRequest, ExecResult, ExitStatus, Result, raw::ExecAccess,
 };
 use tonic::transport::Channel;
 
@@ -37,7 +37,7 @@ impl Sandboxd {
 }
 
 #[async_trait]
-impl Connection for Sandboxd {
+impl ExecAccess for Sandboxd {
     fn backend(&self) -> &'static str {
         "sandboxd"
     }
@@ -50,10 +50,6 @@ impl Connection for Sandboxd {
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
-        request.validate("sandboxd")?;
-        if !request.stdin.is_empty() {
-            return Err(Error::unsupported("sandboxd", "exec_stdin"));
-        }
         deadline(request.timeout, "sandboxd", "exec", async {
             let mut message = self.config.request(
                 protocol::ExecuteRequest {

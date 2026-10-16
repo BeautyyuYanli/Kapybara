@@ -9,8 +9,8 @@ use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
-    Command, Connection, CreateOptions, Error, ErrorKind, ExecRequest, Lifecycle,
-    LifecycleCapabilities, ResourceInfo, ResourceRef, ResourceState, Result,
+    Command, Connection, CreateOptions, Error, ErrorKind, ExecRequest, LifecycleCapabilities,
+    ResourceInfo, ResourceRef, ResourceState, Result, raw::LifecycleAccess,
 };
 use serde_json::{Value, json};
 
@@ -93,7 +93,7 @@ impl AgentSandboxLifecycle {
             global.push(format!("--kubeconfig={}", path.display()));
         }
         global.extend(args);
-        let result = Local
+        let result = Connection::new(Local)
             .exec(ExecRequest {
                 command: Command::new(self.config.program.to_string_lossy(), global),
                 stdin,
@@ -129,7 +129,6 @@ impl AgentSandboxLifecycle {
     }
 
     async fn set_mode(&self, resource: &ResourceRef, mode: &str, operation: &str) -> Result<()> {
-        resource.validate("agent-sandbox", operation)?;
         self.run(
             vec![
                 "patch".into(),
@@ -149,7 +148,7 @@ impl AgentSandboxLifecycle {
 }
 
 #[async_trait]
-impl Lifecycle for AgentSandboxLifecycle {
+impl LifecycleAccess for AgentSandboxLifecycle {
     fn backend(&self) -> &'static str {
         "agent-sandbox"
     }
@@ -183,7 +182,6 @@ impl Lifecycle for AgentSandboxLifecycle {
     }
 
     async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
-        resource.validate("agent-sandbox", "inspect")?;
         let output = self
             .run(
                 vec![
@@ -263,7 +261,6 @@ impl Lifecycle for AgentSandboxLifecycle {
     }
 
     async fn delete(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("agent-sandbox", "delete")?;
         self.run(
             vec![
                 "delete".into(),

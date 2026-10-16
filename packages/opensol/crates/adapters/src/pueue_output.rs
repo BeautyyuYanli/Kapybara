@@ -6,7 +6,7 @@
 //! that are observable at a request boundary; truncate-and-regrow between requests is
 //! not a durable-history guarantee. Cursor fields never select a path or task to read.
 
-use opensol_core::{OutputChunk, OutputCursor, OutputInfo, OutputPage, validate_output_limit};
+use opensol_core::{OutputChunk, OutputCursor, OutputInfo, OutputPage};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -321,7 +321,6 @@ impl Pueue {
         cursor: Option<&OutputCursor>,
         limit: usize,
     ) -> Result<OutputPage> {
-        validate_output_limit(limit, "pueue")?;
         self.output_resource(process, cursor, limit)
             .await
             .map(|(_, page)| page)

@@ -2,7 +2,7 @@
 
 use std::{future::Future, time::Duration};
 
-use opensol_core::{Error, ErrorKind, Result, validate_timeout};
+use opensol_core::{Error, ErrorKind, Result};
 
 pub(crate) async fn deadline<Value>(
     timeout: Option<Duration>,
@@ -10,7 +10,6 @@ pub(crate) async fn deadline<Value>(
     operation: &str,
     future: impl Future<Output = Result<Value>>,
 ) -> Result<Value> {
-    validate_timeout(timeout, backend, operation)?;
     match timeout {
         Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| {
             Error::new(

@@ -7,7 +7,7 @@ use opensol_core::{Command, Connection, ExecRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let result = Local
+    let result = Connection::new(Local)
         .exec(ExecRequest {
             command: Command::new("printf", ["%s", "local argv, not a sandbox\n"]),
             stdin: Vec::new(),

@@ -1,11 +1,13 @@
-//! Independent contracts for resource lifecycle, completed commands, and managed processes.
+//! Public clients for resource lifecycle, completed commands, and managed processes.
 //!
+//! Adapters implement [`raw`] contracts; clients enforce shared validation and capability checks.
 //! Dropping clients never destroys environments. References contain identity, not credentials.
 //! A transport failure or cancelled call does not imply that a remote side effect was undone.
 
+pub mod raw;
+
 use std::{collections::BTreeMap, fmt, pin::Pin, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
@@ -146,18 +148,71 @@ impl LifecycleCapabilities {
     };
 }
 
-/// Explicit resource operations. Start/stop request native behavior, not uniform memory snapshots.
-#[async_trait]
-pub trait Lifecycle: Send + Sync {
-    fn backend(&self) -> &'static str;
-    fn capabilities(&self) -> LifecycleCapabilities;
-    async fn create(&self, options: CreateOptions) -> Result<ResourceRef>;
-    async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo>;
-    async fn start(&self, resource: &ResourceRef) -> Result<()>;
-    async fn stop(&self, resource: &ResourceRef) -> Result<()>;
-    async fn delete(&self, resource: &ResourceRef) -> Result<()>;
-    async fn fork(&self, _resource: &ResourceRef) -> Result<ResourceRef> {
-        Err(Error::unsupported(self.backend(), "fork"))
+/// Explicit resource operations. Start/stop retain native semantics, including memory preservation.
+/// Clones share the adapter; dropping a client never deletes its resources.
+#[derive(Clone)]
+pub struct Lifecycle {
+    access: Arc<dyn raw::LifecycleAccess>,
+}
+
+impl Lifecycle {
+    pub fn new(access: impl raw::LifecycleAccess + 'static) -> Self {
+        Self {
+            access: Arc::new(access),
+        }
+    }
+    pub fn backend(&self) -> &'static str {
+        self.access.backend()
+    }
+    pub fn capabilities(&self) -> LifecycleCapabilities {
+        self.access.capabilities()
+    }
+    pub async fn create(&self, options: CreateOptions) -> Result<ResourceRef> {
+        if options
+            .name
+            .as_ref()
+            .is_some_and(|name| name.is_empty() || name.contains('\0'))
+            || options
+                .labels
+                .iter()
+                .any(|(key, value)| key.is_empty() || key.contains('\0') || value.contains('\0'))
+        {
+            return Err(Error::invalid(
+                self.backend(),
+                "create",
+                "invalid creation metadata",
+            ));
+        }
+        self.require(self.capabilities().create, "create")?;
+        self.access.create(options).await
+    }
+    pub async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
+        resource.validate(self.backend(), "inspect")?;
+        self.require(self.capabilities().inspect, "inspect")?;
+        self.access.inspect(resource).await
+    }
+    pub async fn start(&self, resource: &ResourceRef) -> Result<()> {
+        resource.validate(self.backend(), "start")?;
+        self.require(self.capabilities().start, "start")?;
+        self.access.start(resource).await
+    }
+    pub async fn stop(&self, resource: &ResourceRef) -> Result<()> {
+        resource.validate(self.backend(), "stop")?;
+        self.require(self.capabilities().stop, "stop")?;
+        self.access.stop(resource).await
+    }
+    pub async fn delete(&self, resource: &ResourceRef) -> Result<()> {
+        resource.validate(self.backend(), "delete")?;
+        self.require(self.capabilities().delete, "delete")?;
+        self.access.delete(resource).await
+    }
+    pub async fn fork(&self, resource: &ResourceRef) -> Result<ResourceRef> {
+        resource.validate(self.backend(), "fork")?;
+        self.require(self.capabilities().fork, "fork")?;
+        self.access.fork(resource).await
+    }
+    fn require(&self, supported: bool, operation: &str) -> Result<()> {
+        require(supported, self.backend(), operation)
     }
 }
 
@@ -305,24 +360,52 @@ pub struct ConnectionCapabilities {
     pub separate_stderr: bool,
 }
 
-/// Completed-command interface bound to one execution target. Calls are never retried implicitly.
-#[async_trait]
-pub trait Connection: Send + Sync {
-    fn backend(&self) -> &'static str;
-    fn capabilities(&self) -> ConnectionCapabilities;
-    async fn exec(&self, request: ExecRequest) -> Result<ExecResult>;
+/// Completed-command client bound to one execution target. Calls are never retried implicitly.
+#[derive(Clone)]
+pub struct Connection {
+    access: Arc<dyn raw::ExecAccess>,
+}
+
+impl Connection {
+    pub fn new(access: impl raw::ExecAccess + 'static) -> Self {
+        Self {
+            access: Arc::new(access),
+        }
+    }
+    pub fn backend(&self) -> &'static str {
+        self.access.backend()
+    }
+    pub fn capabilities(&self) -> ConnectionCapabilities {
+        self.access.capabilities()
+    }
+    pub async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
+        request.validate(self.backend())?;
+        let capabilities = self.capabilities();
+        require(
+            request.stdin.is_empty() || capabilities.stdin,
+            self.backend(),
+            "exec",
+        )?;
+        require(
+            request.timeout.is_none() || capabilities.timeout,
+            self.backend(),
+            "exec",
+        )?;
+        self.access.exec(request).await
+    }
 }
 
 /// Process identity is opaque and scoped to the manager's target, not necessarily an OS PID.
+/// `pty` is a mode hint, not identity: `None` means native discovery did not report the mode.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProcessRef {
     pub backend: String,
     pub id: String,
-    pub pty: bool,
+    pub pty: Option<bool>,
 }
 
 impl ProcessRef {
-    pub fn new(backend: &str, id: impl Into<String>, pty: bool) -> Self {
+    pub fn new(backend: &str, id: impl Into<String>, pty: Option<bool>) -> Self {
         Self {
             backend: backend.into(),
             id: id.into(),
@@ -495,6 +578,7 @@ pub struct ProcessCapabilities {
     pub output_resource: bool,
     pub stdin: bool,
     pub close_stdin: bool,
+    /// False limits input to UTF-8 text without NUL, suitable for CLI transports.
     pub binary_stdin: bool,
     pub pty: bool,
     pub resize: bool,
@@ -507,7 +591,7 @@ pub struct ProcessCapabilities {
     pub daemon_restart_recovery: bool,
 }
 
-/// Supported portable signals. Adapters reject signals missing from their native protocol.
+/// Portable signals. Public clients check the adapter's declared supported set before dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum Signal {
     Interrupt,
@@ -525,81 +609,179 @@ impl Signal {
     }
 }
 
-/// Managed processes. Output may be live-only; consult capabilities and each adapter's retention contract.
-#[async_trait]
-pub trait ProcessManager: Send + Sync {
-    fn backend(&self) -> &'static str;
-    fn capabilities(&self) -> ProcessCapabilities;
-    async fn probe(&self) -> Result<ManagerInfo> {
-        Err(Error::unsupported(self.backend(), "probe"))
+/// Managed-process client. Output retention and state remain native to the adapter.
+#[derive(Clone)]
+pub struct ProcessManager {
+    access: Arc<dyn raw::ProcessAccess>,
+}
+
+impl ProcessManager {
+    pub fn new(access: impl raw::ProcessAccess + 'static) -> Self {
+        Self {
+            access: Arc::new(access),
+        }
     }
-    async fn list(&self) -> Result<Vec<ProcessInfo>> {
-        Err(Error::unsupported(self.backend(), "list"))
+    pub fn backend(&self) -> &'static str {
+        self.access.backend()
     }
-    async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle>;
-    async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo>;
-    async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>) -> Result<ExitStatus>;
-    async fn output(&self, process: &ProcessRef) -> Result<EventStream>;
-    /// Backend extension contract. Callers normally use `Process::output().stat()`.
-    async fn output_stat(&self, _process: &ProcessRef) -> Result<OutputInfo> {
-        Err(Error::unsupported(self.backend(), "output_stat"))
+    pub fn capabilities(&self) -> ProcessCapabilities {
+        self.access.capabilities()
     }
-    /// Backend extension contract; cursor validation and log retention are adapter-specific.
-    async fn read_output(
+    /// Bind a reference locally. Subsequent operations check identity, existence and permissions.
+    pub fn get(&self, reference: ProcessRef) -> Process {
+        Process::new(self.clone(), reference)
+    }
+    pub async fn probe(&self) -> Result<ManagerInfo> {
+        self.access.probe().await
+    }
+    pub async fn list(&self) -> Result<Vec<ProcessInfo>> {
+        self.require(self.capabilities().list, "list")?;
+        self.access.list().await
+    }
+    pub async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
+        request.validate(self.backend())?;
+        let capabilities = self.capabilities();
+        self.require(!request.stdin || capabilities.stdin, "spawn")?;
+        self.require(request.pty.is_none() || capabilities.pty, "spawn")?;
+        self.access.spawn(request).await
+    }
+    pub async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
+        process.validate(self.backend(), "status")?;
+        self.access.status(process).await
+    }
+    pub async fn wait(
         &self,
-        _process: &ProcessRef,
-        _cursor: Option<&OutputCursor>,
+        process: &ProcessRef,
+        timeout: Option<Duration>,
+    ) -> Result<ExitStatus> {
+        process.validate(self.backend(), "wait")?;
+        validate_timeout(timeout, self.backend(), "wait")?;
+        self.access.wait(process, timeout).await
+    }
+    pub async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
+        process.validate(self.backend(), "output")?;
+        self.access.output(process).await
+    }
+    pub async fn output_stat(&self, process: &ProcessRef) -> Result<OutputInfo> {
+        process.validate(self.backend(), "output_stat")?;
+        self.require(self.capabilities().output_resource, "output_stat")?;
+        self.access.output_stat(process).await
+    }
+    /// Reads are bounded; cursor encoding, versions and retention are checked by the adapter.
+    pub async fn read_output(
+        &self,
+        process: &ProcessRef,
+        cursor: Option<&OutputCursor>,
         limit: usize,
     ) -> Result<OutputPage> {
+        process.validate(self.backend(), "read_output")?;
         validate_output_limit(limit, self.backend())?;
-        Err(Error::unsupported(self.backend(), "read_output"))
+        self.require(self.capabilities().output_resource, "read_output")?;
+        self.access.read_output(process, cursor, limit).await
     }
-    async fn pause(&self, _process: &ProcessRef) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "pause"))
+    pub async fn pause(&self, process: &ProcessRef) -> Result<()> {
+        process.validate(self.backend(), "pause")?;
+        self.require(self.capabilities().pause, "pause")?;
+        self.access.pause(process).await
     }
-    /// Native start/resume; a manager may force a queued task past normal queue limits.
-    async fn start(&self, _process: &ProcessRef) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "start"))
+    /// Native start/resume; some managers force queued tasks past queue limits.
+    pub async fn start(&self, process: &ProcessRef) -> Result<()> {
+        process.validate(self.backend(), "start")?;
+        self.require(self.capabilities().start, "start")?;
+        self.access.start(process).await
     }
-    /// Native restart, preserving the manager's task identity and replacing the prior execution.
-    async fn restart(&self, _process: &ProcessRef) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "restart"))
+    /// Restarts the same task identity, replacing the previous execution and its logs.
+    pub async fn restart(&self, process: &ProcessRef) -> Result<()> {
+        process.validate(self.backend(), "restart")?;
+        self.require(self.capabilities().restart, "restart")?;
+        self.access.restart(process).await
     }
-    /// Native termination path. Acceptance does not imply the process has already exited.
-    async fn kill(&self, _process: &ProcessRef) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "kill"))
+    /// Acceptance does not imply that the process has exited.
+    pub async fn kill(&self, process: &ProcessRef) -> Result<()> {
+        process.validate(self.backend(), "kill")?;
+        self.require(self.capabilities().kill, "kill")?;
+        self.access.kill(process).await
     }
-    /// Remove a retained task and its native logs; never implicitly kill it.
-    async fn remove(&self, _process: &ProcessRef) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "remove"))
+    /// Removes retained task/logs, never implicitly killing a running task.
+    pub async fn remove(&self, process: &ProcessRef) -> Result<()> {
+        process.validate(self.backend(), "remove")?;
+        self.require(self.capabilities().remove, "remove")?;
+        self.access.remove(process).await
     }
-    async fn send_input(&self, _process: &ProcessRef, _data: Vec<u8>) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "send_input"))
+    /// Unknown mode cannot choose between ordinary stdin and terminal input.
+    /// Terminal input also requires the manager's declared PTY support.
+    pub async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
+        process.validate(self.backend(), "send_input")?;
+        let capabilities = self.capabilities();
+        self.require(capabilities.stdin, "send_input")?;
+        self.require_mode(process, "send_input")?;
+        self.require(process.pty != Some(true) || capabilities.pty, "send_input")?;
+        self.require(
+            capabilities.binary_stdin || (!data.contains(&0) && std::str::from_utf8(&data).is_ok()),
+            "send_input",
+        )?;
+        self.access.send_input(process, data).await
     }
-    async fn close_stdin(&self, _process: &ProcessRef) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "close_stdin"))
+    pub async fn close_stdin(&self, process: &ProcessRef) -> Result<()> {
+        process.validate(self.backend(), "close_stdin")?;
+        self.require(self.capabilities().close_stdin, "close_stdin")?;
+        self.require_mode(process, "close_stdin")?;
+        self.access.close_stdin(process).await
     }
-    async fn signal(&self, _process: &ProcessRef, _signal: Signal) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "signal"))
+    pub async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
+        process.validate(self.backend(), "signal")?;
+        self.require(
+            self.capabilities().supported_signals.contains(&signal),
+            "signal",
+        )?;
+        self.access.signal(process, signal).await
     }
-    async fn resize(&self, _process: &ProcessRef, _size: PtySize) -> Result<()> {
-        Err(Error::unsupported(self.backend(), "resize"))
+    pub async fn resize(&self, process: &ProcessRef, size: PtySize) -> Result<()> {
+        process.validate(self.backend(), "resize")?;
+        size.validate(self.backend(), "resize")?;
+        self.require(self.capabilities().resize, "resize")?;
+        self.require_mode(process, "resize")?;
+        self.access.resize(process, size).await
     }
-    async fn reconnect(&self, _process: &ProcessRef) -> Result<ProcessHandle> {
-        Err(Error::unsupported(self.backend(), "reconnect"))
+    pub async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
+        process.validate(self.backend(), "reconnect")?;
+        self.require(self.capabilities().reconnect, "reconnect")?;
+        self.access.reconnect(process).await
+    }
+    fn require_mode(&self, process: &ProcessRef, operation: &str) -> Result<()> {
+        if process.pty.is_none() {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                self.backend(),
+                operation,
+                "process PTY mode is unknown; supply a known-mode reference",
+            ));
+        }
+        Ok(())
+    }
+    fn require(&self, supported: bool, operation: &str) -> Result<()> {
+        require(supported, self.backend(), operation)
+    }
+}
+
+fn require(supported: bool, backend: &str, operation: &str) -> Result<()> {
+    if supported {
+        Ok(())
+    } else {
+        Err(Error::unsupported(backend, operation))
     }
 }
 
 /// Bound resource facade; owns neither a process nor authoritative cached state.
 #[derive(Clone)]
 pub struct Process {
-    manager: Arc<dyn ProcessManager>,
+    manager: ProcessManager,
     reference: ProcessRef,
 }
 
 impl Process {
     /// Binding is local; existence and access are checked by subsequent native operations.
-    pub fn new(manager: Arc<dyn ProcessManager>, reference: ProcessRef) -> Self {
+    pub fn new(manager: ProcessManager, reference: ProcessRef) -> Self {
         Self { manager, reference }
     }
     pub fn reference(&self) -> &ProcessRef {
@@ -645,13 +827,6 @@ impl Process {
     }
 }
 
-impl dyn ProcessManager {
-    /// Bind a retained reference without contacting the native manager.
-    pub fn get(self: &Arc<Self>, reference: ProcessRef) -> Process {
-        Process::new(self.clone(), reference)
-    }
-}
-
 /// Independent access to the manager's native log; subscribing does not advance read cursors.
 #[derive(Clone)]
 pub struct ProcessOutput {
@@ -667,7 +842,6 @@ impl ProcessOutput {
     }
     /// Default page size is `DEFAULT_OUTPUT_LIMIT`; callers choose an explicit limit in Rust.
     pub async fn read(&self, cursor: Option<&OutputCursor>, limit: usize) -> Result<OutputPage> {
-        validate_output_limit(limit, self.process.manager.backend())?;
         self.process
             .manager
             .read_output(&self.process.reference, cursor, limit)

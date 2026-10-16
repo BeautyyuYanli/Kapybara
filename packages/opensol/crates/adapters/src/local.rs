@@ -4,8 +4,8 @@ use std::{io::ErrorKind as IoErrorKind, process::Stdio};
 
 use async_trait::async_trait;
 use opensol_core::{
-    Connection, ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, ExitStatus,
-    Result,
+    ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, ExitStatus, Result,
+    raw::ExecAccess,
 };
 use tokio::{io::AsyncWriteExt, process::Command as TokioCommand};
 
@@ -35,7 +35,7 @@ fn io_error(error: std::io::Error) -> Error {
 }
 
 #[async_trait]
-impl Connection for Local {
+impl ExecAccess for Local {
     fn backend(&self) -> &'static str {
         "local"
     }
@@ -49,7 +49,6 @@ impl Connection for Local {
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
-        request.validate("local")?;
         deadline(request.timeout, "local", "exec", async move {
             let mut command = TokioCommand::new(&request.command.argv[0]);
             command

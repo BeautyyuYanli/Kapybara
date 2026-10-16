@@ -20,15 +20,23 @@
 
 ```text
 DockerLifecycle ──资源引用──> DockerConnection ──注入──> Pueue
-E2bLifecycle ──资源引用──> Envd ──实现──> Connection + ProcessManager
+E2bLifecycle ──资源引用──> Envd ──视图──> Connection + ProcessManager
 AgentSandboxLifecycle                  Sandboxd (Connection)
 OpenShellLifecycle ──资源引用──> OpenShellConnection
 Local 或 Ssh ──注入──> Pueue
 ```
 
-Pueue 是包装任意 `Arc<dyn Connection>` 的适配器；envd 则直接通过原生 RPC 同时实现第二、第三层，不需要虚构一个下层 exec。生命周期层也不负责为任意资源猜测网络地址。`sandboxd` 的端点由调用方提供。
+Pueue 包装已有的公共 `Connection`；envd 通过原生 RPC 同时实现第二、第三层，`connection()` / `processes()` 返回复用同一原生客户端的公共视图。生命周期层也不负责为任意资源猜测网络地址。`sandboxd` 的端点由调用方提供。
 
-统一入口是 [`opensol-core`](crates/core/src/lib.rs) 的三个 trait、DTO、错误和能力模型，没有包含多个可选层的总控 `Sandbox` 对象。第三方适配器直接实现 trait；不需要插件注册、全局状态或配置 DSL。
+[`opensol-core`](crates/core/src/lib.rs) 区分适配器扩展契约与业务客户端，共享 DTO、错误和能力模型：
+
+| 适配器实现 | 业务使用 |
+| --- | --- |
+| `raw::LifecycleAccess` | `Lifecycle` |
+| `raw::ExecAccess` | `Connection` |
+| `raw::ProcessAccess` | `ProcessManager`、绑定的 `Process` / `ProcessOutput` |
+
+业务客户端是可廉价 clone 的具体类型，通过 `Lifecycle::new(adapter)` 等构造；不要求调用方管理动态 trait 对象。公共入口统一检查参数、引用与已声明能力，适配器负责原生协议、状态、权限和保留策略。第三方后端只需实现对应 raw trait 并包装，无需插件注册、全局状态、配置 DSL 或总控 `Sandbox`。这借鉴 OpenDAL 的 raw Service / 公共 Operator 边界，三类能力仍独立组合。
 
 ## 集成与能力
 
@@ -76,6 +84,7 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 - 非零退出码属于正常 `ExecResult`，不是传输异常。信号退出可以没有数字退出码；Pueue 的 Killed 结果不包含精确退出码或信号。
 - SDK 错误分为 InvalidArgument、Unsupported、NotFound、Conflict、Permission、Timeout、Transport、Backend，并带 backend/operation。普通错误不回显供应商响应正文、命令输入或凭据。
 - `ExecRequest.timeout=None` 表示不设置整条命令的 SDK deadline；连接建立和原生控制请求仍可以有适配器级超时。零超时无效。
+- 公共客户端在进入适配器前检查 argv、NUL、环境变量、正超时、PTY 尺寸、输出 limit 和引用后端，并按 capabilities 拒绝不支持的 stdin、PTY、信号和可选操作。状态竞争、已知进程模式的原生限制和 cursor 版本仍由适配器判断。
 - 超时/断连不等于远端进程已停止。Local 在取消时清理 Unix 进程组；SSH 只保证结束本机客户端；Docker 关闭 exec attachment，不保证终止 exec；envd 关闭订阅而不隐式发送 kill；OpenShell 的原生执行超时由服务端处理；sandboxd 取消请求的清理行为由服务端决定。
 - SDK 不自行重试 create/fork/exec/spawn 等不确定结果。HTTP 客户端禁用重试及重定向；kubectl 仍保留 client-go 对明确 `Retry-After` 响应的内置行为，创建始终使用明确的 `metadata.name`，同次重放不会产生另一个名称的 CR。调用方不得盲目重做超时的副作用操作。
 - 资源始终显式 `delete`。丢弃 Rust/Python 客户端、输出订阅或网络连接不自动销毁沙盒。
@@ -87,6 +96,8 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 Local 在本机继承环境，并应用请求的环境覆盖；它不是沙盒。SSH 需要 POSIX 远端及系统 `ssh`，使用 BatchMode，保留用户配置、SSH agent 和 known_hosts 校验，不添加跳过主机校验的选项。OpenSSH 的退出 255 无法与远端命令退出 255 完全区分，统一报告 Transport；需要无此歧义的协议时使用其他连接。
 
 Docker 使用调用者提供的 Engine 客户端，或 Bollard 的默认连接配置。不会自动 pull 镜像。create 返回停止的容器，start 需要显式调用；stop/start 不保留进程内存；delete 强制移除容器，但不会代替调用方清理外部卷。隔离、资源限额、挂载和网络设置来自 `DockerConfig.host_config`，SDK 不为它们作安全兜底。
+
+`DockerLifecycle.lifecycle()` 与 `.connection(resource)` 分别提供公共生命周期和执行客户端，复用原来的 Engine 连接。绑定不检查存在性、不启动容器。独立 `DockerConnection::connect_defaults` 用于连接已有容器，使用时包装为公共 `Connection`。
 
 Docker exec 观察原生完成后取消未被消费的 stdin，仍读完输出再返回退出码；进程仍在运行时的输入/传输错误不会被忽略。
 
@@ -106,11 +117,11 @@ Docker exec 观察原生完成后取消未被消费的 stdin，仍读完输出�
 
 E2B 控制面使用 v2 create/connect、inspect、full-memory pause、delete 和原生 fork。create 一般返回运行中沙盒；stop 是原生内存暂停，start 是 resume，不等同 Docker stop/start。权限、模板与套餐是否允许操作仍由服务端决定。
 
-`E2bLifecycle.envd(resource)` 只读 inspect 发现 envd token/domain，然后构造独立客户端，不隐式 resume。也可以直接构造 `EnvdConfig` 连接独立 envd。API key 与 envd access token 分开；E2B 代理路由通过 Sandbox ID/port headers 传递。
+`E2bLifecycle.envd(resource)` 只读 inspect 发现 envd token/domain，复用原 HTTP pool 和超时配置构造 envd 客户端，不隐式 resume。也可以直接构造 `EnvdConfig` 连接独立 envd。API key 与 envd access token 分开，按请求设置；E2B 代理路由通过 Sandbox ID/port headers 传递。
 
 envd 的 `Start` / `Connect` 是 ConnectRPC，而不是假设为 gRPC。字节输出、stdin、信号和 PTY 使用固定的上游 protobuf schema。`status` 使用原生 List；进程不在 List 中时返回 NotFound，不能推断历史退出码。完成结果从 handle 的 Exit 事件获得，输出流在 Exit 前断开返回 Transport。重连遵循 envd 的保留窗口，不是持久日志系统。
 
-`probe/list` 同样使用原生 List，kill 使用原生 SendSignal(SIGKILL)。固定协议没有暂停、开始、重启、历史移除和分页日志 RPC，对应操作返回 Unsupported。List 不包含 PTY 元信息，列举出的引用 `pty=false`；PTY 控制应保存并使用 spawn 返回的原始引用。它也不报告客户端/服务端版本，ManagerInfo 的两项版本为 None。
+`probe/list` 同样使用原生 List，kill 使用原生 SendSignal(SIGKILL)。固定协议没有暂停、开始、重启、历史移除和分页日志 RPC，对应操作返回 Unsupported。`ProcessRef.pty` 为 `Option<bool>`：spawn 返回已知模式，List 不包含 PTY 元信息，返回 `None`。未知模式仍可 inspect、signal、kill、wait 和订阅；send_input、close_stdin、resize 显式返回 Unsupported，不猜测 RPC 通道。应用应保存 spawn 引用，或在已知模式时显式构造引用。Pueue 返回 `Some(false)`。envd 不报告客户端/服务端版本，ManagerInfo 的两项版本为 None。
 
 短命令结束后，SendInput/CloseStdin 可能因原生进程已移除而返回 NotFound；只有同时取得有效 Exit 才将其视为正常完成。等待这类竞争的完成事件受控制请求超时限制，其他输入错误仍然报错。
 
@@ -125,6 +136,8 @@ Suspended 删除 Pod、保留 CR 和卷，不保留内存。sandboxd 是独立�
 使用 OpenShell v0.1.4 原生 gRPC，显式提供 gateway endpoint、workspace，以及可选的 bearer、CA、mTLS 证书/私钥。HTTPS 验证服务器证书，不读取 CLI 登录态，不自动建立代理隧道。远程网络上的明文 HTTP 不适合传凭据。
 
 创建可以使用原生 `SandboxSpec` 或命名 workload template，二选一。exec 先只读查询 owner，转发路由 hint，然后调用原生 exec；不在不确定失败后重试。执行使用非 login shell 模式，保留 argv 和分离的字节输出。普通 exec 不等于主进程 connect：主进程的有限 replay 不作为任意进程历史接口。delete 表示服务端接受请求，不保证资源已同步消失。
+
+`OpenShellLifecycle.lifecycle()` / `.connection(resource)` 复用同一 gateway channel、TLS、凭据和 workspace；connection 绑定无需 I/O。E2B、Docker、OpenShell 的后端专属连接入口保留在后端对象上，不加入 raw 生命周期契约。
 
 ## Rust 使用
 
@@ -166,6 +179,8 @@ while (event := handle.next_event(timeout=10)) is not None:
     print(event.channel, event.data)
 ```
 
+`docker()`、`e2b()`、`openshell()` 返回保留配置的后端对象，通过 `.lifecycle` 操作资源。Docker/OpenShell 的 `.connection(resource)` 本地绑定公共 Connection；E2B 的 `.envd(resource)` 只读发现连接信息，复用原 API key、endpoint 和超时。同步与 aio 使用相同形状，aio 的 E2B 发现需要 await。独立端点工厂仍可连接已有资源。
+
 异步工厂在 coroutine 内使用；配置型工厂是普通函数，连接或端点发现型工厂需要 await：
 
 ```python
@@ -192,7 +207,7 @@ asyncio.run(main())
 
 ## 进程与输出资源
 
-`Process` 绑定 manager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Python 调用 `manager.get(ref)`；Rust 用 `Process::new(Arc<dyn ProcessManager>, ref)`，或在该 Arc trait object 上调用 `.get(ref)`。现有 spawn 仍保留初始输出订阅，尤其不能丢弃 envd Start 的输出再尝试重连。
+`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。spawn 保留初始输出订阅，尤其不能丢弃 envd Start 的输出再尝试重连。
 
 ```python
 manager = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml",
@@ -208,7 +223,7 @@ next_page = process.output.read(cursor=sdk.OutputCursor(saved_cursor))
 print(process.inspect().state, next_page.at_end)
 ```
 
-`process.output.stat/read` 是绑定资源入口；Rust trait 的 `output_stat/read_output` 是适配器扩展契约，两者委托同一实现。Python 不额外暴露重复的 raw manager 日志入口。`output.subscribe()` 建立独立 handle，消费订阅不推进 cursor。
+`process.output.stat/read` 是绑定资源入口；Rust 公共 manager 的 `output_stat/read_output` 经过相同校验，再委托 raw 适配器契约。Python 只暴露绑定资源的日志查询。`output.subscribe()` 建立独立 handle，消费订阅不推进 cursor。
 
 输出页保留原始 bytes 和 channel，Pueue 只有 Combined。默认 64 KiB，允许 1 字节至 1 MiB；读取立即返回当前观测范围，不等待后续输出或退出。`at_end` 只表示读到该次观测的尾部，进程是否终结单独 inspect。cursor 绑定目标、任务、执行和文件版本，不含凭据或可指定的文件路径；只把它作为不透明字符串保存。在同一版本从同一位置可重读，新增字节是否进入这一页取决于该次观测的大小。
 

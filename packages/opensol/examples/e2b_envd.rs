@@ -1,4 +1,4 @@
-//! envd implements Connection and ProcessManager directly; it does not wrap another Connection.
+//! envd exposes Connection and ProcessManager views over the same native client.
 
 use std::{io::Write, time::Duration};
 
@@ -7,21 +7,20 @@ use opensol_adapters::{
     e2b::{E2bConfig, E2bLifecycle},
     secret::Secret,
 };
-use opensol_core::{
-    Command, Connection, CreateOptions, ExecRequest, Lifecycle, ProcessEvent, ProcessManager,
-    SpawnRequest,
-};
+use opensol_core::{Command, CreateOptions, ExecRequest, ProcessEvent, SpawnRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let lifecycle = E2bLifecycle::new(E2bConfig::new(
+    let backend = E2bLifecycle::new(E2bConfig::new(
         Secret::new(std::env::var("E2B_API_KEY")?),
         std::env::var("E2B_TEMPLATE").unwrap_or_else(|_| "base".into()),
     ))?;
+    let lifecycle = backend.lifecycle();
     let resource = lifecycle.create(CreateOptions::default()).await?;
     let execution = async {
-        let native = lifecycle.envd(&resource).await?;
+        let native = backend.envd(&resource).await?;
         let result = native
+            .connection()
             .exec(ExecRequest {
                 command: Command::new("printf", ["%s", "completed command\n"]),
                 stdin: Vec::new(),
@@ -30,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         std::io::stdout().write_all(&result.stdout)?;
         let mut handle = native
+            .processes()
             .spawn(SpawnRequest::new(Command::shell(
                 "printf 'managed process\\n'",
             )))

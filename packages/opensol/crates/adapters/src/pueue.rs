@@ -7,13 +7,13 @@
 //! Task environment overrides are applied inside the queued command, never to the Pueue client.
 //! The execution target requires `env` and `/usr/bin/nice` supporting `-n 0 --`.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessManager,
-    ProcessRef, ProcessState, Result, Signal, SpawnRequest,
+    OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessRef,
+    ProcessState, Result, Signal, SpawnRequest, raw::ProcessAccess,
 };
 use serde_json::Value;
 
@@ -51,7 +51,7 @@ impl Default for PueueConfig {
 /// Stateless task adapter; process references remain valid only while Pueue retains the task.
 #[derive(Clone)]
 pub struct Pueue {
-    connection: Arc<dyn Connection>,
+    connection: Connection,
     config: PueueConfig,
 }
 
@@ -66,7 +66,7 @@ impl std::fmt::Debug for Pueue {
 }
 
 impl Pueue {
-    pub fn new(connection: Arc<dyn Connection>, config: PueueConfig) -> Result<Self> {
+    pub fn new(connection: Connection, config: PueueConfig) -> Result<Self> {
         if config.request_timeout.is_zero() {
             return Err(Error::invalid(
                 "pueue",
@@ -139,8 +139,7 @@ impl Pueue {
     }
 
     fn id(&self, process: &ProcessRef, operation: &str) -> Result<String> {
-        process.validate("pueue", operation)?;
-        if process.pty || process.id.parse::<u64>().is_err() {
+        if process.id.parse::<u64>().is_err() {
             return Err(Error::invalid(
                 "pueue",
                 operation,
@@ -336,7 +335,7 @@ fn protocol_error(operation: &str) -> Error {
 }
 
 #[async_trait]
-impl ProcessManager for Pueue {
+impl ProcessAccess for Pueue {
     fn backend(&self) -> &'static str {
         "pueue"
     }
@@ -402,7 +401,7 @@ impl ProcessManager for Pueue {
                     .is_none_or(|group| task.get("group").and_then(Value::as_str) == Some(group))
             })
             .map(|(id, task)| {
-                let process = ProcessRef::new("pueue", id, false);
+                let process = ProcessRef::new("pueue", id, Some(false));
                 self.id(&process, "list")?;
                 self.task_info(&process, task)
             })
@@ -468,10 +467,6 @@ impl ProcessManager for Pueue {
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
-        request.validate("pueue")?;
-        if request.pty.is_some() {
-            return Err(Error::unsupported("pueue", "spawn_pty"));
-        }
         let mut args = vec!["add".into(), "--print-task-id".into()];
         if let Some(group) = &self.config.group {
             args.extend(["--group".into(), group.clone()]);
@@ -502,7 +497,7 @@ impl ProcessManager for Pueue {
             .filter(|id| id.parse::<u64>().is_ok())
             .ok_or_else(|| protocol_error("spawn"))?
             .to_string();
-        let process = ProcessRef::new("pueue", id, false);
+        let process = ProcessRef::new("pueue", id, Some(false));
         let events = self.output(&process).await?;
         Ok(ProcessHandle { process, events })
     }
@@ -548,10 +543,7 @@ impl ProcessManager for Pueue {
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
         let id = self.id(process, "send_input")?;
         let text =
-            String::from_utf8(data).map_err(|_| Error::unsupported("pueue", "binary_stdin"))?;
-        if text.contains('\0') {
-            return Err(Error::unsupported("pueue", "NUL_stdin"));
-        }
+            String::from_utf8(data).map_err(|_| Error::unsupported("pueue", "send_input"))?;
         self.run(
             vec!["send".into(), id, "--".into(), text],
             "send_input",

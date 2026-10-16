@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, time::Duration};
 use async_trait::async_trait;
 use opensol_core::{
     CreateOptions, Error, ErrorKind, Lifecycle, LifecycleCapabilities, ResourceInfo, ResourceRef,
-    ResourceState, Result,
+    ResourceState, Result, raw::LifecycleAccess,
 };
 use reqwest::{Client, Method, Url, header::HeaderValue};
 use serde::Deserialize;
@@ -87,6 +87,10 @@ struct Sandbox {
 }
 
 impl E2bLifecycle {
+    pub fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::new(self.clone())
+    }
+
     pub fn new(config: E2bConfig) -> Result<Self> {
         if config.template.is_empty()
             || config.sandbox_timeout == 0
@@ -185,7 +189,7 @@ impl E2bLifecycle {
         config.sandbox_id = Some(sandbox.sandbox_id);
         config.access_token = sandbox.envd_access_token.map(Secret::new);
         config.request_timeout = self.config.request_timeout;
-        Envd::new(config)
+        Envd::with_client(config, self.client.clone())
     }
 }
 
@@ -199,7 +203,7 @@ fn response_error(operation: &str) -> Error {
 }
 
 #[async_trait]
-impl Lifecycle for E2bLifecycle {
+impl LifecycleAccess for E2bLifecycle {
     fn backend(&self) -> &'static str {
         "e2b"
     }
@@ -228,7 +232,6 @@ impl Lifecycle for E2bLifecycle {
     }
 
     async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
-        resource.validate("e2b", "inspect")?;
         let sandbox = self.sandbox(
             self.request(Method::GET, &["sandboxes", &resource.id], None, "inspect")
                 .await?,
@@ -251,7 +254,6 @@ impl Lifecycle for E2bLifecycle {
     }
 
     async fn start(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("e2b", "start")?;
         self.sandbox(
             self.request(
                 Method::POST,
@@ -266,7 +268,6 @@ impl Lifecycle for E2bLifecycle {
     }
 
     async fn stop(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("e2b", "stop")?;
         self.request(
             Method::POST,
             &["sandboxes", &resource.id, "pause"],
@@ -278,14 +279,12 @@ impl Lifecycle for E2bLifecycle {
     }
 
     async fn delete(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("e2b", "delete")?;
         self.request(Method::DELETE, &["sandboxes", &resource.id], None, "delete")
             .await?;
         Ok(())
     }
 
     async fn fork(&self, resource: &ResourceRef) -> Result<ResourceRef> {
-        resource.validate("e2b", "fork")?;
         let value = self
             .request(
                 Method::POST,

@@ -193,6 +193,15 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         handle = await manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
         first = await handle.next_event(timeout=2)
         self.assertEqual((first.channel, first.data), ("terminal", b"\x00\xffterminal"))
+        listed = next(info.process for info in await manager.list() if info.process.id == handle.process.id)
+        self.assertIsNone(listed.pty)
+        before = len(self.records)
+        unknown = manager.get(listed)
+        for operation in (lambda: unknown.resize(80, 24),
+                          lambda: unknown.send_input(b"input"), unknown.close_stdin):
+            with self.assertRaises(sdk.UnsupportedError):
+                await operation()
+        self.assertEqual(len(self.records), before)
         await manager.resize(handle.process, 121, 43)
         with self.assertRaises(sdk.UnsupportedError):
             await manager.signal(handle.process, 2)
@@ -226,18 +235,20 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
 
 class AsyncDockerTests(unittest.IsolatedAsyncioTestCase):
     async def test_lifecycle_explicit_delete_and_shared_dto(self):
-        lifecycle = aio.docker(os.environ["OPENSOL_TEST_IMAGE"], command=["sleep", "infinity"])
+        backend = aio.docker(os.environ["OPENSOL_TEST_IMAGE"], command=["sleep", "infinity"])
+        lifecycle = backend.lifecycle
         self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
         resource = await lifecycle.create()
         self.assertIsInstance(resource, sdk.ResourceRef)
         try:
             self.assertEqual((await lifecycle.inspect(resource)).state, "stopped")
             await lifecycle.start(resource)
-            result = await aio.docker_connection(resource.id).exec(
+            result = await backend.connection(resource).exec(
                 ["python3", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
                 stdin=b"\x00\xffdocker", timeout=5,
             )
             self.assertEqual(result.stdout, b"\x00\xffdocker")
+            self.assertTrue((await aio.docker_connection(resource.id).exec(["true"])).success)
             with self.assertRaises(sdk.UnsupportedError):
                 await lifecycle.fork(resource)
             await lifecycle.stop(resource)
@@ -257,6 +268,7 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
             def handle_request(self):
+                assert self.headers["x-api-key"] == "secret"
                 records.append((self.command, self.path))
                 self.rfile.read(int(self.headers.get("content-length", 0)))
                 self.send_response(200)
@@ -276,7 +288,8 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
         worker.start()
         endpoint = f"http://127.0.0.1:{server.server_port}"
         try:
-            lifecycle = aio.e2b("secret", api_endpoint=endpoint)
+            backend = aio.e2b("secret", api_endpoint=endpoint, envd_endpoint=endpoint)
+            lifecycle = backend.lifecycle
             self.assertTrue(lifecycle.capabilities()["stop_preserves_memory"])
             resource = await lifecycle.create()
             self.assertEqual((await lifecycle.inspect(resource)).state, "running")
@@ -284,7 +297,7 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
             await lifecycle.start(resource)
             self.assertEqual((await lifecycle.fork(resource)).id, "child")
             before = len(records)
-            native = await aio.e2b_envd("secret", resource, api_endpoint=endpoint, envd_endpoint=endpoint)
+            native = await backend.envd(resource)
             self.assertIsInstance(native.connection, aio.Connection)
             self.assertIsInstance(native.processes, aio.ProcessManager)
             self.assertEqual(records[before:], [("GET", "/sandboxes/parent")])
@@ -303,11 +316,18 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
         endpoint = f"http://127.0.0.1:{port}"
         try:
             sandboxd = await aio.sandboxd(endpoint)
-            lifecycle = await aio.openshell(endpoint, workload_template="base")
+            backend = await aio.openshell(endpoint, workload_template="base")
+            lifecycle = backend.lifecycle
             connection = await aio.openshell_connection(endpoint, "sandbox")
             self.assertIsInstance(sandboxd, aio.Connection)
             self.assertIsInstance(lifecycle, aio.Lifecycle)
             self.assertIsInstance(connection, aio.Connection)
+            self.assertIsInstance(backend.connection(sdk.ResourceRef("openshell", "sandbox")), aio.Connection)
+            with self.assertRaises(sdk.InvalidArgumentError):
+                backend.connection(sdk.ResourceRef("docker", "sandbox"))
+            synchronous = sdk.openshell(endpoint, workload_template="base")
+            self.assertIsInstance(synchronous.lifecycle, sdk.Lifecycle)
+            self.assertIsInstance(synchronous.connection(sdk.ResourceRef("openshell", "sandbox")), sdk.Connection)
             self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
             with self.assertRaises(sdk.UnsupportedError):
                 await lifecycle.fork(sdk.ResourceRef("openshell", "sandbox"))

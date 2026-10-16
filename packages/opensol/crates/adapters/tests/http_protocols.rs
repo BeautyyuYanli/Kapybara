@@ -21,9 +21,8 @@ use opensol_adapters::{
     secret::Secret,
 };
 use opensol_core::{
-    Command, Connection, CreateOptions, ErrorKind, ExecRequest, Lifecycle, OutputChannel, Process,
-    ProcessEvent, ProcessManager, ProcessRef, PtySize, ResourceRef, ResourceState, Signal,
-    SpawnRequest,
+    Command, CreateOptions, ErrorKind, ExecRequest, OutputChannel, Process, ProcessEvent,
+    ProcessRef, PtySize, ResourceRef, ResourceState, Signal, SpawnRequest,
 };
 use prost::Message;
 use serde_json::{Value, json};
@@ -364,6 +363,7 @@ async fn e2b_body_deadline_is_timeout_not_malformed_json() {
     config.request_timeout = Duration::from_millis(50);
     let error = E2bLifecycle::new(config)
         .unwrap()
+        .lifecycle()
         .create(CreateOptions::default())
         .await
         .unwrap_err();
@@ -375,16 +375,27 @@ async fn e2b_body_deadline_is_timeout_not_malformed_json() {
 #[tokio::test]
 async fn envd_resources_use_native_list_and_kill_without_simulating_missing_operations() {
     let fixture = Fixture::start().await;
-    let envd = Arc::new(fixture.envd());
+    let envd = fixture.envd().processes();
     let info = envd.probe().await.unwrap();
     assert_eq!(info.backend, "envd");
     assert!(info.client_version.is_none() && info.server_version.is_none());
     let listed = envd.list().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].process.id, "42");
+    assert_eq!(listed[0].process.pty, None);
     assert!(listed[0].exit.is_none() && listed[0].native_result.is_none());
     let process = Process::new(envd.clone(), listed[0].process.clone());
     assert_eq!(process.inspect().await.unwrap().process.id, "42");
+    let handle = process.output().subscribe().await.unwrap();
+    assert_eq!(handle.process.pty, None);
+    assert_eq!(
+        opensol_core::wait_events(handle.events, "envd")
+            .await
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    assert_eq!(process.wait(None).await.unwrap().code, Some(7));
     process.kill().await.unwrap();
     for error in [
         process.pause().await.unwrap_err(),
@@ -396,17 +407,15 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
     ] {
         assert_eq!(error.kind, ErrorKind::Unsupported);
     }
-    let missing = ProcessRef::new("envd", "999", false);
+    let missing = ProcessRef::new("envd", "999", Some(false));
     assert_eq!(
         envd.status(&missing).await.unwrap_err().kind,
         ErrorKind::NotFound
     );
     let records = fixture.records.lock().unwrap();
-    assert!(
-        records
-            .iter()
-            .all(|record| record.path.ends_with("/List") || record.path.ends_with("/SendSignal"))
-    );
+    assert!(records.iter().all(|record| record.path.ends_with("/List")
+        || record.path.ends_with("/SendSignal")
+        || record.path.ends_with("/Connect")));
     let killed = records
         .iter()
         .find(|record| record.path.ends_with("/SendSignal"))
@@ -419,7 +428,7 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
 #[tokio::test]
 async fn envd_probe_preserves_native_permission_errors_without_exposing_bodies() {
     let fixture = Fixture::with_input_error(Some(("List", "permission_denied"))).await;
-    let error = fixture.envd().probe().await.unwrap_err();
+    let error = fixture.envd().processes().probe().await.unwrap_err();
     assert_eq!(error.kind, ErrorKind::Permission);
     assert!(!error.to_string().contains("envd-secret"));
 }
@@ -432,6 +441,7 @@ async fn envd_native_framing_bytes_and_finite_stdin() {
     command.cwd = Some("/work".into());
     command.env.insert("KEY".into(), "value".into());
     let result = envd
+        .connection()
         .exec(ExecRequest {
             command,
             stdin: vec![0, 0xff, 7],
@@ -476,12 +486,28 @@ async fn envd_native_framing_bytes_and_finite_stdin() {
 #[tokio::test]
 async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     let fixture = Fixture::start().await;
-    let envd = fixture.envd();
+    let envd = fixture.envd().processes();
     let mut request = SpawnRequest::new(Command::new("program", Vec::<String>::new()));
     request.stdin = true;
     request.pty = Some(PtySize { cols: 90, rows: 30 });
     let mut handle = envd.spawn(request).await.unwrap();
-    assert!(handle.process.pty);
+    assert_eq!(handle.process.pty, Some(true));
+    let listed = envd.list().await.unwrap().remove(0).process;
+    assert_eq!(listed.id, handle.process.id);
+    assert_eq!(listed.pty, None);
+    let unknown = envd.get(listed);
+    let before = fixture.records.lock().unwrap().len();
+    for error in [
+        unknown.send_input(vec![1]).await.unwrap_err(),
+        unknown.close_stdin().await.unwrap_err(),
+        unknown
+            .resize(PtySize { cols: 80, rows: 24 })
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.kind, ErrorKind::Unsupported);
+    }
+    assert_eq!(fixture.records.lock().unwrap().len(), before);
     assert!(
         matches!(handle.events.next().await.unwrap().unwrap(), ProcessEvent::Output { channel: OutputChannel::Terminal, data } if data == [0xff, 0, b'T'])
     );
@@ -512,9 +538,9 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
             .kind,
         ErrorKind::Unsupported
     );
-    assert!(!ProcessManager::capabilities(&envd).historical_output);
-    assert!(ProcessManager::capabilities(&envd).reconnect);
-    let process = ProcessRef::new("envd", "42", false);
+    assert!(!envd.capabilities().historical_output);
+    assert!(envd.capabilities().reconnect);
+    let process = ProcessRef::new("envd", "42", Some(false));
     assert_eq!(
         envd.status(&process).await.unwrap().state,
         opensol_core::ProcessState::Running
@@ -579,6 +605,7 @@ async fn envd_exec_preserves_native_exit_when_input_target_has_expired() {
         let fixture = Fixture::with_input_error(Some((method, "not_found"))).await;
         let result = fixture
             .envd()
+            .connection()
             .exec(ExecRequest {
                 command: Command::new("program", Vec::<String>::new()),
                 stdin: vec![0, 0xff, 7],
@@ -601,6 +628,7 @@ async fn envd_input_not_found_requires_valid_bounded_completion() {
         let fixture = Fixture::with_input_error(Some(("SendInput", "not_found"))).await;
         let error = fixture
             .envd()
+            .connection()
             .exec(ExecRequest {
                 command: Command::new(program, Vec::<String>::new()),
                 stdin: vec![0, 0xff],
@@ -611,7 +639,9 @@ async fn envd_input_not_found_requires_valid_bounded_completion() {
         assert_eq!(error.kind, kind, "program={program}");
     }
     let fixture = Fixture::with_input_error(Some(("SendInput", "not_found"))).await;
-    let envd = fixture.envd_with_timeout(Duration::from_millis(300));
+    let envd = fixture
+        .envd_with_timeout(Duration::from_millis(300))
+        .connection();
     let error = tokio::time::timeout(
         Duration::from_secs(2),
         envd.exec(ExecRequest {
@@ -635,6 +665,7 @@ async fn envd_exec_does_not_hide_other_unary_input_failures_behind_exit() {
         let fixture = Fixture::with_input_error(Some(("SendInput", code))).await;
         let error = fixture
             .envd()
+            .connection()
             .exec(ExecRequest {
                 command: Command::new("program", Vec::<String>::new()),
                 stdin: vec![0, 0xff],
@@ -661,6 +692,7 @@ async fn envd_errors_do_not_become_success_or_implicit_kills() {
         ("never", ErrorKind::Timeout),
     ] {
         let error = envd
+            .connection()
             .exec(ExecRequest {
                 command: Command::new(program, Vec::<String>::new()),
                 stdin: Vec::new(),
@@ -693,7 +725,8 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     config.api_endpoint = fixture.endpoint.clone();
     config.envd_endpoint = Some(fixture.endpoint.clone());
     assert!(!format!("{config:?}").contains("api-secret"));
-    let lifecycle = E2bLifecycle::new(config.clone()).unwrap();
+    let backend = E2bLifecycle::new(config.clone()).unwrap();
+    let lifecycle = backend.lifecycle();
     let resource = lifecycle
         .create(CreateOptions {
             name: Some("friendly".into()),
@@ -709,9 +742,10 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     lifecycle.stop(&resource).await.unwrap();
     lifecycle.start(&resource).await.unwrap();
     assert_eq!(lifecycle.fork(&resource).await.unwrap().id, "child");
-    let native = lifecycle.envd(&resource).await.unwrap();
+    let native = backend.envd(&resource).await.unwrap();
     assert_eq!(
         native
+            .connection()
             .exec(ExecRequest::new(Command::shell("true")))
             .await
             .unwrap()
@@ -729,6 +763,7 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     config.template = "http-fail".into();
     let error = E2bLifecycle::new(config)
         .unwrap()
+        .lifecycle()
         .create(CreateOptions::default())
         .await
         .unwrap_err();

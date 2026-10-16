@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, Result,
+    raw::ExecAccess,
 };
 
 use crate::{
@@ -59,7 +60,7 @@ impl Ssh {
 }
 
 #[async_trait]
-impl Connection for Ssh {
+impl ExecAccess for Ssh {
     fn backend(&self) -> &'static str {
         "ssh"
     }
@@ -72,7 +73,6 @@ impl Connection for Ssh {
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
-        request.validate("ssh")?;
         let mut argv = vec!["-T".into(), "-oBatchMode=yes".into()];
         if let Some(port) = self.config.port {
             argv.extend(["-p".into(), port.to_string()]);
@@ -96,10 +96,13 @@ impl Connection for Ssh {
             stdin: request.stdin,
             timeout: request.timeout,
         };
-        let result = Local.exec(local).await.map_err(|mut error| {
-            error.backend = "ssh".into();
-            error
-        })?;
+        let result = Connection::new(Local)
+            .exec(local)
+            .await
+            .map_err(|mut error| {
+                error.backend = "ssh".into();
+                error
+            })?;
         if result.exit.code == Some(255) {
             return Err(Error::new(
                 ErrorKind::Transport,

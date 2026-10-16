@@ -11,7 +11,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 #[pyclass(name = "AsyncConnection", frozen)]
 pub(super) struct AsyncConnection {
-    inner: Arc<dyn Connection>,
+    inner: Connection,
 }
 
 #[pymethods]
@@ -72,7 +72,7 @@ impl AsyncConnection {
 
 #[pyclass(name = "AsyncLifecycle", frozen)]
 pub(super) struct AsyncLifecycle {
-    inner: Arc<dyn Lifecycle>,
+    inner: Lifecycle,
 }
 
 #[pymethods]
@@ -343,7 +343,7 @@ impl AsyncProcessHandle {
 
 #[pyclass(name = "AsyncProcessManager", frozen)]
 struct AsyncProcessManager {
-    inner: Arc<dyn ProcessManager>,
+    inner: ProcessManager,
 }
 
 #[pymethods]
@@ -359,7 +359,7 @@ impl AsyncProcessManager {
 
     fn get(&self, process: PyRef<'_, PyProcessRef>) -> resources::AsyncProcess {
         resources::AsyncProcess {
-            inner: opensol_core::Process::new(self.inner.clone(), process.inner.clone()),
+            inner: self.inner.get(process.inner.clone()),
         }
     }
 
@@ -558,31 +558,6 @@ fn _async_processes(manager: PyRef<'_, PyProcessManager>) -> AsyncProcessManager
 }
 
 #[pyfunction]
-#[pyo3(signature = (api_key, resource, *, api_endpoint="https://api.e2b.app", envd_endpoint=None))]
-fn _aio_e2b_envd<'py>(
-    py: Python<'py>,
-    api_key: String,
-    resource: PyRef<'_, PyResourceRef>,
-    api_endpoint: &str,
-    envd_endpoint: Option<String>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let mut config = E2bConfig::new(Secret::new(api_key), "base");
-    config.api_endpoint = api_endpoint.into();
-    config.envd_endpoint = envd_endpoint;
-    let client = E2bLifecycle::new(config).map_err(exception)?;
-    let resource = resource.inner.clone();
-    future_into_py(py, async move {
-        client
-            .envd(&resource)
-            .await
-            .map(|inner| PyEnvd {
-                inner: Arc::new(inner),
-            })
-            .map_err(exception)
-    })
-}
-
-#[pyfunction]
 #[pyo3(signature = (endpoint, *, bearer_token=None, ca_certificate=None, client_certificate=None, client_key=None))]
 fn _aio_sandboxd<'py>(
     py: Python<'py>,
@@ -603,7 +578,7 @@ fn _aio_sandboxd<'py>(
         Sandboxd::connect(config)
             .await
             .map(|inner| AsyncConnection {
-                inner: Arc::new(inner),
+                inner: Connection::new(inner),
             })
             .map_err(exception)
     })
@@ -651,9 +626,7 @@ fn _aio_openshell<'py>(
     future_into_py(py, async move {
         OpenShellLifecycle::connect(config, workspace, create)
             .await
-            .map(|inner| AsyncLifecycle {
-                inner: Arc::new(inner),
-            })
+            .map(|inner| PyOpenShell { inner })
             .map_err(exception)
     })
 }
@@ -686,7 +659,7 @@ fn _aio_openshell_connection<'py>(
         OpenShellConnection::connect(config, workspace, sandbox)
             .await
             .map(|inner| AsyncConnection {
-                inner: Arc::new(inner),
+                inner: Connection::new(inner),
             })
             .map_err(exception)
     })
@@ -700,7 +673,6 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_async_connection, module)?)?;
     module.add_function(wrap_pyfunction!(_async_lifecycle, module)?)?;
     module.add_function(wrap_pyfunction!(_async_processes, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_e2b_envd, module)?)?;
     module.add_function(wrap_pyfunction!(_aio_sandboxd, module)?)?;
     module.add_function(wrap_pyfunction!(_aio_openshell, module)?)?;
     module.add_function(wrap_pyfunction!(_aio_openshell_connection, module)?)?;

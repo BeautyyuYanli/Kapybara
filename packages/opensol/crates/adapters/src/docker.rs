@@ -25,6 +25,7 @@ use futures::StreamExt;
 use opensol_core::{
     Connection, ConnectionCapabilities, CreateOptions, Error, ErrorKind, ExecRequest, ExecResult,
     ExitStatus, Lifecycle, LifecycleCapabilities, ResourceInfo, ResourceRef, ResourceState, Result,
+    raw::{ExecAccess, LifecycleAccess},
 };
 use tokio::io::AsyncWriteExt;
 
@@ -77,12 +78,17 @@ impl DockerLifecycle {
         )
     }
 
-    pub fn connection(&self, resource: &ResourceRef) -> Result<DockerConnection> {
+    pub fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::new(self.clone())
+    }
+
+    /// Bind a container using the same Engine client, without checking or starting it.
+    pub fn connection(&self, resource: &ResourceRef) -> Result<Connection> {
         resource.validate("docker", "connect")?;
-        Ok(DockerConnection {
+        Ok(Connection::new(DockerConnection {
             client: self.client.clone(),
             container: resource.id.clone(),
-        })
+        }))
     }
 }
 
@@ -105,7 +111,7 @@ fn docker_error(error: bollard::errors::Error, operation: &str) -> Error {
 }
 
 #[async_trait]
-impl Lifecycle for DockerLifecycle {
+impl LifecycleAccess for DockerLifecycle {
     fn backend(&self) -> &'static str {
         "docker"
     }
@@ -146,7 +152,6 @@ impl Lifecycle for DockerLifecycle {
     }
 
     async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
-        resource.validate("docker", "inspect")?;
         let info = self
             .client
             .inspect_container(&resource.id, None::<InspectContainerOptions>)
@@ -172,7 +177,6 @@ impl Lifecycle for DockerLifecycle {
     }
 
     async fn start(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("docker", "start")?;
         self.client
             .start_container(&resource.id, None::<StartContainerOptions>)
             .await
@@ -180,7 +184,6 @@ impl Lifecycle for DockerLifecycle {
     }
 
     async fn stop(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("docker", "stop")?;
         self.client
             .stop_container(&resource.id, None::<StopContainerOptions>)
             .await
@@ -188,7 +191,6 @@ impl Lifecycle for DockerLifecycle {
     }
 
     async fn delete(&self, resource: &ResourceRef) -> Result<()> {
-        resource.validate("docker", "delete")?;
         self.client
             .remove_container(
                 &resource.id,
@@ -225,7 +227,7 @@ impl DockerConnection {
 }
 
 #[async_trait]
-impl Connection for DockerConnection {
+impl ExecAccess for DockerConnection {
     fn backend(&self) -> &'static str {
         "docker"
     }
@@ -238,7 +240,6 @@ impl Connection for DockerConnection {
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
-        request.validate("docker")?;
         deadline(request.timeout, "docker", "exec", async {
             let exec = self
                 .client

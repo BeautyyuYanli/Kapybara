@@ -16,6 +16,7 @@ use opensol_core::{
     Connection, ConnectionCapabilities, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
     ExitStatus, ManagerInfo, OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle,
     ProcessInfo, ProcessManager, ProcessRef, ProcessState, PtySize, Result, Signal, SpawnRequest,
+    raw::{ExecAccess, ProcessAccess},
     wait_events,
 };
 use prost::Message;
@@ -113,7 +114,21 @@ fn rpc_error(code: &str, operation: &str) -> Error {
 }
 
 impl Envd {
+    /// Both views share this client's configured endpoint, headers and HTTP pool.
+    pub fn connection(&self) -> Connection {
+        Connection::new(self.clone())
+    }
+
+    pub fn processes(&self) -> ProcessManager {
+        ProcessManager::new(self.clone())
+    }
+
     pub fn new(config: EnvdConfig) -> Result<Self> {
+        Self::with_client(config, http::client("envd")?)
+    }
+
+    /// Composition reuses the HTTP pool; authentication remains specific to each RPC.
+    pub(crate) fn with_client(config: EnvdConfig, client: Client) -> Result<Self> {
         if config.request_timeout.is_zero() {
             return Err(Error::invalid(
                 "envd",
@@ -150,7 +165,7 @@ impl Envd {
             headers.insert("e2b-sandbox-port", HeaderValue::from_static("49983"));
         }
         Ok(Self {
-            client: http::client("envd")?,
+            client,
             endpoint: http::endpoint(&config.endpoint, "envd")?,
             headers,
             request_timeout: config.request_timeout,
@@ -255,7 +270,6 @@ impl Envd {
     }
 
     fn selector(&self, process: &ProcessRef, operation: &str) -> Result<protocol::ProcessSelector> {
-        process.validate("envd", operation)?;
         let pid = process
             .id
             .parse::<u32>()
@@ -267,7 +281,12 @@ impl Envd {
         })
     }
 
-    async fn handle(&self, mut raw: RawStream, pty: bool, start: bool) -> Result<ProcessHandle> {
+    async fn handle(
+        &self,
+        mut raw: RawStream,
+        pty: Option<bool>,
+        start: bool,
+    ) -> Result<ProcessHandle> {
         let method = if start { "Start" } else { "Connect" };
         let first = deadline(Some(self.request_timeout), "envd", method, async {
             raw.next().await.ok_or_else(|| protocol_error(method))?
@@ -322,7 +341,7 @@ impl Envd {
 }
 
 #[async_trait]
-impl ProcessManager for Envd {
+impl ProcessAccess for Envd {
     fn backend(&self) -> &'static str {
         "envd"
     }
@@ -354,7 +373,7 @@ impl ProcessManager for Envd {
 
     async fn list(&self) -> Result<Vec<ProcessInfo>> {
         let response: protocol::ListResponse = self.unary("List", protocol::ListRequest {}).await?;
-        // List has no PTY metadata; retain the original spawn reference for PTY-specific controls.
+        // List has no PTY metadata; unknown mode still permits identity-only operations.
         response
             .processes
             .into_iter()
@@ -368,7 +387,7 @@ impl ProcessManager for Envd {
                     ));
                 }
                 Ok(ProcessInfo {
-                    process: ProcessRef::new("envd", info.pid.to_string(), false),
+                    process: ProcessRef::new("envd", info.pid.to_string(), None),
                     state: ProcessState::Running,
                     exit: None,
                     native_state: "listed".into(),
@@ -383,7 +402,6 @@ impl ProcessManager for Envd {
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
-        request.validate("envd")?;
         let config = protocol::ProcessConfig {
             cmd: request.command.argv[0].clone(),
             args: request.command.argv[1..].to_vec(),
@@ -403,7 +421,7 @@ impl ProcessManager for Envd {
         };
         self.handle(
             self.stream("Start", message).await?,
-            request.pty.is_some(),
+            Some(request.pty.is_some()),
             true,
         )
         .await
@@ -444,10 +462,10 @@ impl ProcessManager for Envd {
     }
 
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
-        let input = if process.pty {
-            protocol::process_input::Input::Pty(data)
-        } else {
-            protocol::process_input::Input::Stdin(data)
+        let input = match process.pty {
+            Some(true) => protocol::process_input::Input::Pty(data),
+            Some(false) => protocol::process_input::Input::Stdin(data),
+            None => return Err(Error::unsupported("envd", "send_input")),
         };
         let _: protocol::SendInputResponse = self
             .unary(
@@ -462,7 +480,7 @@ impl ProcessManager for Envd {
     }
 
     async fn close_stdin(&self, process: &ProcessRef) -> Result<()> {
-        if process.pty {
+        if process.pty != Some(false) {
             return Err(Error::unsupported("envd", "close_pty_stdin"));
         }
         let _: protocol::CloseStdinResponse = self
@@ -477,9 +495,6 @@ impl ProcessManager for Envd {
     }
 
     async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
-        if signal == Signal::Interrupt {
-            return Err(Error::unsupported("envd", "signal_SIGINT"));
-        }
         let _: protocol::SendSignalResponse = self
             .unary(
                 "SendSignal",
@@ -493,8 +508,7 @@ impl ProcessManager for Envd {
     }
 
     async fn resize(&self, process: &ProcessRef, size: PtySize) -> Result<()> {
-        size.validate("envd", "resize")?;
-        if !process.pty {
+        if process.pty != Some(true) {
             return Err(Error::unsupported("envd", "resize_without_pty"));
         }
         let _: protocol::UpdateResponse = self
@@ -537,7 +551,7 @@ impl ProcessManager for Envd {
 }
 
 #[async_trait]
-impl Connection for Envd {
+impl ExecAccess for Envd {
     fn backend(&self) -> &'static str {
         "envd"
     }
@@ -550,7 +564,6 @@ impl Connection for Envd {
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
-        request.validate("envd")?;
         deadline(request.timeout, "envd", "exec", async {
             let mut spawn = SpawnRequest::new(request.command);
             spawn.stdin = !request.stdin.is_empty();

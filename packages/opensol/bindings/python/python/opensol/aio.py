@@ -224,6 +224,48 @@ class Envd:
         return ProcessManager(_native._async_processes(self._native.processes))
 
 
+class Docker:
+    """Configured Engine context; lifecycle and connection binding remain explicit."""
+
+    def __init__(self, native: _native.Docker) -> None:
+        self._native = native
+
+    @property
+    def lifecycle(self) -> Lifecycle:
+        return _native._async_lifecycle(self._native.lifecycle)
+
+    def connection(self, resource: ResourceRef) -> Connection:
+        return _native._async_connection(self._native.connection(resource))
+
+
+class E2b:
+    """One control-plane context, including credentials used to discover envd."""
+
+    def __init__(self, native: _native.E2b) -> None:
+        self._native = native
+
+    @property
+    def lifecycle(self) -> Lifecycle:
+        return _native._async_lifecycle(self._native.lifecycle)
+
+    async def envd(self, resource: ResourceRef) -> Envd:
+        return Envd(await self._native._aio_envd(resource))
+
+
+class OpenShell:
+    """Established gateway and workspace context; connection binding is local."""
+
+    def __init__(self, native: _native.OpenShell) -> None:
+        self._native = native
+
+    @property
+    def lifecycle(self) -> Lifecycle:
+        return _native._async_lifecycle(self._native.lifecycle)
+
+    def connection(self, resource: ResourceRef) -> Connection:
+        return _native._async_connection(self._native.connection(resource))
+
+
 def local() -> Connection:
     return _native._async_connection(_native.local())
 
@@ -249,8 +291,8 @@ def docker(
     env: dict[str, str] | None = None,
     working_dir: str | None = None,
     host_config_json: str | None = None,
-) -> Lifecycle:
-    return _native._async_lifecycle(
+) -> Docker:
+    return Docker(
         _native.docker(image, command=command, env=env, working_dir=working_dir,
                        host_config_json=host_config_json)
     )
@@ -296,24 +338,16 @@ def e2b(
     auto_pause: bool = False,
     env: dict[str, str] | None = None,
     metadata: dict[str, str] | None = None,
-) -> Lifecycle:
-    return _native._async_lifecycle(
+    envd_endpoint: str | None = None,
+    sandbox_domain: str = "e2b.app",
+    request_timeout: float = 30.0,
+) -> E2b:
+    return E2b(
         _native.e2b(api_key, template, api_endpoint=api_endpoint,
                     sandbox_timeout=sandbox_timeout, auto_pause=auto_pause,
-                    env=env, metadata=metadata)
+                    env=env, metadata=metadata, envd_endpoint=envd_endpoint,
+                    sandbox_domain=sandbox_domain, request_timeout=request_timeout)
     )
-
-
-async def e2b_envd(
-    api_key: str,
-    resource: ResourceRef,
-    *,
-    api_endpoint: str = "https://api.e2b.app",
-    envd_endpoint: str | None = None,
-) -> Envd:
-    return Envd(await _native._aio_e2b_envd(
-        api_key, resource, api_endpoint=api_endpoint, envd_endpoint=envd_endpoint
-    ))
 
 
 def agent_sandbox(
@@ -346,7 +380,7 @@ def sandboxd(
                                 client_certificate=client_certificate, client_key=client_key)
 
 
-def openshell(
+async def openshell(
     endpoint: str,
     *,
     workspace: str = "default",
@@ -356,12 +390,12 @@ def openshell(
     ca_certificate: str | None = None,
     client_certificate: str | None = None,
     client_key: str | None = None,
-) -> Awaitable[Lifecycle]:
-    return _native._aio_openshell(endpoint, workspace=workspace,
+) -> OpenShell:
+    return OpenShell(await _native._aio_openshell(endpoint, workspace=workspace,
                                  workload_template=workload_template,
                                  spec_protobuf=spec_protobuf, bearer_token=bearer_token,
                                  ca_certificate=ca_certificate,
-                                 client_certificate=client_certificate, client_key=client_key)
+                                 client_certificate=client_certificate, client_key=client_key))
 
 
 def openshell_connection(
@@ -383,6 +417,7 @@ def openshell_connection(
 
 __all__ = [
     "Connection", "Lifecycle", "ProcessManager", "ProcessHandle", "Process", "ProcessOutput", "Envd",
+    "Docker", "E2b", "OpenShell",
     "local", "ssh", "docker", "docker_connection", "pueue", "envd", "e2b",
-    "e2b_envd", "agent_sandbox", "sandboxd", "openshell", "openshell_connection",
+    "agent_sandbox", "sandboxd", "openshell", "openshell_connection",
 ]

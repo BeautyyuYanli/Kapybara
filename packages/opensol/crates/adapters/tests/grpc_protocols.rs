@@ -24,9 +24,7 @@ use opensol_adapters::{
     sandboxd::{Sandboxd, protocol as sandboxd},
     secret::Secret,
 };
-use opensol_core::{
-    Command, Connection, CreateOptions, ErrorKind, ExecRequest, Lifecycle, ResourceState,
-};
+use opensol_core::{Command, Connection, CreateOptions, ErrorKind, ExecRequest, ResourceState};
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{
@@ -378,8 +376,7 @@ fn tls_certificates() -> TlsCertificates {
 }
 
 async fn execute_with_config(config: GrpcConfig) -> opensol_core::Result<opensol_core::ExecResult> {
-    Sandboxd::connect(config)
-        .await?
+    Connection::new(Sandboxd::connect(config).await?)
         .exec(ExecRequest::new(Command::new(
             "program",
             Vec::<String>::new(),
@@ -455,7 +452,7 @@ async fn grpc_tls_handshake_deadline_is_distinct_from_transport_failure() {
 async fn sandboxd_execute_bytes_arguments_deadline_and_unsupported_stdin() {
     let fixture = Fixture::start().await;
     assert!(!format!("{:?}", fixture.config).contains("grpc-secret"));
-    let connection = Sandboxd::connect(fixture.config.clone()).await.unwrap();
+    let connection = Connection::new(Sandboxd::connect(fixture.config.clone()).await.unwrap());
     let mut command = Command::new("printf", ["%s", "' $()"]);
     command.cwd = Some("/work".into());
     command.env.insert("KEY".into(), "value".into());
@@ -501,7 +498,7 @@ async fn sandboxd_execute_bytes_arguments_deadline_and_unsupported_stdin() {
 #[tokio::test]
 async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     let fixture = Fixture::start().await;
-    let lifecycle = OpenShellLifecycle::connect(
+    let backend = OpenShellLifecycle::connect(
         fixture.config.clone(),
         "team",
         OpenShellCreate {
@@ -511,6 +508,7 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     )
     .await
     .unwrap();
+    let lifecycle = backend.lifecycle();
     let resource = lifecycle
         .create(CreateOptions {
             name: Some("sandbox".into()),
@@ -529,7 +527,7 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
         ResourceState::Stopped
     );
     lifecycle.start(&resource).await.unwrap();
-    let connection = lifecycle.connection(&resource).unwrap();
+    let connection = backend.connection(&resource).unwrap();
     let mut command = Command::new("printf", ["%s", "' $()"]);
     command.cwd = Some("/work".into());
     command.env.insert("KEY".into(), "value".into());
