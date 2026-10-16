@@ -1,0 +1,27 @@
+[workspace]
+members = ["crates/core", "crates/adapters", "bindings/python"]
+default-members = ["crates/core", "crates/adapters"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+agent-sandbox-core = { path = "crates/core", version = "0.1.0" }
+agent-sandbox-adapters = { path = "crates/adapters", version = "0.1.0", default-features = false }
+async-trait = "0.1.89"
+async-stream = "0.3.6"
+bytes = "1.10"
+futures = "0.3.31"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "net"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "json", "stream"] }
+prost = "0.14.1"
+tonic = { version = "0.14.2", features = ["transport", "tls-webpki-roots"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

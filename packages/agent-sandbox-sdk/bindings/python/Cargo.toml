@@ -1,0 +1,27 @@
+[package]
+name = "agent-sandbox-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+agent-sandbox-core.workspace = true
+agent-sandbox-adapters = { workspace = true, features = ["all"] }
+pyo3 = { version = "0.27.2", features = ["abi3-py312"] }
+serde_json.workspace = true
+serde.workspace = true
+prost.workspace = true
+tokio.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true
