@@ -1,6 +1,7 @@
 //! Official Pueue v4 CLI over any Connection. The caller runs pueued and retains its logs.
 //!
-//! Output is delivered after completion, as merged bytes from `pueue follow`; it is not a PTY.
+//! Output subscriptions deliver merged bytes after completion via `pueue follow`; they are not PTYs.
+//! Explicit native-log configuration also enables bounded resource reads while a task runs.
 //! Configure Pueue's `client.read_local_logs=true` and run the CLI beside its daemon for binary
 //! preservation. Pueue's remote-log protocol itself decodes text lossily. No daemon is started here.
 //! Task environment overrides are applied inside the queued command, never to the Pueue client.
@@ -10,13 +11,16 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
-    Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, OutputChannel,
-    ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessManager, ProcessRef,
-    ProcessState, Result, Signal, SpawnRequest,
+    Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
+    OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessManager,
+    ProcessRef, ProcessState, Result, Signal, SpawnRequest,
 };
 use serde_json::Value;
 
 use crate::util::{deadline, shell_command};
+
+#[path = "pueue_output.rs"]
+mod output;
 
 /// Native CLI selection and queue group. The SDK does not create groups or change concurrency limits.
 #[derive(Clone, Debug)]
@@ -25,6 +29,9 @@ pub struct PueueConfig {
     pub config_file: Option<String>,
     pub profile: Option<String>,
     pub group: Option<String>,
+    /// Native daemon data directory on the injected Connection's target; never guessed locally.
+    /// Enables bounded output resources; requires Linux and GNU stat/dd on that target.
+    pub pueue_directory: Option<String>,
     pub request_timeout: Duration,
 }
 
@@ -35,6 +42,7 @@ impl Default for PueueConfig {
             config_file: None,
             profile: None,
             group: None,
+            pueue_directory: None,
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -64,6 +72,17 @@ impl Pueue {
                 "pueue",
                 "configure",
                 "request timeout must be positive",
+            ));
+        }
+        if config
+            .pueue_directory
+            .as_ref()
+            .is_some_and(|path| path.is_empty() || path.contains('\0'))
+        {
+            return Err(Error::invalid(
+                "pueue",
+                "configure",
+                "invalid native data directory",
             ));
         }
         Ok(Self { connection, config })
@@ -131,8 +150,7 @@ impl Pueue {
         Ok(process.id.clone())
     }
 
-    async fn task(&self, process: &ProcessRef) -> Result<Value> {
-        let id = self.id(process, "status")?;
+    async fn tasks(&self) -> Result<Value> {
         let bytes = self
             .run(
                 vec!["status".into(), "--json".into()],
@@ -141,7 +159,16 @@ impl Pueue {
             )
             .await?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| protocol_error("status"))?;
-        value
+        if !value.get("tasks").is_some_and(Value::is_object) {
+            return Err(protocol_error("status"));
+        }
+        Ok(value)
+    }
+
+    async fn task(&self, process: &ProcessRef) -> Result<Value> {
+        let id = self.id(process, "status")?;
+        self.tasks()
+            .await?
             .get("tasks")
             .and_then(|tasks| tasks.get(&id))
             .cloned()
@@ -177,16 +204,31 @@ impl Pueue {
             "Done" => ProcessState::Exited,
             _ => ProcessState::Unknown,
         };
+        let mut native_result = None;
         let exit = if native_state == "Done" {
             let result = payload
                 .and_then(|payload| payload.get("result"))
                 .ok_or_else(|| protocol_error("status"))?;
+            native_result = Some(match result {
+                Value::String(name)
+                    if matches!(
+                        name.as_str(),
+                        "Success" | "Killed" | "Errored" | "DependencyFailed"
+                    ) =>
+                {
+                    name.clone()
+                }
+                Value::Object(object)
+                    if object.len() == 1
+                        && (object.contains_key("Failed")
+                            || object.contains_key("FailedToSpawn")) =>
+                {
+                    object.keys().next().unwrap().clone()
+                }
+                _ => return Err(protocol_error("status")),
+            });
             match result {
                 Value::String(value) if value == "Success" => Some(ExitStatus::code(0)),
-                Value::String(value) if value == "Killed" => Some(ExitStatus {
-                    code: None,
-                    signal: None,
-                }),
                 Value::Object(value) if value.contains_key("Failed") => {
                     let code = value["Failed"]
                         .as_i64()
@@ -204,7 +246,83 @@ impl Pueue {
             state,
             exit,
             native_state: native_state.into(),
+            native_result,
         })
+    }
+
+    /// Native commands with one explicit ID. Precondition checks are advisory; the daemon
+    /// remains authoritative and may reject an operation racing another native client.
+    async fn control(
+        &self,
+        process: &ProcessRef,
+        operation: &str,
+        args: Vec<String>,
+        allowed: &[&str],
+    ) -> Result<()> {
+        self.id(process, operation)?;
+        let before = self.task(process).await?;
+        let info = self.task_info(process, &before)?;
+        if !allowed.contains(&info.native_state.as_str()) {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "pueue",
+                operation,
+                "native task state does not permit this operation",
+            ));
+        }
+        let response = self
+            .run(args, operation, Some(self.config.request_timeout))
+            .await?;
+        // v4 single-ID acknowledgement is explicit, unlike a generic successful CLI exit.
+        let text = std::str::from_utf8(&response).map_err(|_| protocol_error(operation))?;
+        let prefix = match operation {
+            "pause" => "Tasks have been paused",
+            "start" => "Tasks have been started/resumed",
+            "restart" => "Restarted tasks",
+            "kill" | "signal" => "Tasks are being killed",
+            "remove" => "Tasks removed from list",
+            _ => return Err(protocol_error(operation)),
+        };
+        let expected = if operation == "restart" {
+            format!("{prefix}: [{}]", process.id)
+        } else {
+            format!("{prefix}: {}", process.id)
+        };
+        if text.trim() != expected {
+            return Err(protocol_error(operation));
+        }
+        let after = self.task(process).await;
+        if operation == "remove" {
+            return match after {
+                Err(error) if error.kind == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+                Ok(_) => Err(Error::new(
+                    ErrorKind::Conflict,
+                    "pueue",
+                    operation,
+                    "native task was not removed",
+                )),
+            };
+        }
+        let after = after?;
+        let state = self.task_info(process, &after)?;
+        let changed = match operation {
+            "pause" => matches!(state.state, ProcessState::Paused | ProcessState::Exited),
+            "start" => matches!(state.state, ProcessState::Running | ProcessState::Exited),
+            "restart" => before.get("status") != after.get("status"),
+            // Native kill/signal acceptance need not synchronously change task state.
+            "kill" | "signal" => true,
+            _ => false,
+        };
+        if !changed {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "pueue",
+                operation,
+                "native task did not enter the requested state",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -225,6 +343,13 @@ impl ProcessManager for Pueue {
 
     fn capabilities(&self) -> ProcessCapabilities {
         ProcessCapabilities {
+            list: true,
+            pause: true,
+            start: true,
+            restart: true,
+            kill: true,
+            remove: true,
+            output_resource: self.config.pueue_directory.is_some(),
             stdin: true,
             binary_stdin: false,
             supported_signals: &[Signal::Interrupt, Signal::Terminate, Signal::Kill],
@@ -233,6 +358,113 @@ impl ProcessManager for Pueue {
             historical_output: true,
             ..Default::default()
         }
+    }
+
+    async fn probe(&self) -> Result<ManagerInfo> {
+        let version = self
+            .run(
+                vec!["--version".into()],
+                "probe",
+                Some(self.config.request_timeout),
+            )
+            .await?;
+        let version = std::str::from_utf8(&version)
+            .map_err(|_| protocol_error("probe"))?
+            .trim();
+        let client_version = version
+            .strip_prefix("pueue ")
+            .map(|version| version.trim_start_matches('v'))
+            .ok_or_else(|| protocol_error("probe"))?;
+        if !client_version.starts_with("4.") {
+            return Err(Error::unsupported("pueue", "probe_cli_version"));
+        }
+        self.tasks().await?;
+        if self.config.pueue_directory.is_some() {
+            self.probe_output().await?;
+        }
+        Ok(ManagerInfo {
+            backend: "pueue".into(),
+            client_version: Some(client_version.into()),
+            server_version: None,
+        })
+    }
+
+    async fn list(&self) -> Result<Vec<ProcessInfo>> {
+        let value = self.tasks().await?;
+        value["tasks"]
+            .as_object()
+            .ok_or_else(|| protocol_error("list"))?
+            .iter()
+            .filter(|(_, task)| {
+                self.config
+                    .group
+                    .as_ref()
+                    .is_none_or(|group| task.get("group").and_then(Value::as_str) == Some(group))
+            })
+            .map(|(id, task)| {
+                let process = ProcessRef::new("pueue", id, false);
+                self.id(&process, "list")?;
+                self.task_info(&process, task)
+            })
+            .collect()
+    }
+
+    async fn output_stat(&self, process: &ProcessRef) -> Result<opensol_core::OutputInfo> {
+        self.stat_output(process).await
+    }
+    async fn read_output(
+        &self,
+        process: &ProcessRef,
+        cursor: Option<&opensol_core::OutputCursor>,
+        limit: usize,
+    ) -> Result<opensol_core::OutputPage> {
+        self.read_output_page(process, cursor, limit).await
+    }
+
+    async fn pause(&self, process: &ProcessRef) -> Result<()> {
+        let id = self.id(process, "pause")?;
+        self.control(process, "pause", vec!["pause".into(), id], &["Running"])
+            .await
+    }
+    async fn start(&self, process: &ProcessRef) -> Result<()> {
+        let id = self.id(process, "start")?;
+        self.control(
+            process,
+            "start",
+            vec!["start".into(), id],
+            &["Queued", "Stashed", "Paused"],
+        )
+        .await
+    }
+    async fn restart(&self, process: &ProcessRef) -> Result<()> {
+        let id = self.id(process, "restart")?;
+        self.control(
+            process,
+            "restart",
+            vec!["restart".into(), "--in-place".into(), id],
+            &["Done"],
+        )
+        .await
+    }
+    async fn kill(&self, process: &ProcessRef) -> Result<()> {
+        let id = self.id(process, "kill")?;
+        self.control(
+            process,
+            "kill",
+            vec!["kill".into(), id],
+            &["Running", "Paused"],
+        )
+        .await
+    }
+    async fn remove(&self, process: &ProcessRef) -> Result<()> {
+        let id = self.id(process, "remove")?;
+        self.control(
+            process,
+            "remove",
+            vec!["remove".into(), id],
+            &["Queued", "Stashed", "Locked", "Done"],
+        )
+        .await
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
@@ -285,12 +517,16 @@ impl ProcessManager for Pueue {
             self.status(process).await?;
             self.run(vec!["wait".into(), "--quiet".into(), id], "wait", None)
                 .await?;
-            self.status(process).await?.exit.ok_or_else(|| {
+            let info = self.status(process).await?;
+            info.exit.ok_or_else(|| {
                 Error::new(
                     ErrorKind::Backend,
                     "pueue",
                     "wait",
-                    "task ended without a command exit status",
+                    &format!(
+                        "native result {} has no command exit status",
+                        info.native_result.as_deref().unwrap_or("unknown")
+                    ),
                 )
             })
         })
@@ -327,15 +563,16 @@ impl ProcessManager for Pueue {
 
     async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
         let id = self.id(process, "signal")?;
-        self.run(
+        self.control(
+            process,
+            "signal",
             vec![
                 "kill".into(),
                 "--signal".into(),
                 signal.number().to_string(),
                 id,
             ],
-            "signal",
-            Some(self.config.request_timeout),
+            &["Running", "Paused"],
         )
         .await?;
         Ok(())

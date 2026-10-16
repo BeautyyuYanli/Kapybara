@@ -21,7 +21,7 @@ use opensol_adapters::{
     secret::Secret,
 };
 use opensol_core::{
-    Command, Connection, CreateOptions, ErrorKind, ExecRequest, Lifecycle, OutputChannel,
+    Command, Connection, CreateOptions, ErrorKind, ExecRequest, Lifecycle, OutputChannel, Process,
     ProcessEvent, ProcessManager, ProcessRef, PtySize, ResourceRef, ResourceState, Signal,
     SpawnRequest,
 };
@@ -370,6 +370,58 @@ async fn e2b_body_deadline_is_timeout_not_malformed_json() {
     assert_eq!(error.kind, ErrorKind::Timeout);
     assert_eq!(error.operation, "create");
     assert_eq!(fixture.records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn envd_resources_use_native_list_and_kill_without_simulating_missing_operations() {
+    let fixture = Fixture::start().await;
+    let envd = Arc::new(fixture.envd());
+    let info = envd.probe().await.unwrap();
+    assert_eq!(info.backend, "envd");
+    assert!(info.client_version.is_none() && info.server_version.is_none());
+    let listed = envd.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].process.id, "42");
+    assert!(listed[0].exit.is_none() && listed[0].native_result.is_none());
+    let process = Process::new(envd.clone(), listed[0].process.clone());
+    assert_eq!(process.inspect().await.unwrap().process.id, "42");
+    process.kill().await.unwrap();
+    for error in [
+        process.pause().await.unwrap_err(),
+        process.start().await.unwrap_err(),
+        process.restart().await.unwrap_err(),
+        process.remove().await.unwrap_err(),
+        process.output().stat().await.unwrap_err(),
+        process.output().read(None, 64).await.unwrap_err(),
+    ] {
+        assert_eq!(error.kind, ErrorKind::Unsupported);
+    }
+    let missing = ProcessRef::new("envd", "999", false);
+    assert_eq!(
+        envd.status(&missing).await.unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    let records = fixture.records.lock().unwrap();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.path.ends_with("/List") || record.path.ends_with("/SendSignal"))
+    );
+    let killed = records
+        .iter()
+        .find(|record| record.path.ends_with("/SendSignal"))
+        .unwrap();
+    let request = protocol::SendSignalRequest::decode(killed.body.as_slice()).unwrap();
+    assert_eq!(request.signal, 9);
+    assert_selector(request.process);
+}
+
+#[tokio::test]
+async fn envd_probe_preserves_native_permission_errors_without_exposing_bodies() {
+    let fixture = Fixture::with_input_error(Some(("List", "permission_denied"))).await;
+    let error = fixture.envd().probe().await.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Permission);
+    assert!(!error.to_string().contains("envd-secret"));
 }
 
 #[tokio::test]

@@ -15,6 +15,10 @@ from ._native import (
     AsyncConnection as Connection,
     AsyncLifecycle as Lifecycle,
     ExitStatus,
+    ManagerInfo,
+    OutputCursor,
+    OutputInfo,
+    OutputPage,
     ProcessEvent,
     ProcessInfo,
     ProcessRef,
@@ -93,6 +97,16 @@ class ProcessManager:
     def capabilities(self) -> _native.ProcessCapabilities:
         return self._native.capabilities()
 
+    def get(self, process: ProcessRef) -> Process:
+        """Bind a resource locally; existence is checked on its next native operation."""
+        return Process(self._native.get(process))
+
+    def probe(self) -> Awaitable[ManagerInfo]:
+        return self._native.probe()
+
+    def list(self) -> Awaitable[list[ProcessInfo]]:
+        return self._native.list()
+
     async def spawn(
         self,
         argv: Sequence[str],
@@ -129,6 +143,70 @@ class ProcessManager:
 
     def resize(self, process: ProcessRef, cols: int, rows: int) -> Awaitable[None]:
         return self._native.resize(process, cols, rows)
+
+
+class Process:
+    """Bound native task resource; no cached status or implicit lifecycle ownership."""
+
+    def __init__(self, native: _native.AsyncProcess) -> None:
+        self._native = native
+
+    @property
+    def ref(self) -> ProcessRef:
+        return self._native.ref
+
+    @property
+    def output(self) -> ProcessOutput:
+        return ProcessOutput(self._native.output)
+
+    def inspect(self) -> Awaitable[ProcessInfo]:
+        return self._native.inspect()
+
+    def wait(self, *, timeout: float | None = None) -> Awaitable[ExitStatus]:
+        return self._native.wait(timeout=timeout)
+
+    def pause(self) -> Awaitable[None]:
+        return self._native.pause()
+
+    def start(self) -> Awaitable[None]:
+        return self._native.start()
+
+    def restart(self) -> Awaitable[None]:
+        return self._native.restart()
+
+    def kill(self) -> Awaitable[None]:
+        return self._native.kill()
+
+    def remove(self) -> Awaitable[None]:
+        return self._native.remove()
+
+    def signal(self, signal: int) -> Awaitable[None]:
+        return self._native.signal(signal)
+
+    def send_input(self, data: bytes) -> Awaitable[None]:
+        return self._native.send_input(data)
+
+    def close_stdin(self) -> Awaitable[None]:
+        return self._native.close_stdin()
+
+    def resize(self, cols: int, rows: int) -> Awaitable[None]:
+        return self._native.resize(cols, rows)
+
+
+class ProcessOutput:
+    """Independent bounded reads and subscriptions to one retained native task log."""
+
+    def __init__(self, native: _native.AsyncProcessOutput) -> None:
+        self._native = native
+
+    def stat(self) -> Awaitable[OutputInfo]:
+        return self._native.stat()
+
+    def read(self, *, cursor: OutputCursor | None = None, limit: int = 65536) -> Awaitable[OutputPage]:
+        return self._native.read(cursor=cursor, limit=limit)
+
+    async def subscribe(self) -> ProcessHandle:
+        return ProcessHandle(await self._native.subscribe())
 
 
 class Envd:
@@ -188,10 +266,12 @@ def pueue(
     config_file: str | None = None,
     profile: str | None = None,
     group: str | None = None,
+    pueue_directory: str | None = None,
     program: str = "pueue",
 ) -> ProcessManager:
     manager = _native.pueue(connection._blocking(), config_file=config_file,
-                            profile=profile, group=group, program=program)
+                            profile=profile, group=group, pueue_directory=pueue_directory,
+                            program=program)
     return ProcessManager(_native._async_processes(manager))
 
 
@@ -302,7 +382,7 @@ def openshell_connection(
 
 
 __all__ = [
-    "Connection", "Lifecycle", "ProcessManager", "ProcessHandle", "Envd",
+    "Connection", "Lifecycle", "ProcessManager", "ProcessHandle", "Process", "ProcessOutput", "Envd",
     "local", "ssh", "docker", "docker_connection", "pueue", "envd", "e2b",
     "e2b_envd", "agent_sandbox", "sandboxd", "openshell", "openshell_connection",
 ]

@@ -1,6 +1,7 @@
 //! Shared Python parameter conversion, blocking wrappers, and native async wrappers.
 
 mod aio;
+mod resources;
 
 use std::{
     collections::BTreeMap,
@@ -367,6 +368,10 @@ impl PyProcessInfo {
     fn exit(&self) -> Option<PyExitStatus> {
         self.inner.exit.map(|inner| PyExitStatus { inner })
     }
+    #[getter]
+    fn native_result(&self) -> Option<&str> {
+        self.inner.native_result.as_deref()
+    }
 }
 
 /// Blocking completed-command methods release the Python GIL during all Rust I/O.
@@ -712,6 +717,32 @@ impl PyProcessManager {
         capabilities(py, self.inner.capabilities())
     }
 
+    fn get(&self, process: PyRef<'_, PyProcessRef>) -> resources::PyProcess {
+        resources::PyProcess {
+            inner: opensol_core::Process::new(self.inner.clone(), process.inner.clone()),
+        }
+    }
+
+    fn probe(&self, py: Python<'_>) -> PyResult<resources::PyManagerInfo> {
+        let client = self.inner.clone();
+        let runtime = runtime()?;
+        py.detach(move || runtime.block_on(client.probe()))
+            .map(|inner| resources::PyManagerInfo { inner })
+            .map_err(exception)
+    }
+
+    fn list(&self, py: Python<'_>) -> PyResult<Vec<PyProcessInfo>> {
+        let client = self.inner.clone();
+        let runtime = runtime()?;
+        py.detach(move || runtime.block_on(client.list()))
+            .map(|list| {
+                list.into_iter()
+                    .map(|inner| PyProcessInfo { inner })
+                    .collect()
+            })
+            .map_err(exception)
+    }
+
     #[pyo3(signature = (argv, *, cwd=None, env=None, stdin=false, pty=None))]
     fn spawn(
         &self,
@@ -894,18 +925,20 @@ fn ssh(
 }
 
 #[pyfunction]
-#[pyo3(signature = (connection, *, config_file=None, profile=None, group=None, program="pueue"))]
+#[pyo3(signature = (connection, *, config_file=None, profile=None, group=None, pueue_directory=None, program="pueue"))]
 fn pueue(
     connection: PyRef<'_, PyConnection>,
     config_file: Option<String>,
     profile: Option<String>,
     group: Option<String>,
+    pueue_directory: Option<String>,
     program: &str,
 ) -> PyResult<PyProcessManager> {
     let config = PueueConfig {
         config_file,
         profile,
         group,
+        pueue_directory,
         program: program.into(),
         ..Default::default()
     };
@@ -1195,6 +1228,7 @@ fn openshell_connection(
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     aio::register(module)?;
+    resources::register(module)?;
     module.add_class::<PyResourceRef>()?;
     module.add_class::<PyProcessRef>()?;
     module.add_class::<PyExitStatus>()?;

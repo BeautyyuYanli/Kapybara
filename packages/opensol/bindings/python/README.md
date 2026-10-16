@@ -19,7 +19,7 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 
 - `Lifecycle`：`create/inspect/start/stop/delete/fork`。`ResourceRef(backend, id)` 可由调用方保存并重建，不包含凭据。
 - `Connection`：`exec(argv, cwd=..., env=..., stdin=b"", timeout=...)`、显式 `.shell(script)`。返回 `ExecResult`，不返回后台任务 ID。
-- `ProcessManager`：`spawn/status/wait/output/reconnect/send_input/close_stdin/signal/resize`。进程引用使用 `ProcessRef(backend, id, pty=False)`。
+- `ProcessManager`：`probe/list/get/spawn` 及兼容的引用控制入口。`get(ProcessRef(backend, id, pty=False))` 返回轻量 Process 资源，不访问管理器。
 
 每层都提供 `.backend` 和 `.capabilities()`，查询不做 I/O。能力字典除布尔项外，`ProcessCapabilities.supported_signals` 是信号编号列表；`LifecycleCapabilities.stop_preserves_memory` 表达 stop 是否保留进程内存，E2B 为 true，Docker、Kubernetes 与 OpenShell 为 false。工厂不需要全局注册：
 
@@ -37,6 +37,39 @@ Docker HostConfig、Kubernetes PodTemplate/PVC 参数分别通过原生 JSON 字
 `aio` 中的配置型工厂（local、ssh、docker、docker_connection、pueue、envd、e2b、agent_sandbox）仍是普通函数；`aio.sandboxd`、`aio.openshell`、`aio.openshell_connection`、`aio.e2b_envd` 建立网络连接或发现端点，需要 await。envd 的 `.connection` / `.processes` 分别返回异步接口。同步工厂保持原来的阻塞语义。
 
 `aio` 的 Connection 与 Lifecycle 方法，以及 ProcessManager 的所有 I/O 方法都可 await。部分方法直接返回原生 awaitable，不能用 `inspect.iscoroutinefunction` 判断能否 await；在运行中的 asyncio loop 内调用它们。公开类型声明使用 `Awaitable[T]` 或 `async def` 准确表达返回值。
+
+## 原生任务和输出资源
+
+进程任务由实际的 pueued/envd 创建、持有和回收。OpenSOL 不托管 daemon，不增加执行队列或后台日志服务。`probe()` 做真实管理请求，返回 ManagerInfo；Pueue 可报告 CLI 版本，其他无法确认的版本为 None。`list()` 只返回原生当前保留的 ProcessInfo，不回传任务环境；Pueue 的 group 用于创建默认值和 list 过滤，不是权限边界。envd List 没有 PTY 信息，列举引用的 pty=false；PTY 控制需保留原始 spawn 引用。
+
+同步资源方法是阻塞调用；异步资源的相同 I/O 方法可 await，DTO 与异常相同。get、ref、output 属性只构造绑定对象：
+
+```python
+from opensol import aio, OutputCursor
+
+async def read_pages(config_file, pueue_directory):
+    manager = aio.pueue(aio.local(), config_file=config_file,
+                         pueue_directory=pueue_directory)
+    await manager.probe()
+    handle = await manager.spawn(["python3", "-c", "print('resource')"])
+    process = manager.get(handle.process)
+    await process.wait(timeout=5)
+    page = await process.output.read(limit=4096)
+    for chunk in page.chunks:
+        print(chunk.channel, chunk.data)
+    saved = page.next_cursor.value
+    page = await process.output.read(cursor=OutputCursor(saved))
+    print(page.at_end, (await process.inspect()).state)
+    await handle.aclose()
+```
+
+Process 提供 inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize。这些都委托原生管理器，资源不缓存状态；handle 的 Exit 缓存仅属于原来的那次订阅。Pueue start 可强制启动 Queued/Stashed 并绕过队列限制和依赖；restart 仅用于终结任务，原地保留 ID、覆盖上次日志。remove 尊重原生状态/依赖，不暗中 kill；kill 回执不等于已经退出，仍需 inspect/wait。envd 只有原生 kill，pause/start/restart/remove 返回 Unsupported。native_result 保留 Pueue 的原生结果名称，无实际退出码的结果由 wait 报告 Backend，不回显原始错误正文。
+
+`process.output.stat()` 返回 channels、size、version；`read(cursor=None, limit=65536)` 返回 chunks、next_cursor、at_end。chunks.data 是 bytes，总量最多 limit（允许 1 至 1048576）；Pueue 只有 combined。读取立即返回当前观测的日志范围，at_end 仅为暂时读到尾部，不能代表任务结束。订阅入口是 `process.output.subscribe()`，返回原有 ProcessHandle；读取和订阅互不推进对方的位置。Rust 的 output_stat/read_output 是后端 trait 契约，Python 只提供这组绑定资源查询入口。
+
+Pueue 需显式传 pueue_directory，指向注入 Connection 目标上的 daemon 数据目录，且与 config/profile 对应；要求 Linux 和 GNU stat/dd。Local、SSH、Docker 都经过同一 Connection 在目标侧读取一个已打开的原生日志，并按限定字节取得数据；不把远端路径当成本机路径。probe 和调用时检查依赖/权限，capabilities.output_resource 只表示已配置访问，不缓存探测结果。未配置及 envd 的 stat/read 返回 Unsupported。CLI 只能提供非结构化失败时保留脱敏 Backend；Connection 已确定的结构化错误种类不被改写。
+
+cursor.value 是可保存的不透明字符串，仅在同一目标、任务和日志版本内有效，不包含凭据和调用者指定的日志路径。Queued/Stashed 尚未开始时返回空页，size=0、version=None，不读取旧日志。Queued 的初始空 cursor 可在同一排队执行开始后继续使用；无法确认同次执行的转换报告 Conflict。任务原地重启、可检测的文件替换/截断返回 Conflict，清理任务/日志返回 NotFound，非法格式或 limit 返回 InvalidArgument，不自动重置。原生日志在请求之间截断后重新写长时，文件身份/大小无法证明其完整历史；它不是不可变归档。
 
 ## 完成式命令
 
@@ -121,9 +154,9 @@ async def watch(config_file):
 
 取消 exec、create、spawn 等 awaitable 仅取消客户端等待，原生清理能力由后端决定；这不证明远端未执行或已经停止。SDK 不自动重试结果不确定的副作用操作。需要终止请显式 signal，需要销毁请显式 delete；丢弃客户端或订阅不会自动删除环境。
 
-`ProcessManager.wait(process, timeout=...)` 同样不代表超时后终止进程。明确停止请用 `.signal(process, 15/9)`；删除环境请显式 `Lifecycle.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
+`ProcessManager.wait(process, timeout=...)` 或 `process.wait(timeout=...)` 同样不代表超时后终止进程。明确停止请用 `process.kill()` 或支持的 signal；删除环境请显式 `Lifecycle.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
 
-Pueue 首版完成后才返回合并日志，并要求 CLI 与 daemon 在同一执行环境、`client.read_local_logs: true`。它不支持 PTY、二进制 stdin 或关闭 stdin。envd 可以实时输出和 PTY，但不承诺完整历史或 daemon 重启恢复。详见[能力矩阵](../../README.md#第三层的独立能力)。
+Pueue 订阅完成后才返回合并日志，并要求 CLI 与 daemon 在同一执行环境、`client.read_local_logs: true`；独立资源查询可读取运行中的原生日志。它不支持 PTY、二进制 stdin 或关闭 stdin。envd 可以实时输出和 PTY，但不承诺完整历史或 daemon 重启恢复。详见[能力矩阵](../../README.md#第三层的独立能力)。
 
 ## 错误与验证
 

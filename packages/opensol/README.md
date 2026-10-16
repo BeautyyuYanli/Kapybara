@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | `Lifecycle` | `create/inspect/start/stop/delete/fork` | 后端名与不透明资源 ID |
 | `Connection` | `exec`，等待短命令完成 | 字节 stdout/stderr、退出状态 |
-| `ProcessManager` | `spawn/status/wait/output`、输入、信号、PTY、重连 | 后端原生进程 ID 与输出订阅 |
+| `ProcessManager` | 原生任务创建、查询、控制、输出资源及订阅 | 后端原生进程 ID 与轻量 `Process` 资源 |
 
 例如：
 
@@ -59,6 +59,11 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 | 历史输出 | Pueue 仍保留任务及日志时 | 不承诺完整历史输出 |
 | 实时输出 | 首版不提供，完成后返回合并日志 | 原生输出流 |
 | daemon 重启后恢复运行进程 | 不承诺 | 不承诺 |
+| probe / list | 原生 status；list 可按配置 group 过滤 | 原生 List |
+| pause / start | 原生暂停及开始；start 可强制启动排队任务 | 不支持 |
+| restart / remove | 原生原地重启、任务及日志移除 | 不支持 |
+| kill | 原生单任务 kill | 原生 SIGKILL |
+| 有限字节输出查询 | 显式配置 `pueue_directory` 后支持 | 不支持 |
 
 运行中、可重连、日志可回读、daemon 重启恢复是不同能力。对具体实例调用 `capabilities()`；不要仅根据后端名假定所有操作可用。`supported_signals` 返回明确的信号集合，Python 对应编号列表；生命周期的 `stop_preserves_memory` 仅在 E2B pause 的原生保证下为 true，Docker stop、Kubernetes Suspended 和 OpenShell 为 false。
 
@@ -89,7 +94,11 @@ Docker exec 观察原生完成后取消未被消费的 stdin，仍读完输出�
 
 调用方安装 Pueue v4，并管理 pueued、分组和并发策略。SDK 不安装、启动或关闭守护进程。CLI 必须与 daemon 位于相同执行环境，并设置 `client.read_local_logs: true`，才能通过 `pueue follow` 保留任意字节；原生远程日志协议会进行文本解码。
 
-首版在任务完成后读取合并日志，以适应第二层的“命令完成后返回结果”契约，不宣称实时 streaming。`send_input` 仅支持 CLI 可表达的 UTF-8、无 NUL 输入，不提供关闭 stdin。清理原生任务或日志后，SDK 没有自己的副本；daemon 重启后的原生任务保留不等于进程恢复。
+输出订阅在任务完成后读取合并日志，不宣称实时 streaming。独立的输出资源可以读取运行中已写入的原生日志：配置 `pueue_directory` 为同一执行目标上的 daemon 数据目录，要求 Linux 和 GNU stat/dd。所有文件访问经过注入的 Local/SSH/Docker Connection；不把远端路径当成本机路径。目录需与 config/profile 匹配，不自动猜测配置。`send_input` 仅支持 CLI 可表达的 UTF-8、无 NUL 输入，不提供关闭 stdin。清理原生任务或日志后，SDK 没有自己的副本；daemon 重启后的原生任务保留不等于进程恢复。
+
+`probe()` 通过实际管理请求验证可访问性，配置日志访问时也检查目标依赖与目录。返回可确认的 CLI 版本，server_version 为 None；Pueue CLI 无法结构化区分的认证/连接失败保留为脱敏 Backend，注入 Connection 的结构化错误类别仍保留。静态能力表达配置，不缓存探测结果。
+
+`pause/start/restart/kill/remove` 始终针对明确的单个 task ID。start 使用 Pueue 的原生强制开始语义，可绕过队列限制和依赖；restart 只允许终结任务，使用 `restart --in-place` 保留 ID 并覆盖上次日志。remove 由原生状态和依赖决定是否允许，绝不暗中 kill 或删除其他任务。kill 的原生回执表示接受请求，退出由 inspect/wait 确认。`native_result` 只返回 Success、Failed、FailedToSpawn、Killed、Errored、DependencyFailed 等原生名称；没有退出码时 wait 报告 Backend，不伪造成功或数字信号。
 
 任务 `env` 在安全引用的队列命令内应用，不修改 Pueue CLI 的 PATH、HOME 或配置环境。
 
@@ -100,6 +109,8 @@ E2B 控制面使用 v2 create/connect、inspect、full-memory pause、delete 和
 `E2bLifecycle.envd(resource)` 只读 inspect 发现 envd token/domain，然后构造独立客户端，不隐式 resume。也可以直接构造 `EnvdConfig` 连接独立 envd。API key 与 envd access token 分开；E2B 代理路由通过 Sandbox ID/port headers 传递。
 
 envd 的 `Start` / `Connect` 是 ConnectRPC，而不是假设为 gRPC。字节输出、stdin、信号和 PTY 使用固定的上游 protobuf schema。`status` 使用原生 List；进程不在 List 中时返回 NotFound，不能推断历史退出码。完成结果从 handle 的 Exit 事件获得，输出流在 Exit 前断开返回 Transport。重连遵循 envd 的保留窗口，不是持久日志系统。
+
+`probe/list` 同样使用原生 List，kill 使用原生 SendSignal(SIGKILL)。固定协议没有暂停、开始、重启、历史移除和分页日志 RPC，对应操作返回 Unsupported。List 不包含 PTY 元信息，列举出的引用 `pty=false`；PTY 控制应保存并使用 spawn 返回的原始引用。它也不报告客户端/服务端版本，ManagerInfo 的两项版本为 None。
 
 短命令结束后，SendInput/CloseStdin 可能因原生进程已移除而返回 NotFound；只有同时取得有效 Exit 才将其视为正常完成。等待这类竞争的完成事件受控制请求超时限制，其他输入错误仍然报错。
 
@@ -178,6 +189,30 @@ asyncio.run(main())
 ```
 
 取消 `next_event` 或等待超时后可继续读取，已从 Rust 消费但尚未交付 Python 的一条事件会保留。`wait` 会丢弃输出；`aclose` 可重复调用并唤醒阻塞读取，不终止任务。取消 create/spawn/exec 不表示远端未执行或已停止，也不触发自动重试。详见 [Python 订阅与取消](bindings/python/README.md#输出订阅与取消)；[本地异步示例](examples/async_local.py) 可直接运行。
+
+## 进程与输出资源
+
+`Process` 绑定 manager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Python 调用 `manager.get(ref)`；Rust 用 `Process::new(Arc<dyn ProcessManager>, ref)`，或在该 Arc trait object 上调用 `.get(ref)`。现有 spawn 仍保留初始输出订阅，尤其不能丢弃 envd Start 的输出再尝试重连。
+
+```python
+manager = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml",
+                    pueue_directory="/path/to/pueue-data")
+print(manager.probe().client_version)
+handle = manager.spawn(["python3", "-c", "print('managed')"])
+process = manager.get(handle.process)
+page = process.output.read(limit=65536)
+for chunk in page.chunks:
+    print(chunk.channel, chunk.data)
+saved_cursor = page.next_cursor.value  # 可由应用保存
+next_page = process.output.read(cursor=sdk.OutputCursor(saved_cursor))
+print(process.inspect().state, next_page.at_end)
+```
+
+`process.output.stat/read` 是绑定资源入口；Rust trait 的 `output_stat/read_output` 是适配器扩展契约，两者委托同一实现。Python 不额外暴露重复的 raw manager 日志入口。`output.subscribe()` 建立独立 handle，消费订阅不推进 cursor。
+
+输出页保留原始 bytes 和 channel，Pueue 只有 Combined。默认 64 KiB，允许 1 字节至 1 MiB；读取立即返回当前观测范围，不等待后续输出或退出。`at_end` 只表示读到该次观测的尾部，进程是否终结单独 inspect。cursor 绑定目标、任务、执行和文件版本，不含凭据或可指定的文件路径；只把它作为不透明字符串保存。在同一版本从同一位置可重读，新增字节是否进入这一页取决于该次观测的大小。
+
+尚未开始的任务返回空页、size=0、version=None，不读可能残留的上次日志；同一 Queued 执行的初始空 cursor 可以在其开始后继续使用，无法确认同次执行的状态转换返回 Conflict。原地重启、可检测的文件替换/截断返回 Conflict，原生任务/日志清理返回 NotFound，非法 cursor/limit 返回 InvalidArgument；SDK 不静默回到开头。文件身份和大小检查无法提供截断后在两次请求间重新写长的完整历史保证，外部修改原生日志后应重新查询。新接口不启动后台采集或持久化存储，也不安装/启停 pueued/envd。
 
 ## 生成与验证
 

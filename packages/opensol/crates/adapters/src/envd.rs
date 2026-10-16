@@ -14,8 +14,9 @@ use bytes::{Buf, BytesMut};
 use futures::{Stream, StreamExt};
 use opensol_core::{
     Connection, ConnectionCapabilities, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
-    ExitStatus, OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo,
-    ProcessManager, ProcessRef, ProcessState, PtySize, Result, Signal, SpawnRequest, wait_events,
+    ExitStatus, ManagerInfo, OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle,
+    ProcessInfo, ProcessManager, ProcessRef, ProcessState, PtySize, Result, Signal, SpawnRequest,
+    wait_events,
 };
 use prost::Message;
 use reqwest::{
@@ -327,6 +328,8 @@ impl ProcessManager for Envd {
     }
     fn capabilities(&self) -> ProcessCapabilities {
         ProcessCapabilities {
+            list: true,
+            kill: true,
             stdin: true,
             close_stdin: true,
             binary_stdin: true,
@@ -338,6 +341,45 @@ impl ProcessManager for Envd {
             streaming_output: true,
             ..Default::default()
         }
+    }
+
+    async fn probe(&self) -> Result<ManagerInfo> {
+        let _: protocol::ListResponse = self.unary("List", protocol::ListRequest {}).await?;
+        Ok(ManagerInfo {
+            backend: "envd".into(),
+            client_version: None,
+            server_version: None,
+        })
+    }
+
+    async fn list(&self) -> Result<Vec<ProcessInfo>> {
+        let response: protocol::ListResponse = self.unary("List", protocol::ListRequest {}).await?;
+        // List has no PTY metadata; retain the original spawn reference for PTY-specific controls.
+        response
+            .processes
+            .into_iter()
+            .map(|info| {
+                if info.pid == 0 {
+                    return Err(Error::new(
+                        ErrorKind::Backend,
+                        "envd",
+                        "list",
+                        "native List returned an invalid PID",
+                    ));
+                }
+                Ok(ProcessInfo {
+                    process: ProcessRef::new("envd", info.pid.to_string(), false),
+                    state: ProcessState::Running,
+                    exit: None,
+                    native_state: "listed".into(),
+                    native_result: None,
+                })
+            })
+            .collect()
+    }
+
+    async fn kill(&self, process: &ProcessRef) -> Result<()> {
+        self.signal(process, Signal::Kill).await
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
@@ -378,6 +420,7 @@ impl ProcessManager for Envd {
                 state: ProcessState::Running,
                 exit: None,
                 native_state: "listed".into(),
+                native_result: None,
             })
         } else {
             Err(Error::new(

@@ -158,7 +158,9 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sdk.TransportError):
             await handle.wait()
         await self.manager.signal(handle.process, 9)
-        self.assertFalse((await self.manager.wait(handle.process, timeout=3)).success)
+        with self.assertRaisesRegex(sdk.BackendError, "Killed"):
+            await self.manager.wait(handle.process, timeout=3)
+        self.assertIsNone((await self.manager.status(handle.process)).exit)
 
 
 class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):

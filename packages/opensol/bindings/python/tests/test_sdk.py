@@ -234,7 +234,9 @@ class PueueTests(unittest.TestCase):
         with self.assertRaises(sdk.TransportError):
             handle.wait()
         self.manager.signal(handle.process, 9)
-        self.assertFalse(self.manager.wait(handle.process, timeout=3).success)
+        with self.assertRaisesRegex(sdk.BackendError, "Killed"):
+            self.manager.wait(handle.process, timeout=3)
+        self.assertIsNone(self.manager.status(handle.process).exit)
 
 
 class EnvdBindingTests(unittest.TestCase):
@@ -268,8 +270,20 @@ class EnvdBindingTests(unittest.TestCase):
 
             def handle_rpc(self):
                 assert self.headers["connect-protocol-version"] == "1"
-                body = self.rfile.read(int(self.headers["content-length"]))
+                body = self.rfile.read(int(self.headers.get("content-length", "0")))
                 method = self.path.rsplit("/", 1)[1]
+                if method == "List":
+                    assert self.headers["content-type"] == "application/proto"
+                    message = envd_protocol.ListRequest.FromString(body)
+                    with lock:
+                        records.append((method, message))
+                        response = envd_protocol.ListResponse(processes=[
+                            envd_protocol.ProcessInfo(pid=pid)
+                            for pid, process in processes.items()
+                            if not process["completed"].is_set()
+                        ])
+                    self.reply(200, "application/proto", response.SerializeToString())
+                    return
                 if method == "Start":
                     assert self.headers["content-type"] == "application/connect+proto"
                     assert body[0] == 0 and int.from_bytes(body[1:5], "big") == len(body) - 5
@@ -336,6 +350,7 @@ class EnvdBindingTests(unittest.TestCase):
                         envd_protocol.CloseStdinResponse,
                     ),
                     "Update": (envd_protocol.UpdateRequest, envd_protocol.UpdateResponse),
+                    "SendSignal": (envd_protocol.SendSignalRequest, envd_protocol.SendSignalResponse),
                 }
                 if method not in request_types:
                     self.reply(404, "application/json", b'{"code":"unimplemented"}')
@@ -355,6 +370,9 @@ class EnvdBindingTests(unittest.TestCase):
                             process["completed"].set()
                     elif method == "CloseStdin":
                         assert not process["pty"]
+                        process["completed"].set()
+                    elif method == "SendSignal":
+                        assert message.signal in (9, 15)
                         process["completed"].set()
                     else:
                         assert process["pty"] and message.HasField("pty")

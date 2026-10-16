@@ -3,7 +3,7 @@
 //! Dropping clients never destroys environments. References contain identity, not credentials.
 //! A transport failure or cancelled call does not imply that a remote side effect was undone.
 
-use std::{collections::BTreeMap, fmt, pin::Pin, time::Duration};
+use std::{collections::BTreeMap, fmt, pin::Pin, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -402,6 +402,8 @@ pub struct ProcessInfo {
     pub state: ProcessState,
     pub exit: Option<ExitStatus>,
     pub native_state: String,
+    /// Native result name only, never the provider's error body or task environment.
+    pub native_result: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -411,6 +413,57 @@ pub enum OutputChannel {
     Stderr,
     Terminal,
     Combined,
+}
+
+/// Retained native output metadata. A missing version means this execution has not started.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputInfo {
+    pub channels: Vec<OutputChannel>,
+    pub size: u64,
+    pub version: Option<String>,
+}
+
+/// Persistable opaque position, scoped to one manager target, task and log version.
+/// Adapters validate their encoding; callers must not interpret or modify it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OutputCursor(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputChunk {
+    pub channel: OutputChannel,
+    pub data: Vec<u8>,
+}
+
+/// `at_end` is the observed log tail, not process completion. Reads never wait for new output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputPage {
+    pub chunks: Vec<OutputChunk>,
+    pub next_cursor: OutputCursor,
+    pub at_end: bool,
+}
+
+pub const DEFAULT_OUTPUT_LIMIT: usize = 65_536;
+pub const MAX_OUTPUT_LIMIT: usize = 1_048_576;
+
+/// Enforce a bounded read before doing any target I/O.
+pub fn validate_output_limit(limit: usize, backend: &str) -> Result<()> {
+    if !(1..=MAX_OUTPUT_LIMIT).contains(&limit) {
+        return Err(Error::invalid(
+            backend,
+            "read_output",
+            "limit must be between 1 and 1048576 bytes",
+        ));
+    }
+    Ok(())
+}
+
+/// Successful native management request, not just an open port. Versions may be unavailable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagerInfo {
+    pub backend: String,
+    pub client_version: Option<String>,
+    pub server_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -432,6 +485,14 @@ pub struct ProcessHandle {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ProcessCapabilities {
+    pub list: bool,
+    pub pause: bool,
+    pub start: bool,
+    pub restart: bool,
+    pub kill: bool,
+    pub remove: bool,
+    /// Configured access to a retained, bounded native log resource.
+    pub output_resource: bool,
     pub stdin: bool,
     pub close_stdin: bool,
     pub binary_stdin: bool,
@@ -469,10 +530,49 @@ impl Signal {
 pub trait ProcessManager: Send + Sync {
     fn backend(&self) -> &'static str;
     fn capabilities(&self) -> ProcessCapabilities;
+    async fn probe(&self) -> Result<ManagerInfo> {
+        Err(Error::unsupported(self.backend(), "probe"))
+    }
+    async fn list(&self) -> Result<Vec<ProcessInfo>> {
+        Err(Error::unsupported(self.backend(), "list"))
+    }
     async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle>;
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo>;
     async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>) -> Result<ExitStatus>;
     async fn output(&self, process: &ProcessRef) -> Result<EventStream>;
+    /// Backend extension contract. Callers normally use `Process::output().stat()`.
+    async fn output_stat(&self, _process: &ProcessRef) -> Result<OutputInfo> {
+        Err(Error::unsupported(self.backend(), "output_stat"))
+    }
+    /// Backend extension contract; cursor validation and log retention are adapter-specific.
+    async fn read_output(
+        &self,
+        _process: &ProcessRef,
+        _cursor: Option<&OutputCursor>,
+        limit: usize,
+    ) -> Result<OutputPage> {
+        validate_output_limit(limit, self.backend())?;
+        Err(Error::unsupported(self.backend(), "read_output"))
+    }
+    async fn pause(&self, _process: &ProcessRef) -> Result<()> {
+        Err(Error::unsupported(self.backend(), "pause"))
+    }
+    /// Native start/resume; a manager may force a queued task past normal queue limits.
+    async fn start(&self, _process: &ProcessRef) -> Result<()> {
+        Err(Error::unsupported(self.backend(), "start"))
+    }
+    /// Native restart, preserving the manager's task identity and replacing the prior execution.
+    async fn restart(&self, _process: &ProcessRef) -> Result<()> {
+        Err(Error::unsupported(self.backend(), "restart"))
+    }
+    /// Native termination path. Acceptance does not imply the process has already exited.
+    async fn kill(&self, _process: &ProcessRef) -> Result<()> {
+        Err(Error::unsupported(self.backend(), "kill"))
+    }
+    /// Remove a retained task and its native logs; never implicitly kill it.
+    async fn remove(&self, _process: &ProcessRef) -> Result<()> {
+        Err(Error::unsupported(self.backend(), "remove"))
+    }
     async fn send_input(&self, _process: &ProcessRef, _data: Vec<u8>) -> Result<()> {
         Err(Error::unsupported(self.backend(), "send_input"))
     }
@@ -487,6 +587,97 @@ pub trait ProcessManager: Send + Sync {
     }
     async fn reconnect(&self, _process: &ProcessRef) -> Result<ProcessHandle> {
         Err(Error::unsupported(self.backend(), "reconnect"))
+    }
+}
+
+/// Bound resource facade; owns neither a process nor authoritative cached state.
+#[derive(Clone)]
+pub struct Process {
+    manager: Arc<dyn ProcessManager>,
+    reference: ProcessRef,
+}
+
+impl Process {
+    /// Binding is local; existence and access are checked by subsequent native operations.
+    pub fn new(manager: Arc<dyn ProcessManager>, reference: ProcessRef) -> Self {
+        Self { manager, reference }
+    }
+    pub fn reference(&self) -> &ProcessRef {
+        &self.reference
+    }
+    pub fn output(&self) -> ProcessOutput {
+        ProcessOutput {
+            process: self.clone(),
+        }
+    }
+    pub async fn inspect(&self) -> Result<ProcessInfo> {
+        self.manager.status(&self.reference).await
+    }
+    pub async fn wait(&self, timeout: Option<Duration>) -> Result<ExitStatus> {
+        self.manager.wait(&self.reference, timeout).await
+    }
+    pub async fn pause(&self) -> Result<()> {
+        self.manager.pause(&self.reference).await
+    }
+    pub async fn start(&self) -> Result<()> {
+        self.manager.start(&self.reference).await
+    }
+    pub async fn restart(&self) -> Result<()> {
+        self.manager.restart(&self.reference).await
+    }
+    pub async fn kill(&self) -> Result<()> {
+        self.manager.kill(&self.reference).await
+    }
+    pub async fn remove(&self) -> Result<()> {
+        self.manager.remove(&self.reference).await
+    }
+    pub async fn signal(&self, signal: Signal) -> Result<()> {
+        self.manager.signal(&self.reference, signal).await
+    }
+    pub async fn send_input(&self, data: Vec<u8>) -> Result<()> {
+        self.manager.send_input(&self.reference, data).await
+    }
+    pub async fn close_stdin(&self) -> Result<()> {
+        self.manager.close_stdin(&self.reference).await
+    }
+    pub async fn resize(&self, size: PtySize) -> Result<()> {
+        self.manager.resize(&self.reference, size).await
+    }
+}
+
+impl dyn ProcessManager {
+    /// Bind a retained reference without contacting the native manager.
+    pub fn get(self: &Arc<Self>, reference: ProcessRef) -> Process {
+        Process::new(self.clone(), reference)
+    }
+}
+
+/// Independent access to the manager's native log; subscribing does not advance read cursors.
+#[derive(Clone)]
+pub struct ProcessOutput {
+    process: Process,
+}
+
+impl ProcessOutput {
+    pub async fn stat(&self) -> Result<OutputInfo> {
+        self.process
+            .manager
+            .output_stat(&self.process.reference)
+            .await
+    }
+    /// Default page size is `DEFAULT_OUTPUT_LIMIT`; callers choose an explicit limit in Rust.
+    pub async fn read(&self, cursor: Option<&OutputCursor>, limit: usize) -> Result<OutputPage> {
+        validate_output_limit(limit, self.process.manager.backend())?;
+        self.process
+            .manager
+            .read_output(&self.process.reference, cursor, limit)
+            .await
+    }
+    pub async fn subscribe(&self) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            process: self.process.reference.clone(),
+            events: self.process.manager.output(&self.process.reference).await?,
+        })
     }
 }
 

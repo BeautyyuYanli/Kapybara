@@ -183,7 +183,7 @@ struct StreamState {
 /// The Python wrapper serializes consumers, while this lock also covers a bridge
 /// future that has been cancelled but has not yet stopped on the Rust executor.
 #[pyclass(name = "AsyncProcessHandle", frozen)]
-struct AsyncProcessHandle {
+pub(super) struct AsyncProcessHandle {
     process: ProcessRef,
     state: Arc<tokio::sync::Mutex<StreamState>>,
     pending: Arc<Mutex<Option<Result<ProcessEvent>>>>,
@@ -355,6 +355,38 @@ impl AsyncProcessManager {
 
     fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         capabilities(py, self.inner.capabilities())
+    }
+
+    fn get(&self, process: PyRef<'_, PyProcessRef>) -> resources::AsyncProcess {
+        resources::AsyncProcess {
+            inner: opensol_core::Process::new(self.inner.clone(), process.inner.clone()),
+        }
+    }
+
+    fn probe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            client
+                .probe()
+                .await
+                .map(|inner| resources::PyManagerInfo { inner })
+                .map_err(exception)
+        })
+    }
+
+    fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            client
+                .list()
+                .await
+                .map(|list| {
+                    list.into_iter()
+                        .map(|inner| PyProcessInfo { inner })
+                        .collect::<Vec<_>>()
+                })
+                .map_err(exception)
+        })
     }
 
     #[pyo3(signature = (argv, *, cwd=None, env=None, stdin=false, pty=None))]
