@@ -349,6 +349,96 @@ async fn real_ssh_preserves_executable_arguments_input_and_host_verification() {
     );
 }
 
+#[cfg(feature = "tmux")]
+#[tokio::test]
+async fn real_ssh_tmux_uses_the_injected_connection() {
+    use opensol_adapters::tmux::{Tmux, TmuxConfig};
+    let (_daemon, ssh, _) = ssh_fixture().await;
+    let directory = TempDir::new().unwrap();
+    let socket = directory
+        .path()
+        .join("tmux.sock")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let result = ssh
+        .exec(ExecRequest::new(Command::new(
+            "tmux",
+            [
+                "-S",
+                &socket,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "user-session",
+                "sleep",
+                "infinity",
+            ],
+        )))
+        .await
+        .unwrap();
+    assert!(result.exit.success());
+    let result = AssertUnwindSafe(async {
+        let manager = ProcessManager::new(Tmux::new(ssh.clone(), TmuxConfig::new(&socket))?);
+        manager.probe().await?;
+        let handle = manager
+            .spawn(SpawnRequest {
+                command: Command::new("printf", ["%s", "SSH tmux ; #{pane_id}"]),
+                stdin: false,
+                pty: Some(PtySize { cols: 80, rows: 24 }),
+            })
+            .await?;
+        let process = manager.get(handle.process);
+        assert!(
+            process
+                .wait(Some(Duration::from_secs(5)))
+                .await?
+                .exit
+                .unwrap()
+                .success()
+        );
+        assert!(
+            String::from_utf8(process.output().snapshot().await?)
+                .unwrap()
+                .contains("SSH tmux ; #{pane_id}")
+        );
+        process.remove().await?;
+        let input = manager.spawn(SpawnRequest {
+            command: Command::new("python3", ["-u", "-c",
+                "import os,tty; tty.setraw(0); print('READY',flush=True); data=b''\nwhile len(data)<4: data+=os.read(0,4-len(data))\nprint(data.hex(),flush=True)"]),
+            stdin: true, pty: Some(PtySize { cols: 80, rows: 24 }),
+        }).await?;
+        let input = manager.get(input.process);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if String::from_utf8_lossy(&input.output().snapshot().await?).contains("READY") { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<(), opensol_core::Error>(())
+        }).await.unwrap()?;
+        input.send_input(vec![0, 255, 10, 65]).await?;
+        assert!(input.wait(Some(Duration::from_secs(5))).await?.exit.unwrap().success());
+        assert!(String::from_utf8_lossy(&input.output().snapshot().await?).contains("00ff0a41"));
+        input.remove().await?;
+        Ok::<(), opensol_core::Error>(())
+    })
+    .catch_unwind()
+    .await;
+    assert!(
+        ssh.exec(ExecRequest::new(Command::new(
+            "tmux",
+            ["-N", "-S", &socket, "kill-server"]
+        )))
+        .await
+        .unwrap()
+        .exit
+        .success()
+    );
+    result.unwrap().unwrap();
+}
+
 async fn pueue_fixture() -> (Daemon, ProcessManager) {
     let directory = TempDir::with_prefix("opensol pueue ' $() ").unwrap();
     let path = directory.path().join("pueue.yml");

@@ -23,10 +23,10 @@ DockerLifecycle ──资源引用──> DockerConnection ──注入──> P
 E2bLifecycle ──资源引用──> Envd ──视图──> Connection + ProcessManager
 AgentSandboxLifecycle                  Sandboxd (Connection)
 OpenShellLifecycle ──资源引用──> OpenShellConnection
-Local 或 Ssh ──注入──> Pueue
+Local、Ssh 或 DockerConnection ──注入──> Pueue 或 Tmux
 ```
 
-Pueue 包装已有的公共 `Connection`；envd 通过原生 RPC 同时实现第二、第三层，`connection()` / `processes()` 返回复用同一原生客户端的公共视图。生命周期层也不负责为任意资源猜测网络地址。`sandboxd` 的端点由调用方提供。
+Pueue 和 Tmux 包装已有的公共 `Connection`；envd 通过原生 RPC 同时实现第二、第三层，`connection()` / `processes()` 返回复用同一原生客户端的公共视图。生命周期层也不负责为任意资源猜测网络地址。`sandboxd` 的端点由调用方提供。
 
 [`opensol-core`](crates/core/src/lib.rs) 区分适配器扩展契约与业务客户端，共享 DTO、错误和能力模型：
 
@@ -42,13 +42,14 @@ Pueue 包装已有的公共 `Connection`；envd 通过原生 RPC 同时实现第
 
 | 后端 / Cargo feature | 生命周期 | 短命令连接 | 进程管理 |
 | --- | --- | --- | --- |
-| Local / `local` | 无 | 本机 argv 与显式 shell | 可组合本机 Pueue；没有隔离保证 |
-| SSH / `ssh` | 无 | 系统 OpenSSH | 可组合远端 Pueue |
-| Docker / `docker` | create/inspect/start/stop/delete | 原生 Engine exec，Bollard | 可组合容器内 Pueue |
+| Local / `local` | 无 | 本机 argv 与显式 shell | 可组合本机 Pueue / Tmux；没有隔离保证 |
+| SSH / `ssh` | 无 | 系统 OpenSSH | 可组合远端 Pueue / Tmux |
+| Docker / `docker` | create/inspect/start/stop/delete | 原生 Engine exec，Bollard | 可组合容器内 Pueue / Tmux |
 | E2B / `e2b` | create/inspect/resume/pause/delete/native fork | 组合 envd | 组合 envd |
 | agent-sandbox / `agent-sandbox` | Kubernetes Sandbox CR 生命周期 | 独立组合 sandboxd 或其他连接 | 无 SDK 自建进程服务 |
 | OpenShell / `openshell` | 原生 gRPC 生命周期 | 原生 gRPC exec | 不提供通用进程管理 |
 | Pueue / `pueue` | 无 | 复用注入的连接 | 官方 v4 CLI / pueued |
+| Tmux / `tmux` | 无 | 复用注入的连接 | 已有 tmux >= 3.5 server，每任务一个 session/window/pane |
 | envd / `envd` | 无 | 原生 Start 并收集结果 | 原生 ConnectRPC 进程接口 |
 | sandboxd / `sandboxd` | 无 | 原生 gRPC Execute | 不提供连接外的进程句柄 |
 
@@ -56,26 +57,27 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 
 ### 第三层的独立能力
 
-| 能力 | Pueue | envd |
-| --- | --- | --- |
-| stdin | UTF-8、无 NUL 的有限输入 | 字节 stdin / PTY 输入 |
-| close_stdin | 不支持 | 非 PTY 支持 |
-| PTY / resize | 不支持 | 支持；输出是 `terminal` 合并终端流 |
-| 信号 | SIGINT / SIGTERM / SIGKILL，由原生任务状态决定 | SIGTERM / SIGKILL；SIGINT 返回 Unsupported |
-| 脱离输出订阅继续运行 | 支持 | 支持 |
-| 按 ID 重连 | 原生任务仍保留时 | 原生 PID 仍可连接时 |
-| 历史输出 | Pueue 仍保留任务及日志时 | 不承诺完整历史输出 |
-| 实时输出 | 首版不提供，完成后返回合并日志 | 原生输出流 |
-| daemon 重启后恢复运行进程 | 不承诺 | 不承诺 |
-| probe / list | 原生 status；list 可按配置 group 过滤 | 原生 List |
-| pause / start | 原生暂停及开始；start 可强制启动排队任务 | 不支持 |
-| restart / remove | 原生原地重启、任务及日志移除 | 不支持 |
-| kill | 原生单任务 kill | 原生 SIGKILL |
-| 有限字节输出查询 | 显式配置 `pueue_directory` 后支持 | 不支持 |
+| 能力 | Pueue | envd | Tmux |
+| --- | --- | --- | --- |
+| stdin | UTF-8、无 NUL 的有限输入 | 字节 stdin / PTY 输入 | 任意字节，单次最多 8192 字节；PTY 行规仍生效 |
+| close_stdin | 不支持 | 非 PTY 支持 | 不支持 |
+| PTY / resize | 不支持 | 支持；输出是 `terminal` 合并终端流 | 必须显式请求 PTY；支持 resize |
+| 信号 | SIGINT / SIGTERM / SIGKILL，由原生任务状态决定 | SIGTERM / SIGKILL；SIGINT 返回 Unsupported | 不支持 |
+| 脱离输出订阅继续运行 | 支持 | 支持 | 支持 |
+| 按 ID 重连 | 原生任务仍保留时 | 原生 PID 仍可连接时 | 原生 session、window、pane 和归属仍匹配时 |
+| 历史输出 | Pueue 仍保留任务及日志时 | 不承诺完整历史输出 | 不支持 |
+| 实时输出 | 首版不提供，完成后返回合并日志 | 原生输出流 | 不支持；订阅只交付 Completed |
+| daemon 重启后恢复运行进程 | 不承诺 | 不承诺 | 不承诺 |
+| probe / list | 原生 status；list 可按配置 group 过滤 | 原生 List | 实际访问 server；只发现本前缀内有效归属的任务 |
+| pause / start | 原生暂停及开始；start 可强制启动排队任务 | 不支持 | 不支持 |
+| restart / remove | 原生原地重启、任务及日志移除 | 不支持 | 仅 dead pane；原生队列内检查，运行中 Conflict |
+| kill | 原生单任务 kill | 原生 SIGKILL | 销毁 pane 和任务；后续 NotFound，没有退出结果 |
+| 有限字节输出查询 | 显式配置 `pueue_directory` 后支持 | 不支持 | 不支持 |
+| terminal_snapshot | 不支持 | 不支持 | 当前渲染屏幕的原生文本字节，无滚动历史或属性转义 |
 
 运行中、可重连、日志可回读、daemon 重启恢复是不同能力。对具体实例调用 `capabilities()`；不要仅根据后端名假定所有操作可用。`supported_signals` 返回明确的信号集合，Python 对应编号列表；生命周期的 `stop_preserves_memory` 仅在 E2B pause 的原生保证下为 true，Docker stop、Kubernetes Suspended 和 OpenShell 为 false。
 
-`binary_stdin=true` 保证任意字节输入；false 表示存在由适配器检查的原生载荷限制。Pueue 在 Connection I/O 前拒绝无效 UTF-8 和 NUL，返回 Unsupported；envd 原样传递 bytes。`ProcessRef.pty` 是可保存的可选模式提示，由实际操作的适配器决定是否需要；Pueue send 只需 task ID，envd 输入路由及终端控制需要已知模式。
+`binary_stdin=true` 保证任意字节输入；请求大小限制仍由适配器检查。false 表示存在由适配器检查的字节内容限制。Pueue 在 Connection I/O 前拒绝无效 UTF-8 和 NUL，返回 Unsupported；envd 原样传递 bytes；Tmux 将每个字节经 `send-keys -H` 发送，超过 8192 字节在目标 I/O 前返回 InvalidArgument，由调用方显式拆分。`ProcessRef.pty` 是可保存的可选模式提示，由实际操作的适配器决定是否需要；Pueue send 只需 task ID，envd 输入路由及终端控制需要已知模式。
 
 ## 命令与错误契约
 
@@ -83,7 +85,7 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 - SSH 远端和 Pueue 的 CLI/daemon 执行环境需要 `env`，以及支持 `-n 0 --` 的 `/usr/bin/nice`。该固定原生 helper 在环境覆盖后保持优先级不变，并保留包含 `=` 的可执行路径和非 POSIX 环境键；任务 PATH 不影响 helper 定位。
 - `cwd`、`env` 是请求字段，`stdin`、stdout、stderr 都使用字节。PTY、Pueue 合并输出分别标为 `Terminal`、`Combined`，不伪装成分离 stderr。
 - 第二层 `exec` 等待完成，不返回后台任务 ID。Rust 为 async I/O，Python 根入口为释放 GIL 的阻塞调用，`opensol.aio` 将同一 Rust Future 接入调用方的 asyncio loop；输出收集到内存，不适合无限输出。
-- 非零退出码属于正常 `ExecResult`，不是传输异常。信号退出可以没有数字退出码。管理任务的 wait 返回 `ProcessOutcome { exit: Option<ExitStatus>, native_result: Option<String> }`，仅用于已确认终结且至少一项可用的结果；`ProcessInfo.outcome` 在非终态为 None，事件为 `Completed(ProcessOutcome)`。`Connection.exec` 继续返回带 ExitStatus 的 ExecResult。
+- 非零退出码属于正常 `ExecResult`，不是传输异常。信号退出可以没有数字退出码。管理任务的 wait 按后端原生任务生命周期确认完成，返回 `ProcessOutcome { exit: Option<ExitStatus>, native_result: Option<String> }`，至少一项可用；是否同时保证 OS 进程退出由具体后端决定。`ProcessInfo.outcome` 在该原生生命周期的非终态为 None，事件为 `Completed(ProcessOutcome)`。`Connection.exec` 继续返回带 ExitStatus 的 ExecResult。
 - SDK 错误分为 InvalidArgument、Unsupported、NotFound、Conflict、Permission、Timeout、Transport、Backend，并带 backend/operation。普通错误不回显供应商响应正文、命令输入或凭据。
 - `ExecRequest.timeout=None` 表示不设置整条命令的 SDK deadline；连接建立和原生控制请求仍可以有适配器级超时。零超时无效。
 - 公共客户端在进入适配器前检查 argv、工作目录和环境变量的 NUL 等约束、正超时、PTY 尺寸、输出 limit 和引用后端，并按 capabilities 拒绝不支持的 stdin、PTY、信号和可选操作。输入载荷、模式信息的必要性、状态竞争和 cursor 版本由适配器判断。
@@ -114,6 +116,36 @@ Docker exec 观察原生完成后取消未被消费的 stdin，仍读完输出�
 `pause/start/restart/kill/remove` 始终针对明确的单个 task ID。start 使用 Pueue 的原生强制开始语义，可绕过队列限制和依赖；restart 只允许终结任务，使用 `restart --in-place` 保留 ID 并覆盖上次日志。remove 由原生状态和依赖决定是否允许，绝不暗中 kill 或删除其他任务。kill 的原生回执表示接受请求，终结由 inspect/wait 确认。`ProcessOutcome.native_result` 只返回 Success、Failed、FailedToSpawn、Killed、Errored、DependencyFailed 等脱敏的原生名称；Success/Failed 保留真实退出码，Killed 等结果的 exit 为 None。订阅读取可用日志后交付 Completed；日志读取、权限、传输和协议失败仍按实际错误返回。
 
 任务 `env` 在安全引用的队列命令内应用，不修改 Pueue CLI 的 PATH、HOME 或配置环境。
+
+### Tmux
+
+调用方安装 tmux 3.5 或更新版本并启动 server，保留一个 session 或自行配置 `exit-empty off`。适配器通过注入的 Connection 执行所有目标操作；tmux 管理请求始终显式指定 `-S socket_path` 和 `-N`，不隐式启动、关闭 server，不修改全局选项。`probe()` 实际访问 server，并返回可确认的 client/server version；离线、权限或版本不支持均返回真实类别的脱敏错误。Rust 使用 `Tmux::new(connection, TmuxConfig::new("/absolute/target/socket"))`，再包装为 `ProcessManager`；独立 `tmux` feature 不要求 local/ssh/docker。配置可选 program、session_prefix 和正数 request_timeout，构造不进行目标 I/O。
+
+每个任务占用独立 session/window/pane，原生 user option 保存归属与执行代次。ProcessRef 是可保存的不透明完整身份，pty 为 True；list 只发现本前缀且归属有效的任务，不接管用户 session。前缀限制发现范围，不是权限隔离。调用方不得改写归属选项或重组被管理 session。
+
+spawn 必须显式提供 PTY 尺寸；缺少 PTY 在创建任何资源前返回 Unsupported。创建在一个原生队列中先启动阻塞于 shell 内建 read 的占位 pane，配置本任务的 remain-on-exit、归属与尺寸，再以初始化专用的强制 respawn 启动实际命令。本 pane 的 remain-on-exit-format 为空，避免默认退出横幅把首行滚入历史；管理客户端显式使用 `-u`，保留 UTF-8 文本和结构化分隔字段。目标需要 `/bin/sh`、`env` 与支持 `-n 0 --` 的 `/usr/bin/nice`；任务 env 只应用于被管理命令，不污染 tmux 客户端。
+
+指定 cwd 时，完整启动 argv 包含进入目录后才 exec 用户 argv 的固定 shell 门槛，任务环境在成功进入目录后应用，仍保留非 POSIX 环境键及包含 `=` 的可执行路径。相对 cwd 使用同一 Connection 目标的 `pwd -P` 解析为绝对路径，保留到后续执行。tmux 原生 chdir 失败会回退 HOME 或 `/`，因此每次初始执行和 restart 都重新进入该绝对目录，失败时实际启动进程以 125 退出，用户命令不会在回退目录执行。OS 退出状态就绪后可由 wait/inspect 读取该结果，不是 spawn 的同步目录预检查。tmux 保存完整启动 argv/cwd/env，后续 restart 不由 SDK 保存或重建任务配置。
+
+state、wait 和 Completed 均以原生 pane 生命周期为准：pane Dead/EOF 时映射 Exited 并可返回完成。pane Dead/EOF、OS 进程退出和数值退出状态就绪可以分离；wait 返回后 OS 进程仍可能继续工作，exit=None 不能推断 OS 进程成功或已退出。wait 轮询原生 pane 状态，超时仅停止等待。可用的真实退出码、原生数字信号以及可确认的 INT/KILL/TERM 名称对应编号保留在 exit，其他原生信号以 `SIG...` 名称保留在 native_result，无可用 OS 状态时仅报告 `Dead`。
+
+restart 只允许 dead pane，保留引用并更新原生执行代次；remove 在同一原生队列内按 dead 条件销毁任务，运行中返回 Conflict。kill 使用 kill-pane，销毁任务和画面，后续查询为 NotFound，不生成退出结果。server 消失返回连接错误，SDK 不恢复进程。
+
+初始与额外订阅在建立时绑定执行代次与原生 pane PID，只交付 Completed，不生成 Output 事件。消费与完成交付前核对代次；可检测的内部/外部 respawn 返回 Conflict，原生清理返回 NotFound。已完成的 Python handle 始终保留首次结果，包括 exit=None，不会随 OS 状态就绪而补填；Process.wait/inspect 查询当前执行，后续可取得已就绪的状态。不承诺检测两次观察间无法分辨的外部修改。轮询没有独立后台任务，关闭或取消订阅不会 kill。
+
+输入直接使用 `send-keys -H`，无 UTF-8 或 NUL 限制，不使用 paste buffer 或临时文件。为绕过 tmux 3.5 的 CLI 消息容量限制，一条经过完整身份保护的发送命令由原生 `source-file -` 从 stdin 读取，仍仅执行一次 send-keys；输入能力要求注入 Connection 支持 stdin，Local/SSH/Docker 均支持。空输入不发送按键；单次上限 8192 字节，超过上限在目标 I/O 前返回 InvalidArgument。PTY 行规仍控制目标如何接收字节，应用若需逐字节接收应自行切换 raw 模式。不会把输入解释为额外的 signal 操作，也不会重试结果不确定的输入。
+
+```python
+# server 已由调用方启动；socket 路径属于 connection 的目标机器。
+manager = sdk.tmux(sdk.local(), socket_path="/tmp/my-tmux.sock")
+handle = manager.spawn(["python3", "-c", "print('terminal')"], pty=(80, 24))
+process = manager.get(handle.process)
+print(process.wait(timeout=5).exit)
+screen = process.output.snapshot()  # bytes：当前渲染画面，没有 cursor。
+process.remove()
+```
+
+`terminal_snapshot=true` 与 output_resource/historical_output/streaming_output 独立。snapshot 使用原生 `capture-pane -p`，返回当前画面的文本字节，不主动读取滚动历史或属性转义。它受尺寸、换行、清屏和重绘影响，不是原始 stdout/stderr 或可追加日志；stat/read 仍为 Unsupported。Pueue/envd 的快照能力默认为 false。
 
 ### E2B / envd
 
@@ -214,7 +246,7 @@ asyncio.run(main())
 | 对象 | 公共入口 |
 | --- | --- |
 | `Process` | 引用与 output、inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize |
-| `ProcessOutput` | stat、read、subscribe |
+| `ProcessOutput` | snapshot、stat、read、subscribe |
 | `ProcessHandle` | 一次输出订阅及其 ProcessRef；Rust 使用 events / wait_events，Python 使用 next_event / wait / disconnect 或 aclose |
 
 `Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。spawn 返回带初始输出订阅的 ProcessHandle，尤其保留 envd Start 的原始流。绑定 Process 不消费该订阅。
@@ -245,7 +277,7 @@ Pueue 尚未开始的任务返回空页、size=0、version=None，不读可能�
 
 协议来源与固定版本见 [`protocols/README.md`](crates/adapters/protocols/README.md)。上游文件由 `scripts/update-protocols.sh` 按固定版本下载并核对 SHA-256；Rust 通过 vendored protoc 在 Cargo `OUT_DIR` 生成。不手工改下载文件或生成代码。
 
-流程测试需要真实进程、SSH、Pueue、kubectl、OpenSSL 和 Docker socket，必须在容器中运行，不以宿主机 skip 作为通过。构建测试镜像不会创建 Kubernetes 或云沙盒：
+流程测试需要真实进程、SSH、Pueue、tmux >= 3.5、kubectl、OpenSSL 和 Docker socket，必须在容器中运行，不以宿主机 skip 作为通过。构建测试镜像不会创建 Kubernetes 或云沙盒：
 
 ```sh
 docker build -f Dockerfile.tests -t opensol-tests:latest .
@@ -259,6 +291,6 @@ docker run --rm \
   opensol-tests:latest
 ```
 
-Docker socket 具有宿主机管理权限，只对可信代码运行。测试会创建并删除隔离的 Docker 容器、sshd 和 pueued；不启动 Kapy。脚本执行格式检查、各 feature 编译、Rust 测试/Clippy/rustdoc、构建并安装 Python wheel，再运行 Python 绑定测试。Python envd fixture 使用同一固定 schema，由 grpcio-tools 在临时目录生成协议类型；它不是 wheel 的运行时依赖。
+Docker socket 具有宿主机管理权限，只对可信代码运行。测试会创建并删除隔离的 Docker 容器、sshd、pueued 和 tmux server；不启动 Kapy。脚本执行格式检查、各 feature 编译、Rust 测试/Clippy/rustdoc、构建并安装 Python wheel，再运行 Python 绑定测试。Python envd fixture 使用同一固定 schema，由 grpcio-tools 在临时目录生成协议类型；它不是 wheel 的运行时依赖。
 
-Local、SSH、Docker、Pueue 使用真实运行时验证；E2B/envd、sandboxd、OpenShell 使用固定 schema 的本地 HTTP/ConnectRPC/gRPC fixture；gRPC 另验证真实 TLS 的 CA/主机名校验和必需的 mTLS 客户端身份；agent-sandbox 使用真实 kubectl 对接本地 Kubernetes discovery/CR fixture。后者验证协议与参数边界，不代表已通过真实云服务、Kubernetes controller 或 OpenShell 部署的端到端认证测试。
+Local、SSH、Docker、Pueue、Tmux 使用真实运行时验证；Tmux 覆盖短命令退出、二进制输入、resize、渲染快照、代次绑定及注入目标边界。E2B/envd、sandboxd、OpenShell 使用固定 schema 的本地 HTTP/ConnectRPC/gRPC fixture；gRPC 另验证真实 TLS 的 CA/主机名校验和必需的 mTLS 客户端身份；agent-sandbox 使用真实 kubectl 对接本地 Kubernetes discovery/CR fixture。后者验证协议与参数边界，不代表已通过真实云服务、Kubernetes controller 或 OpenShell 部署的端到端认证测试。

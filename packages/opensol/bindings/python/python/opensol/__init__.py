@@ -44,6 +44,7 @@ from ._native import (
     pueue,
     sandboxd,
     ssh,
+    tmux,
 )
 
 from . import aio
@@ -93,4 +94,5 @@ __all__ = [
     "pueue",
     "sandboxd",
     "ssh",
+    "tmux",
 ]

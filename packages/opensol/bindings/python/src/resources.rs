@@ -235,6 +235,15 @@ struct PyProcessOutput {
 }
 #[pymethods]
 impl PyProcessOutput {
+    /// Current rendered terminal text, not raw output, scrollback, or a cursor-based log.
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let output = self.inner.clone();
+        let runtime = runtime()?;
+        let bytes = py
+            .detach(move || runtime.block_on(output.snapshot()))
+            .map_err(exception)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
     fn stat(&self, py: Python<'_>) -> PyResult<PyOutputInfo> {
         let output = self.inner.clone();
         let runtime = runtime()?;
@@ -367,6 +376,13 @@ struct AsyncProcessOutput {
 }
 #[pymethods]
 impl AsyncProcessOutput {
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let output = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = output.snapshot().await.map_err(exception)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &bytes).unbind()))
+        })
+    }
     fn stat<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let output = self.inner.clone();
         future_into_py(py, async move {

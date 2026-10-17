@@ -54,6 +54,10 @@ pub trait ProcessAccess: Send + Sync {
     async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>)
     -> Result<ProcessOutcome>;
     async fn output(&self, process: &ProcessRef) -> Result<EventStream>;
+    /// One rendered terminal screen, not raw output, scrollback, or a cursor-based log.
+    async fn terminal_snapshot(&self, _process: &ProcessRef) -> Result<Vec<u8>> {
+        Err(Error::unsupported(self.backend(), "terminal_snapshot"))
+    }
     async fn output_stat(&self, _process: &ProcessRef) -> Result<OutputInfo> {
         Err(Error::unsupported(self.backend(), "output_stat"))
     }

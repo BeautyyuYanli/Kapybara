@@ -30,6 +30,7 @@ use opensol_adapters::{
     sandboxd::Sandboxd,
     secret::Secret,
     ssh::{Ssh, SshConfig},
+    tmux::{Tmux, TmuxConfig},
 };
 use opensol_core::{
     Command, Connection, CreateOptions, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
@@ -961,6 +962,25 @@ fn pueue(
 }
 
 #[pyfunction]
+/// Bind a caller-owned tmux server on the Connection target without remote I/O.
+#[pyo3(signature = (connection, *, socket_path, session_prefix="opensol", program="tmux"))]
+fn tmux(
+    connection: PyRef<'_, PyConnection>,
+    socket_path: String,
+    session_prefix: &str,
+    program: &str,
+) -> PyResult<PyProcessManager> {
+    let mut config = TmuxConfig::new(socket_path);
+    config.session_prefix = session_prefix.into();
+    config.program = program.into();
+    Tmux::new(connection.inner.clone(), config)
+        .map(|inner| PyProcessManager {
+            inner: ProcessManager::new(inner),
+        })
+        .map_err(exception)
+}
+
+#[pyfunction]
 #[pyo3(signature = (endpoint, *, access_token=None, user=None, sandbox_id=None, request_timeout=30.0))]
 fn envd(
     endpoint: String,
@@ -1241,6 +1261,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(docker, module)?)?;
     module.add_function(wrap_pyfunction!(docker_connection, module)?)?;
     module.add_function(wrap_pyfunction!(pueue, module)?)?;
+    module.add_function(wrap_pyfunction!(tmux, module)?)?;
     module.add_function(wrap_pyfunction!(envd, module)?)?;
     module.add_function(wrap_pyfunction!(e2b, module)?)?;
     module.add_function(wrap_pyfunction!(agent_sandbox, module)?)?;

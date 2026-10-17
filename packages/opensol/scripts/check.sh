@@ -7,7 +7,7 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/target}
 cargo fmt --all --check
 cargo check --locked --workspace --all-features
 cargo check --locked -p opensol-adapters --no-default-features
-for feature in local ssh docker pueue envd e2b sandboxd agent-sandbox openshell; do
+for feature in local ssh docker pueue tmux envd e2b sandboxd agent-sandbox openshell; do
     cargo check --locked -p opensol-adapters --no-default-features --features "$feature"
 done
 cargo test --locked -p opensol-core -p opensol-adapters --all-features

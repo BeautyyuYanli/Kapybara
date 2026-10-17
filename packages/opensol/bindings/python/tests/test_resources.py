@@ -110,11 +110,14 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(missing.ref.id, "123", "binding must not contact a daemon")
         manager = sdk.pueue(sdk.local(), config_file=str(self.config))
         self.assertFalse(manager.capabilities()["output_resource"])
+        self.assertFalse(manager.capabilities()["terminal_snapshot"])
         handle = manager.spawn(["sleep", "30"])
         self.running(handle.process)
         process = manager.get(handle.process)
         with self.assertRaises(sdk.UnsupportedError):
             process.output.stat()
+        with self.assertRaises(sdk.UnsupportedError):
+            process.output.snapshot()
         process.pause()
         self.assertEqual(process.inspect().state, "paused")
         process.start()

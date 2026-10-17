@@ -417,6 +417,7 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
             process.kill().await.unwrap_err(),
             process.remove().await.unwrap_err(),
             process.output().stat().await.unwrap_err(),
+            process.output().snapshot().await.unwrap_err(),
             process.output().read(None, 64).await.unwrap_err(),
             process.signal(Signal::Interrupt).await.unwrap_err(),
             manager.list().await.unwrap_err(),

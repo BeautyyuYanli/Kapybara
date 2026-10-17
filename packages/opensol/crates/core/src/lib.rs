@@ -586,6 +586,8 @@ pub struct ProcessCapabilities {
     pub remove: bool,
     /// Configured access to a retained, bounded native log resource.
     pub output_resource: bool,
+    /// A rendered terminal screen; independent of retained logs and output subscriptions.
+    pub terminal_snapshot: bool,
     pub stdin: bool,
     pub close_stdin: bool,
     /// True guarantees arbitrary bytes; false leaves native payload restrictions to the adapter.
@@ -674,6 +676,11 @@ impl ProcessManager {
         process.validate(self.backend(), "output_stat")?;
         self.require(self.capabilities().output_resource, "output_stat")?;
         self.access.output_stat(process).await
+    }
+    async fn terminal_snapshot(&self, process: &ProcessRef) -> Result<Vec<u8>> {
+        process.validate(self.backend(), "terminal_snapshot")?;
+        self.require(self.capabilities().terminal_snapshot, "terminal_snapshot")?;
+        self.access.terminal_snapshot(process).await
     }
     /// Reads are bounded; cursor encoding, versions and retention are checked by the adapter.
     async fn read_output(
@@ -829,6 +836,15 @@ pub struct ProcessOutput {
 }
 
 impl ProcessOutput {
+    /// Returns the current rendered terminal screen as native text bytes, without scrollback
+    /// or format-attribute escapes. Size, wrapping, clearing and redraw affect this screen.
+    /// This is not raw stdout/stderr or an append-only log and has no cursor or background reader.
+    pub async fn snapshot(&self) -> Result<Vec<u8>> {
+        self.process
+            .manager
+            .terminal_snapshot(&self.process.reference)
+            .await
+    }
     pub async fn stat(&self) -> Result<OutputInfo> {
         self.process
             .manager

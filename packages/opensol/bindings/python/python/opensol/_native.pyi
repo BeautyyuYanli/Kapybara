@@ -44,6 +44,7 @@ class ProcessCapabilities(TypedDict):
     kill: bool
     remove: bool
     output_resource: bool
+    terminal_snapshot: bool
     stdin: bool
     close_stdin: bool
     binary_stdin: bool
@@ -175,6 +176,9 @@ class Process:
     def resize(self, cols: int, rows: int) -> None: ...
 
 class ProcessOutput:
+    def snapshot(self) -> bytes:
+        """Rendered terminal screen, without raw-output, scrollback or cursor guarantees."""
+        ...
     def stat(self) -> OutputInfo: ...
     def read(self, *, cursor: OutputCursor | None = None, limit: int = 65536) -> OutputPage: ...
     def subscribe(self) -> ProcessHandle: ...
@@ -337,6 +341,7 @@ class AsyncProcess:
     def resize(self, cols: int, rows: int) -> Awaitable[None]: ...
 
 class AsyncProcessOutput:
+    def snapshot(self) -> Awaitable[bytes]: ...
     def stat(self) -> Awaitable[OutputInfo]: ...
     def read(self, *, cursor: OutputCursor | None = None, limit: int = 65536) -> Awaitable[OutputPage]: ...
     def subscribe(self) -> Awaitable[AsyncProcessHandle]: ...
@@ -387,6 +392,13 @@ def pueue(
     group: str | None = None,
     pueue_directory: str | None = None,
     program: str = "pueue",
+) -> ProcessManager: ...
+def tmux(
+    connection: Connection,
+    *,
+    socket_path: str,
+    session_prefix: str = "opensol",
+    program: str = "tmux",
 ) -> ProcessManager: ...
 def envd(
     endpoint: str,

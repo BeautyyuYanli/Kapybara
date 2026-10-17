@@ -18,6 +18,8 @@ pub mod pueue;
 pub mod sandboxd;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+#[cfg(feature = "tmux")]
+pub mod tmux;
 
 #[cfg(feature = "grpc")]
 pub mod grpc;
@@ -28,6 +30,7 @@ pub mod secret;
     feature = "local",
     feature = "docker",
     feature = "pueue",
+    feature = "tmux",
     feature = "envd",
     feature = "grpc"
 ))]

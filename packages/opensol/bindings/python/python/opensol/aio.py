@@ -247,6 +247,10 @@ class ProcessOutput:
     def __init__(self, native: _native.AsyncProcessOutput) -> None:
         self._native = native
 
+    async def snapshot(self) -> bytes:
+        """Current rendered screen; no raw stdout/stderr, scrollback, cursor or background reader."""
+        return await self._native.snapshot()
+
     async def stat(self) -> OutputInfo:
         return await self._native.stat()
 
@@ -368,6 +372,19 @@ def pueue(
     return ProcessManager(_native._async_processes(manager))
 
 
+def tmux(
+    connection: Connection,
+    *,
+    socket_path: str,
+    session_prefix: str = "opensol",
+    program: str = "tmux",
+) -> ProcessManager:
+    """Bind a caller-owned tmux server on the Connection target without I/O."""
+    manager = _native.tmux(connection._native._blocking(), socket_path=socket_path,
+                           session_prefix=session_prefix, program=program)
+    return ProcessManager(_native._async_processes(manager))
+
+
 def envd(
     endpoint: str,
     *,
@@ -481,6 +498,6 @@ async def openshell_connection(
 __all__ = [
     "Connection", "Lifecycle", "ProcessManager", "ProcessHandle", "Process", "ProcessOutput", "Envd",
     "Docker", "E2b", "OpenShell",
-    "local", "ssh", "docker", "docker_connection", "pueue", "envd", "e2b",
+    "local", "ssh", "docker", "docker_connection", "pueue", "tmux", "envd", "e2b",
     "agent_sandbox", "sandboxd", "openshell", "openshell_connection",
 ]

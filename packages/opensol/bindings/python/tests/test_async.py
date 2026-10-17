@@ -74,7 +74,7 @@ class CoroutineContractTests(unittest.TestCase):
             aio.ProcessManager: ("probe", "list", "spawn"),
             aio.Process: ("inspect", "wait", "pause", "start", "restart", "kill", "remove",
                           "signal", "send_input", "close_stdin", "resize"),
-            aio.ProcessOutput: ("stat", "read", "subscribe"),
+            aio.ProcessOutput: ("stat", "read", "snapshot", "subscribe"),
             aio.ProcessHandle: ("next_event", "wait", "aclose", "__anext__"),
             aio.E2b: ("envd",),
         }
@@ -84,7 +84,7 @@ class CoroutineContractTests(unittest.TestCase):
                     self.assertTrue(inspect.iscoroutinefunction(getattr(owner, name)))
         for factory in (aio.sandboxd, aio.openshell, aio.openshell_connection):
             self.assertTrue(inspect.iscoroutinefunction(factory))
-        for factory in (aio.local, aio.ssh, aio.docker, aio.docker_connection, aio.pueue,
+        for factory in (aio.local, aio.ssh, aio.docker, aio.docker_connection, aio.pueue, aio.tmux,
                         aio.envd, aio.e2b, aio.agent_sandbox):
             self.assertFalse(inspect.iscoroutinefunction(factory))
 

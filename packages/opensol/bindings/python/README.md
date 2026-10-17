@@ -32,11 +32,12 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 | `agent_sandbox(namespace, pod_template_json, ...)` | `Lifecycle` |
 | `openshell_connection(endpoint, sandbox, ...)`、`sandboxd(endpoint, ...)` | `Connection` |
 | `pueue(connection, config_file=..., ...)` | `ProcessManager`，包装注入的连接 |
+| `tmux(connection, *, socket_path, session_prefix="opensol", program="tmux")` | `ProcessManager`，连接目标机器上已有的 tmux >= 3.5 server |
 | `envd(endpoint, ...)`、E2b 的 `.envd(resource)` | 同一个原生 envd 客户端，其 `.connection` / `.processes` 提供两层接口 |
 
 Docker HostConfig、Kubernetes PodTemplate/PVC 参数分别通过原生 JSON 字符串传递，不把供应商字段混入公共 `create()`。OpenShell 可选命名 workload template，或通过 `spec_protobuf` 传原生 SandboxSpec 编码；TLS 参数为 PEM 内容，不是文件路径。支持的信号编号为 2、9、15，具体后端仍可能返回 Unsupported。
 
-`aio` 中的配置型工厂（local、ssh、docker、docker_connection、pueue、envd、e2b、agent_sandbox）是普通函数；`aio.sandboxd`、`aio.openshell`、`aio.openshell_connection` 建立网络连接，需要 await。后端 `.lifecycle` 提供异步生命周期；Docker/OpenShell 的 `.connection(resource)` 是无需 I/O 的普通方法；E2b 的 `.envd(resource)` 只读发现需要 await。envd 的 `.connection` / `.processes` 分别返回异步接口。同步入口的所有 I/O 都是阻塞调用。
+`aio` 中的配置型工厂（local、ssh、docker、docker_connection、pueue、tmux、envd、e2b、agent_sandbox）是普通函数；`aio.sandboxd`、`aio.openshell`、`aio.openshell_connection` 建立网络连接，需要 await。后端 `.lifecycle` 提供异步生命周期；Docker/OpenShell 的 `.connection(resource)` 是无需 I/O 的普通方法；E2b 的 `.envd(resource)` 只读发现需要 await。envd 的 `.connection` / `.processes` 分别返回异步接口。同步入口的所有 I/O 都是阻塞调用。
 
 后端对象保留原始 Engine/gateway/HTTP 客户端、凭据、作用域与超时，不重复转发生命周期方法。E2B 的 envd_endpoint、sandbox_domain、request_timeout 在 `e2b()` 配置，连接资源时无需再次提供 API key 或 endpoint。工厂不隐式 create/start/probe、不恢复暂停沙盒、不启动 daemon。公共参数校验和能力检查复用 Rust 客户端，Python 仅做语言参数、awaitable 和异常转换。
 
@@ -44,7 +45,7 @@ Docker HostConfig、Kubernetes PodTemplate/PVC 参数分别通过原生 JSON 字
 
 ## 原生任务和输出资源
 
-进程任务由实际的 pueued/envd 创建、持有和回收。OpenSOL 不托管 daemon，不增加执行队列或后台日志服务。`probe()` 做真实管理请求，返回 ManagerInfo；Pueue 可报告 CLI 版本，其他无法确认的版本为 None。`list()` 只返回原生当前保留的 ProcessInfo，不回传任务环境；Pueue 的 group 用于创建默认值和 list 过滤，不是权限边界。ProcessRef.pty 是可保存的 `bool | None` 模式提示，由适配器决定操作是否需要模式；envd List 返回 None，spawn 返回 True/False，Pueue 返回 False。envd 未知模式仍可 inspect、signal、kill、wait 和订阅，但 send_input、close_stdin、resize 返回 UnsupportedError，不发送猜测的 RPC；应保存 spawn 引用，或在已知模式时显式传 pty 参数。Pueue send 只需 task ID，重建的 `ProcessRef("pueue", id)` 仍可发送输入。
+进程任务由实际的 pueued/envd/tmux 创建、持有和回收。OpenSOL 不托管 daemon，不增加执行队列或后台日志服务。`probe()` 做真实管理请求，返回 ManagerInfo；Pueue 可报告 CLI 版本，Tmux 可报告 client/server version，无法确认的版本为 None。`list()` 只返回原生当前保留的 ProcessInfo，不回传任务环境；Pueue 的 group 用于创建默认值和 list 过滤，不是权限边界。ProcessRef.pty 是可保存的 `bool | None` 模式提示，由适配器决定操作是否需要模式；envd List 返回 None，spawn 返回 True/False，Pueue 返回 False，Tmux 返回 True。envd 未知模式仍可 inspect、signal、kill、wait 和订阅，但 send_input、close_stdin、resize 返回 UnsupportedError，不发送猜测的 RPC；应保存 spawn 引用，或在已知模式时显式传 pty 参数。Pueue send 只需 task ID，重建的 `ProcessRef("pueue", id)` 仍可发送输入。
 
 同步资源方法是阻塞调用；异步资源的相同 I/O 方法可 await，DTO 与异常相同。get、ref、output 属性只构造绑定对象：
 
@@ -69,13 +70,45 @@ async def read_pages(config_file, pueue_directory):
 
 Process 提供 inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize。这些都委托原生管理器，资源不缓存状态；handle 的 outcome 缓存仅属于原来的那次订阅。Pueue start 可强制启动 Queued/Stashed 并绕过队列限制和依赖；restart 仅用于终结任务，原地保留 ID、覆盖上次日志。remove 尊重原生状态/依赖，不暗中 kill；kill 回执不等于已经终结，仍需 inspect/wait。envd 只有原生 kill，pause/start/restart/remove 返回 Unsupported。
 
-`Process.wait()` 和 `ProcessHandle.wait()` 返回共享的 `ProcessOutcome`，表示已确认终结的任务，至少有 exit 或 native_result 一项可用。`outcome.exit` 是 `ExitStatus | None`，`outcome.native_result` 是脱敏的原生结果名称。Pueue Success/Failed 保留真实退出码，Killed、FailedToSpawn 等可以没有退出码；任务终态通过正常值返回。`ProcessInfo.outcome` 统一表达终态，非终态为 None；envd 通过原生完成事件提供含真实 ExitStatus 的 outcome。`Connection.exec()` 的 ExecResult 和 ExitStatus 保持原有含义。
+`Process.wait()` 和 `ProcessHandle.wait()` 返回共享的 `ProcessOutcome`，表示后端原生任务生命周期的完成，至少有 exit 或 native_result 一项可用；是否同时保证 OS 进程退出由具体后端决定。`outcome.exit` 是 `ExitStatus | None`，`outcome.native_result` 是脱敏的原生结果名称。Pueue Success/Failed 保留真实退出码，Killed、FailedToSpawn 等可以没有退出码；任务终态通过正常值返回。`ProcessInfo.outcome` 表达该原生生命周期的终态，非终态为 None；envd 通过原生完成事件提供含真实 ExitStatus 的 outcome。`Connection.exec()` 的 ExecResult 和 ExitStatus 保持原有含义。
 
 `process.output.stat()` 返回 channels、size、version；version 是后端可提供的不透明输出代次标识，None 只表示没有可报告的标识，任务状态由 ProcessInfo 表达。`read(cursor=None, limit=65536)` 返回 chunks、next_cursor、at_end。chunks.data 是 bytes，总量最多 limit（允许 1 至 1048576）；Pueue 只有 combined。读取立即返回当前观测的日志范围，at_end 仅为暂时读到尾部，不能代表任务结束。额外订阅只通过 `process.output.subscribe()` 建立，要求 reconnect 能力并调用原生重连，返回独立 ProcessHandle；读取和订阅互不推进对方的位置。订阅不要求 output_resource 能力，Rust/Python 均只公开这组绑定资源的输出入口。
 
 Pueue 需显式传 pueue_directory，指向注入 Connection 目标上的 daemon 数据目录，且与 config/profile 对应；要求 Linux 和 GNU stat/dd。Local、SSH、Docker 都经过同一 Connection 在目标侧读取一个已打开的原生日志，并按限定字节取得数据；不把远端路径当成本机路径。probe 和调用时检查依赖/权限，capabilities.output_resource 只表示已配置访问，不缓存探测结果。未配置及 envd 的 stat/read 返回 Unsupported。CLI 只能提供非结构化失败时保留脱敏 Backend；Connection 已确定的结构化错误种类不被改写。
 
 cursor.value 是可保存的不透明字符串，仅在同一目标、任务和日志版本内有效，不包含凭据和调用者指定的日志路径。Queued/Stashed 尚未开始时返回空页，size=0、version=None，不读取旧日志。Queued 的初始空 cursor 可在同一排队执行开始后继续使用；无法确认同次执行的转换报告 Conflict。任务原地重启、可检测的文件替换/截断返回 Conflict，清理任务/日志返回 NotFound，非法格式或 limit 返回 InvalidArgument，不自动重置。原生日志在请求之间截断后重新写长时，文件身份/大小无法证明其完整历史；它不是不可变归档。
+
+## tmux 任务与终端快照
+
+同步 `sdk.tmux` 和 `aio.tmux` 形状相同，构造不做 I/O。socket_path 必须为 Connection 目标上的绝对路径，session_prefix 为非空 ASCII 字母、数字、下划线或连字符。调用方安装 tmux >= 3.5，启动并保留 server；SDK 的 tmux 管理请求使用显式 socket 和 `-N`，不启动/关闭 server 或修改全局配置。probe 实际访问 server 并报告可确认的 client/server version。目标环境还需 `env` 和 `/usr/bin/nice`（支持 `-n 0 --`），任务环境不覆盖管理客户端环境。
+
+```python
+from opensol import aio
+
+async def terminal_job(connection, socket_path):
+    manager = aio.tmux(connection, socket_path=socket_path)
+    handle = await manager.spawn(["python3", "-c", "print('screen')"], pty=(80, 24))
+    process = manager.get(handle.process)
+    try:
+        outcome = await process.wait(timeout=5)
+        screen = await process.output.snapshot()  # bytes
+        await process.remove()  # 仅 dead pane 可移除；运行中返回 ConflictError。
+        return outcome, screen
+    finally:
+        await handle.aclose()
+```
+
+每任务为独立 session/window/pane，ProcessRef.id 是可保存的不透明完整身份，pty=True。list 只发现配置前缀内带有效归属的任务；前缀不是安全隔离，调用方不得修改归属选项或重组被管理 session。spawn 必须传 `pty=(cols, rows)`，未传时在资源创建前返回 UnsupportedError。restart 仅对 dead pane 生效，保留任务身份、开始新代次；remove 在原生队列中检查 dead 条件，不暗中 kill。kill 销毁 pane、任务和画面，后续 inspect/wait/snapshot 返回 NotFoundError，不伪造退出结果。
+
+指定 cwd 后，每次初始执行及 restart 都必须成功进入该目录才执行用户命令；失败时原生启动进程以 125 退出，OS 退出状态就绪后可从 `outcome.exit.code` 观察，用户命令不会在 tmux 的 HOME 或 `/` 回退目录执行。相对 cwd 经同一 Connection 目标的 `pwd -P` 解析并作为绝对路径保存在原生启动 argv 中；目标需要 `/bin/sh`，进入目录后再应用任务 env，保留非 POSIX 环境键、任务 PATH 和包含 `=` 的可执行路径。SDK 不缓存任务配置或通过目录预检查代替执行时的保证。
+
+`process.output.snapshot()`（aio 需 await）是当前渲染画面的原生文本 bytes，不主动包含滚动历史或属性转义；尺寸、换行、清屏、重绘均影响内容。它不是原始 stdout/stderr、完整历史或可追加日志，没有 cursor，不推进其他读取，也不启动后台采集。capabilities.terminal_snapshot 为 true，而 output_resource/historical_output/streaming_output/daemon_restart_recovery 均为 false；stat/read、pause/start/signal/close_stdin 返回 UnsupportedError。Pueue/envd 的 terminal_snapshot 为 false，snapshot 默认 UnsupportedError。
+
+send_input 接受任意 bytes，经原生 `send-keys -H` 发送，不经过 paste buffer 或文件；PTY 行规仍由目标控制。为支持 8192 字节上限，一条受身份保护的原生命令经 `source-file -` 从 Connection stdin 传入；输入能力要求 Connection 支持 stdin（Local/SSH/Docker 均支持）。空 bytes 不产生按键；超限在目标 I/O 前返回 InvalidArgumentError，由调用方显式拆分，不自动重试不确定发送。创建会关闭本 pane 的原生退出横幅，避免首行被滚入历史；管理客户端的 `-u` 保留 UTF-8 文本。
+
+Tmux 的 state、wait 和 Completed 均以原生 pane 生命周期为准，pane Dead/EOF 即可使 `ProcessInfo.state="exited"` 并返回完成。pane Dead/EOF、OS 进程退出和数值退出状态就绪可以分离；wait 返回后 OS 进程仍可能继续工作，`exit=None` 不能推断 OS 进程成功或已退出。可用的退出码和可确认的便携信号编号保留在 outcome.exit；其他信号保留 `SIG...` 名称，无可用 OS 状态时保留 Dead。
+
+初始及额外订阅在建立时绑定原生执行代次和 PID，仅交付 Completed，不生成 Output 事件。可检测的内部或外部 respawn 返回 ConflictError，任务清理返回 NotFoundError。已完成的 handle 始终保留首次结果，包括 `exit=None`，不会随 OS 状态就绪而补填；`Process.wait()` / `Process.inspect()` 查询当前执行，后续可取得已就绪的状态。关闭/取消订阅或 wait 不终止任务，server 消失后 SDK 不恢复进程。详见[后端契约](../../README.md#tmux)。
 
 ## 完成式命令
 
@@ -174,4 +207,4 @@ Pueue 订阅完成后才返回合并日志，并要求 CLI 与 daemon 在同一�
 
 超时与断连都可能留下正在运行的远端操作；SDK 不自行重做不确定的副作用。不将异常字符串当成日志存档，原生输出通过正常返回值消费。
 
-绑定验证由 SDK 根目录的 `Dockerfile.tests` / `scripts/check.sh` 执行，测试安装后的 wheel，而不导入未编译的源码。真实 Local/Pueue/Docker 验证同步与异步进程、字节与资源边界；本地 E2B HTTP fixture 验证资源包装和异常转换，envd ConnectRPC fixture 验证二进制 stdin/关闭、PTY 维度与终端字节及 resize。异步覆盖事件循环推进、读取/等待取消、输出及完成事件交付前取消、无退出码的终态、意外断流、显式关闭和网络工厂的真实 gRPC 握手。供应商 RPC/TLS 的固定 schema 契约另由 Rust fixture 验证，不调用真实云服务。测试脚本从固定的上游 schema 在临时目录生成 Python protobuf 类型，grpcio-tools 仅为测试依赖。
+绑定验证由 SDK 根目录的 `Dockerfile.tests` / `scripts/check.sh` 执行，测试安装后的 wheel，而不导入未编译的源码。真实 Local/Pueue/Tmux/Docker 验证同步与异步进程、字节与资源边界；Tmux 验证渲染快照、8192 字节二进制输入、resize、代次绑定、取消和目标侧 socket/文件。本地 E2B HTTP fixture 验证资源包装和异常转换，envd ConnectRPC fixture 验证二进制 stdin/关闭、PTY 维度与终端字节及 resize。异步覆盖事件循环推进、读取/等待取消、输出及完成事件交付前取消、无退出码的终态、意外断流、显式关闭和网络工厂的真实 gRPC 握手。供应商 RPC/TLS 的固定 schema 契约另由 Rust fixture 验证，不调用真实云服务。测试脚本从固定的上游 schema 在临时目录生成 Python protobuf 类型，grpcio-tools 仅为测试依赖。
