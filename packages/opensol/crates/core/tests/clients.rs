@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use futures::{StreamExt, executor::block_on, stream};
 use opensol_core::{
-    raw::{ExecAccess, LifecycleAccess, ProcessAccess},
+    raw::{ExecAccess, LifecycleAccess, OutputAccess, ProcessAccess, TerminalAccess},
     *,
 };
 
@@ -229,10 +229,14 @@ impl ProcessAccess for Backend {
             ..Default::default()
         }
     }
-    async fn spawn(&self, _request: SpawnRequest) -> Result<ProcessHandle> {
+    fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
+        self.reconnect
+            .then(|| Arc::new(self.clone()) as Arc<dyn OutputAccess>)
+    }
+    async fn spawn(&self, _request: SpawnRequest) -> Result<OutputSubscription> {
         self.calls.lock().unwrap().push("spawn");
-        Ok(ProcessHandle {
-            process: ProcessRef::new("extension", "task", Some(false)),
+        Ok(OutputSubscription {
+            reference: ProcessRef::new("extension", "task", Some(false)),
             events: Box::pin(stream::iter([
                 Ok(ProcessEvent::Output {
                     channel: OutputChannel::Combined,
@@ -257,20 +261,6 @@ impl ProcessAccess for Backend {
         _timeout: Option<Duration>,
     ) -> Result<ProcessOutcome> {
         self.entered("wait")
-    }
-    async fn output(&self, _process: &ProcessRef) -> Result<EventStream> {
-        self.entered("output")
-    }
-    async fn output_stat(&self, _process: &ProcessRef) -> Result<OutputInfo> {
-        self.entered("output_stat")
-    }
-    async fn read_output(
-        &self,
-        _process: &ProcessRef,
-        _cursor: Option<&OutputCursor>,
-        _limit: usize,
-    ) -> Result<OutputPage> {
-        self.entered("read_output")
     }
     async fn pause(&self, _process: &ProcessRef) -> Result<()> {
         self.entered("pause")
@@ -299,10 +289,37 @@ impl ProcessAccess for Backend {
     async fn resize(&self, _process: &ProcessRef, _size: PtySize) -> Result<()> {
         self.entered("resize")
     }
-    async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
+}
+
+#[async_trait]
+impl OutputAccess for Backend {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities {
+            read: true,
+            tail: true,
+            subscribe: self.reconnect,
+            ..Default::default()
+        }
+    }
+    async fn read(
+        &self,
+        _process: &ProcessRef,
+        _cursor: Option<&OutputCursor>,
+        _direction: ReadDirection,
+        _max_bytes: usize,
+    ) -> Result<OutputPage> {
+        self.entered("read_output")
+    }
+    async fn tail(&self, _process: &ProcessRef, _max_bytes: usize) -> Result<OutputPage> {
+        self.entered("tail_output")
+    }
+    async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         self.calls.lock().unwrap().push("reconnect");
-        Ok(ProcessHandle {
-            process: process.clone(),
+        Ok(OutputSubscription {
+            reference: process.clone(),
             events: Box::pin(stream::iter([Ok(ProcessEvent::Completed(
                 ProcessOutcome {
                     exit: None,
@@ -416,9 +433,13 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
             process.restart().await.unwrap_err(),
             process.kill().await.unwrap_err(),
             process.remove().await.unwrap_err(),
-            process.output().stat().await.unwrap_err(),
-            process.output().snapshot().await.unwrap_err(),
-            process.output().read(None, 64).await.unwrap_err(),
+            process.output().tail(64).await.unwrap_err(),
+            process.terminal().screen().await.unwrap_err(),
+            process
+                .output()
+                .read(None, opensol_core::ReadDirection::Forward, 64)
+                .await
+                .unwrap_err(),
             process.signal(Signal::Interrupt).await.unwrap_err(),
             manager.list().await.unwrap_err(),
         ] {
@@ -429,7 +450,12 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
         );
         for limit in [0, MAX_OUTPUT_LIMIT + 1] {
             assert_eq!(
-                process.output().read(None, limit).await.unwrap_err().kind,
+                process
+                    .output()
+                    .read(None, opensol_core::ReadDirection::Forward, limit)
+                    .await
+                    .unwrap_err()
+                    .kind,
                 ErrorKind::InvalidArgument
             );
         }
@@ -467,21 +493,22 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
             matches!(manager.spawn(request).await, Err(error) if error.kind == ErrorKind::Unsupported)
         );
         assert!(adapter.calls.lock().unwrap().is_empty());
-        let mut handle = manager
+        let (bound, mut subscription) = manager
             .spawn(SpawnRequest::new(Command::shell("true")))
             .await
             .unwrap();
-        let bound = manager.clone().get(handle.process.clone());
+        assert_eq!(bound.reference(), &subscription.reference);
+        assert_eq!(*adapter.calls.lock().unwrap(), ["spawn"]);
         drop(manager);
         assert_eq!(
-            handle.events.next().await.unwrap().unwrap(),
+            subscription.events.next().await.unwrap().unwrap(),
             ProcessEvent::Output {
                 channel: OutputChannel::Combined,
                 data: vec![0xff]
             }
         );
         assert_eq!(
-            wait_events(handle.events, "extension").await.unwrap(),
+            wait_events(subscription.events, "extension").await.unwrap(),
             ProcessOutcome {
                 exit: Some(ExitStatus::code(7)),
                 native_result: None,
@@ -515,11 +542,11 @@ fn additional_subscriptions_use_native_reconnect_and_preserve_identity() {
         };
         let manager = ProcessManager::new(adapter.clone());
         let reference = ProcessRef::new("extension", "task", None);
-        let output = manager.get(reference.clone()).output();
+        let process = manager.get(reference.clone());
         drop(manager);
         assert!(adapter.calls.lock().unwrap().is_empty());
-        let handle = output.subscribe().await.unwrap();
-        assert_eq!(handle.process, reference);
+        let handle = process.output().subscribe().await.unwrap();
+        assert_eq!(handle.reference, reference);
         assert_eq!(
             wait_events(handle.events, "extension").await.unwrap(),
             ProcessOutcome {
@@ -528,5 +555,106 @@ fn additional_subscriptions_use_native_reconnect_and_preserve_identity() {
             }
         );
         assert_eq!(*adapter.calls.lock().unwrap(), ["reconnect"]);
+    });
+}
+
+/// A third party can expose native terminal text without implementing task control or bytes.
+#[derive(Clone, Default)]
+struct TerminalOnly(Arc<Mutex<Vec<&'static str>>>);
+#[async_trait]
+impl TerminalAccess for TerminalOnly {
+    fn backend(&self) -> &'static str {
+        "terminal-only"
+    }
+    fn capabilities(&self) -> TerminalCapabilities {
+        TerminalCapabilities {
+            tail: true,
+            screen: true,
+            ..Default::default()
+        }
+    }
+    async fn tail(&self, _process: &ProcessRef, lines: usize) -> Result<TerminalPage> {
+        self.0.lock().unwrap().push("tail");
+        Ok(TerminalPage {
+            lines: vec!["kept  \r\t\u{2028}".into(); lines.min(2)],
+            before: None,
+            after: None,
+            at_head: Some(lines >= 2),
+            at_tail: true,
+        })
+    }
+}
+
+#[test]
+fn representation_extensions_bind_and_validate_independently_of_task_control() {
+    block_on(async {
+        let adapter = TerminalOnly::default();
+        let terminal = Terminal::new(
+            adapter.clone(),
+            ProcessRef::new("terminal-only", "task", None),
+        );
+        assert!(terminal.clone().capabilities().tail);
+        assert!(!terminal.capabilities().read);
+        assert!(adapter.0.lock().unwrap().is_empty());
+        for lines in [0, MAX_TERMINAL_LINES + 1] {
+            assert_eq!(
+                terminal.tail(lines).await.unwrap_err().kind,
+                ErrorKind::InvalidArgument
+            );
+            assert_eq!(
+                terminal
+                    .read(None, ReadDirection::Backward, lines)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::InvalidArgument
+            );
+        }
+        assert_eq!(
+            terminal
+                .read(None, ReadDirection::Backward, 1)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert!(adapter.0.lock().unwrap().is_empty());
+        let page = terminal.tail(1).await.unwrap();
+        assert_eq!(page.lines, ["kept  \r\t\u{2028}"]);
+        assert_eq!(
+            (page.before, page.after, page.at_head, page.at_tail),
+            (None, None, Some(false), true)
+        );
+        assert_eq!(*adapter.0.lock().unwrap(), ["tail"]);
+
+        let bytes = Backend::default();
+        let output = Output::new(bytes.clone(), ProcessRef::new("extension", "task", None));
+        assert!(output.capabilities().read);
+        assert!(bytes.calls.lock().unwrap().is_empty());
+        for max_bytes in [0, MAX_OUTPUT_LIMIT + 1] {
+            assert_eq!(
+                output
+                    .read(None, ReadDirection::Forward, max_bytes)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::InvalidArgument
+            );
+            assert_eq!(
+                output.tail(max_bytes).await.unwrap_err().kind,
+                ErrorKind::InvalidArgument
+            );
+        }
+        assert!(bytes.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            output
+                .read(None, ReadDirection::Backward, 1)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Transport
+        );
+        assert_eq!(output.tail(1).await.unwrap_err().kind, ErrorKind::Transport);
+        assert_eq!(*bytes.calls.lock().unwrap(), ["read_output", "tail_output"]);
     });
 }

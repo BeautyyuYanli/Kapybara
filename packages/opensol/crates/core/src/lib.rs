@@ -507,20 +507,23 @@ pub enum OutputChannel {
     Combined,
 }
 
-/// Retained native output metadata, independent of task state (see `ProcessInfo`).
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct OutputInfo {
-    pub channels: Vec<OutputChannel>,
-    pub size: u64,
-    /// Opaque output generation identifier; None means the backend has no identifier to report.
-    pub version: Option<String>,
-}
-
 /// Persistable opaque position, scoped to one manager target, task and log version.
 /// Adapters validate their encoding; callers must not interpret or modify it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OutputCursor(pub String);
+
+/// A terminal-history boundary, distinct from a raw byte-output position.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TerminalCursor(pub String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadDirection {
+    Forward,
+    Backward,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputChunk {
@@ -528,16 +531,39 @@ pub struct OutputChunk {
     pub data: Vec<u8>,
 }
 
-/// `at_end` is the observed log tail, not process completion. Reads never wait for new output.
+/// Boundaries surround this page; backward pages retain native content order.
+/// `at_tail` describes this observation, never process completion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputPage {
     pub chunks: Vec<OutputChunk>,
-    pub next_cursor: OutputCursor,
-    pub at_end: bool,
+    pub before: Option<OutputCursor>,
+    pub after: Option<OutputCursor>,
+    pub at_head: Option<bool>,
+    pub at_tail: bool,
+}
+
+/// Native rendered history; lines exclude protocol LF separators and retain all other text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalPage {
+    pub lines: Vec<String>,
+    pub before: Option<TerminalCursor>,
+    pub after: Option<TerminalCursor>,
+    pub at_head: Option<bool>,
+    pub at_tail: bool,
+}
+
+/// The active native screen, including blank lines, with its actual rendered dimensions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalScreen {
+    pub cols: u32,
+    pub rows: u32,
+    pub lines: Vec<String>,
 }
 
 pub const DEFAULT_OUTPUT_LIMIT: usize = 65_536;
 pub const MAX_OUTPUT_LIMIT: usize = 1_048_576;
+pub const DEFAULT_TERMINAL_LINES: usize = 200;
+pub const MAX_TERMINAL_LINES: usize = 10_000;
 
 /// Enforce a bounded read before doing any target I/O.
 pub fn validate_output_limit(limit: usize, backend: &str) -> Result<()> {
@@ -545,10 +571,159 @@ pub fn validate_output_limit(limit: usize, backend: &str) -> Result<()> {
         return Err(Error::invalid(
             backend,
             "read_output",
-            "limit must be between 1 and 1048576 bytes",
+            "max_bytes must be between 1 and 1048576 bytes",
         ));
     }
     Ok(())
+}
+
+pub fn validate_terminal_lines(lines: usize, backend: &str) -> Result<()> {
+    if !(1..=MAX_TERMINAL_LINES).contains(&lines) {
+        return Err(Error::invalid(
+            backend,
+            "read_terminal",
+            "lines must be between 1 and 10000",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct OutputCapabilities {
+    pub read: bool,
+    pub tail: bool,
+    pub subscribe: bool,
+    /// Subscription delivery only; independent of paginated native logs.
+    pub historical_output: bool,
+    pub streaming_output: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct TerminalCapabilities {
+    pub read: bool,
+    pub tail: bool,
+    pub screen: bool,
+}
+
+/// Locally bound raw byte view. It neither collects output nor owns a task's lifetime.
+#[derive(Clone)]
+pub struct Output {
+    access: Arc<dyn raw::OutputAccess>,
+    reference: ProcessRef,
+}
+
+impl Output {
+    pub fn new(access: impl raw::OutputAccess + 'static, reference: ProcessRef) -> Self {
+        Self {
+            access: Arc::new(access),
+            reference,
+        }
+    }
+    pub fn backend(&self) -> &'static str {
+        self.access.backend()
+    }
+    pub fn capabilities(&self) -> OutputCapabilities {
+        self.access.capabilities()
+    }
+    /// Reads immediately. An absent cursor selects the head (forward) or observed tail (backward).
+    pub async fn read(
+        &self,
+        cursor: Option<&OutputCursor>,
+        direction: ReadDirection,
+        max_bytes: usize,
+    ) -> Result<OutputPage> {
+        self.reference.validate(self.backend(), "read_output")?;
+        validate_output_limit(max_bytes, self.backend())?;
+        require(self.capabilities().read, self.backend(), "read_output")?;
+        self.access
+            .read(&self.reference, cursor, direction, max_bytes)
+            .await
+    }
+    pub async fn tail(&self, max_bytes: usize) -> Result<OutputPage> {
+        self.reference.validate(self.backend(), "tail_output")?;
+        validate_output_limit(max_bytes, self.backend())?;
+        require(self.capabilities().tail, self.backend(), "tail_output")?;
+        self.access.tail(&self.reference, max_bytes).await
+    }
+    /// Opens the native subscription without changing any page cursor or spawning a task.
+    pub async fn subscribe(&self) -> Result<OutputSubscription> {
+        self.reference
+            .validate(self.backend(), "subscribe_output")?;
+        require(
+            self.capabilities().subscribe,
+            self.backend(),
+            "subscribe_output",
+        )?;
+        self.access.subscribe(&self.reference).await
+    }
+}
+
+/// Locally bound native rendered text. This view never interprets raw output bytes.
+#[derive(Clone)]
+pub struct Terminal {
+    access: Arc<dyn raw::TerminalAccess>,
+    reference: ProcessRef,
+}
+
+impl Terminal {
+    pub fn new(access: impl raw::TerminalAccess + 'static, reference: ProcessRef) -> Self {
+        Self {
+            access: Arc::new(access),
+            reference,
+        }
+    }
+    pub fn backend(&self) -> &'static str {
+        self.access.backend()
+    }
+    pub fn capabilities(&self) -> TerminalCapabilities {
+        self.access.capabilities()
+    }
+    pub async fn read(
+        &self,
+        cursor: Option<&TerminalCursor>,
+        direction: ReadDirection,
+        lines: usize,
+    ) -> Result<TerminalPage> {
+        self.reference.validate(self.backend(), "read_terminal")?;
+        validate_terminal_lines(lines, self.backend())?;
+        require(self.capabilities().read, self.backend(), "read_terminal")?;
+        self.access
+            .read(&self.reference, cursor, direction, lines)
+            .await
+    }
+    pub async fn tail(&self, lines: usize) -> Result<TerminalPage> {
+        self.reference.validate(self.backend(), "tail_terminal")?;
+        validate_terminal_lines(lines, self.backend())?;
+        require(self.capabilities().tail, self.backend(), "tail_terminal")?;
+        self.access.tail(&self.reference, lines).await
+    }
+    pub async fn screen(&self) -> Result<TerminalScreen> {
+        self.reference.validate(self.backend(), "terminal_screen")?;
+        require(
+            self.capabilities().screen,
+            self.backend(),
+            "terminal_screen",
+        )?;
+        self.access.screen(&self.reference).await
+    }
+}
+
+struct UnavailableView(&'static str);
+impl raw::OutputAccess for UnavailableView {
+    fn backend(&self) -> &'static str {
+        self.0
+    }
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::default()
+    }
+}
+impl raw::TerminalAccess for UnavailableView {
+    fn backend(&self) -> &'static str {
+        self.0
+    }
+    fn capabilities(&self) -> TerminalCapabilities {
+        TerminalCapabilities::default()
+    }
 }
 
 /// Successful native management request, not just an open port. Versions may be unavailable.
@@ -571,8 +746,8 @@ pub enum ProcessEvent {
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProcessEvent>> + Send + 'static>>;
 
 /// Owns a native output subscription, not the process lifetime. Dropping it does not delete resources.
-pub struct ProcessHandle {
-    pub process: ProcessRef,
+pub struct OutputSubscription {
+    pub reference: ProcessRef,
     pub events: EventStream,
 }
 
@@ -584,10 +759,6 @@ pub struct ProcessCapabilities {
     pub restart: bool,
     pub kill: bool,
     pub remove: bool,
-    /// Configured access to a retained, bounded native log resource.
-    pub output_resource: bool,
-    /// A rendered terminal screen; independent of retained logs and output subscriptions.
-    pub terminal_snapshot: bool,
     pub stdin: bool,
     pub close_stdin: bool,
     /// True guarantees arbitrary bytes; false leaves native payload restrictions to the adapter.
@@ -598,8 +769,6 @@ pub struct ProcessCapabilities {
     pub supported_signals: &'static [Signal],
     pub detached: bool,
     pub reconnect: bool,
-    pub historical_output: bool,
-    pub streaming_output: bool,
     pub daemon_restart_recovery: bool,
 }
 
@@ -651,13 +820,15 @@ impl ProcessManager {
         self.require(self.capabilities().list, "list")?;
         self.access.list().await
     }
-    /// Returns the native initial output subscription; binding a Process does not consume it.
-    pub async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
+    /// Returns the bound task and its native initial subscription without querying or reconnecting.
+    pub async fn spawn(&self, request: SpawnRequest) -> Result<(Process, OutputSubscription)> {
         request.validate(self.backend())?;
         let capabilities = self.capabilities();
         self.require(!request.stdin || capabilities.stdin, "spawn")?;
         self.require(request.pty.is_none() || capabilities.pty, "spawn")?;
-        self.access.spawn(request).await
+        let subscription = self.access.spawn(request).await?;
+        let process = self.get(subscription.reference.clone());
+        Ok((process, subscription))
     }
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
         process.validate(self.backend(), "status")?;
@@ -671,28 +842,6 @@ impl ProcessManager {
         process.validate(self.backend(), "wait")?;
         validate_timeout(timeout, self.backend(), "wait")?;
         self.access.wait(process, timeout).await
-    }
-    async fn output_stat(&self, process: &ProcessRef) -> Result<OutputInfo> {
-        process.validate(self.backend(), "output_stat")?;
-        self.require(self.capabilities().output_resource, "output_stat")?;
-        self.access.output_stat(process).await
-    }
-    async fn terminal_snapshot(&self, process: &ProcessRef) -> Result<Vec<u8>> {
-        process.validate(self.backend(), "terminal_snapshot")?;
-        self.require(self.capabilities().terminal_snapshot, "terminal_snapshot")?;
-        self.access.terminal_snapshot(process).await
-    }
-    /// Reads are bounded; cursor encoding, versions and retention are checked by the adapter.
-    async fn read_output(
-        &self,
-        process: &ProcessRef,
-        cursor: Option<&OutputCursor>,
-        limit: usize,
-    ) -> Result<OutputPage> {
-        process.validate(self.backend(), "read_output")?;
-        validate_output_limit(limit, self.backend())?;
-        self.require(self.capabilities().output_resource, "read_output")?;
-        self.access.read_output(process, cursor, limit).await
     }
     async fn pause(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "pause")?;
@@ -749,11 +898,6 @@ impl ProcessManager {
         self.require(process.pty != Some(true) || capabilities.pty, "resize")?;
         self.access.resize(process, size).await
     }
-    async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
-        process.validate(self.backend(), "reconnect")?;
-        self.require(self.capabilities().reconnect, "reconnect")?;
-        self.access.reconnect(process).await
-    }
     fn require(&self, supported: bool, operation: &str) -> Result<()> {
         require(supported, self.backend(), operation)
     }
@@ -767,7 +911,8 @@ fn require(supported: bool, backend: &str, operation: &str) -> Result<()> {
     }
 }
 
-/// Bound resource facade; owns neither a process nor authoritative cached state.
+/// Bound task operations and output access; owns neither the task nor authoritative cached state.
+/// Log reads and subscriptions have independent positions; only subscriptions own delivery state.
 #[derive(Clone)]
 pub struct Process {
     manager: ProcessManager,
@@ -781,11 +926,6 @@ impl Process {
     }
     pub fn reference(&self) -> &ProcessRef {
         &self.reference
-    }
-    pub fn output(&self) -> ProcessOutput {
-        ProcessOutput {
-            process: self.clone(),
-        }
     }
     pub async fn inspect(&self) -> Result<ProcessInfo> {
         self.manager.status(&self.reference).await
@@ -827,44 +967,26 @@ impl Process {
     pub async fn resize(&self, size: PtySize) -> Result<()> {
         self.manager.resize(&self.reference, size).await
     }
-}
-
-/// Bound output access; subscribing does not advance read cursors or require retained logs.
-#[derive(Clone)]
-pub struct ProcessOutput {
-    process: Process,
-}
-
-impl ProcessOutput {
-    /// Returns the current rendered terminal screen as native text bytes, without scrollback
-    /// or format-attribute escapes. Size, wrapping, clearing and redraw affect this screen.
-    /// This is not raw stdout/stderr or an append-only log and has no cursor or background reader.
-    pub async fn snapshot(&self) -> Result<Vec<u8>> {
-        self.process
-            .manager
-            .terminal_snapshot(&self.process.reference)
-            .await
+    /// View binding and capability queries are local, including for unsupported representations.
+    pub fn output(&self) -> Output {
+        Output {
+            access: self
+                .manager
+                .access
+                .output_access()
+                .unwrap_or_else(|| Arc::new(UnavailableView(self.manager.backend()))),
+            reference: self.reference.clone(),
+        }
     }
-    pub async fn stat(&self) -> Result<OutputInfo> {
-        self.process
-            .manager
-            .output_stat(&self.process.reference)
-            .await
-    }
-    /// Reads are bounded; cursor versions and retention are checked by the adapter.
-    /// Default page size is `DEFAULT_OUTPUT_LIMIT`; callers choose an explicit limit in Rust.
-    pub async fn read(&self, cursor: Option<&OutputCursor>, limit: usize) -> Result<OutputPage> {
-        self.process
-            .manager
-            .read_output(&self.process.reference, cursor, limit)
-            .await
-    }
-    /// Opens an independent subscription through native reconnect, requiring that capability.
-    pub async fn subscribe(&self) -> Result<ProcessHandle> {
-        self.process
-            .manager
-            .reconnect(&self.process.reference)
-            .await
+    pub fn terminal(&self) -> Terminal {
+        Terminal {
+            access: self
+                .manager
+                .access
+                .terminal_access()
+                .unwrap_or_else(|| Arc::new(UnavailableView(self.manager.backend()))),
+            reference: self.reference.clone(),
+        }
     }
 }
 

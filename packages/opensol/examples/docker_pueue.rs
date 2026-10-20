@@ -39,19 +39,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .await??;
-        let manager = ProcessManager::new(Pueue::new(connection, PueueConfig::default())?);
-        let mut handle = manager
+        // This path belongs to the container's daemon, not the SDK host.
+        let config = PueueConfig {
+            pueue_directory: std::env::var("PUEUE_DIRECTORY").ok(),
+            ..Default::default()
+        };
+        let manager = ProcessManager::new(Pueue::new(connection, config)?);
+        let (process, mut subscription) = manager
             .spawn(SpawnRequest::new(Command::new(
                 "printf",
                 ["%s", "Docker + Pueue\n"],
             )))
             .await?;
-        eprintln!("native task ID: {}", handle.process.id);
-        while let Some(event) = handle.events.next().await {
+        eprintln!("native task ID: {}", process.reference().id);
+        while let Some(event) = subscription.events.next().await {
             match event? {
                 ProcessEvent::Output { data, .. } => std::io::stdout().write_all(&data)?,
                 ProcessEvent::Completed(outcome) => eprintln!("completed: {outcome:?}"),
             }
+        }
+        let output = process.output();
+        if output.capabilities().tail {
+            let last = output.tail(4096).await?;
+            let previous = output
+                .read(
+                    last.before.as_ref(),
+                    opensol_core::ReadDirection::Backward,
+                    4096,
+                )
+                .await?;
+            eprintln!(
+                "last page at head: {:?}; preceding chunks: {}",
+                last.at_head,
+                previous.chunks.len()
+            );
         }
         Ok::<_, Box<dyn std::error::Error>>(())
     }

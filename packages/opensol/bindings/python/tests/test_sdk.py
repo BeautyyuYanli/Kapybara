@@ -159,7 +159,7 @@ class PueueTests(unittest.TestCase):
         self.fail("native task did not start")
 
     def test_task_output_identity_and_reconnect(self):
-        handle = self.manager.spawn(
+        process, handle = self.manager.spawn(
             [
                 "python3",
                 "-c",
@@ -171,51 +171,54 @@ class PueueTests(unittest.TestCase):
             cwd=str(self.directory),
             env={"SDK_TEST": "x '$()\n你好"},
         )
-        process = handle.process
-        self.assertIsInstance(process, sdk.ProcessRef)
+        self.assertIsInstance(process, sdk.Process)
+        self.assertIsInstance(handle, sdk.OutputSubscription)
+        reference = handle.ref
+        self.assertIsInstance(reference, sdk.ProcessRef)
+        self.assertEqual(process.ref.id, reference.id)
         output, outcome = collect(handle)
         self.assertEqual(combined_output(output), b"\x00\xffouterr")
         self.assertIsInstance(outcome, sdk.ProcessOutcome)
         self.assertEqual((outcome.exit.code, outcome.native_result), (7, "Failed"))
         self.assertEqual(handle.wait().exit.code, 7)
-        restored = sdk.ProcessRef(process.backend, process.id)
+        restored = sdk.ProcessRef(reference.backend, reference.id)
         self.assertEqual(self.manager.get(restored).inspect().state, "exited")
         self.assertEqual(self.manager.get(restored).wait(timeout=2).exit.code, 7)
         replay, replay_outcome = collect(self.manager.get(restored).output.subscribe())
         self.assertEqual(combined_output(replay), b"\x00\xffouterr")
         self.assertEqual(replay_outcome.exit.code, 7)
-        capabilities = self.manager.capabilities()
+        capabilities = process.output.capabilities()
         self.assertTrue(capabilities["historical_output"])
         self.assertFalse(capabilities["streaming_output"])
 
     def test_stdin_polling_timeouts_and_unsupported_capabilities(self):
-        handle = self.manager.spawn(
+        process, handle = self.manager.spawn(
             ["/bin/sh", "-c", "read -r value; printf '%s' \"$value\""],
             stdin=True,
         )
-        self.running(handle.process)
+        self.running(handle.ref)
         with self.assertRaises(sdk.TimeoutError):
             handle.next_event(timeout=0.03)
         with self.assertRaises(sdk.TimeoutError):
-            self.manager.get(handle.process).wait(timeout=0.03)
-        self.assertEqual(self.manager.get(handle.process).inspect().state, "running")
+            process.wait(timeout=0.03)
+        self.assertEqual(process.inspect().state, "running")
         with self.assertRaises(sdk.UnsupportedError):
-            self.manager.get(handle.process).send_input(b"\xff")
+            process.send_input(b"\xff")
         with self.assertRaises(sdk.UnsupportedError):
-            self.manager.get(handle.process).send_input(b"\x00")
+            process.send_input(b"\x00")
         with self.assertRaises(sdk.UnsupportedError):
-            self.manager.get(handle.process).close_stdin()
+            process.close_stdin()
         with self.assertRaises(sdk.UnsupportedError):
             self.manager.spawn(["true"], pty=(80, 24))
-        restored = sdk.ProcessRef("pueue", handle.process.id)
+        restored = sdk.ProcessRef("pueue", handle.ref.id)
         self.manager.get(restored).send_input(b"hello '$()\n")
         output, outcome = collect(handle)
         self.assertEqual(combined_output(output), b"hello '$()")
         self.assertTrue(outcome.exit.success)
 
-    def test_disconnect_wakes_blocked_reader_without_killing_task(self):
-        handle = self.manager.spawn(["sleep", "5"])
-        self.running(handle.process)
+    def test_close_wakes_blocked_reader_without_killing_task(self):
+        process, handle = self.manager.spawn(["sleep", "5"])
+        self.running(handle.ref)
         started = threading.Event()
         results = []
 
@@ -230,18 +233,18 @@ class PueueTests(unittest.TestCase):
         reader.start()
         self.assertTrue(started.wait(1))
         time.sleep(0.03)
-        handle.disconnect()
+        handle.close()
         reader.join(2)
         self.assertFalse(reader.is_alive())
         self.assertEqual(results, [None])
-        self.assertEqual(self.manager.get(handle.process).inspect().state, "running")
+        self.assertEqual(process.inspect().state, "running")
         with self.assertRaises(sdk.TransportError):
             handle.wait()
-        self.manager.get(handle.process).signal(9)
-        outcome = self.manager.get(handle.process).wait(timeout=3)
+        process.signal(9)
+        outcome = process.wait(timeout=3)
         self.assertIsNone(outcome.exit)
         self.assertEqual(outcome.native_result, "Killed")
-        self.assertIsNone(self.manager.get(handle.process).inspect().outcome.exit)
+        self.assertIsNone(process.inspect().outcome.exit)
 
 
 class EnvdBindingTests(unittest.TestCase):
@@ -299,6 +302,7 @@ class EnvdBindingTests(unittest.TestCase):
                             pid = 42 + len(processes)
                             process = {
                                 "pty": message.HasField("pty"),
+                                "streaming": message.process.cmd == "stream-program",
                                 "input": bytearray(),
                                 "completed": threading.Event(),
                             }
@@ -337,6 +341,14 @@ class EnvdBindingTests(unittest.TestCase):
                     if method == "Start" and message.process.cmd == "disconnect":
                         self.close_connection = True
                         return
+                    if process["streaming"]:
+                        # Real ConnectRPC data frames continue across the client's wait deadline.
+                        for _ in range(500):
+                            if process["completed"].wait(.01):
+                                break
+                            self.wfile.write(event_frame(envd_protocol.ProcessEvent(
+                                data=envd_protocol.ProcessEvent.DataEvent(stdout=b"tick")), response_type))
+                            self.wfile.flush()
                     assert process["completed"].wait(5), "fixture process did not finish"
                     with lock:
                         data = bytes(process["input"])
@@ -411,25 +423,41 @@ class EnvdBindingTests(unittest.TestCase):
         self.native = sdk.envd(self.endpoint)
 
     def test_unexpected_end_does_not_cache_a_completion(self):
-        handle = self.native.processes.spawn(["disconnect"])
+        process, handle = self.native.processes.spawn(["disconnect"])
         with self.assertRaises(sdk.TransportError):
             handle.next_event(timeout=2)
         with self.assertRaises(sdk.TransportError):
             handle.wait()
-        handle.disconnect()
+        handle.close()
+
+    def test_subscription_wait_has_one_deadline_despite_continuous_native_output(self):
+        process, handle = self.native.processes.spawn(["stream-program"], stdin=True)
+        for timeout in (0, -1, float("inf"), float("nan")):
+            with self.assertRaises(sdk.InvalidArgumentError):
+                handle.wait(timeout=timeout)
+        started = time.monotonic()
+        with self.assertRaises(sdk.TimeoutError) as caught:
+            handle.wait(timeout=.12)
+        self.assertLess(time.monotonic() - started, .8)
+        self.assertEqual((caught.exception.backend, caught.exception.operation), ("envd", "wait"))
+        self.assertEqual(process.inspect().state, "running")
+        process.close_stdin()
+        self.assertEqual(handle.wait(timeout=2).exit.code, 7)
+        self.assertEqual(handle.wait(timeout=1).exit.code, 7)
+        handle.close()
 
     def test_initial_stream_and_additional_subscription_use_start_and_connect(self):
         manager = self.native.processes
-        initial = manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
-        process = manager.get(initial.process)
+        process, initial = manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+
         self.assertEqual(initial.next_event(timeout=2).data, b"\x00\xffterminal")
         self.assertEqual([method for method, _ in self.records], ["Start"])
-        # Saved references and output bindings remain local even for an unreachable endpoint.
+        # Binding a saved reference stays local even for an unreachable endpoint.
         restored = sdk.ProcessRef("envd", process.ref.id, pty=True)
         offline = sdk.envd("http://127.0.0.1:1").processes.get(restored)
-        self.assertIsInstance(offline.output, sdk.ProcessOutput)
+        self.assertIsInstance(offline, sdk.Process)
         replay = manager.get(restored).output.subscribe()
-        self.assertEqual((replay.process.id, replay.process.pty), (restored.id, True))
+        self.assertEqual((replay.ref.id, replay.ref.pty), (restored.id, True))
         self.assertEqual(replay.next_event(timeout=2).data, b"\x00\xffterminal")
         process.send_input(b"\x00\xffreconnected\x04")
         original_output, original_outcome = collect(initial)
@@ -441,16 +469,16 @@ class EnvdBindingTests(unittest.TestCase):
         self.assertEqual(replay.wait().exit.code, 7)
         connected = [message for method, message in self.records if method == "Connect"]
         self.assertEqual([message.process.pid for message in connected], [int(restored.id)])
-        initial.disconnect()
-        replay.disconnect()
+        initial.close()
+        replay.close()
 
     def test_binary_process_stdin_and_close_stdin(self):
         manager = self.native.processes
-        handle = manager.spawn(["stdin-program"], stdin=True)
-        self.assertFalse(handle.process.pty)
+        process, handle = manager.spawn(["stdin-program"], stdin=True)
+        self.assertFalse(handle.ref.pty)
         data = b"\x00\xff\x80input\n"
-        manager.get(handle.process).send_input(data)
-        manager.get(handle.process).close_stdin()
+        process.send_input(data)
+        process.close_stdin()
         output, outcome = collect(handle)
         self.assertTrue(all(channel == "stdout" for channel, _data in output))
         self.assertEqual(b"".join(data for _channel, data in output), data)
@@ -460,21 +488,21 @@ class EnvdBindingTests(unittest.TestCase):
         self.assertTrue(start.stdin)
         self.assertFalse(start.HasField("pty"))
         sent = next(message for method, message in self.records if method == "SendInput")
-        self.assertEqual(sent.process.pid, int(handle.process.id))
+        self.assertEqual(sent.process.pid, int(handle.ref.id))
         self.assertEqual(sent.input.WhichOneof("input"), "stdin")
         self.assertEqual(sent.input.stdin, data)
         closed = next(message for method, message in self.records if method == "CloseStdin")
-        self.assertEqual(closed.process.pid, int(handle.process.id))
+        self.assertEqual(closed.process.pid, int(handle.ref.id))
 
     def test_pty_dimensions_terminal_bytes_binary_input_and_resize(self):
         manager = self.native.processes
-        handle = manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
-        self.assertTrue(handle.process.pty)
+        process, handle = manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
+        self.assertTrue(handle.ref.pty)
         event = handle.next_event(timeout=2)
         self.assertEqual(event.channel, "terminal")
         self.assertEqual(event.data, b"\x00\xffterminal")
         listed = manager.list()[0].process
-        self.assertEqual(listed.id, handle.process.id)
+        self.assertEqual(listed.id, handle.ref.id)
         self.assertIsNone(listed.pty)
         self.assertIsNone(sdk.ProcessRef("envd", listed.id).pty)
         unknown = manager.get(listed)
@@ -485,9 +513,9 @@ class EnvdBindingTests(unittest.TestCase):
             with self.assertRaises(sdk.UnsupportedError):
                 operation()
         self.assertEqual(len(self.records), before, "unknown mode must never guess an RPC channel")
-        manager.get(handle.process).resize(121, 43)
+        process.resize(121, 43)
         data = b"\x00\xff\x80pty\x04"
-        manager.get(handle.process).send_input(data)
+        process.send_input(data)
         output, outcome = collect(handle)
         self.assertTrue(all(channel == "terminal" for channel, _data in output))
         self.assertEqual(b"".join(data for _channel, data in output), data)
@@ -495,11 +523,11 @@ class EnvdBindingTests(unittest.TestCase):
         start = next(message for method, message in self.records if method == "Start")
         self.assertEqual((start.pty.size.cols, start.pty.size.rows), (93, 27))
         sent = next(message for method, message in self.records if method == "SendInput")
-        self.assertEqual(sent.process.pid, int(handle.process.id))
+        self.assertEqual(sent.process.pid, int(handle.ref.id))
         self.assertEqual(sent.input.WhichOneof("input"), "pty")
         self.assertEqual(sent.input.pty, data)
         update = next(message for method, message in self.records if method == "Update")
-        self.assertEqual(update.process.pid, int(handle.process.id))
+        self.assertEqual(update.process.pid, int(handle.ref.id))
         self.assertEqual((update.pty.size.cols, update.pty.size.rows), (121, 43))
 
 

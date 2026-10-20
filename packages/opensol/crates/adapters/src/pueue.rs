@@ -9,13 +9,15 @@
 //! Task environment overrides are applied inside the queued command, never to the Pueue client.
 //! The execution target requires `env` and `/usr/bin/nice` supporting `-n 0 --`.
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessOutcome,
-    ProcessRef, ProcessState, Result, Signal, SpawnRequest, raw::ProcessAccess,
+    OutputCapabilities, OutputChannel, OutputCursor, OutputPage, OutputSubscription,
+    ProcessCapabilities, ProcessEvent, ProcessInfo, ProcessOutcome, ProcessRef, ProcessState,
+    ReadDirection, Result, Signal, SpawnRequest,
+    raw::{OutputAccess, ProcessAccess},
 };
 use serde_json::Value;
 
@@ -369,15 +371,17 @@ impl ProcessAccess for Pueue {
             restart: true,
             kill: true,
             remove: true,
-            output_resource: self.config.pueue_directory.is_some(),
             stdin: true,
             binary_stdin: false,
             supported_signals: &[Signal::Interrupt, Signal::Terminate, Signal::Kill],
             detached: true,
             reconnect: true,
-            historical_output: true,
             ..Default::default()
         }
+    }
+
+    fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
+        Some(Arc::new(self.clone()))
     }
 
     async fn probe(&self) -> Result<ManagerInfo> {
@@ -429,18 +433,6 @@ impl ProcessAccess for Pueue {
             .collect()
     }
 
-    async fn output_stat(&self, process: &ProcessRef) -> Result<opensol_core::OutputInfo> {
-        self.stat_output(process).await
-    }
-    async fn read_output(
-        &self,
-        process: &ProcessRef,
-        cursor: Option<&opensol_core::OutputCursor>,
-        limit: usize,
-    ) -> Result<opensol_core::OutputPage> {
-        self.read_output_page(process, cursor, limit).await
-    }
-
     async fn pause(&self, process: &ProcessRef) -> Result<()> {
         let id = self.id(process, "pause")?;
         self.control(process, "pause", vec!["pause".into(), id], &["Running"])
@@ -487,7 +479,7 @@ impl ProcessAccess for Pueue {
         .await
     }
 
-    async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
+    async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription> {
         let mut args = vec!["add".into(), "--print-task-id".into()];
         if let Some(group) = &self.config.group {
             args.extend(["--group".into(), group.clone()]);
@@ -520,7 +512,10 @@ impl ProcessAccess for Pueue {
             .to_string();
         let process = ProcessRef::new("pueue", id, Some(false));
         let events = self.output(&process).await?;
-        Ok(ProcessHandle { process, events })
+        Ok(OutputSubscription {
+            reference: process,
+            events,
+        })
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
@@ -541,28 +536,6 @@ impl ProcessAccess for Pueue {
             info.outcome.ok_or_else(|| protocol_error("wait"))
         })
         .await
-    }
-
-    async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
-        let id = self.id(process, "output")?;
-        // Capture now, not on the first poll: even an unconsumed spawn/reconnect handle
-        // belongs to this observed execution, not a future reuse of the same task ID.
-        let execution = output::Execution::from_task(&self.task(process).await?, "output")?;
-        let manager = self.clone();
-        let process = process.clone();
-        Ok(Box::pin(async_stream::try_stream! {
-            let execution = manager.check_execution(&process, &execution).await?;
-            let outcome = manager.wait(&process, None).await;
-            let execution = manager.check_execution(&process, &execution).await?;
-            let outcome = outcome?;
-            let data = manager.run(vec!["follow".into(), id], "output", None).await;
-            // Recheck even failed native calls: task cleanup must remain NotFound and
-            // restart/replacement Conflict, rather than an ambiguous CLI failure.
-            manager.check_execution(&process, &execution).await?;
-            let data = data?;
-            if !data.is_empty() { yield ProcessEvent::Output { channel: OutputChannel::Combined, data }; }
-            yield ProcessEvent::Completed(outcome);
-        }))
     }
 
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
@@ -598,11 +571,63 @@ impl ProcessAccess for Pueue {
         .await?;
         Ok(())
     }
+}
 
-    async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
-        Ok(ProcessHandle {
-            process: process.clone(),
+#[async_trait]
+impl OutputAccess for Pueue {
+    fn backend(&self) -> &'static str {
+        "pueue"
+    }
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities {
+            read: self.config.pueue_directory.is_some(),
+            tail: self.config.pueue_directory.is_some(),
+            subscribe: true,
+            historical_output: true,
+            streaming_output: false,
+        }
+    }
+    async fn read(
+        &self,
+        process: &ProcessRef,
+        cursor: Option<&OutputCursor>,
+        direction: ReadDirection,
+        max_bytes: usize,
+    ) -> Result<OutputPage> {
+        self.read_output_page(process, cursor, direction, max_bytes)
+            .await
+    }
+    async fn tail(&self, process: &ProcessRef, max_bytes: usize) -> Result<OutputPage> {
+        self.read_output_page(process, None, ReadDirection::Backward, max_bytes)
+            .await
+    }
+    async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
+        Ok(OutputSubscription {
+            reference: process.clone(),
             events: self.output(process).await?,
         })
+    }
+}
+
+impl Pueue {
+    async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
+        let id = self.id(process, "output")?;
+        // Capture now, not on the first poll: even an unconsumed initial subscription
+        // belongs to this observed execution, not a future reuse of the same task ID.
+        let execution = output::Execution::from_task(&self.task(process).await?, "output")?;
+        let manager = self.clone();
+        let process = process.clone();
+        Ok(Box::pin(async_stream::try_stream! {
+            let execution = manager.check_execution(&process, &execution).await?;
+            let outcome = manager.wait(&process, None).await;
+            let execution = manager.check_execution(&process, &execution).await?;
+            let outcome = outcome?;
+            let data = manager.run(vec!["follow".into(), id], "output", None).await;
+            // Recheck failures too: preserve task cleanup and execution conflicts.
+            manager.check_execution(&process, &execution).await?;
+            let data = data?;
+            if !data.is_empty() { yield ProcessEvent::Output { channel: OutputChannel::Combined, data }; }
+            yield ProcessEvent::Completed(outcome);
+        }))
     }
 }

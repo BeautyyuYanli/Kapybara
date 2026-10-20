@@ -31,14 +31,16 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         missing_socket = str(Path(self.directory.name) / "never-started.sock")
         missing = sdk.tmux(sdk.local(), socket_path=missing_socket)
         capabilities = missing.capabilities()
-        for name in ("list", "restart", "kill", "remove", "terminal_snapshot", "stdin",
+        for name in ("list", "restart", "kill", "remove", "stdin",
                      "binary_stdin", "pty", "resize", "detached", "reconnect"):
             self.assertTrue(capabilities[name], name)
-        for name in ("output_resource", "historical_output", "streaming_output",
-                     "daemon_restart_recovery", "pause", "start", "close_stdin"):
+        for name in ("daemon_restart_recovery", "pause", "start", "close_stdin"):
             self.assertFalse(capabilities[name], name)
         self.assertEqual(capabilities["supported_signals"], [])
         bound = missing.get(sdk.ProcessRef("tmux", "opaque-unchecked"))
+        self.assertEqual(bound.output.capabilities(), dict(read=False, tail=False, subscribe=True,
+                                                         historical_output=False, streaming_output=False))
+        self.assertEqual(bound.terminal.capabilities(), dict(read=False, tail=True, screen=True))
         self.assertEqual(bound.ref.id, "opaque-unchecked")
         with self.assertRaises(sdk.UnsupportedError):
             missing.spawn(["true"])
@@ -63,20 +65,20 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
 
     def test_sync_binary_input_resize_screen_and_completion_only_subscription(self):
         payload = bytes(range(256)) * 32
-        handle = self.manager.spawn(["python3", "-u", "-c",
+        process, handle = self.manager.spawn(["python3", "-u", "-c",
             "import os,tty,hashlib; tty.setraw(0); print('READY',flush=True); data=b''\n"
             "while len(data)<8192: data+=os.read(0,8192-len(data))\n"
             "print(hashlib.sha256(data).hexdigest(), os.get_terminal_size(0),flush=True); raise SystemExit(7)"],
             stdin=True, pty=(101, 29))
-        process = self.manager.get(handle.process)
-        self.assertIs(handle.process.pty, True)
+
+        self.assertIs(handle.ref.pty, True)
         for _ in range(100):
-            if b"READY" in process.output.snapshot():
+            if "READY" in "\n".join(process.terminal.screen().lines):
                 break
             time.sleep(.02)
         else:
             self.fail("raw terminal did not become ready")
-        for call in (process.output.stat, process.output.read, process.pause, process.start,
+        for call in (process.output.tail, process.output.read, process.pause, process.start,
                      process.close_stdin, lambda: process.signal(2)):
             with self.assertRaises(sdk.UnsupportedError):
                 call()
@@ -95,22 +97,24 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         self.assertEqual(event.outcome.exit.code, 7)
         self.assertIsNone(handle.next_event(timeout=1))
         self.assertEqual(handle.wait().exit.code, 7)
-        output = process.output.snapshot()
-        self.assertIsInstance(output, bytes)
-        self.assertIn(hashlib.sha256(payload).hexdigest().encode(), output)
-        self.assertIn(b"columns=107, lines=33", output)
+        screen = process.terminal.screen()
+        self.assertIsInstance(screen, sdk.TerminalScreen)
+        self.assertEqual((screen.cols, screen.rows, len(screen.lines)), (107, 33, 33))
+        output = "\n".join(screen.lines)
+        self.assertIn(hashlib.sha256(payload).hexdigest(), output)
+        self.assertIn("columns=107, lines=33", output)
         self.assertEqual(process.wait(timeout=5).exit.code, 7)
-        self.assertEqual(self.manager.list()[0].process.id, handle.process.id)
+        self.assertEqual(self.manager.list()[0].process.id, handle.ref.id)
         process.remove()
         with self.assertRaises(sdk.NotFoundError):
-            process.output.snapshot()
+            "\n".join(process.terminal.screen().lines)
 
     def test_restart_reconnection_execution_cache_and_external_respawn(self):
         marker = str(Path(self.directory.name) / "execution")
-        handle = self.manager.spawn(["python3", "-c",
+        process, handle = self.manager.spawn(["python3", "-c",
             "from pathlib import Path; import sys; p=Path(sys.argv[1]); old=p.exists(); p.touch(); "
             "print('new-screen' if old else 'old-screen'); sys.exit(9 if old else 7)", marker], pty=(80, 24))
-        process = self.manager.get(handle.process)
+
         self.assertEqual(handle.wait().exit.code, 7)
         original = process.output.subscribe()
         process.restart()
@@ -118,18 +122,18 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
             original.wait()
         self.assertEqual(handle.wait().exit.code, 7)
         self.assertEqual(process.wait(timeout=5).exit.code, 9)
-        self.assertIn(b"new-screen", process.output.snapshot())
+        self.assertIn("new-screen", "\n".join(process.terminal.screen().lines))
         rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(
-            sdk.ProcessRef("tmux", handle.process.id))
+            sdk.ProcessRef("tmux", handle.ref.id))
         self.assertEqual(rebound.output.subscribe().wait().exit.code, 9)
         old = rebound.output.subscribe()
-        pane = json.loads(handle.process.id)["pane"]
+        pane = json.loads(handle.ref.id)["pane"]
         subprocess.run(["tmux", "-N", "-S", self.socket, "respawn-pane", "-t", pane,
                         "sleep", "30"], check=True, capture_output=True)
         with self.assertRaises(sdk.ConflictError):
             old.wait()
         current = rebound.output.subscribe()
-        current.disconnect()
+        current.close()
         self.assertEqual(rebound.inspect().state, "running")
         with self.assertRaises(sdk.ConflictError):
             rebound.restart()
@@ -143,16 +147,16 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         cwd.mkdir()
         program = cwd / "run=python3;"
         program.symlink_to("/usr/bin/python3")
-        handle = self.manager.spawn(["./run=python3;", "-c",
+        process, handle = self.manager.spawn(["./run=python3;", "-c",
             "import os,sys; assert os.getcwd()==sys.argv[1]; assert os.environ['SDK-TEST']==sys.argv[2]; "
             "assert os.environ['PATH']=='/task-only'; print('relative-screen'); sys.exit(7)",
             str(cwd), "x '$()\n;"], cwd=os.path.relpath(cwd),
             env={"SDK-TEST": "x '$()\n;", "PATH": "/task-only"}, pty=(80, 24))
         self.assertEqual(handle.wait().exit.code, 7)
-        rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(handle.process)
+        rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(handle.ref)
         rebound.restart()
         self.assertEqual(rebound.wait(timeout=5).exit.code, 7)
-        self.assertIn(b"relative-screen", rebound.output.snapshot())
+        self.assertIn("relative-screen", "\n".join(rebound.terminal.screen().lines))
         program.unlink()
         cwd.rmdir()
         rebound.restart()
@@ -160,29 +164,87 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         rebound.remove()
 
     def test_capture_is_rendered_screen_and_never_a_log(self):
-        handle = self.manager.spawn(["python3", "-c",
+        process, handle = self.manager.spawn(["python3", "-c",
             "import sys; sys.stdout.write('old-content\\x1b[2J\\x1b[HOPENSOL_TMUX_NOT_FOUND\\n'); sys.stdout.flush()"],
             pty=(80, 24))
-        process = self.manager.get(handle.process)
+
         self.assertEqual(process.wait(timeout=5).exit.code, 0)
-        screen = process.output.snapshot()
-        self.assertIn(b"OPENSOL_TMUX_NOT_FOUND", screen)
-        self.assertNotIn(b"old-content", screen)
-        self.assertNotIn(b"\x1b", screen)
+        screen = "\n".join(process.terminal.screen().lines)
+        self.assertIn("OPENSOL_TMUX_NOT_FOUND", screen)
+        self.assertNotIn("old-content", screen)
+        self.assertNotIn("\x1b", screen)
+        process.remove()
+
+    def test_native_history_bounds_active_alternate_grid_and_exact_text_lines(self):
+        process, handle = self.manager.spawn(["python3", "-u", "-c",
+            "import os,tty; tty.setraw(0); "
+            "os.write(1, ''.join(f'line-{i:03}  \\r\\n' for i in range(50)).encode()); "
+            "os.write(1, 'wide:界 é sep:\u2028end  READY'.encode()); os.read(0,1); "
+            "os.write(1,b'\\x1b[?1049hALT-READY'); os.read(0,1); "
+            "os.write(1,b'\\x1b[?1049l'); os.read(0,1)"], stdin=True, pty=(40, 6))
+        pane = json.loads(process.ref.id)["pane"]
+
+        def native(*args):
+            return subprocess.run(["tmux", "-u", "-N", "-S", self.socket, *args],
+                                  check=True, capture_output=True).stdout
+
+        def wait_text(needle):
+            for _ in range(200):
+                screen = process.terminal.screen()
+                if needle in "\n".join(screen.lines):
+                    return screen
+                time.sleep(.01)
+            self.fail(f"terminal never showed {needle}")
+
+        screen = wait_text("READY")
+        self.assertEqual((screen.cols, screen.rows, len(screen.lines)), (40, 6, 6))
+        expected = native("capture-pane", "-p", "-N", "-t", pane).decode().removesuffix("\n").split("\n")
+        self.assertEqual(screen.lines, expected)
+        self.assertTrue(any("\u2028end" in line for line in screen.lines), "only LF separates rendered lines")
+        self.assertTrue(any(line.endswith("  ") for line in screen.lines))
+        page = process.terminal.tail(lines=3)
+        expected = native("capture-pane", "-p", "-N", "-t", pane, "-S", "-3", "-E", "-1").decode().removesuffix("\n").split("\n")
+        self.assertEqual(page.lines, expected)
+        self.assertEqual((len(page.lines), page.before, page.after, page.at_head, page.at_tail), (3, None, None, False, True))
+        self.assertTrue(process.terminal.tail(lines=200).at_head)
+        for size in (0, -1, 10001, 1 << 100, True, 1.5):
+            with self.assertRaises(sdk.InvalidArgumentError):
+                process.terminal.tail(lines=size)
+            with self.assertRaises(sdk.InvalidArgumentError):
+                process.terminal.read(lines=size)
+        with self.assertRaises(sdk.UnsupportedError):
+            process.terminal.read(direction="backward")
+
+        native("copy-mode", "-t", pane)
+        native("send-keys", "-t", pane, "-X", "history-top")
+        self.assertEqual(process.terminal.screen().lines, screen.lines, "query reads the active grid through copy mode")
+        native("send-keys", "-t", pane, "-X", "cancel")
+        process.send_input(b"a")
+        alternate = wait_text("ALT-READY")
+        self.assertNotIn("line-", "\n".join(alternate.lines))
+        page = process.terminal.tail(lines=5)
+        self.assertEqual((page.lines, page.before, page.after, page.at_head, page.at_tail), ([], None, None, True, True))
+        process.send_input(b"b")
+        self.assertEqual(wait_text("wide:").lines, screen.lines)
+        native("clear-history", "-t", pane)
+        self.assertEqual(process.terminal.tail().lines, [])
+        self.assertEqual(process.terminal.screen().lines, screen.lines)
+        process.send_input(b"c")
+        handle.wait(timeout=5)
         process.remove()
 
 
 class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
-    async def test_async_input_snapshot_wait_cancellation_and_disconnect(self):
+    async def test_async_input_snapshot_wait_cancellation_and_close(self):
         manager = aio.tmux(aio.local(), socket_path=self.socket)
         self.assertEqual((await manager.probe()).backend, "tmux")
-        handle = await manager.spawn(["python3", "-u", "-c",
+        process, handle = await manager.spawn(["python3", "-u", "-c",
             "import os,tty; tty.setraw(0); print('READY',flush=True); data=b''\n"
             "while len(data)<4: data+=os.read(0,4-len(data))\nprint(data.hex(),flush=True)"],
             stdin=True, pty=(80, 24))
-        process = manager.get(handle.process)
+
         for _ in range(100):
-            if b"READY" in await process.output.snapshot():
+            if "READY" in "\n".join((await process.terminal.screen()).lines):
                 break
             await asyncio.sleep(.02)
         else:
@@ -203,9 +265,9 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
         await process.resize(90, 30)
         await process.send_input(b"\x00\xff\nA")
         self.assertEqual((await replacement.wait()).exit.code, 0)
-        self.assertIn(b"00ff0a41", await process.output.snapshot())
+        self.assertIn("00ff0a41", "\n".join((await process.terminal.screen()).lines))
         self.assertEqual((await process.wait(timeout=5)).exit.code, 0)
-        self.assertEqual((await manager.list())[0].process.id, handle.process.id)
+        self.assertEqual((await manager.list())[0].process.id, handle.ref.id)
         stale = await process.output.subscribe()
         await process.restart()
         with self.assertRaises(sdk.ConflictError):
@@ -228,22 +290,22 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
                                          "-s", "remote-user", "sleep", "infinity"]).success)
             manager = aio.tmux(aio.docker_connection(resource.id), socket_path=self.socket)
             self.assertEqual((await manager.probe()).backend, "tmux")
-            handle = await manager.spawn(["python3", "-u", "-c",
+            process, handle = await manager.spawn(["python3", "-u", "-c",
                 "from pathlib import Path; import os,tty; tty.setraw(0); print('remote-ready',flush=True); data=b''\n"
                 "while len(data)<4: data+=os.read(0,4-len(data))\n"
                 "Path('target-file').write_text(os.environ['TASK']+data.hex()); print('remote-screen',flush=True)"],
                 cwd=os.path.relpath(self.directory.name, start="/"),
                 env={"TASK": "remote"}, stdin=True, pty=(80, 24))
-            process = manager.get(handle.process)
+
             for _ in range(100):
-                if b"remote-ready" in await process.output.snapshot():
+                if "remote-ready" in "\n".join((await process.terminal.screen()).lines):
                     break
                 await asyncio.sleep(.02)
             else:
                 self.fail("remote raw terminal did not become ready")
             await process.send_input(b"\x00\xff\nA")
             self.assertEqual((await handle.wait()).exit.code, 0)
-            self.assertIn(b"remote-screen", await process.output.snapshot())
+            self.assertIn("remote-screen", "\n".join((await process.terminal.screen()).lines))
             self.assertFalse((Path(self.directory.name) / "target-file").exists())
             self.assertEqual(target.exec(["cat", str(Path(self.directory.name) / "target-file")]).stdout, b"remote00ff0a41")
             self.assertEqual(self.manager.list(), [], "host server at the same socket path is untouched")

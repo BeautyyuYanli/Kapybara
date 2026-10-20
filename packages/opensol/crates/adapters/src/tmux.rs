@@ -10,7 +10,7 @@
 //! and numeric exit-status readiness can occur separately. The SDK can report Exited and return
 //! from wait while the OS process is still working. `exit=None` proves neither success nor OS exit.
 //! Later `Process::wait` / `Process::inspect` calls may obtain the now-available OS status;
-//! a completed Python handle always keeps its first outcome, including `exit=None`, without
+//! a completed Python subscription always keeps its first outcome, including `exit=None`, without
 //! refreshing it.
 //!
 //! Explicit cwd is entered by the stored launch command on every execution, before applying
@@ -18,13 +18,15 @@
 //! A failed cd ends that native execution with status 125. Relative cwd is anchored once using
 //! `pwd -P` on the injected Connection target; no SDK-side task configuration is retained.
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    ProcessCapabilities, ProcessEvent, ProcessHandle, ProcessInfo, ProcessOutcome, ProcessRef,
-    ProcessState, PtySize, Result, SpawnRequest, raw::ProcessAccess,
+    OutputCapabilities, OutputSubscription, ProcessCapabilities, ProcessEvent, ProcessInfo,
+    ProcessOutcome, ProcessRef, ProcessState, PtySize, Result, SpawnRequest, TerminalCapabilities,
+    TerminalPage, TerminalScreen,
+    raw::{OutputAccess, ProcessAccess, TerminalAccess},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -517,7 +519,6 @@ impl ProcessAccess for Tmux {
             restart: true,
             kill: true,
             remove: true,
-            terminal_snapshot: true,
             stdin,
             binary_stdin: stdin,
             pty: true,
@@ -526,6 +527,13 @@ impl ProcessAccess for Tmux {
             reconnect: true,
             ..Default::default()
         }
+    }
+
+    fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
+        Some(Arc::new(self.clone()))
+    }
+    fn terminal_access(&self) -> Option<Arc<dyn TerminalAccess>> {
+        Some(Arc::new(self.clone()))
     }
 
     async fn probe(&self) -> Result<ManagerInfo> {
@@ -576,7 +584,7 @@ impl ProcessAccess for Tmux {
             .collect())
     }
 
-    async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
+    async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription> {
         request.validate("tmux")?;
         let size = request
             .pty
@@ -712,7 +720,10 @@ impl ProcessAccess for Tmux {
         let process = self.reference(&pane.identity);
         // Bind the execution observed in the creation queue, rather than a later rediscovery.
         let events = self.subscription(pane.identity, pane.execution);
-        Ok(ProcessHandle { process, events })
+        Ok(OutputSubscription {
+            reference: process,
+            events,
+        })
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
@@ -732,17 +743,6 @@ impl ProcessAccess for Tmux {
             self.completion(&identity, None, "wait"),
         )
         .await
-    }
-    async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
-        let identity = self.identity(process, "output")?;
-        let pane = self.pane(&identity, "output").await?;
-        Ok(self.subscription(identity, pane.execution))
-    }
-    async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
-        Ok(ProcessHandle {
-            process: process.clone(),
-            events: self.output(process).await?,
-        })
     }
     async fn restart(&self, process: &ProcessRef) -> Result<()> {
         let identity = self.identity(process, "restart")?;
@@ -823,18 +823,153 @@ impl ProcessAccess for Tmux {
         .await?;
         Ok(())
     }
-    async fn terminal_snapshot(&self, process: &ProcessRef) -> Result<Vec<u8>> {
-        let identity = self.identity(process, "terminal_snapshot")?;
-        self.guarded(
-            &identity,
-            format!("capture-pane -p -t {}", identity.pane),
-            "terminal_snapshot",
-        )
-        .await
+}
+
+#[async_trait]
+impl OutputAccess for Tmux {
+    fn backend(&self) -> &'static str {
+        "tmux"
+    }
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities {
+            subscribe: true,
+            ..Default::default()
+        }
+    }
+    async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
+        let identity = self.identity(process, "output")?;
+        let pane = self.pane(&identity, "output").await?;
+        Ok(OutputSubscription {
+            reference: process.clone(),
+            events: self.subscription(identity, pane.execution),
+        })
+    }
+}
+
+#[async_trait]
+impl TerminalAccess for Tmux {
+    fn backend(&self) -> &'static str {
+        "tmux"
+    }
+    fn capabilities(&self) -> TerminalCapabilities {
+        TerminalCapabilities {
+            tail: true,
+            screen: true,
+            ..Default::default()
+        }
+    }
+    async fn tail(&self, process: &ProcessRef, lines: usize) -> Result<TerminalPage> {
+        let (text, _, history) = self.capture(process, Some(lines)).await?;
+        Ok(TerminalPage {
+            at_head: Some(text.len() == history),
+            lines: text,
+            before: None,
+            after: None,
+            at_tail: true,
+        })
+    }
+    async fn screen(&self, process: &ProcessRef) -> Result<TerminalScreen> {
+        let (lines, size, _) = self.capture(process, None).await?;
+        Ok(TerminalScreen {
+            cols: size.cols,
+            rows: size.rows,
+            lines,
+        })
     }
 }
 
 impl Tmux {
+    /// Capture only the requested active grid range in one guarded native queue. Metadata
+    /// brackets the capture, so observable respawn, resize or grid changes are conflicts.
+    /// LF is the sole protocol separator; whitespace and Unicode inside each line are data.
+    async fn capture(
+        &self,
+        process: &ProcessRef,
+        history_lines: Option<usize>,
+    ) -> Result<(Vec<String>, PtySize, usize)> {
+        let operation = if history_lines.is_some() {
+            "tail_terminal"
+        } else {
+            "terminal_screen"
+        };
+        let identity = self.identity(process, operation)?;
+        let before = self.pane(&identity, operation).await?;
+        let metadata = format!(
+            "{ROW}\t#{{pane_width}}\t#{{pane_height}}\t#{{history_size}}\t#{{alternate_on}}"
+        );
+        let display = format!("display-message -p -t {} '{metadata}'", identity.pane);
+        let capture = match history_lines {
+            // With zero history, tmux clamps negative indexes into the visible screen.
+            // Alternate mode disables history but retains the primary hsize in the
+            // same grid (screen_alternate_on in tmux). Never expose that saved history.
+            Some(lines) => format!(
+                "if-shell -F -t {} '#{{?alternate_on,0,#{{history_size}}}}' 'capture-pane -p -N -t {} -S -{lines} -E -1' ''",
+                identity.pane, identity.pane
+            ),
+            None => format!("capture-pane -p -N -t {}", identity.pane),
+        };
+        let bytes = self
+            .guarded(
+                &identity,
+                format!("{display} ; {capture} ; {display}"),
+                operation,
+            )
+            .await?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| protocol(operation))?;
+        let text = text.strip_suffix('\n').ok_or_else(|| protocol(operation))?;
+        let (first, rest) = text.split_once('\n').ok_or_else(|| protocol(operation))?;
+        let captured = rest.rsplit_once('\n');
+        let (body, last) = captured.unwrap_or(("", rest));
+        let metadata = |row: &str| {
+            let fields: Vec<_> = row.split('\t').collect();
+            if fields.len() != 14 {
+                return Err(protocol(operation));
+            }
+            let pane = self
+                .parse_pane(&fields[..10].join("\t"))
+                .ok_or_else(|| protocol(operation))?;
+            let dimension = |value: &str| {
+                value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| protocol(operation))
+            };
+            let size = PtySize {
+                cols: dimension(fields[10])?,
+                rows: dimension(fields[11])?,
+            };
+            let history = fields[12]
+                .parse::<usize>()
+                .map_err(|_| protocol(operation))?;
+            let history = match fields[13] {
+                "0" => history,
+                "1" => 0,
+                _ => return Err(protocol(operation)),
+            };
+            Ok((pane, size, history))
+        };
+        let (pane, size, history) = metadata(first)?;
+        metadata(last)?;
+        if first != last || pane.identity != identity || pane.execution != before.execution {
+            return Err(capture_conflict(operation));
+        }
+        let expected = history_lines.map_or(size.rows as usize, |lines| history.min(lines));
+        // An empty captured line still has a protocol LF. With no history there is no body.
+        if captured.is_some() != (expected > 0) {
+            return Err(protocol(operation));
+        }
+        let lines: Vec<String> = if expected == 0 {
+            Vec::new()
+        } else {
+            body.split('\n').map(String::from).collect()
+        };
+        if lines.len() != expected || (expected == 0 && !body.is_empty()) {
+            return Err(protocol(operation));
+        }
+        Ok((lines, size, history))
+    }
+
     fn subscription(&self, identity: Identity, execution: Execution) -> EventStream {
         let manager = self.clone();
         Box::pin(async_stream::try_stream! {
@@ -842,4 +977,13 @@ impl Tmux {
             yield ProcessEvent::Completed(outcome);
         })
     }
+}
+
+fn capture_conflict(operation: &str) -> Error {
+    Error::new(
+        ErrorKind::Conflict,
+        "tmux",
+        operation,
+        "terminal execution or grid changed during capture",
+    )
 }

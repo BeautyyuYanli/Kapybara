@@ -6,7 +6,7 @@
 //! that are observable at a request boundary; truncate-and-regrow between requests is
 //! not a durable-history guarantee. Cursor fields never select a path or task to read.
 
-use opensol_core::{OutputChunk, OutputCursor, OutputInfo, OutputPage};
+use opensol_core::{OutputChunk, OutputCursor, OutputPage, ReadDirection};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -22,7 +22,7 @@ case $(dd --version 2>/dev/null) in 'dd (coreutils)'*|'dd (GNU coreutils)'*) ;; 
 "#;
 
 const READ: &str = r#"
-directory=$1 id=$2 expected=$3 offset=$4 limit=$5 observed=$6
+directory=$1 id=$2 expected=$3 position=$4 limit=$5 observed=$6 direction=$7
 file=$directory/task_logs/$id.log
 [ -e "$file" ] || exit 44
 [ -r "$file" ] || exit 45
@@ -33,15 +33,28 @@ metadata=$(stat -Lc '%d:%i:%W %s' -- /proc/self/fd/3) || exit 48
 set -- $metadata
 identity=$1 size=$2
 [ -z "$expected" ] || [ "$identity" = "$expected" ] || exit 47
-[ "$size" -ge "$observed" ] && [ "$size" -ge "$offset" ] || exit 47
-count=$((size - offset))
-[ "$count" -le "$limit" ] || count=$limit
-printf '%s %s %s\n' "$directory_id" "$identity" "$size"
+[ "$size" -ge "$observed" ] || exit 47
+[ "$position" -ne -1 ] || position=$size
+[ "$size" -ge "$position" ] || exit 47
+if [ "$direction" = backward ]; then
+    end=$position
+    offset=$((position - limit))
+    [ "$offset" -ge 0 ] || offset=0
+else
+    offset=$position
+    count=$((size - position))
+    [ "$count" -le "$limit" ] || count=$limit
+    end=$((position + count))
+fi
+count=$((end - offset))
+printf '%s %s %s %s %s\n' "$directory_id" "$identity" "$size" "$offset" "$end"
 dd bs=65536 iflag=skip_bytes,count_bytes skip="$offset" count="$count" status=none <&3 2>/dev/null || exit 48
 after_size=$(stat -Lc '%s' -- /proc/self/fd/3) || exit 48
 [ "$after_size" -ge "$size" ] || exit 47
 current_identity=$(stat -Lc '%d:%i:%W' -- "$file" 2>/dev/null) || exit 44
 [ "$current_identity" = "$identity" ] || exit 47
+current_directory=$(stat -Lc '%d:%i:%W' -- "$directory" 2>/dev/null) || exit 44
+[ "$current_directory" = "$directory_id" ] || exit 47
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -111,6 +124,8 @@ impl Execution {
 #[serde(deny_unknown_fields)]
 struct Cursor {
     format: u8,
+    representation: String,
+    scope: String,
     task: String,
     execution: Execution,
     directory: Option<String>,
@@ -120,13 +135,13 @@ struct Cursor {
 }
 
 impl Cursor {
-    fn parse(value: &OutputCursor, id: &str) -> Result<Self> {
+    fn parse(value: &OutputCursor, id: &str, scope: &str) -> Result<Self> {
         let invalid = || Error::invalid("pueue", "read_output", "invalid output cursor");
         if value.0.len() > 8192 {
             return Err(invalid());
         }
         let cursor: Self = serde_json::from_str(&value.0).map_err(|_| invalid())?;
-        if cursor.format != 1
+        if cursor.format != 2
             || cursor.offset > cursor.observed
             || cursor.observed > i64::MAX as u64
             || cursor.file.is_some() != cursor.directory.is_some()
@@ -142,7 +157,7 @@ impl Cursor {
         {
             return Err(invalid());
         }
-        if cursor.task != id {
+        if cursor.task != id || cursor.representation != "output" || cursor.scope != scope {
             return Err(conflict());
         }
         Ok(cursor)
@@ -175,6 +190,8 @@ struct NativeRead {
     directory: String,
     file: String,
     size: u64,
+    start: u64,
+    end: u64,
     data: Vec<u8>,
 }
 
@@ -232,7 +249,7 @@ impl Pueue {
             .config
             .pueue_directory
             .as_ref()
-            .ok_or_else(|| Error::unsupported("pueue", "output_resource"))?;
+            .ok_or_else(|| Error::unsupported("pueue", "read_output"))?;
         self.log_command(TOOLS, vec![directory.clone()], "probe")
             .await
             .map(|_| ())
@@ -242,13 +259,14 @@ impl Pueue {
         &self,
         id: &str,
         cursor: Option<&Cursor>,
+        direction: ReadDirection,
         limit: usize,
     ) -> Result<NativeRead> {
         let directory = self
             .config
             .pueue_directory
             .as_ref()
-            .ok_or_else(|| Error::unsupported("pueue", "output_resource"))?;
+            .ok_or_else(|| Error::unsupported("pueue", "read_output"))?;
         // Probe on actual use too; construction never turns dependency failures into cached capabilities.
         let script = format!("{TOOLS}\n{READ}");
         let bytes = self
@@ -260,9 +278,19 @@ impl Pueue {
                     cursor
                         .and_then(|cursor| cursor.file.clone())
                         .unwrap_or_default(),
-                    cursor.map_or(0, |cursor| cursor.offset).to_string(),
+                    cursor
+                        .map(|cursor| cursor.offset.to_string())
+                        .unwrap_or_else(|| match direction {
+                            ReadDirection::Forward => "0".into(),
+                            ReadDirection::Backward => "-1".into(),
+                        }),
                     limit.to_string(),
                     cursor.map_or(0, |cursor| cursor.observed).to_string(),
+                    match direction {
+                        ReadDirection::Forward => "forward",
+                        ReadDirection::Backward => "backward",
+                    }
+                    .into(),
                 ],
                 "read_output",
             )
@@ -274,7 +302,7 @@ impl Pueue {
         let header =
             std::str::from_utf8(&bytes[..newline]).map_err(|_| protocol_error("read_output"))?;
         let fields: Vec<_> = header.split(' ').collect();
-        if fields.len() != 3 || !valid_identity(fields[0]) || !valid_identity(fields[1]) {
+        if fields.len() != 5 || !valid_identity(fields[0]) || !valid_identity(fields[1]) {
             return Err(protocol_error("read_output"));
         }
         let size = fields[2]
@@ -282,13 +310,27 @@ impl Pueue {
             .ok()
             .filter(|size| *size <= i64::MAX as u64)
             .ok_or_else(|| protocol_error("read_output"))?;
-        let offset = cursor.map_or(0, |cursor| cursor.offset);
-        let expected = size
-            .checked_sub(offset)
-            .ok_or_else(conflict)?
-            .min(limit as u64);
+        let position = cursor.map_or_else(
+            || match direction {
+                ReadDirection::Forward => 0,
+                ReadDirection::Backward => size,
+            },
+            |cursor| cursor.offset,
+        );
+        if position > size {
+            return Err(conflict());
+        }
+        let (start, end) = match direction {
+            ReadDirection::Forward => (position, position.saturating_add(limit as u64).min(size)),
+            ReadDirection::Backward => (position.saturating_sub(limit as u64), position),
+        };
+        if fields[3].parse::<u64>().ok() != Some(start)
+            || fields[4].parse::<u64>().ok() != Some(end)
+        {
+            return Err(protocol_error("read_output"));
+        }
         let data = bytes[newline + 1..].to_vec();
-        if data.len() as u64 != expected {
+        if data.len() as u64 != end - start {
             return Err(conflict());
         }
         if cursor
@@ -301,43 +343,27 @@ impl Pueue {
             directory: fields[0].into(),
             file: fields[1].into(),
             size,
+            start,
+            end,
             data,
         })
-    }
-
-    pub(super) async fn stat_output(&self, process: &ProcessRef) -> Result<OutputInfo> {
-        self.output_resource(process, None, 0)
-            .await
-            .map(|(info, _)| info)
-            .map_err(|mut error| {
-                error.operation = "output_stat".into();
-                error
-            })
     }
 
     pub(super) async fn read_output_page(
         &self,
         process: &ProcessRef,
         cursor: Option<&OutputCursor>,
+        direction: ReadDirection,
         limit: usize,
     ) -> Result<OutputPage> {
-        self.output_resource(process, cursor, limit)
-            .await
-            .map(|(_, page)| page)
-    }
-
-    async fn output_resource(
-        &self,
-        process: &ProcessRef,
-        cursor: Option<&OutputCursor>,
-        limit: usize,
-    ) -> Result<(OutputInfo, OutputPage)> {
-        if self.config.pueue_directory.is_none() {
-            return Err(Error::unsupported("pueue", "output_resource"));
-        }
+        let scope = self
+            .config
+            .pueue_directory
+            .as_deref()
+            .ok_or_else(|| Error::unsupported("pueue", "read_output"))?;
         let id = self.id(process, "read_output")?;
         let cursor = cursor
-            .map(|cursor| Cursor::parse(cursor, &id))
+            .map(|cursor| Cursor::parse(cursor, &id, scope))
             .transpose()?;
         let before = self.task(process).await?;
         let execution = Execution::from_task(&before, "read_output")?;
@@ -347,8 +373,10 @@ impl Pueue {
         {
             return Err(conflict());
         }
-        let mut next = Cursor {
-            format: 1,
+        let mut boundary = Cursor {
+            format: 2,
+            representation: "output".into(),
+            scope: scope.into(),
             task: id.clone(),
             execution: execution.clone(),
             directory: None,
@@ -360,30 +388,28 @@ impl Pueue {
             if cursor.as_ref().is_some_and(|cursor| cursor.file.is_some()) {
                 return Err(conflict());
             }
-            return Ok((
-                OutputInfo {
-                    channels: vec![OutputChannel::Combined],
-                    size: 0,
-                    version: None,
-                },
-                OutputPage {
-                    chunks: Vec::new(),
-                    next_cursor: next.encode()?,
-                    at_end: true,
-                },
-            ));
+            return Ok(OutputPage {
+                chunks: Vec::new(),
+                before: Some(boundary.encode()?),
+                after: Some(boundary.encode()?),
+                at_head: Some(true),
+                at_tail: true,
+            });
         }
-        let log = self.native_read(&id, cursor.as_ref(), limit).await?;
+        let log = self
+            .native_read(&id, cursor.as_ref(), direction, limit)
+            .await?;
         let after = self.task(process).await?;
         if Execution::from_task(&after, "read_output")? != execution {
             return Err(conflict());
         }
-        next.directory = Some(log.directory);
-        next.file = Some(log.file.clone());
-        next.offset = cursor.as_ref().map_or(0, |cursor| cursor.offset) + log.data.len() as u64;
-        next.observed = log.size;
-        let version = serde_json::to_string(&(&next.execution, &next.directory, &next.file))
-            .map_err(|_| protocol_error("read_output"))?;
+        boundary.directory = Some(log.directory);
+        boundary.file = Some(log.file);
+        boundary.observed = log.size;
+        boundary.offset = log.start;
+        let before = Some(boundary.encode()?);
+        boundary.offset = log.end;
+        let after = Some(boundary.encode()?);
         let chunks = if log.data.is_empty() {
             Vec::new()
         } else {
@@ -392,17 +418,12 @@ impl Pueue {
                 data: log.data,
             }]
         };
-        Ok((
-            OutputInfo {
-                channels: vec![OutputChannel::Combined],
-                size: log.size,
-                version: Some(version),
-            },
-            OutputPage {
-                chunks,
-                at_end: next.offset == log.size,
-                next_cursor: next.encode()?,
-            },
-        ))
+        Ok(OutputPage {
+            chunks,
+            before,
+            after,
+            at_head: Some(log.start == 0),
+            at_tail: log.end == log.size,
+        })
     }
 }

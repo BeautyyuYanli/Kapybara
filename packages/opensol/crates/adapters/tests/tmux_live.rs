@@ -102,7 +102,14 @@ fn pane_id(reference: &ProcessRef) -> String {
 async fn screen(process: &Process, needle: &[u8]) -> Vec<u8> {
     let end = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let screen = process.output().snapshot().await.unwrap();
+        let screen = process
+            .terminal()
+            .screen()
+            .await
+            .unwrap()
+            .lines
+            .join("\n")
+            .into_bytes();
         if screen.windows(needle.len()).any(|bytes| bytes == needle) {
             return screen;
         }
@@ -114,6 +121,88 @@ async fn screen(process: &Process, needle: &[u8]) -> Vec<u8> {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Count actual target response bytes; the request still executes against real tmux.
+/// This catches unbounded native capture followed by slicing inside the SDK.
+#[derive(Clone, Default)]
+struct CountingConnection(Arc<AtomicUsize>);
+
+#[async_trait]
+impl ExecAccess for CountingConnection {
+    fn backend(&self) -> &'static str {
+        "local"
+    }
+    fn capabilities(&self) -> ConnectionCapabilities {
+        Connection::new(Local).capabilities()
+    }
+    async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
+        let result = Connection::new(Local).exec(request).await?;
+        self.0
+            .fetch_add(result.stdout.len() + result.stderr.len(), Ordering::SeqCst);
+        Ok(result)
+    }
+}
+
+#[tokio::test]
+async fn history_tail_bounds_native_transfer_before_returning_the_last_lines() {
+    let server = Server::new();
+    let connection = CountingConnection::default();
+    let manager = ProcessManager::new(
+        Tmux::new(
+            Connection::new(connection.clone()),
+            TmuxConfig::new(&server.socket),
+        )
+        .unwrap(),
+    );
+    let (process, _) = manager
+        .spawn(terminal(Command::new(
+            "python3",
+            [
+                "-c",
+                "for index in range(4000): print(f'{index:04} ' + 'x' * 60)",
+            ],
+        )))
+        .await
+        .unwrap();
+    process.wait(Some(Duration::from_secs(5))).await.unwrap();
+    let terminal = process.terminal();
+    let history = terminal.tail(10_000).await.unwrap();
+    const METADATA_BUDGET: usize = 4096;
+    const REQUESTED_LINES: usize = 3;
+    assert!(
+        history.lines.len() > 1000,
+        "fixture must retain much more than the requested tail"
+    );
+    assert_eq!((history.at_head, history.at_tail), (Some(true), true));
+    assert!(
+        history
+            .lines
+            .iter()
+            .map(|line| line.len() + 1)
+            .sum::<usize>()
+            > 10 * METADATA_BUDGET
+    );
+    let expected = history.lines[history.lines.len() - REQUESTED_LINES..].to_vec();
+    assert_eq!(
+        expected[0].trim_end_matches(' '),
+        format!("{:04} {}", 3974, "x".repeat(60))
+    );
+
+    connection.0.store(0, Ordering::SeqCst);
+    let tail = terminal.tail(REQUESTED_LINES).await.unwrap();
+    let received = connection.0.load(Ordering::SeqCst);
+    let payload = expected.iter().map(|line| line.len() + 1).sum::<usize>();
+    assert!(
+        received <= payload + METADATA_BUDGET,
+        "small tail transferred {received} bytes for {payload} bytes of requested text"
+    );
+    assert_eq!(tail.lines, expected);
+    assert_eq!(
+        (tail.before, tail.after, tail.at_head, tail.at_tail),
+        (None, None, Some(false), true)
+    );
+    process.remove().await.unwrap();
 }
 
 #[tokio::test]
@@ -153,9 +242,8 @@ async fn native_tasks_preserve_argv_cwd_environment_short_exits_and_ownership() 
         ("SDK_TEST".into(), value.into()),
         ("SDK-TEST".into(), value.into()),
     ]);
-    let mut handle = manager.spawn(terminal(command)).await.unwrap();
-    assert_eq!(handle.process.pty, Some(true));
-    let process = manager.get(handle.process.clone());
+    let (process, mut handle) = manager.spawn(terminal(command)).await.unwrap();
+    assert_eq!(handle.reference.pty, Some(true));
     assert_eq!(
         process
             .wait(Some(Duration::from_secs(5)))
@@ -177,23 +265,22 @@ async fn native_tasks_preserve_argv_cwd_environment_short_exits_and_ownership() 
     assert!(handle.events.next().await.is_none());
     let listed = manager.list().await.unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].process, handle.process);
+    assert_eq!(listed[0].process, handle.reference);
     assert_eq!(listed[0].state, ProcessState::Exited);
     assert_eq!(
         server
             .manager()
-            .get(handle.process.clone())
+            .get(handle.reference.clone())
             .inspect()
             .await
             .unwrap(),
         listed[0]
     );
     for script in ["exit 0", "exit 7", "exit 91"] {
-        let handle = manager
+        let (task, _) = manager
             .spawn(terminal(Command::shell(script)))
             .await
             .unwrap();
-        let task = manager.get(handle.process);
         assert_eq!(
             task.wait(Some(Duration::from_secs(5)))
                 .await
@@ -205,11 +292,10 @@ async fn native_tasks_preserve_argv_cwd_environment_short_exits_and_ownership() 
         );
         task.remove().await.unwrap();
     }
-    let signal = manager
+    let (task, _) = manager
         .spawn(terminal(Command::shell("kill -TERM $$")))
         .await
         .unwrap();
-    let task = manager.get(signal.process);
     let outcome = task.wait(Some(Duration::from_secs(5))).await.unwrap();
     assert_eq!(outcome.exit.unwrap().signal, Some(15));
     assert_eq!(outcome.native_result.as_deref(), Some("SIGTERM"));
@@ -237,8 +323,8 @@ async fn explicit_cwd_is_required_on_initial_launch_and_each_native_restart() {
         ],
     );
     command.cwd = Some(cwd.to_str().unwrap().into());
-    let handle = manager.spawn(terminal(command)).await.unwrap();
-    let reference = handle.process;
+    let (_, handle) = manager.spawn(terminal(command)).await.unwrap();
+    let reference = handle.reference;
     let process = manager.get(reference.clone());
     let outcome = process.wait(Some(Duration::from_secs(5))).await.unwrap();
     assert_eq!(outcome.exit.unwrap().code, Some(125));
@@ -291,9 +377,8 @@ async fn explicit_cwd_is_required_on_initial_launch_and_each_native_restart() {
 async fn native_input_resize_snapshot_and_explicit_destruction() {
     let server = Server::new();
     let manager = server.manager();
-    let handle = manager.spawn(terminal(Command::new("python3", ["-u", "-c",
+    let (process, _) = manager.spawn(terminal(Command::new("python3", ["-u", "-c",
         "import os,tty; tty.setraw(0); print('READY',flush=True); data=b''\nwhile len(data)<4: data+=os.read(0,4-len(data))\nprint(data.hex(), os.get_terminal_size(0), flush=True)"]))).await.unwrap();
-    let process = manager.get(handle.process);
     screen(&process, b"READY").await;
     process.send_input(Vec::new()).await.unwrap();
     assert_eq!(
@@ -317,8 +402,12 @@ async fn native_input_resize_snapshot_and_explicit_destruction() {
         process.start().await.unwrap_err(),
         process.signal(Signal::Interrupt).await.unwrap_err(),
         process.close_stdin().await.unwrap_err(),
-        process.output().read(None, 32).await.unwrap_err(),
-        process.output().stat().await.unwrap_err(),
+        process
+            .output()
+            .read(None, opensol_core::ReadDirection::Forward, 32)
+            .await
+            .unwrap_err(),
+        process.output().tail(32).await.unwrap_err(),
     ] {
         assert_eq!(error.kind, ErrorKind::Unsupported);
     }
@@ -353,11 +442,10 @@ async fn native_input_resize_snapshot_and_explicit_destruction() {
         process.inspect().await.unwrap_err().kind,
         ErrorKind::NotFound
     );
-    let handle = manager
+    let (process, handle) = manager
         .spawn(terminal(Command::new("sleep", ["60"])))
         .await
         .unwrap();
-    let process = manager.get(handle.process);
     drop(handle.events);
     assert_eq!(
         process.inspect().await.unwrap().state,
@@ -369,7 +457,7 @@ async fn native_input_resize_snapshot_and_explicit_destruction() {
         ErrorKind::NotFound
     );
     assert_eq!(
-        process.output().snapshot().await.unwrap_err().kind,
+        process.terminal().screen().await.unwrap_err().kind,
         ErrorKind::NotFound
     );
 }
@@ -378,11 +466,10 @@ async fn native_input_resize_snapshot_and_explicit_destruction() {
 async fn subscriptions_bind_generations_and_full_identity_survives_reconnection_only() {
     let server = Server::new();
     let manager = server.manager();
-    let mut initial = manager
+    let (process, mut initial) = manager
         .spawn(terminal(Command::shell("exit 7")))
         .await
         .unwrap();
-    let process = manager.get(initial.process.clone());
     process.wait(Some(Duration::from_secs(5))).await.unwrap();
     let mut extra = process.output().subscribe().await.unwrap();
     process.restart().await.unwrap();
@@ -411,13 +498,13 @@ async fn subscriptions_bind_generations_and_full_identity_survives_reconnection_
         external.events.next().await.unwrap().unwrap_err().kind,
         ErrorKind::Conflict
     );
-    let mut forged: serde_json::Value = serde_json::from_str(&initial.process.id).unwrap();
+    let mut forged: serde_json::Value = serde_json::from_str(&initial.reference.id).unwrap();
     forged["window"] = "@99999999".into();
     let forged = manager.get(ProcessRef::new("tmux", forged.to_string(), Some(true)));
     for error in [
         forged.inspect().await.unwrap_err(),
         forged.kill().await.unwrap_err(),
-        forged.output().snapshot().await.unwrap_err(),
+        forged.terminal().screen().await.unwrap_err(),
     ] {
         assert_eq!(error.kind, ErrorKind::NotFound);
     }
@@ -431,16 +518,16 @@ async fn subscriptions_bind_generations_and_full_identity_survives_reconnection_
         cleaned.events.next().await.unwrap().unwrap_err().kind,
         ErrorKind::NotFound
     );
-    let mut replaced = manager
+    let (_, mut replaced) = manager
         .spawn(terminal(Command::shell("exit 0")))
         .await
         .unwrap();
     manager
-        .get(replaced.process.clone())
+        .get(replaced.reference.clone())
         .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
-    let session: serde_json::Value = serde_json::from_str(&replaced.process.id).unwrap();
+    let session: serde_json::Value = serde_json::from_str(&replaced.reference.id).unwrap();
     server.native(&[
         "rename-session",
         "-t",
@@ -530,15 +617,14 @@ impl ExecAccess for RespawnAtBoundary {
 async fn removal_tests_dead_state_inside_the_native_control_queue() {
     let server = Server::new();
     let manager = server.manager();
-    let handle = manager
+    let (process, handle) = manager
         .spawn(terminal(Command::shell("exit 0")))
         .await
         .unwrap();
-    let process = manager.get(handle.process.clone());
     process.wait(Some(Duration::from_secs(5))).await.unwrap();
     let connection = Connection::new(RespawnAtBoundary {
         socket: server.socket.clone(),
-        pane: pane_id(&handle.process),
+        pane: pane_id(&handle.reference),
         command: "if-shell",
         observation: 1,
         after: false,
@@ -547,7 +633,12 @@ async fn removal_tests_dead_state_inside_the_native_control_queue() {
     let racing =
         ProcessManager::new(Tmux::new(connection, TmuxConfig::new(&server.socket)).unwrap());
     assert_eq!(
-        racing.get(handle.process).remove().await.unwrap_err().kind,
+        racing
+            .get(handle.reference)
+            .remove()
+            .await
+            .unwrap_err()
+            .kind,
         ErrorKind::Conflict
     );
     assert_eq!(
@@ -558,18 +649,118 @@ async fn removal_tests_dead_state_inside_the_native_control_queue() {
 }
 
 #[tokio::test]
+async fn terminal_reads_reject_a_respawn_between_identity_check_and_capture() {
+    for history in [false, true] {
+        let server = Server::new();
+        let manager = server.manager();
+        let (process, _) = manager
+            .spawn(terminal(Command::shell("printf old; exit 0")))
+            .await
+            .unwrap();
+        process.wait(Some(Duration::from_secs(5))).await.unwrap();
+        let connection = Connection::new(RespawnAtBoundary {
+            socket: server.socket.clone(),
+            pane: pane_id(process.reference()),
+            command: "if-shell",
+            observation: 1,
+            after: false,
+            observed: Arc::new(AtomicUsize::new(0)),
+        });
+        let racing =
+            ProcessManager::new(Tmux::new(connection, TmuxConfig::new(&server.socket)).unwrap())
+                .get(process.reference().clone());
+        let error = if history {
+            racing.terminal().tail(3).await.unwrap_err()
+        } else {
+            racing.terminal().screen().await.unwrap_err()
+        };
+        assert_eq!(error.kind, ErrorKind::Conflict);
+        process.kill().await.unwrap();
+    }
+}
+
+/// Corrupt only the returned capture framing after executing the real native request.
+#[derive(Clone)]
+struct DamagedCapture {
+    damage: u8,
+}
+#[async_trait]
+impl ExecAccess for DamagedCapture {
+    fn backend(&self) -> &'static str {
+        "local"
+    }
+    fn capabilities(&self) -> ConnectionCapabilities {
+        Connection::new(Local).capabilities()
+    }
+    async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
+        let capture = request
+            .command
+            .argv
+            .iter()
+            .any(|arg| arg.contains("capture-pane"));
+        let mut result = Connection::new(Local).exec(request).await?;
+        if capture && result.exit.success() {
+            let text = String::from_utf8(result.stdout).unwrap();
+            let mut rows: Vec<_> = text.split('\n').map(String::from).collect();
+            match self.damage {
+                0 => {
+                    rows.remove(2);
+                }
+                1 => {
+                    rows.insert(2, String::new());
+                }
+                _ => {
+                    let end = rows.len() - 2;
+                    rows[end] = "private malformed metadata".into();
+                }
+            }
+            result.stdout = rows.join("\n").into_bytes();
+        }
+        Ok(result)
+    }
+}
+
+#[tokio::test]
+async fn malformed_capture_framing_is_backend_error_and_not_an_empty_page_or_conflict() {
+    let server = Server::new();
+    let manager = server.manager();
+    let mut request = terminal(Command::shell("exit 0"));
+    request.pty = Some(PtySize { cols: 20, rows: 1 });
+    let (process, _) = manager.spawn(request).await.unwrap();
+    process.wait(Some(Duration::from_secs(5))).await.unwrap();
+    assert!(process.terminal().tail(1).await.unwrap().lines.is_empty());
+    for damage in 0..3 {
+        let bound = ProcessManager::new(
+            Tmux::new(
+                Connection::new(DamagedCapture { damage }),
+                TmuxConfig::new(&server.socket),
+            )
+            .unwrap(),
+        )
+        .get(process.reference().clone());
+        let error = if damage == 1 {
+            bound.terminal().tail(1).await.unwrap_err()
+        } else {
+            bound.terminal().screen().await.unwrap_err()
+        };
+        assert_eq!(error.kind, ErrorKind::Backend);
+        assert!(!error.to_string().contains("private malformed metadata"));
+    }
+    process.remove().await.unwrap();
+}
+
+#[tokio::test]
 async fn completion_is_rechecked_after_native_terminal_observation() {
     let server = Server::new();
     let manager = server.manager();
-    let handle = manager
+    let (process, handle) = manager
         .spawn(terminal(Command::shell("exit 7")))
         .await
         .unwrap();
-    let process = manager.get(handle.process.clone());
     process.wait(Some(Duration::from_secs(5))).await.unwrap();
     let connection = Connection::new(RespawnAtBoundary {
         socket: server.socket.clone(),
-        pane: pane_id(&handle.process),
+        pane: pane_id(&handle.reference),
         command: "display-message",
         observation: 2,
         after: true,
@@ -578,7 +769,7 @@ async fn completion_is_rechecked_after_native_terminal_observation() {
     let racing =
         ProcessManager::new(Tmux::new(connection, TmuxConfig::new(&server.socket)).unwrap());
     let mut handle = racing
-        .get(handle.process)
+        .get(handle.reference)
         .output()
         .subscribe()
         .await
@@ -607,11 +798,11 @@ async fn caller_retained_empty_server_and_namespaces_keep_native_global_options(
     let mut config = TmuxConfig::new(&server.socket);
     config.session_prefix = "another-team".into();
     let other = ProcessManager::new(Tmux::new(Connection::new(Local), config).unwrap());
-    let a = manager
+    let (_, a) = manager
         .spawn(terminal(Command::shell("exit 0")))
         .await
         .unwrap();
-    let b = other
+    let (_, b) = other
         .spawn(terminal(Command::shell("exit 7")))
         .await
         .unwrap();
@@ -623,7 +814,7 @@ async fn caller_retained_empty_server_and_namespaces_keep_native_global_options(
             .iter()
             .map(|info| &info.process)
             .collect::<Vec<_>>(),
-        [&a.process]
+        [&a.reference]
     );
     assert_eq!(
         other
@@ -633,10 +824,10 @@ async fn caller_retained_empty_server_and_namespaces_keep_native_global_options(
             .iter()
             .map(|info| &info.process)
             .collect::<Vec<_>>(),
-        [&b.process]
+        [&b.reference]
     );
-    let a = manager.get(a.process);
-    let b = other.get(b.process);
+    let a = manager.get(a.reference);
+    let b = other.get(b.reference);
     a.wait(Some(Duration::from_secs(5))).await.unwrap();
     b.wait(Some(Duration::from_secs(5))).await.unwrap();
     a.remove().await.unwrap();
@@ -723,8 +914,7 @@ async fn docker_connection_uses_target_program_socket_environment_and_screen() {
             ],
         );
         command.env.insert("SDK_TEST".into(), "remote".into());
-        let handle = manager.spawn(terminal(command)).await?;
-        let process = manager.get(handle.process);
+        let (process, _) = manager.spawn(terminal(command)).await?;
         assert!(
             process
                 .wait(Some(Duration::from_secs(5)))
@@ -733,7 +923,7 @@ async fn docker_connection_uses_target_program_socket_environment_and_screen() {
                 .unwrap()
                 .success()
         );
-        let snapshot = String::from_utf8(process.output().snapshot().await?).unwrap();
+        let snapshot = process.terminal().screen().await?.lines.join("\n");
         assert!(
             snapshot.contains("remote-screen"),
             "native snapshot: {snapshot:?}"

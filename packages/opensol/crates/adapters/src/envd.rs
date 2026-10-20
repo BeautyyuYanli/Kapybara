@@ -7,18 +7,18 @@
 //! Exec tolerates input NotFound only with a valid native End event. Reconciliation without it is
 //! bounded by the control-request timeout; other input failures remain errors alongside completion.
 
-use std::{pin::Pin, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{Buf, BytesMut};
 use futures::{Stream, StreamExt};
 use opensol_core::{
-    Connection, ConnectionCapabilities, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
-    ExitStatus, ManagerInfo, OutputChannel, ProcessCapabilities, ProcessEvent, ProcessHandle,
-    ProcessInfo, ProcessManager, ProcessOutcome, ProcessRef, ProcessState, PtySize, Result, Signal,
-    SpawnRequest,
-    raw::{ExecAccess, ProcessAccess},
+    Connection, ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, ExitStatus,
+    ManagerInfo, OutputCapabilities, OutputChannel, OutputSubscription, ProcessCapabilities,
+    ProcessEvent, ProcessInfo, ProcessManager, ProcessOutcome, ProcessRef, ProcessState, PtySize,
+    Result, Signal, SpawnRequest,
+    raw::{ExecAccess, OutputAccess, ProcessAccess},
     wait_events,
 };
 use prost::Message;
@@ -288,7 +288,7 @@ impl Envd {
         mut raw: RawStream,
         pty: Option<bool>,
         start: bool,
-    ) -> Result<ProcessHandle> {
+    ) -> Result<OutputSubscription> {
         let method = if start { "Start" } else { "Connect" };
         let first = deadline(Some(self.request_timeout), "envd", method, async {
             raw.next().await.ok_or_else(|| protocol_error(method))?
@@ -338,8 +338,8 @@ impl Envd {
             }
             if !exited { Err(Error::new(ErrorKind::Transport, "envd", method, "process stream ended before exit status"))?; }
         });
-        Ok(ProcessHandle {
-            process: ProcessRef::new("envd", pid.to_string(), pty),
+        Ok(OutputSubscription {
+            reference: ProcessRef::new("envd", pid.to_string(), pty),
             events,
         })
     }
@@ -362,9 +362,12 @@ impl ProcessAccess for Envd {
             supported_signals: &[Signal::Terminate, Signal::Kill],
             detached: true,
             reconnect: true,
-            streaming_output: true,
             ..Default::default()
         }
+    }
+
+    fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
+        Some(Arc::new(self.clone()))
     }
 
     async fn probe(&self) -> Result<ManagerInfo> {
@@ -405,7 +408,7 @@ impl ProcessAccess for Envd {
         self.signal(process, Signal::Kill).await
     }
 
-    async fn spawn(&self, request: SpawnRequest) -> Result<ProcessHandle> {
+    async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription> {
         let config = protocol::ProcessConfig {
             cmd: request.command.argv[0].clone(),
             args: request.command.argv[1..].to_vec(),
@@ -459,13 +462,9 @@ impl ProcessAccess for Envd {
         timeout: Option<Duration>,
     ) -> Result<ProcessOutcome> {
         deadline(timeout, "envd", "wait", async {
-            wait_events(self.output(process).await?, "envd").await
+            wait_events(self.subscribe(process).await?.events, "envd").await
         })
         .await
-    }
-
-    async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
-        Ok(self.reconnect(process).await?.events)
     }
 
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
@@ -534,8 +533,21 @@ impl ProcessAccess for Envd {
             .await?;
         Ok(())
     }
+}
 
-    async fn reconnect(&self, process: &ProcessRef) -> Result<ProcessHandle> {
+#[async_trait]
+impl OutputAccess for Envd {
+    fn backend(&self) -> &'static str {
+        "envd"
+    }
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities {
+            subscribe: true,
+            streaming_output: true,
+            ..Default::default()
+        }
+    }
+    async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         let selector = self.selector(process, "reconnect")?;
         let handle = self
             .handle(
@@ -550,7 +562,7 @@ impl ProcessAccess for Envd {
                 false,
             )
             .await?;
-        if handle.process.id != process.id {
+        if handle.reference.id != process.id {
             return Err(protocol_error("Connect"));
         }
         Ok(handle)
@@ -574,8 +586,8 @@ impl ExecAccess for Envd {
         deadline(request.timeout, "envd", "exec", async {
             let mut spawn = SpawnRequest::new(request.command);
             spawn.stdin = !request.stdin.is_empty();
-            let ProcessHandle {
-                process,
+            let OutputSubscription {
+                reference: process,
                 mut events,
             } = self.spawn(spawn).await?;
             let write = async {

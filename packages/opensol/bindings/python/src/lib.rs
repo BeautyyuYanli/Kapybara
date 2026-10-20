@@ -34,8 +34,9 @@ use opensol_adapters::{
 };
 use opensol_core::{
     Command, Connection, CreateOptions, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
-    ExitStatus, Lifecycle, OutputChannel, ProcessEvent, ProcessHandle, ProcessInfo, ProcessManager,
-    ProcessOutcome, ProcessRef, PtySize, ResourceInfo, ResourceRef, Result, Signal, SpawnRequest,
+    ExitStatus, Lifecycle, OutputChannel, OutputSubscription, ProcessEvent, ProcessInfo,
+    ProcessManager, ProcessOutcome, ProcessRef, PtySize, ResourceInfo, ResourceRef, Result, Signal,
+    SpawnRequest,
 };
 use prost::Message;
 use pyo3::{
@@ -580,42 +581,92 @@ impl PyProcessEvent {
     }
 }
 
-struct HandleState {
+struct SubscriptionState {
     events: Option<EventStream>,
     // Completion belongs to this subscription's execution, even if its task ID is restarted.
     outcome: Option<ProcessOutcome>,
 }
 
-/// One output subscription. disconnect releases it without killing the remote process.
-#[pyclass(name = "ProcessHandle", frozen)]
-struct PyProcessHandle {
-    process: ProcessRef,
-    state: Arc<Mutex<HandleState>>,
+/// One output subscription. close releases it without killing the remote process.
+#[pyclass(name = "OutputSubscription", frozen)]
+struct PyOutputSubscription {
+    reference: ProcessRef,
+    state: Arc<tokio::sync::Mutex<SubscriptionState>>,
     abort: AbortHandle,
-    disconnected: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
 }
 
-impl From<ProcessHandle> for PyProcessHandle {
-    fn from(handle: ProcessHandle) -> Self {
+impl From<OutputSubscription> for PyOutputSubscription {
+    fn from(subscription: OutputSubscription) -> Self {
         let (abort, registration) = AbortHandle::new_pair();
         Self {
-            process: handle.process,
-            state: Arc::new(Mutex::new(HandleState {
-                events: Some(Box::pin(Abortable::new(handle.events, registration))),
+            reference: subscription.reference,
+            state: Arc::new(tokio::sync::Mutex::new(SubscriptionState {
+                events: Some(Box::pin(Abortable::new(subscription.events, registration))),
                 outcome: None,
             })),
             abort,
-            disconnected: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
+/// Call with consumption ownership held. Cancellation while awaiting the native stream
+/// leaves it attached; completion is cached only for this subscription's execution.
+/// Callers apply nonterminal wait timeouts outside this function, so returned errors
+/// are terminal stream failures that aio must reserve until Python acknowledges them.
+async fn subscription_event(
+    state: &mut SubscriptionState,
+    closed: &AtomicBool,
+    backend: &str,
+) -> Result<Option<ProcessEvent>> {
+    let Some(events) = state.events.as_mut() else {
+        return Ok(None);
+    };
+    let event = events.next().await;
+    match event {
+        Some(Ok(event)) => {
+            if let ProcessEvent::Completed(outcome) = &event {
+                state.outcome = Some(outcome.clone());
+                state.events = None;
+            }
+            Ok(Some(event))
+        }
+        Some(Err(error)) => {
+            state.events = None;
+            Err(error)
+        }
+        None => {
+            state.events = None;
+            if state.outcome.is_none() && !closed.load(Ordering::Acquire) {
+                Err(Error::new(
+                    ErrorKind::Transport,
+                    backend,
+                    "output",
+                    "subscription ended before process completion",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn subscription_timeout(backend: &str, operation: &str) -> Error {
+    Error::new(
+        ErrorKind::Timeout,
+        backend,
+        operation,
+        "output wait timed out",
+    )
+}
+
 #[pymethods]
-impl PyProcessHandle {
+impl PyOutputSubscription {
     #[getter]
-    fn process(&self) -> PyProcessRef {
+    fn r#ref(&self) -> PyProcessRef {
         PyProcessRef {
-            inner: self.process.clone(),
+            inner: self.reference.clone(),
         }
     }
 
@@ -623,116 +674,89 @@ impl PyProcessHandle {
     fn next_event(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<PyProcessEvent>> {
         let timeout = crate::timeout(timeout)?;
         let state = self.state.clone();
-        let backend = self.process.backend.clone();
-        let disconnected = self.disconnected.clone();
+        let backend = self.reference.backend.clone();
+        let closed = self.closed.clone();
         let runtime = runtime()?;
-        py.detach(move || -> Result<Option<ProcessEvent>> {
-            let mut state = state.lock().map_err(|_| {
-                Error::new(
-                    ErrorKind::Backend,
-                    &backend,
-                    "output",
-                    "output subscription lock failed",
-                )
-            })?;
-            let Some(events) = state.events.as_mut() else {
-                return Ok(None);
-            };
-            let event =
-                runtime.block_on(async {
-                    match timeout {
-                        Some(timeout) => tokio::time::timeout(timeout, events.next())
-                            .await
-                            .map_err(|_| {
-                                Error::new(
-                                    ErrorKind::Timeout,
-                                    &backend,
-                                    "output",
-                                    "output wait timed out",
-                                )
-                            }),
-                        None => Ok(events.next().await),
-                    }
-                })?;
-            match event {
-                Some(Ok(event)) => {
-                    if let ProcessEvent::Completed(outcome) = &event {
-                        state.outcome = Some(outcome.clone());
-                        state.events = None;
-                    }
-                    Ok(Some(event))
+        py.detach(move || {
+            runtime.block_on(async {
+                let mut state = state.lock().await;
+                let consume = subscription_event(&mut state, &closed, &backend);
+                match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, consume)
+                        .await
+                        .map_err(|_| subscription_timeout(&backend, "output"))?,
+                    None => consume.await,
                 }
-                Some(Err(error)) => {
-                    state.events = None;
-                    Err(error)
-                }
-                None => {
-                    state.events = None;
-                    if state.outcome.is_none() && !disconnected.load(Ordering::Acquire) {
-                        Err(Error::new(
-                            ErrorKind::Transport,
-                            &backend,
-                            "output",
-                            "subscription ended before process completion",
-                        ))
-                    } else {
-                        Ok(None)
-                    }
-                }
-            }
+            })
         })
         .map(|event| event.map(|inner| PyProcessEvent { inner }))
         .map_err(exception)
     }
 
-    fn wait(&self, py: Python<'_>) -> PyResult<PyProcessOutcome> {
-        loop {
-            let state = self.state.clone();
-            let backend = self.process.backend.clone();
-            let outcome = py.detach(move || {
-                state
-                    .lock()
-                    .map(|state| state.outcome.clone())
-                    .map_err(|_| {
-                        exception(Error::new(
-                            ErrorKind::Backend,
-                            &backend,
-                            "wait",
-                            "output subscription lock failed",
-                        ))
+    #[pyo3(signature = (*, timeout=None))]
+    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyProcessOutcome> {
+        let timeout = crate::timeout(timeout)?;
+        let deadline = timeout
+            .map(|duration| {
+                tokio::time::Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| {
+                        exception(Error::invalid("python", "wait", "timeout is too large"))
                     })
-            })?;
-            if let Some(outcome) = outcome {
-                return Ok(PyProcessOutcome { inner: outcome });
-            }
-            if self.next_event(py, None)?.is_none() {
-                return Err(exception(Error::new(
-                    ErrorKind::Transport,
-                    &self.process.backend,
-                    "wait",
-                    "subscription is disconnected; completion is unknown",
-                )));
-            }
-        }
+            })
+            .transpose()?;
+        let state = self.state.clone();
+        let backend = self.reference.backend.clone();
+        let closed = self.closed.clone();
+        let runtime = runtime()?;
+        py.detach(move || {
+            runtime.block_on(async {
+                // The single deadline covers acquiring consumption ownership as well as
+                // every event. Ready output must not starve the timer or renew the budget.
+                let consume = async {
+                    let mut state = state.lock().await;
+                    loop {
+                        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            return Err(subscription_timeout(&backend, "wait"));
+                        }
+                        if let Some(outcome) = state.outcome.clone() {
+                            return Ok(outcome);
+                        }
+                        if subscription_event(&mut state, &closed, &backend)
+                            .await?
+                            .is_none()
+                        {
+                            return Err(Error::new(
+                                ErrorKind::Transport,
+                                &backend,
+                                "wait",
+                                "subscription is closed; completion is unknown",
+                            ));
+                        }
+                    }
+                };
+                match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, consume)
+                        .await
+                        .map_err(|_| subscription_timeout(&backend, "wait"))?,
+                    None => consume.await,
+                }
+            })
+        })
+        .map(|inner| PyProcessOutcome { inner })
+        .map_err(exception)
     }
 
-    fn disconnect(&self, py: Python<'_>) -> PyResult<()> {
-        self.disconnected.store(true, Ordering::Release);
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.closed.store(true, Ordering::Release);
         self.abort.abort();
         let state = self.state.clone();
-        let backend = self.process.backend.clone();
+        let runtime = runtime()?;
         py.detach(move || {
-            state
-                .lock()
-                .map_err(|_| {
-                    exception(Error::new(
-                        ErrorKind::Backend,
-                        &backend,
-                        "disconnect",
-                        "output subscription lock failed",
-                    ))
-                })?
-                .events = None;
+            runtime.block_on(async {
+                state.lock().await.events = None;
+            });
             Ok(())
         })
     }
@@ -781,6 +805,7 @@ impl PyProcessManager {
     }
 
     #[pyo3(signature = (argv, *, cwd=None, env=None, stdin=false, pty=None))]
+    /// Create a bound task and its native initial output subscription without another request.
     fn spawn(
         &self,
         py: Python<'_>,
@@ -789,7 +814,7 @@ impl PyProcessManager {
         env: Option<BTreeMap<String, String>>,
         stdin: bool,
         pty: Option<(u32, u32)>,
-    ) -> PyResult<PyProcessHandle> {
+    ) -> PyResult<(resources::PyProcess, PyOutputSubscription)> {
         let request = SpawnRequest {
             command: command(argv, cwd, env),
             stdin,
@@ -798,7 +823,9 @@ impl PyProcessManager {
         let client = self.inner.clone();
         let runtime = runtime()?;
         py.detach(move || runtime.block_on(client.spawn(request)))
-            .map(Into::into)
+            .map(|(process, subscription)| {
+                (resources::PyProcess { inner: process }, subscription.into())
+            })
             .map_err(exception)
     }
 }
@@ -1250,7 +1277,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyConnection>()?;
     module.add_class::<PyLifecycle>()?;
     module.add_class::<PyProcessManager>()?;
-    module.add_class::<PyProcessHandle>()?;
+    module.add_class::<PyOutputSubscription>()?;
     module.add_class::<PyProcessEvent>()?;
     module.add_class::<PyEnvd>()?;
     module.add_class::<PyDocker>()?;

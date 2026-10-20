@@ -2,7 +2,7 @@
 
 Public I/O methods and network factories are coroutines: native Futures are
 created only when the coroutine runs. Configuration and local binding stay synchronous.
-Each process handle has one output subscription. Read operations are serialized;
+Each OutputSubscription owns one native stream. Read operations are serialized;
 cancellation retains a reserved event until a Python consumer acknowledges it.
 Closing a subscription never signals the process or deletes its environment.
 """
@@ -10,15 +10,20 @@ Closing a subscription never signals the process or deletes its environment.
 from __future__ import annotations
 
 import asyncio
+import builtins
+import math
 from collections.abc import AsyncIterator, Sequence
+from typing import Literal
 
 from . import _native
 from ._native import (
     ExecResult,
     ManagerInfo,
     OutputCursor,
-    OutputInfo,
     OutputPage,
+    TerminalCursor,
+    TerminalPage,
+    TerminalScreen,
     ProcessEvent,
     ProcessInfo,
     ProcessOutcome,
@@ -98,7 +103,7 @@ class Lifecycle:
         return await self._native.fork(resource)
 
 
-class ProcessHandle(AsyncIterator[ProcessEvent]):
+class OutputSubscription(AsyncIterator[ProcessEvent]):
     """One subscription; ``wait`` discards output, ``aclose`` only detaches.
 
     The asyncio lock is owned by the Python coroutine, so it is released on
@@ -106,13 +111,13 @@ class ProcessHandle(AsyncIterator[ProcessEvent]):
     coroutine confirms delivery without another await between those steps.
     """
 
-    def __init__(self, native: _native.AsyncProcessHandle) -> None:
+    def __init__(self, native: _native.AsyncOutputSubscription) -> None:
         self._native = native
         self._reader = asyncio.Lock()
 
     @property
-    def process(self) -> ProcessRef:
-        return self._native.process
+    def ref(self) -> ProcessRef:
+        return self._native.ref
 
     async def next_event(self, *, timeout: float | None = None) -> ProcessEvent | None:
         """Read one event; timeout/cancellation leaves the subscription usable.
@@ -135,18 +140,36 @@ class ProcessHandle(AsyncIterator[ProcessEvent]):
             self._native._commit()
             return event
 
-    async def wait(self) -> ProcessOutcome:
-        """Consume remaining output and return this subscription's confirmed completion."""
-        while (event := await self.next_event()) is not None:
-            if event.outcome is not None:
-                return event.outcome
-        return await self._native._outcome()
+    async def wait(self, *, timeout: float | None = None) -> ProcessOutcome:
+        """Discard output until completion; timeout covers this entire call, including locks."""
+        def error(cls, kind, message):
+            result = cls(message)
+            result.backend, result.operation, result.kind = self.ref.backend, "wait", kind
+            return result
+
+        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+            raise error(_native.InvalidArgumentError, "InvalidArgument", "timeout must be finite and positive, or None")
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        try:
+            async with asyncio.timeout_at(deadline):
+                while True:
+                    # A continuously ready subscription must still respect the same deadline.
+                    if deadline is not None and loop.time() >= deadline:
+                        raise builtins.TimeoutError
+                    event = await self.next_event()
+                    if event is None:
+                        return await self._native._outcome()
+                    if event.outcome is not None:
+                        return event.outcome
+        except builtins.TimeoutError:
+            raise error(_native.TimeoutError, "Timeout", "output wait timed out") from None
 
     async def aclose(self) -> None:
         """Detach and wake blocked readers; safe to call repeatedly."""
         await self._native.aclose()
 
-    def __aiter__(self) -> ProcessHandle:
+    def __aiter__(self) -> OutputSubscription:
         return self
 
     async def __anext__(self) -> ProcessEvent:
@@ -187,14 +210,16 @@ class ProcessManager:
         env: dict[str, str] | None = None,
         stdin: bool = False,
         pty: tuple[int, int] | None = None,
-    ) -> ProcessHandle:
-        return ProcessHandle(
+    ) -> tuple[Process, OutputSubscription]:
+        """Create a task and retain its native initial stream without querying or reconnecting."""
+        process, subscription = (
             await self._native.spawn(argv, cwd=cwd, env=env, stdin=stdin, pty=pty)
         )
+        return Process(process), OutputSubscription(subscription)
 
 
 class Process:
-    """Bound native task resource; no cached status or implicit lifecycle ownership."""
+    """Bound task operations, logs and screen; no cached status or lifecycle ownership."""
 
     def __init__(self, native: _native.AsyncProcess) -> None:
         self._native = native
@@ -202,10 +227,6 @@ class Process:
     @property
     def ref(self) -> ProcessRef:
         return self._native.ref
-
-    @property
-    def output(self) -> ProcessOutput:
-        return ProcessOutput(self._native.output)
 
     async def inspect(self) -> ProcessInfo:
         return await self._native.inspect()
@@ -240,26 +261,53 @@ class Process:
     async def resize(self, cols: int, rows: int) -> None:
         await self._native.resize(cols, rows)
 
+    @property
+    def output(self) -> Output:
+        return Output(self._native.output)
 
-class ProcessOutput:
-    """Bound output access; subscriptions and bounded log reads have independent positions."""
+    @property
+    def terminal(self) -> Terminal:
+        return Terminal(self._native.terminal)
 
-    def __init__(self, native: _native.AsyncProcessOutput) -> None:
+
+class Output:
+    """Locally bound raw bytes; page cursors and subscriptions consume independently."""
+
+    def __init__(self, native: _native.AsyncOutput) -> None:
         self._native = native
 
-    async def snapshot(self) -> bytes:
-        """Current rendered screen; no raw stdout/stderr, scrollback, cursor or background reader."""
-        return await self._native.snapshot()
+    def capabilities(self) -> _native.OutputCapabilities:
+        return self._native.capabilities()
 
-    async def stat(self) -> OutputInfo:
-        return await self._native.stat()
+    async def read(self, *, cursor: OutputCursor | None = None,
+                   direction: Literal["forward", "backward"] = "forward", max_bytes: int = 65536) -> OutputPage:
+        return await self._native.read(cursor=cursor, direction=direction, max_bytes=max_bytes)
 
-    async def read(self, *, cursor: OutputCursor | None = None, limit: int = 65536) -> OutputPage:
-        return await self._native.read(cursor=cursor, limit=limit)
+    async def tail(self, *, max_bytes: int = 65536) -> OutputPage:
+        return await self._native.tail(max_bytes=max_bytes)
 
-    async def subscribe(self) -> ProcessHandle:
-        """Open an independent native subscription; requires reconnect capability."""
-        return ProcessHandle(await self._native.subscribe())
+    async def subscribe(self) -> OutputSubscription:
+        return OutputSubscription(await self._native.subscribe())
+
+
+class Terminal:
+    """Native rendered text, read without interpreting bytes or owning a process."""
+
+    def __init__(self, native: _native.AsyncTerminal) -> None:
+        self._native = native
+
+    def capabilities(self) -> _native.TerminalCapabilities:
+        return self._native.capabilities()
+
+    async def read(self, *, cursor: TerminalCursor | None = None,
+                   direction: Literal["forward", "backward"] = "forward", lines: int = 200) -> TerminalPage:
+        return await self._native.read(cursor=cursor, direction=direction, lines=lines)
+
+    async def tail(self, *, lines: int = 200) -> TerminalPage:
+        return await self._native.tail(lines=lines)
+
+    async def screen(self) -> TerminalScreen:
+        return await self._native.screen()
 
 
 class Envd:
@@ -496,7 +544,7 @@ async def openshell_connection(
 
 
 __all__ = [
-    "Connection", "Lifecycle", "ProcessManager", "ProcessHandle", "Process", "ProcessOutput", "Envd",
+    "Connection", "Lifecycle", "ProcessManager", "OutputSubscription", "Process", "Output", "Terminal", "Envd",
     "Docker", "E2b", "OpenShell",
     "local", "ssh", "docker", "docker_connection", "pueue", "tmux", "envd", "e2b",
     "agent_sandbox", "sandboxd", "openshell", "openshell_connection",

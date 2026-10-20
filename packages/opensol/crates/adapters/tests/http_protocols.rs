@@ -387,7 +387,7 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
     let process = Process::new(envd.clone(), listed[0].process.clone());
     assert_eq!(process.inspect().await.unwrap().process.id, "42");
     let handle = process.output().subscribe().await.unwrap();
-    assert_eq!(handle.process.pty, None);
+    assert_eq!(handle.reference.pty, None);
     assert_eq!(
         opensol_core::wait_events(handle.events, "envd")
             .await
@@ -406,8 +406,12 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
         process.start().await.unwrap_err(),
         process.restart().await.unwrap_err(),
         process.remove().await.unwrap_err(),
-        process.output().stat().await.unwrap_err(),
-        process.output().read(None, 64).await.unwrap_err(),
+        process.output().tail(64).await.unwrap_err(),
+        process
+            .output()
+            .read(None, opensol_core::ReadDirection::Forward, 64)
+            .await
+            .unwrap_err(),
     ] {
         assert_eq!(error.kind, ErrorKind::Unsupported);
     }
@@ -494,10 +498,10 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     let mut request = SpawnRequest::new(Command::new("program", Vec::<String>::new()));
     request.stdin = true;
     request.pty = Some(PtySize { cols: 90, rows: 30 });
-    let mut handle = envd.spawn(request).await.unwrap();
-    assert_eq!(handle.process.pty, Some(true));
+    let (_, mut handle) = envd.spawn(request).await.unwrap();
+    assert_eq!(handle.reference.pty, Some(true));
     let listed = envd.list().await.unwrap().remove(0).process;
-    assert_eq!(listed.id, handle.process.id);
+    assert_eq!(listed.id, handle.reference.id);
     assert_eq!(listed.pty, None);
     let unknown = envd.get(listed);
     let before = fixture.records.lock().unwrap().len();
@@ -515,27 +519,27 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     assert!(
         matches!(handle.events.next().await.unwrap().unwrap(), ProcessEvent::Output { channel: OutputChannel::Terminal, data } if data == [0xff, 0, b'T'])
     );
-    envd.get(handle.process.clone())
+    envd.get(handle.reference.clone())
         .send_input(vec![0xff, 4])
         .await
         .unwrap();
-    envd.get(handle.process.clone())
+    envd.get(handle.reference.clone())
         .resize(PtySize {
             cols: 100,
             rows: 40,
         })
         .await
         .unwrap();
-    envd.get(handle.process.clone())
+    envd.get(handle.reference.clone())
         .signal(Signal::Kill)
         .await
         .unwrap();
-    envd.get(handle.process.clone())
+    envd.get(handle.reference.clone())
         .signal(Signal::Terminate)
         .await
         .unwrap();
     assert_eq!(
-        envd.get(handle.process.clone())
+        envd.get(handle.reference.clone())
             .close_stdin()
             .await
             .unwrap_err()
@@ -543,14 +547,14 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
         ErrorKind::Unsupported
     );
     assert_eq!(
-        envd.get(handle.process.clone())
+        envd.get(handle.reference.clone())
             .signal(Signal::Interrupt)
             .await
             .unwrap_err()
             .kind,
         ErrorKind::Unsupported
     );
-    assert!(!envd.capabilities().historical_output);
+    assert!(!unknown.output().capabilities().historical_output);
     assert!(envd.capabilities().reconnect);
     let process = ProcessRef::new("envd", "42", Some(false));
     assert_eq!(

@@ -175,30 +175,24 @@ impl AsyncLifecycle {
     }
 }
 
-struct StreamState {
-    events: Option<EventStream>,
-    // This subscription's completion never becomes authoritative state for the task ID.
-    outcome: Option<ProcessOutcome>,
-}
-
 /// The Python wrapper serializes consumers, while this lock also covers a bridge
 /// future that has been cancelled but has not yet stopped on the Rust executor.
-#[pyclass(name = "AsyncProcessHandle", frozen)]
-pub(super) struct AsyncProcessHandle {
-    process: ProcessRef,
-    state: Arc<tokio::sync::Mutex<StreamState>>,
+#[pyclass(name = "AsyncOutputSubscription", frozen)]
+pub(super) struct AsyncOutputSubscription {
+    reference: ProcessRef,
+    state: Arc<tokio::sync::Mutex<SubscriptionState>>,
     pending: Arc<Mutex<Option<Result<ProcessEvent>>>>,
     abort: AbortHandle,
     closed: Arc<AtomicBool>,
 }
 
-impl From<ProcessHandle> for AsyncProcessHandle {
-    fn from(handle: ProcessHandle) -> Self {
+impl From<OutputSubscription> for AsyncOutputSubscription {
+    fn from(subscription: OutputSubscription) -> Self {
         let (abort, registration) = AbortHandle::new_pair();
         Self {
-            process: handle.process,
-            state: Arc::new(tokio::sync::Mutex::new(StreamState {
-                events: Some(Box::pin(Abortable::new(handle.events, registration))),
+            reference: subscription.reference,
+            state: Arc::new(tokio::sync::Mutex::new(SubscriptionState {
+                events: Some(Box::pin(Abortable::new(subscription.events, registration))),
                 outcome: None,
             })),
             pending: Arc::new(Mutex::new(None)),
@@ -218,11 +212,11 @@ fn delivery_lock_error() -> PyErr {
 }
 
 #[pymethods]
-impl AsyncProcessHandle {
+impl AsyncOutputSubscription {
     #[getter]
-    fn process(&self) -> PyProcessRef {
+    fn r#ref(&self) -> PyProcessRef {
         PyProcessRef {
-            inner: self.process.clone(),
+            inner: self.reference.clone(),
         }
     }
 
@@ -232,7 +226,7 @@ impl AsyncProcessHandle {
         let state = self.state.clone();
         let pending = self.pending.clone();
         let closed = self.closed.clone();
-        let backend = self.process.backend.clone();
+        let backend = self.reference.backend.clone();
         future_into_py(py, async move {
             let mut state = state.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -246,55 +240,26 @@ impl AsyncProcessHandle {
                     .map(|inner| Some(PyProcessEvent { inner }))
                     .map_err(exception);
             }
-            let Some(events) = state.events.as_mut() else {
-                return Ok(None);
-            };
+            let consume = subscription_event(&mut state, &closed, &backend);
             let event = match timeout {
-                Some(timeout) => {
-                    tokio::time::timeout(timeout, events.next())
-                        .await
-                        .map_err(|_| {
-                            exception(Error::new(
-                                ErrorKind::Timeout,
-                                &backend,
-                                "output",
-                                "output wait timed out",
-                            ))
-                        })?
-                }
-                None => events.next().await,
+                Some(timeout) => tokio::time::timeout(timeout, consume)
+                    .await
+                    .map_err(|_| exception(subscription_timeout(&backend, "output")))?,
+                None => consume.await,
             };
+            // Shared consumption has already recorded completion or terminal closure.
+            // No await separates that native result from reserving its Python delivery;
+            // a timer expiry above leaves both the stream and pending slot untouched.
             match event {
-                Some(Ok(event)) => {
-                    if let ProcessEvent::Completed(outcome) = &event {
-                        state.outcome = Some(outcome.clone());
-                        state.events = None;
-                    }
-                    // No await separates consuming the stream and reserving delivery.
+                Ok(Some(event)) => {
                     *pending.lock().map_err(|_| delivery_lock_error())? = Some(Ok(event.clone()));
                     Ok(Some(PyProcessEvent { inner: event }))
                 }
-                Some(Err(error)) => {
-                    state.events = None;
+                Err(error) => {
                     *pending.lock().map_err(|_| delivery_lock_error())? = Some(Err(error.clone()));
                     Err(exception(error))
                 }
-                None => {
-                    state.events = None;
-                    if state.outcome.is_none() && !closed.load(Ordering::Acquire) {
-                        let error = Error::new(
-                            ErrorKind::Transport,
-                            &backend,
-                            "output",
-                            "subscription ended before process completion",
-                        );
-                        *pending.lock().map_err(|_| delivery_lock_error())? =
-                            Some(Err(error.clone()));
-                        Err(exception(error))
-                    } else {
-                        Ok(None)
-                    }
-                }
+                Ok(None) => Ok(None),
             }
         })
     }
@@ -311,7 +276,7 @@ impl AsyncProcessHandle {
 
     fn _outcome<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
-        let backend = self.process.backend.clone();
+        let backend = self.reference.backend.clone();
         future_into_py(py, async move {
             state
                 .lock()
@@ -324,7 +289,7 @@ impl AsyncProcessHandle {
                         ErrorKind::Transport,
                         &backend,
                         "wait",
-                        "subscription is disconnected; completion is unknown",
+                        "subscription is closed; completion is unknown",
                     ))
                 })
         })
@@ -411,7 +376,12 @@ impl AsyncProcessManager {
             client
                 .spawn(request)
                 .await
-                .map(AsyncProcessHandle::from)
+                .map(|(process, subscription)| {
+                    (
+                        resources::AsyncProcess { inner: process },
+                        AsyncOutputSubscription::from(subscription),
+                    )
+                })
                 .map_err(exception)
         })
     }
@@ -550,7 +520,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AsyncConnection>()?;
     module.add_class::<AsyncLifecycle>()?;
     module.add_class::<AsyncProcessManager>()?;
-    module.add_class::<AsyncProcessHandle>()?;
+    module.add_class::<AsyncOutputSubscription>()?;
     module.add_function(wrap_pyfunction!(_async_connection, module)?)?;
     module.add_function(wrap_pyfunction!(_async_lifecycle, module)?)?;
     module.add_function(wrap_pyfunction!(_async_processes, module)?)?;

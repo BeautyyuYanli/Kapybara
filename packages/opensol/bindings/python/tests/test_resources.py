@@ -3,6 +3,8 @@
 import asyncio
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 
 import opensol as sdk
@@ -31,43 +33,72 @@ class ResourceTests(unittest.TestCase):
         self.assertIsInstance(info, sdk.ManagerInfo)
         self.assertTrue(info.client_version.startswith("4."))
         self.assertIsNone(info.server_version)
-        self.assertTrue(self.manager.capabilities()["output_resource"])
-        handle = self.manager.spawn(["python3", "-c",
+        process, handle = self.manager.spawn(["python3", "-c",
                                      "import sys; sys.stdout.buffer.write(b'\\x00\\xffout'); sys.exit(7)"])
-        process = self.manager.get(handle.process)
+
         self.assertIsInstance(process, sdk.Process)
-        self.assertEqual(process.ref.id, handle.process.id)
+        self.assertIsInstance(process.output, sdk.Output)
+        self.assertIsInstance(process.terminal, sdk.Terminal)
+        self.assertEqual(process.output.capabilities(), dict(read=True, tail=True, subscribe=True,
+                                                           historical_output=True, streaming_output=False))
+        self.assertEqual(process.terminal.capabilities(), dict(read=False, tail=False, screen=False))
+        self.assertIsInstance(handle, sdk.OutputSubscription)
+        self.assertEqual(process.ref.id, handle.ref.id)
+        for bound in (process, handle):
+            with self.assertRaises(AttributeError):
+                bound.ref = sdk.ProcessRef("pueue", "other")
+        for name in ("output", "terminal"):
+            with self.assertRaises(AttributeError):
+                setattr(process, name, None)
         self.assertEqual(process.wait(timeout=5).exit.code, 7)
         self.assertEqual(process.inspect().outcome.native_result, "Failed")
         self.assertEqual(handle.wait().native_result, "Failed")
         self.assertIn(process.ref.id, [item.process.id for item in self.manager.list()])
-        output = process.output
-        self.assertIsInstance(output, sdk.ProcessOutput)
-        info = output.stat()
-        self.assertIsInstance(info, sdk.OutputInfo)
-        self.assertEqual((info.channels, info.size), (["combined"], 5))
-        self.assertIsNotNone(info.version)
-        first = output.read(limit=2)
+        first = process.output.read(max_bytes=2)
         self.assertIsInstance(first, sdk.OutputPage)
         self.assertIsInstance(first.chunks[0], sdk.OutputChunk)
         self.assertEqual(data(first), b"\x00\xff")
-        self.assertFalse(first.at_end)
-        saved = sdk.OutputCursor(first.next_cursor.value)
+        self.assertFalse(first.at_tail)
+        self.assertIs(first.at_head, True)
+        saved = sdk.OutputCursor(first.after.value)
         self.assertEqual(str(saved), saved.value)
-        second = output.read(cursor=saved)
+        second = process.output.read(cursor=saved)
         self.assertEqual(data(second), b"out")
-        self.assertTrue(second.at_end)
-        self.assertEqual(data(output.read(cursor=saved)), b"out")
-        self.assertEqual(data(output.read(cursor=second.next_cursor)), b"")
-        replay, outcome = test_sdk.collect(output.subscribe())
+        self.assertTrue(second.at_tail)
+        self.assertIs(second.at_head, False)
+        self.assertEqual(data(process.output.read(cursor=second.before, direction="backward")), b"\x00\xff")
+        tail = process.output.tail(max_bytes=2)
+        self.assertEqual(data(tail), b"ut")
+        self.assertEqual(data(process.output.read(direction="backward", max_bytes=2)), b"ut")
+        self.assertEqual(data(process.output.read(cursor=tail.before, direction="backward", max_bytes=3)), b"\x00\xffo")
+        self.assertEqual(data(process.output.read(cursor=first.before, direction="backward")), b"")
+        for name, value in (("before", None), ("after", None), ("at_head", False), ("at_tail", False)):
+            with self.assertRaises(AttributeError):
+                setattr(first, name, value)
+        self.assertEqual(data(process.output.read(cursor=saved)), b"out")
+        self.assertEqual(data(process.output.read(cursor=second.after)), b"")
+        replay, outcome = test_sdk.collect(process.output.subscribe())
         self.assertEqual(test_sdk.combined_output(replay), b"\x00\xffout")
         self.assertEqual(outcome.exit.code, 7)
-        self.assertEqual(data(output.read(cursor=saved)), b"out", "subscription must not move saved cursors")
-        for limit in (0, -1, 1048577):
-            with self.subTest(limit=limit), self.assertRaises(sdk.InvalidArgumentError):
-                output.read(limit=limit)
+        self.assertEqual(data(process.output.read(cursor=saved)), b"out", "subscription must not move saved cursors")
+        for limit in (0, -1, 1048577, 1 << 100, True, 1.5):
+            with self.subTest(max_bytes=limit), self.assertRaises(sdk.InvalidArgumentError):
+                process.output.read(max_bytes=limit)
+            with self.assertRaises(sdk.InvalidArgumentError):
+                process.output.tail(max_bytes=limit)
         with self.assertRaises(sdk.InvalidArgumentError):
-            output.read(cursor=sdk.OutputCursor("bad cursor"))
+            process.output.read(direction="sideways")
+        with self.assertRaises(TypeError):
+            process.output.read(cursor=sdk.TerminalCursor(saved.value))
+        with self.assertRaises(TypeError):
+            process.terminal.read(cursor=saved)
+        import json
+        token = json.loads(saved.value)
+        token["representation"] = "terminal"
+        with self.assertRaises(sdk.ConflictError):
+            process.output.read(cursor=sdk.OutputCursor(json.dumps(token)))
+        with self.assertRaises(sdk.InvalidArgumentError):
+            process.output.read(cursor=sdk.OutputCursor("bad cursor"))
         subprocess.run(["pueue", "--config", str(self.config), "pause", "--group", "default"],
                        check=True, capture_output=True)
         process.restart()
@@ -75,29 +106,31 @@ class ResourceTests(unittest.TestCase):
         self.assertIsNone(process.inspect().outcome)
         self.assertEqual(handle.wait().exit.code, 7, "completion cache belongs to the original subscription")
         with self.assertRaises(sdk.ConflictError):
-            output.read(cursor=saved)
-        self.assertEqual(data(output.read()), b"")
-        self.assertEqual((output.stat().size, output.stat().version), (0, None))
+            process.output.read(cursor=saved)
+        self.assertEqual(data(process.output.read()), b"")
+        queued = process.output.tail()
+        self.assertEqual((data(queued), queued.at_head, queued.at_tail), (b"", True, True))
+        self.assertEqual(queued.before.value, queued.after.value)
         process.start()
         self.assertEqual(process.wait(timeout=5).exit.code, 7)
-        self.assertEqual(data(output.read()), b"\x00\xffout")
+        self.assertEqual(data(process.output.read()), b"\x00\xffout")
         process.remove()
         self.assertEqual(self.manager.list(), [])
         with self.assertRaises(sdk.NotFoundError):
-            output.read(cursor=saved)
+            process.output.read(cursor=saved)
 
     def test_failed_to_spawn_completes_without_exit_or_private_error_text(self):
         sdk.local().exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
         with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
-            handle = self.manager.spawn(["true"], cwd=cwd)
-        process = self.manager.get(handle.process)
+            process, handle = self.manager.spawn(["true"], cwd=cwd)
+
         process.start()
         outcome = process.wait(timeout=5)
         self.assertIsNone(outcome.exit)
         self.assertEqual(outcome.native_result, "FailedToSpawn")
         self.assertEqual(process.inspect().outcome.native_result, "FailedToSpawn")
         output, completed = test_sdk.collect(handle)
-        retained = (self.directory / "task_logs" / f"{handle.process.id}.log").read_bytes()
+        retained = (self.directory / "task_logs" / f"{handle.ref.id}.log").read_bytes()
         self.assertEqual(test_sdk.combined_output(output), retained)
         self.assertIsNone(completed.exit)
         self.assertEqual(completed.native_result, "FailedToSpawn")
@@ -108,16 +141,18 @@ class ResourceTests(unittest.TestCase):
         unavailable = sdk.pueue(sdk.local(), config_file="/no-opensol-config")
         missing = unavailable.get(sdk.ProcessRef("pueue", "123"))
         self.assertEqual(missing.ref.id, "123", "binding must not contact a daemon")
+        self.assertTrue(missing.output.capabilities()["subscribe"])
+        self.assertFalse(missing.terminal.capabilities()["screen"])
         manager = sdk.pueue(sdk.local(), config_file=str(self.config))
-        self.assertFalse(manager.capabilities()["output_resource"])
-        self.assertFalse(manager.capabilities()["terminal_snapshot"])
-        handle = manager.spawn(["sleep", "30"])
-        self.running(handle.process)
-        process = manager.get(handle.process)
+        process, handle = manager.spawn(["sleep", "30"])
+        self.assertFalse(process.output.capabilities()["read"])
+        self.assertFalse(process.terminal.capabilities()["screen"])
+        self.running(handle.ref)
+
         with self.assertRaises(sdk.UnsupportedError):
-            process.output.stat()
+            process.output.tail()
         with self.assertRaises(sdk.UnsupportedError):
-            process.output.snapshot()
+            process.terminal.screen()
         process.pause()
         self.assertEqual(process.inspect().state, "paused")
         process.start()
@@ -125,7 +160,7 @@ class ResourceTests(unittest.TestCase):
             process.restart()
         with self.assertRaises(sdk.ConflictError):
             process.remove()
-        handle.disconnect()
+        handle.close()
         self.assertEqual(process.inspect().state, "running")
         process.kill()
         outcome = process.wait(timeout=5)
@@ -137,6 +172,28 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(replay, [])
         self.assertEqual(completed.native_result, "Killed")
         process.remove()
+
+    def test_wait_timeout_includes_blocking_reader_lock_and_preserves_subscription(self):
+        process, handle = self.manager.spawn(["sleep", "30"])
+        self.running(handle.ref)
+        results = []
+        reader = threading.Thread(target=lambda: results.append(handle.next_event()), daemon=True)
+        reader.start()
+        time.sleep(.05)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(sdk.TimeoutError) as caught:
+                handle.wait(timeout=.05)
+            self.assertLess(time.monotonic() - started, .5)
+            self.assertEqual((caught.exception.backend, caught.exception.operation), ("pueue", "wait"))
+            self.assertEqual(process.inspect().state, "running")
+            self.assertTrue(reader.is_alive())
+        finally:
+            handle.close()
+            reader.join(2)
+            process.kill()
+            process.wait(timeout=5)
+        self.assertEqual(results, [None])
 
 
 class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
@@ -150,8 +207,8 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_to_spawn_is_delivered_and_cached_as_completion(self):
         await aio.local().exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
         with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
-            handle = await self.manager.spawn(["true"], cwd=cwd)
-        process = self.manager.get(handle.process)
+            process, handle = await self.manager.spawn(["true"], cwd=cwd)
+
         await process.start()
         outcome = await process.wait(timeout=5)
         self.assertIsNone(outcome.exit)
@@ -159,7 +216,7 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await process.inspect()).outcome.native_result, "FailedToSpawn")
         from test_async import collect
         output, completed = await collect(handle)
-        retained = (self.directory / "task_logs" / f"{handle.process.id}.log").read_bytes()
+        retained = (self.directory / "task_logs" / f"{handle.ref.id}.log").read_bytes()
         self.assertEqual(test_sdk.combined_output(output), retained)
         self.assertIsNone(completed.exit)
         self.assertEqual(completed.native_result, "FailedToSpawn")
@@ -170,34 +227,43 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_resources_share_dtos_and_read_running_output(self):
         self.assertIsInstance(await self.manager.probe(), sdk.ManagerInfo)
-        handle = await self.manager.spawn(["python3", "-c",
+        process, handle = await self.manager.spawn(["python3", "-c",
                                           "import sys; sys.stdout.buffer.write(b'\\x00\\xfffirst'); "
                                           "sys.stdout.buffer.flush(); sys.stdin.readline(); "
                                           "sys.stdout.buffer.write(b'last'); sys.exit(7)"])
-        process = self.manager.get(handle.process)
+
         self.assertIsInstance(process, aio.Process)
-        self.assertEqual(process.ref.id, handle.process.id)
+        self.assertIsInstance(handle, aio.OutputSubscription)
+        self.assertEqual(process.ref.id, handle.ref.id)
+        for bound in (process, handle):
+            with self.assertRaises(AttributeError):
+                bound.ref = sdk.ProcessRef("pueue", "other")
+        for name in ("output", "terminal"):
+            with self.assertRaises(AttributeError):
+                setattr(process, name, None)
         deadline = asyncio.get_running_loop().time() + 5
-        while (await process.output.stat()).size < 7:
+        while len(data(await process.output.tail(max_bytes=7))) < 7:
             self.assertLess(asyncio.get_running_loop().time(), deadline)
             await asyncio.sleep(.02)
-        self.assertIsInstance(process.output, aio.ProcessOutput)
-        first = await process.output.read(limit=2)
+        first = await process.output.read(max_bytes=2)
         self.assertIsInstance(first, sdk.OutputPage)
         self.assertEqual(data(first), b"\x00\xff")
-        tail = await process.output.read(cursor=sdk.OutputCursor(first.next_cursor.value))
+        tail = await process.output.read(cursor=sdk.OutputCursor(first.after.value))
         self.assertEqual(data(tail), b"first")
-        self.assertTrue(tail.at_end)
+        self.assertTrue(tail.at_tail)
+        self.assertEqual(data(await process.output.tail(max_bytes=3)), b"rst")
+        backward = await process.output.read(cursor=tail.before, direction="backward", max_bytes=2)
+        self.assertEqual(data(backward), b"\x00\xff")
         self.assertEqual((await process.inspect()).state, "running")
         self.assertIn(process.ref.id, [item.process.id for item in await self.manager.list()])
         with self.assertRaises(sdk.InvalidArgumentError):
-            await process.output.read(limit=0)
+            await process.output.read(max_bytes=0)
         await process.pause()
         self.assertEqual((await process.inspect()).state, "paused")
         await process.start()
         await process.send_input(b"finish\n")
         self.assertEqual((await process.wait(timeout=5)).exit.code, 7)
-        self.assertEqual(data(await process.output.read(cursor=tail.next_cursor)), b"last")
+        self.assertEqual(data(await process.output.read(cursor=tail.after)), b"last")
         replay = await process.output.subscribe()
         from test_async import collect
         chunks, outcome = await collect(replay)
@@ -237,13 +303,14 @@ class EnvdResourceTests(unittest.TestCase):
         info = manager.probe()
         self.assertEqual((info.backend, info.client_version, info.server_version), ("envd", None, None))
         self.assertEqual(manager.list(), [])
-        handle = manager.spawn(["stdin-program"], stdin=True)
-        process = manager.get(handle.process)
+        process, handle = manager.spawn(["stdin-program"], stdin=True)
+
         self.assertEqual([info.process.id for info in manager.list()], [process.ref.id])
         self.assertEqual(process.inspect().state, "running")
         self.assertIsNone(process.inspect().outcome)
         for operation in (process.pause, process.start, process.restart, process.remove,
-                          process.output.stat, process.output.read):
+                          process.output.tail, process.output.read, process.terminal.read,
+                          process.terminal.tail, process.terminal.screen):
             with self.subTest(operation=operation), self.assertRaises(sdk.UnsupportedError):
                 operation()
         process.send_input(b"\x00\xffinput")

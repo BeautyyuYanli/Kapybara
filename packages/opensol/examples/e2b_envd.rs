@@ -28,14 +28,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         std::io::stdout().write_all(&result.stdout)?;
-        let mut handle = native
+        let (process, mut subscription) = native
             .processes()
             .spawn(SpawnRequest::new(Command::shell(
                 "printf 'managed process\\n'",
             )))
             .await?;
-        eprintln!("native process ID: {}", handle.process.id);
-        while let Some(event) = handle.events.next().await {
+        eprintln!("native process ID: {}", process.reference().id);
+        // envd supplies native byte subscriptions, without paginated logs or rendered text.
+        eprintln!("output capabilities: {:?}", process.output().capabilities());
+        while let Some(event) = subscription.events.next().await {
             match event? {
                 ProcessEvent::Output { data, .. } => std::io::stdout().write_all(&data)?,
                 ProcessEvent::Completed(outcome) => eprintln!("completed: {outcome:?}"),

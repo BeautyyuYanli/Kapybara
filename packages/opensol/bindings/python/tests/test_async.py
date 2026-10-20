@@ -30,13 +30,16 @@ async def collect(handle):
     raise AssertionError("stream ended without native completion")
 
 
-async def cancel_before_delivery(handle):
+async def cancel_before_delivery(handle, *, waiting=False):
     """Cancel after a real Rust result is ready, before its Python await resumes."""
     native = handle._native
     observed = []
     reading = None
 
     class CancelOnDelivery:
+        def __getattr__(self, name):
+            return getattr(native, name)
+
         def _reserve(self, **kwargs):
             future = native._reserve(**kwargs)
 
@@ -49,7 +52,7 @@ async def cancel_before_delivery(handle):
             return future
 
     handle._native = CancelOnDelivery()
-    reading = asyncio.create_task(handle.next_event())
+    reading = asyncio.create_task(handle.wait(timeout=2) if waiting else handle.next_event())
     try:
         try:
             await asyncio.wait_for(reading, 2)
@@ -74,8 +77,9 @@ class CoroutineContractTests(unittest.TestCase):
             aio.ProcessManager: ("probe", "list", "spawn"),
             aio.Process: ("inspect", "wait", "pause", "start", "restart", "kill", "remove",
                           "signal", "send_input", "close_stdin", "resize"),
-            aio.ProcessOutput: ("stat", "read", "snapshot", "subscribe"),
-            aio.ProcessHandle: ("next_event", "wait", "aclose", "__anext__"),
+            aio.Output: ("read", "tail", "subscribe"),
+            aio.Terminal: ("read", "tail", "screen"),
+            aio.OutputSubscription: ("next_event", "wait", "aclose", "__anext__"),
             aio.E2b: ("envd",),
         }
         for owner, names in methods.items():
@@ -170,10 +174,10 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_reads_timeouts_and_input_keep_task_and_subscription(self):
         manager = self.manager
         self.assertEqual(set(manager.capabilities()["supported_signals"]), {2, 9, 15})
-        handle = await manager.spawn(
+        process, handle = await manager.spawn(
             ["/bin/sh", "-c", "read -r value; printf '%s' \"$value\"; exit 7"], stdin=True,
         )
-        await self.running(handle.process)
+        await self.running(handle.ref)
         reading = asyncio.create_task(handle.next_event())
         await asyncio.sleep(0.03)
         reading.cancel()
@@ -187,13 +191,13 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sdk.TimeoutError):
             await handle.next_event(timeout=0.02)
         with self.assertRaises(sdk.TimeoutError):
-            await manager.get(handle.process).wait(timeout=0.02)
-        self.assertEqual((await manager.get(handle.process).inspect()).state, "running")
+            await process.wait(timeout=0.02)
+        self.assertEqual((await process.inspect()).state, "running")
         with self.assertRaises(sdk.UnsupportedError):
-            await manager.get(handle.process).close_stdin()
+            await process.close_stdin()
         with self.assertRaises(sdk.UnsupportedError):
-            await manager.get(handle.process).resize(80, 24)
-        restored = sdk.ProcessRef("pueue", handle.process.id)
+            await process.resize(80, 24)
+        restored = sdk.ProcessRef("pueue", handle.ref.id)
         await manager.get(restored).send_input(b"hello '$()\n")
         output, outcome = await collect(handle)
         self.assertTrue(all(channel == "combined" for channel, _ in output))
@@ -202,8 +206,8 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((outcome.exit.code, outcome.native_result), (7, "Failed"))
         self.assertIsNone(await handle.next_event())
         self.assertEqual((await handle.wait()).exit.code, 7)
-        self.assertEqual((await manager.get(handle.process).wait(timeout=2)).exit.code, 7)
-        restored = sdk.ProcessRef(handle.process.backend, handle.process.id)
+        self.assertEqual((await process.wait(timeout=2)).exit.code, 7)
+        restored = sdk.ProcessRef(handle.ref.backend, handle.ref.id)
         replay = await manager.get(restored).output.subscribe()
         replay_output, replay_outcome = await collect(replay)
         self.assertEqual(b"".join(data for _, data in replay_output), b"hello '$()")
@@ -213,8 +217,8 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_unconsumed_subscriptions_reject_new_execution_and_keep_completed_cache(self):
         script = self.directory / "command.sh"
         script.write_text("printf 7; exit 7")
-        initial = await self.manager.spawn(["sh", str(script)])
-        process = self.manager.get(initial.process)
+        process, initial = await self.manager.spawn(["sh", str(script)])
+
         self.assertEqual((await process.wait(timeout=5)).exit.code, 7)
         replay = await process.output.subscribe()
         cached = await process.output.subscribe()
@@ -242,11 +246,11 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
         await removed.aclose()
 
     async def test_cancel_before_delivery_preserves_native_only_completion_and_cache(self):
-        handle = await self.manager.spawn(["sleep", "30"])
-        await self.running(handle.process)
-        await self.manager.get(handle.process).signal(9)
+        process, handle = await self.manager.spawn(["sleep", "30"])
+        await self.running(handle.ref)
+        await process.signal(9)
         # Isolate delivery cancellation from the native CLI's two-second wait polling.
-        await self.manager.get(handle.process).wait(timeout=5)
+        await process.wait(timeout=5)
         observed = await cancel_before_delivery(handle)
         self.assertIsNone(observed.outcome.exit)
         self.assertEqual(observed.outcome.native_result, "Killed")
@@ -263,21 +267,21 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
         await handle.aclose()
 
     async def test_aclose_wakes_reader_without_signalling_and_is_idempotent(self):
-        handle = await self.manager.spawn(["sleep", "10"])
-        await self.running(handle.process)
+        process, handle = await self.manager.spawn(["sleep", "10"])
+        await self.running(handle.ref)
         reading = asyncio.create_task(handle.next_event())
         await asyncio.sleep(0.03)
         await handle.aclose()
         self.assertIsNone(await asyncio.wait_for(reading, 2))
         await handle.aclose()
-        self.assertEqual((await self.manager.get(handle.process).inspect()).state, "running")
+        self.assertEqual((await process.inspect()).state, "running")
         with self.assertRaises(sdk.TransportError):
             await handle.wait()
-        await self.manager.get(handle.process).signal(9)
-        outcome = await self.manager.get(handle.process).wait(timeout=3)
+        await process.signal(9)
+        outcome = await process.wait(timeout=3)
         self.assertIsNone(outcome.exit)
         self.assertEqual(outcome.native_result, "Killed")
-        self.assertIsNone((await self.manager.get(handle.process).inspect()).outcome.exit)
+        self.assertIsNone((await process.inspect()).outcome.exit)
 
 
 class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
@@ -285,17 +289,35 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         test_sdk.EnvdBindingTests.setUp(self)
         self.native = aio.envd(self.endpoint)
 
+    async def test_views_and_unscheduled_io_preserve_native_initial_stream(self):
+        process, initial = await self.native.processes.spawn(["stdin-program"], stdin=True)
+        output, terminal = process.output, process.terminal
+        self.assertIsInstance(output, aio.Output)
+        self.assertIsInstance(terminal, aio.Terminal)
+        self.assertTrue(output.capabilities()["streaming_output"])
+        self.assertFalse(terminal.capabilities()["read"])
+        for coroutine in (output.subscribe(), output.read(), output.tail(), terminal.read(),
+                          terminal.tail(), terminal.screen()):
+            self.assertTrue(inspect.iscoroutine(coroutine))
+            task = asyncio.create_task(coroutine)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual([method for method, _ in self.records], ["Start"])
+        await process.close_stdin()
+        self.assertEqual((await initial.wait(timeout=2)).exit.code, 7)
+
     async def test_initial_stream_and_additional_subscription_use_start_and_connect(self):
         manager = self.native.processes
-        initial = await manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
-        process = manager.get(initial.process)
+        process, initial = await manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+
         self.assertEqual((await initial.next_event(timeout=2)).data, b"\x00\xffterminal")
         self.assertEqual([method for method, _ in self.records], ["Start"])
         restored = sdk.ProcessRef("envd", process.ref.id, pty=True)
         offline = aio.envd("http://127.0.0.1:1").processes.get(restored)
-        self.assertIsInstance(offline.output, aio.ProcessOutput)
+        self.assertIsInstance(offline, aio.Process)
         replay = await manager.get(restored).output.subscribe()
-        self.assertEqual((replay.process.id, replay.process.pty), (restored.id, True))
+        self.assertEqual((replay.ref.id, replay.ref.pty), (restored.id, True))
         self.assertEqual((await replay.next_event(timeout=2)).data, b"\x00\xffterminal")
         await process.send_input(b"\x00\xffreconnected\x04")
         original_output, original_outcome = await collect(initial)
@@ -311,7 +333,7 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         await replay.aclose()
 
     async def test_unexpected_end_is_transport_error_and_never_success(self):
-        handle = await self.native.processes.spawn(["disconnect"])
+        process, handle = await self.native.processes.spawn(["disconnect"])
         observed = await cancel_before_delivery(handle)
         self.assertIsInstance(observed, sdk.TransportError)
         with self.assertRaises(sdk.TransportError):
@@ -320,23 +342,68 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
             await handle.wait()
         await handle.aclose()
 
+    async def test_wait_deadline_spans_continuous_output_and_reader_queue(self):
+        process, handle = await self.native.processes.spawn(["stream-program"], stdin=True)
+        for timeout in (0, -1, float("inf"), float("nan")):
+            with self.assertRaises(sdk.InvalidArgumentError):
+                await handle.wait(timeout=timeout)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with self.assertRaises(sdk.TimeoutError) as caught:
+            await handle.wait(timeout=.12)
+        self.assertLess(loop.time() - started, .8)
+        self.assertEqual((caught.exception.backend, caught.exception.operation), ("envd", "wait"))
+        self.assertEqual((await process.inspect()).state, "running")
+        await process.close_stdin()
+        self.assertEqual((await handle.wait(timeout=2)).exit.code, 7)
+        self.assertEqual((await handle.wait(timeout=1)).exit.code, 7)
+
+        process, queued = await self.native.processes.spawn(["stdin-program"], stdin=True)
+        reader = asyncio.create_task(queued.next_event())
+        await asyncio.sleep(.03)
+        started = loop.time()
+        with self.assertRaises(sdk.TimeoutError):
+            await queued.wait(timeout=.05)
+        self.assertLess(loop.time() - started, .5)
+        self.assertFalse(reader.done())
+        self.assertEqual((await process.inspect()).state, "running")
+        await queued.aclose()
+        self.assertIsNone(await reader)
+
+    async def test_cancelled_wait_retains_undelivered_output_completion_and_errors(self):
+        process, handle = await self.native.processes.spawn(["pty-program"], stdin=True, pty=(80, 24))
+        observed = await cancel_before_delivery(handle, waiting=True)
+        self.assertEqual(observed.data, b"\x00\xffterminal")
+        self.assertEqual((await handle.next_event()).data, observed.data)
+        await process.send_input(b"final\x04")
+        self.assertEqual((await handle.next_event()).data, b"final\x04")
+        completed = await cancel_before_delivery(handle, waiting=True)
+        self.assertEqual(completed.outcome.exit.code, 7)
+        self.assertEqual((await handle.next_event()).outcome.exit.code, 7)
+        self.assertEqual((await handle.wait(timeout=1)).exit.code, 7)
+        _, broken = await self.native.processes.spawn(["disconnect"])
+        error = await cancel_before_delivery(broken, waiting=True)
+        self.assertIsInstance(error, sdk.TransportError)
+        with self.assertRaises(sdk.TransportError):
+            await broken.next_event()
+
     async def test_binary_stdin_exec_and_pty_capabilities(self):
         manager = self.native.processes
         self.assertEqual(set(manager.capabilities()["supported_signals"]), {9, 15})
         data = b"\x00\xff\x80input"
         result = await self.native.connection.exec(["stdin-program"], stdin=data, timeout=3)
         self.assertEqual((result.stdout, result.exit_code), (data, 7))
-        plain = await manager.spawn(["stdin-program"], stdin=True)
-        await manager.get(plain.process).send_input(data)
-        await manager.get(plain.process).close_stdin()
+        plain_process, plain = await manager.spawn(["stdin-program"], stdin=True)
+        await plain_process.send_input(data)
+        await plain_process.close_stdin()
         plain_output, plain_outcome = await collect(plain)
         self.assertEqual(b"".join(data for _, data in plain_output), data)
         self.assertEqual(plain_outcome.exit.code, 7)
         self.assertIsNone(plain_outcome.native_result)
-        handle = await manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
+        process, handle = await manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
         first = await handle.next_event(timeout=2)
         self.assertEqual((first.channel, first.data), ("terminal", b"\x00\xffterminal"))
-        listed = next(info.process for info in await manager.list() if info.process.id == handle.process.id)
+        listed = next(info.process for info in await manager.list() if info.process.id == handle.ref.id)
         self.assertIsNone(listed.pty)
         before = len(self.records)
         unknown = manager.get(listed)
@@ -345,10 +412,10 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(sdk.UnsupportedError):
                 await operation()
         self.assertEqual(len(self.records), before)
-        await manager.get(handle.process).resize(121, 43)
+        await process.resize(121, 43)
         with self.assertRaises(sdk.UnsupportedError):
-            await manager.get(handle.process).signal(2)
-        await manager.get(handle.process).send_input(data + b"\x04")
+            await process.signal(2)
+        await process.send_input(data + b"\x04")
         output, outcome = await collect(handle)
         self.assertEqual(b"".join(data for _, data in output), data + b"\x04")
         self.assertEqual(outcome.exit.code, 7)
@@ -356,12 +423,12 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_after_native_consumption_before_python_delivery_retains_event(self):
         manager = self.native.processes
-        handle = await manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+        process, handle = await manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
         observed = await cancel_before_delivery(handle)
         self.assertEqual(observed.data, b"\x00\xffterminal")
         event = await handle.next_event(timeout=2)
         self.assertEqual((event.channel, event.data), ("terminal", b"\x00\xffterminal"))
-        await manager.get(handle.process).send_input(b"second\x04")
+        await process.send_input(b"second\x04")
         output = []
         while True:
             observed = await cancel_before_delivery(handle)

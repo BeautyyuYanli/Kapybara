@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | `Lifecycle` | `create/inspect/start/stop/delete/fork` | 后端名与不透明资源 ID |
 | `Connection` | `exec`，等待短命令完成 | 字节 stdout/stderr、退出状态 |
-| `ProcessManager` | 原生任务发现与创建；绑定 `Process` 资源 | 后端原生进程 ID 与含初始订阅的 `ProcessHandle` |
+| `ProcessManager` | 原生任务发现、创建与本地绑定 | `(Process, OutputSubscription)`：任务操作与原生初始订阅 |
 
 例如：
 
@@ -34,7 +34,9 @@ Pueue 和 Tmux 包装已有的公共 `Connection`；envd 通过原生 RPC 同时
 | --- | --- |
 | `raw::LifecycleAccess` | `Lifecycle` |
 | `raw::ExecAccess` | `Connection` |
-| `raw::ProcessAccess` | `ProcessManager`、绑定的 `Process` / `ProcessOutput` |
+| `raw::ProcessAccess` | `ProcessManager`、绑定的 `Process` 与 `OutputSubscription` |
+| `raw::OutputAccess` | 原始字节 `Output` |
+| `raw::TerminalAccess` | 原生渲染文本 `Terminal` |
 
 业务客户端是可廉价 clone 的具体类型，通过 `Lifecycle::new(adapter)` 等构造；不要求调用方管理动态 trait 对象。公共入口统一检查参数、引用与已声明能力，适配器负责原生协议、状态、权限和保留策略。第三方后端只需实现对应 raw trait 并包装，无需插件注册、全局状态、配置 DSL 或总控 `Sandbox`。这借鉴 OpenDAL 的 raw Service / 公共 Operator 边界，三类能力仍独立组合。
 
@@ -72,8 +74,10 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 | pause / start | 原生暂停及开始；start 可强制启动排队任务 | 不支持 | 不支持 |
 | restart / remove | 原生原地重启、任务及日志移除 | 不支持 | 仅 dead pane；原生队列内检查，运行中 Conflict |
 | kill | 原生单任务 kill | 原生 SIGKILL | 销毁 pane 和任务；后续 NotFound，没有退出结果 |
-| 有限字节输出查询 | 显式配置 `pueue_directory` 后支持 | 不支持 | 不支持 |
-| terminal_snapshot | 不支持 | 不支持 | 当前渲染屏幕的原生文本字节，无滚动历史或属性转义 |
+| Output.read / tail | 配置 `pueue_directory` 后支持有界双向读取 | 不支持 | 不支持 |
+| Output.subscribe | 完成后交付保留日志 | 原生输出订阅 | 仅 Completed |
+| Terminal.read | 不支持 | 不支持 | 不支持，无可靠稳定游标 |
+| Terminal.tail / screen | 不支持 | 不支持 | 有界滚动历史 / 当前画面，均为原生文本行 |
 
 运行中、可重连、日志可回读、daemon 重启恢复是不同能力。对具体实例调用 `capabilities()`；不要仅根据后端名假定所有操作可用。`supported_signals` 返回明确的信号集合，Python 对应编号列表；生命周期的 `stop_preserves_memory` 仅在 E2B pause 的原生保证下为 true，Docker stop、Kubernetes Suspended 和 OpenShell 为 false。
 
@@ -131,21 +135,25 @@ state、wait 和 Completed 均以原生 pane 生命周期为准：pane Dead/EOF 
 
 restart 只允许 dead pane，保留引用并更新原生执行代次；remove 在同一原生队列内按 dead 条件销毁任务，运行中返回 Conflict。kill 使用 kill-pane，销毁任务和画面，后续查询为 NotFound，不生成退出结果。server 消失返回连接错误，SDK 不恢复进程。
 
-初始与额外订阅在建立时绑定执行代次与原生 pane PID，只交付 Completed，不生成 Output 事件。消费与完成交付前核对代次；可检测的内部/外部 respawn 返回 Conflict，原生清理返回 NotFound。已完成的 Python handle 始终保留首次结果，包括 exit=None，不会随 OS 状态就绪而补填；Process.wait/inspect 查询当前执行，后续可取得已就绪的状态。不承诺检测两次观察间无法分辨的外部修改。轮询没有独立后台任务，关闭或取消订阅不会 kill。
+初始与额外订阅在建立时绑定执行代次与原生 pane PID，只交付 Completed，不生成 Output 事件。消费与完成交付前核对代次；可检测的内部/外部 respawn 返回 Conflict，原生清理返回 NotFound。已完成的 Python 订阅始终保留首次结果，包括 exit=None，不会随 OS 状态就绪而补填；Process.wait/inspect 查询当前执行，后续可取得已就绪的状态。不承诺检测两次观察间无法分辨的外部修改。轮询没有独立后台任务，关闭或取消订阅不会 kill。
 
 输入直接使用 `send-keys -H`，无 UTF-8 或 NUL 限制，不使用 paste buffer 或临时文件。为绕过 tmux 3.5 的 CLI 消息容量限制，一条经过完整身份保护的发送命令由原生 `source-file -` 从 stdin 读取，仍仅执行一次 send-keys；输入能力要求注入 Connection 支持 stdin，Local/SSH/Docker 均支持。空输入不发送按键；单次上限 8192 字节，超过上限在目标 I/O 前返回 InvalidArgument。PTY 行规仍控制目标如何接收字节，应用若需逐字节接收应自行切换 raw 模式。不会把输入解释为额外的 signal 操作，也不会重试结果不确定的输入。
 
 ```python
 # server 已由调用方启动；socket 路径属于 connection 的目标机器。
 manager = sdk.tmux(sdk.local(), socket_path="/tmp/my-tmux.sock")
-handle = manager.spawn(["python3", "-c", "print('terminal')"], pty=(80, 24))
-process = manager.get(handle.process)
+process, subscription = manager.spawn(["python3", "-c", "print('terminal')"], pty=(80, 24))
 print(process.wait(timeout=5).exit)
-screen = process.output.snapshot()  # bytes：当前渲染画面，没有 cursor。
+screen = process.terminal.screen()  # TerminalScreen：实际 cols / rows 和文本行。
+history = process.terminal.tail(lines=200)  # 只读取滚动历史，不含当前画面。
 process.remove()
 ```
 
-`terminal_snapshot=true` 与 output_resource/historical_output/streaming_output 独立。snapshot 使用原生 `capture-pane -p`，返回当前画面的文本字节，不主动读取滚动历史或属性转义。它受尺寸、换行、清屏和重绘影响，不是原始 stdout/stderr 或可追加日志；stat/read 仍为 Unsupported。Pueue/envd 的快照能力默认为 false。
+`process.terminal.capabilities()` 的 tail/screen 为 true、read 为 false；`process.output` 的 read/tail、订阅历史/实时交付声明均为 false。Tmux 订阅只交付 Completed，不合成 Output 字节。Terminal 复用完整任务归属与执行代次/PID 检查；可观察的代次变化或捕获冲突返回 Conflict，任务清理返回 NotFound。
+
+Terminal 使用目标侧 `tmux -u -N -S ... capture-pane -p -N`，保留行尾空格和每条物理渲染行，只按 LF 分隔，不解码控制序列、不合并软换行、不捕获属性转义。screen 返回真实 cols/rows 及恰好 rows 条文本行，宽度由原生渲染列决定。tail 使用 `-S -<lines> -E -1` 的有限历史范围，空历史直接返回空页。两种查询都读取当前活动主屏或备用屏的原生 grid，不读取 copy-mode 浏览画面；备用屏无历史时为空，退出备用屏后恢复主屏，不拼接保存的历史。capture 范围见 [Tmux 3.5a 手册](https://raw.githubusercontent.com/tmux/tmux/3.5a/tmux.1)与[原生实现](https://raw.githubusercontent.com/tmux/tmux/3.5a/cmd-capture-pane.c)。
+
+Tmux tail 的 before/after 均为 None，at_tail 为 true；同次观测可证明覆盖全部保留历史时 at_head 为 true，否则为 false。历史可以增长、淘汰、清除；清屏遵循原生 scroll-on-clear 设置。SDK 不修改该设置、不归档画面，也不使用 pipe-pane、日志文件或常驻采集进程。
 
 ### E2B / envd
 
@@ -206,8 +214,8 @@ assert result.stdout == b"hello\n"
 
 # pueued 由调用方预先启动，SDK 只连接它。
 processes = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml")
-handle = processes.spawn(["python3", "-c", "print('job')"])
-while (event := handle.next_event(timeout=10)) is not None:
+process, subscription = processes.spawn(["python3", "-c", "print('job')"])
+while (event := subscription.next_event(timeout=10)) is not None:
     if event.outcome is not None:
         break
     print(event.channel, event.data)
@@ -226,52 +234,70 @@ async def main():
     print(result.stdout)
     # pueued 和配置文件由调用方提供。
     processes = aio.pueue(aio.local(), config_file="/path/to/pueue.yml")
-    handle = await processes.spawn(["python3", "-c", "print('job')"])
+    process, subscription = await processes.spawn(["python3", "-c", "print('job')"])
     try:
-        async for event in handle:
+        async for event in subscription:
             if event.outcome is None:
                 print(event.channel, event.data)
     finally:
-        await handle.aclose()  # 只关闭订阅；终止进程需显式 signal。
+        await subscription.aclose()  # 只关闭订阅；终止进程需显式 signal。
 
 asyncio.run(main())
 ```
 
-取消 `next_event` 或等待超时后可继续读取，已从 Rust 消费但尚未交付 Python 的一条事件会保留。`wait` 会丢弃输出；`aclose` 可重复调用并唤醒阻塞读取，不终止任务。取消 create/spawn/exec 不表示远端未执行或已停止，也不触发自动重试。详见 [Python 订阅与取消](bindings/python/README.md#输出订阅与取消)；[本地异步示例](examples/async_local.py) 可直接运行。
+取消 `next_event` 或等待超时后可继续读取，已从 Rust 消费但尚未交付 Python 的一条事件或终结错误会保留。`subscription.wait(timeout=...)` 会丢弃输出，使用覆盖消费锁排队和全部事件交付的单一总 deadline；持续输出不会重新计时。`aclose` 可重复调用并唤醒阻塞读取，不终止任务。取消 create/spawn/exec 不表示远端未执行或已停止，也不触发自动重试。详见 [Python 订阅与取消](bindings/python/README.md#输出订阅与取消)；[本地异步示例](examples/async_local.py) 可直接运行。
 
-## 进程与输出资源
+## 进程、Output 与 Terminal
 
-公共 ProcessManager 只负责构造、后端信息、capabilities、probe、list、spawn、get。单任务操作先 `manager.get(ref)`，再使用绑定资源：
+公共 ProcessManager 负责构造、后端信息、capabilities、probe、list、spawn、get。`spawn` 返回任务与初始订阅；已有引用通过 `manager.get(ref)` 本地绑定：
 
 | 对象 | 公共入口 |
 | --- | --- |
-| `Process` | 引用与 output、inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize |
-| `ProcessOutput` | snapshot、stat、read、subscribe |
-| `ProcessHandle` | 一次输出订阅及其 ProcessRef；Rust 使用 events / wait_events，Python 使用 next_event / wait / disconnect 或 aclose |
+| `Process` | 引用、inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize；只读 output、terminal |
+| `Output` | capabilities、read、tail、subscribe；带 channel 的原始 bytes |
+| `Terminal` | capabilities、read、tail、screen；上游已渲染的文本行 |
+| `OutputSubscription` | 一次输出订阅及其引用；Rust 使用 reference、events / wait_events，Python 使用 ref、next_event / wait / close 或 aclose |
 
-`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。spawn 返回带初始输出订阅的 ProcessHandle，尤其保留 envd Start 的原始流。绑定 Process 不消费该订阅。
+`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均可调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。公共 `spawn` 返回 `(Process, OutputSubscription)`，两者绑定同一引用，保留 envd Start 的原始流及 Pueue/Tmux 初始执行标识，不增加 probe、状态查询或重连。Python 的 Process 和订阅均通过只读 `.ref` 返回 ProcessRef；Rust 分别使用 `reference()` 和 `reference`。
+
+属性、视图构造及 capabilities 只做本地绑定，不 probe、查询、重连或采集。aio 的属性同步返回视图，I/O 方法都是 coroutine。Output 的 terminal channel 仍表示可含终端控制序列的 PTY 原始字节，与 Terminal 的文本表示独立；SDK 不在两种表示之间转换。
+
+`raw::ProcessAccess` 的单任务操作继续接受 ProcessRef；spawn 直接保留原生初始订阅，二元组由公共 manager 本地组装。同步 output_access / terminal_access 钩子 clone 既有原生客户端，为视图提供独立的 `raw::OutputAccess` / `raw::TerminalAccess`。未供应 access 时也能取得视图，能力全 false，I/O 为 Unsupported。第三方可用 `Output::new(access, reference)` 或 `Terminal::new(access, reference)` 直接包装一种表示，无需实现另一种表示或 ProcessManager。
 
 ```python
 manager = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml",
                     pueue_directory="/path/to/pueue-data")
 print(manager.probe().client_version)
-handle = manager.spawn(["python3", "-c", "print('managed')"])
-process = manager.get(handle.process)
-page = process.output.read(limit=65536)
+process, subscription = manager.spawn(["python3", "-c", "print('managed')"])
+page = process.output.read(max_bytes=65536)
 for chunk in page.chunks:
     print(chunk.channel, chunk.data)
-saved_cursor = page.next_cursor.value  # 可由应用保存
+saved_cursor = page.after.value  # 可由应用保存
 next_page = process.output.read(cursor=sdk.OutputCursor(saved_cursor))
-print(process.inspect().state, next_page.at_end)
+previous_page = process.output.read(cursor=next_page.before, direction="backward")
+last_page = process.output.tail(max_bytes=4096)
+print(process.inspect().state, next_page.at_tail)
 ```
 
-`process.output.stat/read` 查询绑定任务的原生日志；`process.output.subscribe()` 是建立额外订阅的唯一公共入口，检查 reconnect 能力并调用原生重连，返回独立 ProcessHandle。订阅不要求 output_resource 能力，消费订阅不推进 cursor。共享引用校验与能力检查保留在 Rust 内部；适配器的 raw::ProcessAccess 引用接口保持独立。
+两种表示分别查询能力。OutputCapabilities 的 read/tail/subscribe 独立；historical_output/streaming_output 只声明订阅交付，不代表分页。Pueue 配置目录时 read/tail 为 true，订阅为历史 true、实时 false；未配置目录时仍可订阅。envd 只有订阅及实时声明为 true，遵循原生保留窗口。Tmux 只有 Output.subscribe 和 Terminal.tail/screen 为 true。subscribe=true 不承诺历史重放、实时或无丢失重连。额外订阅只调用原生 Connect/重连，不 spawn，不丢弃初始 Start 流。
 
-`process.wait()` 查询原生任务的完成状态；Python `handle.wait()` 消费并缓存该次订阅的完成结果。Pueue 的初始与额外订阅在建立时绑定可观测的原生执行，延迟消费也不跟随任务 ID 的重启或替换；wait/follow 前后发现执行改变返回 Conflict，任务清理返回 NotFound。正常的同一 Queued 执行开始仍可消费，已经交付的完成缓存继续属于原来的执行；SDK 不归档被替换的旧日志。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
+`process.wait()` 查询原生任务的完成状态；Python `subscription.wait()` 消费并缓存该次订阅的完成结果。Pueue 的初始与额外订阅在建立时绑定可观测的原生执行，延迟消费也不跟随任务 ID 的重启或替换；wait/follow 前后发现执行改变返回 Conflict，任务清理返回 NotFound。正常的同一 Queued 执行开始仍可消费，已经交付的完成缓存继续属于原来的执行；SDK 不归档被替换的旧日志。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
 
-输出页保留原始 bytes 和 channel，Pueue 只有 Combined。默认 64 KiB，允许 1 字节至 1 MiB；读取立即返回当前观测范围，不等待后续输出或终结。`at_end` 只表示读到该次观测的尾部，进程是否终结单独 inspect。`OutputInfo.version` 是后端可提供的不透明输出代次标识，None 只表示没有可报告的标识，任务状态由 ProcessInfo 表达。cursor 绑定目标、任务、执行和文件版本，不含凭据或可指定的文件路径；只把它作为不透明字符串保存。在同一版本从同一位置可重读，新增字节是否进入这一页取决于该次观测的大小。
+OutputPage 包含 chunks、before/after、at_head/at_tail；TerminalPage 对应 lines 和 TerminalCursor。before/after 是本页前后边界：after 向前、before 向后读取相邻内容且不重复；反向页内仍按原生顺序返回。无 cursor 时 forward 从保留头部、backward 从本次观测尾部开始；tail 直接取得最后一页，不依赖 read 能力。空且已知位置的页允许两个边界相同，不能证明位置时边界为 None。at_head 无法确认时为 None，at_tail 只表示本次观测尾部，与任务完成无关。
 
-Pueue 尚未开始的任务返回空页、size=0、version=None，不读可能残留的上次日志；同一 Queued 执行的初始空 cursor 可以在其开始后继续使用，无法确认同次执行的状态转换返回 Conflict。原地重启、可检测的文件替换/截断返回 Conflict，原生任务/日志清理返回 NotFound，非法 cursor/limit 返回 InvalidArgument；SDK 不静默回到开头。文件身份和大小检查无法提供截断后在两次请求间重新写长的完整历史保证，外部修改原生日志后应重新查询。新接口不启动后台采集或持久化存储，也不安装/启停 pueued/envd。
+Output 默认 65,536 字节，整数范围 1–1,048,576，限制全部 chunks 合计字节数；Terminal 默认 200 行，整数范围 1–10,000。公共边界在目标 I/O 前校验大小和方向，目标侧有界读取，立即返回，不先下载全量再切片。OutputCursor / TerminalCursor 是不同类型，可保存 value；编码绑定目标、任务、执行、表示及可观察的文件身份与大小，不携带凭据，也不能选择目标路径。格式非法返回 InvalidArgument，可检测的不相容变化返回 Conflict，原生任务/日志清理返回 NotFound，不重置到开头或跳过缺失数据。
+
+Pueue 页保持 Combined bytes，通过同一 Connection 在同一打开的日志描述符上 stat/dd，观察大小后计算正向、反向或尾部范围；请求前后核对执行与原生身份。尚未开始的任务返回空页，不读上次残留日志；同一 Queued 执行的初始空 cursor 可以在其开始后继续使用，无法确认同次执行的转换返回 Conflict。文件身份和大小无法检测两次请求之间截断后重新写长的全部历史，也无法识别完整克隆目标。SDK 不归档被上游清除的数据，不增加输出保留缓冲、终端解释器、后台采集、持久化或 daemon 管理。
+
+Rust 使用相同 DTO 和 `ReadDirection`，大小显式传入：
+
+```rust,ignore
+let output = process.output();
+let page = output.read(None, ReadDirection::Forward, 65_536).await?;
+let previous = output.read(page.before.as_ref(), ReadDirection::Backward, 65_536).await?;
+let last = output.tail(4096).await?;
+let screen = process.terminal().screen().await?;
+```
 
 ## 生成与验证
 
