@@ -360,6 +360,14 @@ impl PySandboxInfo {
         }
     }
     #[getter]
+    fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+    #[getter]
+    fn labels(&self) -> BTreeMap<String, String> {
+        self.inner.labels.clone()
+    }
+    #[getter]
     fn state(&self) -> String {
         serde_json::to_value(self.inner.state)
             .expect("state is serializable")
@@ -758,7 +766,7 @@ impl PyProcessManager {
     }
 
     #[pyo3(signature = (argv, *, cwd=None, env=None, stdin=false, pty=None))]
-    /// Create a bound task; its first output subscription takes the native initial stream.
+    /// Create a bound task, preserving an indispensable Start stream only on envd.
     fn spawn(
         &self,
         py: Python<'_>,

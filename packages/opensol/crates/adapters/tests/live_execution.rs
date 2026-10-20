@@ -527,6 +527,61 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
 }
 
 #[tokio::test]
+async fn real_pueue_first_subscriptions_observe_restarts_through_all_bound_views() {
+    let (daemon, manager) = pueue_fixture().await;
+    let script = daemon._directory.path().join("command.sh");
+    for restart in ["process", "rebound", "native"] {
+        std::fs::write(&script, "printf 7; exit 7").unwrap();
+        let process = manager
+            .spawn(SpawnRequest::new(Command::new(
+                "sh",
+                [script.to_str().unwrap()],
+            )))
+            .await
+            .unwrap();
+        let output = process.output();
+        let cloned = process.clone();
+        let rebound = manager.get(process.reference().clone());
+        process.wait(Some(Duration::from_secs(5))).await.unwrap();
+        std::fs::write(&script, "printf 9; exit 9").unwrap();
+        match restart {
+            "process" => process.restart().await.unwrap(),
+            "rebound" => rebound.restart().await.unwrap(),
+            _ => {
+                assert!(
+                    NativeCommand::new("pueue")
+                        .args([
+                            "--config",
+                            daemon._directory.path().join("pueue.yml").to_str().unwrap(),
+                            "restart",
+                            "--in-place",
+                            &process.reference().id
+                        ])
+                        .output()
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            }
+        }
+        process.wait(Some(Duration::from_secs(5))).await.unwrap();
+        let cloned_output = cloned.output();
+        let rebound_output = rebound.output();
+        let (a, b, c) = futures::join!(
+            output.subscribe(),
+            cloned_output.subscribe(),
+            rebound_output.subscribe()
+        );
+        for subscription in [a.unwrap(), b.unwrap(), c.unwrap()] {
+            let (bytes, outcome) = collect(subscription.events).await;
+            assert_eq!(combined_output(&bytes), b"9", "restart via {restart}");
+            assert_eq!(outcome.exit.unwrap().code, Some(9));
+        }
+        process.remove().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn real_pueue_delayed_subscriptions_reject_restarts_and_native_cleanup() {
     let (daemon, manager) = pueue_fixture().await;
     let script = daemon._directory.path().join("command.sh");
@@ -1483,7 +1538,12 @@ async fn real_pueue_native_spawn_failure_has_a_result_name_without_a_fabricated_
         .start()
         .await
         .unwrap();
-    await_state(&manager, spawned_handle.reference(), ProcessState::Exited).await;
+    await_state(
+        &manager,
+        spawned_handle.reference(),
+        ProcessState::Completed,
+    )
+    .await;
     let info = manager
         .get(spawned_handle.reference().clone())
         .inspect()
@@ -1711,9 +1771,20 @@ async fn real_docker_lifecycle_exec_and_in_container_pueue() {
     })
     .unwrap();
     let lifecycle = backend.sandboxes();
-    let resource = lifecycle.create(CreateOptions::default()).await.unwrap();
+    let name = format!("opensol-contracts-{}", uuid::Uuid::new_v4());
+    let resource = lifecycle
+        .create(CreateOptions {
+            name: Some(name.clone()),
+            labels: [("project".into(), "native".into())].into(),
+        })
+        .await
+        .unwrap();
     let result = AssertUnwindSafe(async {
-        assert_eq!(resource.inspect().await?.state, SandboxState::Stopped);
+        let inspected = resource.inspect().await?;
+        assert_eq!(inspected.state, SandboxState::Stopped);
+        assert_eq!(inspected.name.as_deref(), Some(name.as_str()));
+        assert_eq!(inspected.labels["project"], "native");
+        assert_eq!(lifecycle.list().await?.into_iter().find(|info| info.sandbox == *resource.reference()).unwrap(), inspected);
         assert!(lifecycle.list().await?.iter().any(|info| info.sandbox == *resource.reference() && info.state == SandboxState::Stopped));
         resource.start().await?;
         assert!(lifecycle.list().await?.iter().any(|info| info.sandbox == *resource.reference() && info.state == SandboxState::Running));

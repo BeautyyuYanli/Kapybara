@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use futures::{StreamExt, executor::block_on, stream};
 use opensol_core::{
     raw::{
-        ConnectionAccess, OutputAccess, ProcessManagerAccess, SandboxManagerAccess, TerminalAccess,
+        ConnectionAccess, OutputAccess, ProcessManagerAccess, SandboxManagerAccess, SpawnedProcess,
+        TerminalAccess,
     },
     *,
 };
@@ -249,21 +250,25 @@ impl ProcessManagerAccess for Backend {
         self.reconnect
             .then(|| Arc::new(self.clone()) as Arc<dyn OutputAccess>)
     }
-    async fn spawn(&self, _request: SpawnRequest) -> Result<OutputSubscription> {
+    async fn spawn(&self, _request: SpawnRequest) -> Result<SpawnedProcess> {
         self.calls.lock().unwrap().push("spawn");
-        Ok(OutputSubscription::new(
-            ProcessRef::new("extension", "task", Some(false)),
-            Box::pin(stream::iter([
-                Ok(ProcessEvent::Output {
-                    channel: OutputChannel::Combined,
-                    data: vec![0xff],
-                }),
-                Ok(ProcessEvent::Completed(ProcessOutcome {
-                    exit: Some(ExitStatus::code(7)),
-                    native_result: None,
-                })),
-            ])),
-        ))
+        let reference = ProcessRef::new("extension", "task", Some(false));
+        Ok(SpawnedProcess {
+            reference: reference.clone(),
+            initial_subscription: Some(OutputSubscription::new(
+                reference,
+                Box::pin(stream::iter([
+                    Ok(ProcessEvent::Output {
+                        channel: OutputChannel::Combined,
+                        data: vec![0xff],
+                    }),
+                    Ok(ProcessEvent::Completed(ProcessOutcome {
+                        exit: Some(ExitStatus::code(7)),
+                        native_result: None,
+                    })),
+                ])),
+            )),
+        })
     }
     async fn list(&self) -> Result<Vec<ProcessInfo>> {
         self.entered("list")
@@ -354,6 +359,9 @@ fn terminal_input_requires_pty_support_without_changing_reference_identity() {
         let terminal = ProcessRef::new("extension", "task", Some(true));
         let bound = manager.get(terminal.clone());
         assert_eq!(bound.reference(), &terminal);
+        let capabilities = bound.capabilities();
+        assert!(!capabilities.stdin && !capabilities.close_stdin && !capabilities.resize);
+        assert!(manager.capabilities().stdin && manager.capabilities().close_stdin);
         assert_eq!(
             bound.send_input(b"text".to_vec()).await.unwrap_err().kind,
             ErrorKind::Unsupported

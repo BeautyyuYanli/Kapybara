@@ -182,7 +182,7 @@ class PueueTests(unittest.TestCase):
         self.assertIsInstance(outcome, sdk.ProcessOutcome)
         self.assertEqual((outcome.exit.code, outcome.native_result), (7, "Failed"))
         restored = sdk.ProcessRef(reference.backend, reference.id)
-        self.assertEqual(self.manager.get(restored).inspect().state, "exited")
+        self.assertEqual(self.manager.get(restored).inspect().state, "completed")
         self.assertEqual(self.manager.get(restored).wait(timeout=2).exit.code, 7)
         replay, replay_outcome = collect(self.manager.get(restored).output.subscribe())
         self.assertEqual(combined_output(replay), b"\x00\xffouterr")
@@ -496,6 +496,14 @@ class EnvdBindingTests(unittest.TestCase):
         unknown = manager.get(listed)
         self.assertEqual(unknown.inspect().state, "running")
         before = len(self.records)
+        self.assertEqual(
+            {key: unknown.capabilities()[key] for key in ("stdin", "binary_stdin", "close_stdin", "pty", "resize")},
+            dict(stdin=False, binary_stdin=False, close_stdin=False, pty=False, resize=False),
+        )
+        self.assertTrue(manager.capabilities()["close_stdin"])
+        self.assertTrue(process.capabilities()["pty"])
+        self.assertFalse(process.capabilities()["close_stdin"])
+        self.assertEqual(manager.get(process.ref).capabilities(), process.capabilities())
         for operation in (lambda: unknown.resize(80, 24),
                           lambda: unknown.send_input(b"input"), unknown.close_stdin):
             with self.assertRaises(sdk.UnsupportedError):
@@ -524,7 +532,8 @@ class DockerTests(unittest.TestCase):
         image = os.environ["OPENSOL_TEST_IMAGE"]
         backend = sdk.docker(image, command=["sleep", "infinity"])
         creator = backend.sandboxes
-        resource = creator.create()
+        name = f"opensol-python-{time.time_ns()}"
+        resource = creator.create(name=name, labels={"project": "python"})
         admin = sdk.docker(image).sandboxes
         try:
             self.assertIsInstance(resource, sdk.Sandbox)
@@ -533,6 +542,15 @@ class DockerTests(unittest.TestCase):
             listed = next(info for info in creator.list() if info.sandbox.id == resource.ref.id)
             self.assertIsInstance(listed, sdk.SandboxInfo)
             self.assertEqual(listed.state, "stopped")
+            self.assertEqual(listed.name, name)
+            self.assertEqual(listed.labels["project"], "python")
+            native_labels = listed.labels
+            listed.labels["project"] = "changed"
+            self.assertEqual(listed.labels, native_labels)
+            self.assertEqual((resource.inspect().name, resource.inspect().labels), (listed.name, listed.labels))
+            for attr, value in (("name", "changed"), ("labels", {})):
+                with self.assertRaises(AttributeError):
+                    setattr(listed, attr, value)
             with self.assertRaises(AttributeError):
                 resource.ref = sdk.SandboxRef("docker", "other")
             self.assertEqual(resource.inspect().state, "stopped")
@@ -581,6 +599,7 @@ class SandboxManagerBindingTests(unittest.TestCase):
                     "sandboxID": "parent",
                     "state": "running",
                     "envdAccessToken": "envd-secret",
+                    "metadata": {"name": "native", "project": "provider"},
                 }
                 status = 200
                 if self.path.endswith("/missing"):
@@ -613,6 +632,8 @@ class SandboxManagerBindingTests(unittest.TestCase):
             self.assertIsInstance(resource, sdk.Sandbox)
             self.assertEqual((resource.ref.backend, resource.ref.id), ("e2b", "parent"))
             self.assertEqual(resource.inspect().state, "running")
+            self.assertEqual((resource.inspect().name, resource.inspect().labels),
+                             ("native", {"name": "native", "project": "provider"}))
             resource.stop()
             resource.start()
             self.assertEqual(resource.fork().ref.id, "child")

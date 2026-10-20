@@ -87,6 +87,8 @@ struct Sandbox {
     domain: Option<String>,
     #[serde(default)]
     envd_access_token: Option<String>,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
 }
 
 impl E2bSandboxManager {
@@ -214,6 +216,8 @@ fn sandbox_info(sandbox: Sandbox) -> SandboxInfo {
     };
     SandboxInfo {
         sandbox: SandboxRef::new("e2b", sandbox.sandbox_id),
+        name: sandbox.metadata.get("name").cloned(),
+        labels: sandbox.metadata,
         state,
         native_state,
     }

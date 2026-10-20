@@ -92,6 +92,7 @@ class CoroutineContractTests(unittest.TestCase):
         for factory in (aio.local, aio.ssh, aio.docker, aio.docker_connection, aio.pueue, aio.tmux,
                         aio.envd, aio.e2b, aio.agent_sandbox):
             self.assertFalse(inspect.iscoroutinefunction(factory))
+        self.assertFalse(inspect.iscoroutinefunction(aio.Process.capabilities))
 
     def test_command_coroutine_can_be_created_before_the_loop(self):
         command = aio.local().exec(["printf", "%s", "scheduled"])
@@ -347,6 +348,11 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         result = await self.native.connection.exec(["stdin-program"], stdin=data, timeout=3)
         self.assertEqual((result.stdout, result.exit_code), (data, 7))
         plain_process = await manager.spawn(["stdin-program"], stdin=True)
+        self.assertEqual(manager.get(plain_process.ref).capabilities(), plain_process.capabilities())
+        self.assertTrue(plain_process.capabilities()["stdin"])
+        self.assertTrue(plain_process.capabilities()["close_stdin"])
+        self.assertFalse(plain_process.capabilities()["pty"])
+        self.assertFalse(plain_process.capabilities()["resize"])
         plain = await plain_process.output.subscribe()
         await plain_process.send_input(data)
         await plain_process.close_stdin()
@@ -362,6 +368,11 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(listed.pty)
         before = len(self.records)
         unknown = manager.get(listed)
+        for capability in ("stdin", "binary_stdin", "close_stdin", "pty", "resize"):
+            self.assertFalse(unknown.capabilities()[capability])
+        self.assertTrue(process.capabilities()["stdin"])
+        self.assertTrue(process.capabilities()["resize"])
+        self.assertFalse(process.capabilities()["close_stdin"])
         for operation in (lambda: unknown.resize(80, 24),
                           lambda: unknown.send_input(b"input"), unknown.close_stdin):
             with self.assertRaises(sdk.UnsupportedError):
@@ -402,13 +413,18 @@ class AsyncDockerTests(unittest.IsolatedAsyncioTestCase):
         backend = aio.docker(os.environ["OPENSOL_TEST_IMAGE"], command=["sleep", "infinity"])
         lifecycle = backend.sandboxes
         self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
-        resource = await lifecycle.create()
+        resource = await lifecycle.create(labels={"project": "async-python"})
         self.assertIsInstance(resource, aio.Sandbox)
         try:
             self.assertTrue(lifecycle.capabilities()["list"])
             listed = next(info for info in await lifecycle.list() if info.sandbox.id == resource.ref.id)
             self.assertIsInstance(listed, sdk.SandboxInfo)
             self.assertEqual(listed.state, "stopped")
+            self.assertTrue(listed.name)
+            self.assertFalse(listed.name.startswith("/"))
+            self.assertEqual(listed.labels["project"], "async-python")
+            inspected = await resource.inspect()
+            self.assertEqual((inspected.name, inspected.labels), (listed.name, listed.labels))
             rebound = lifecycle.get(listed.sandbox)
             self.assertIsInstance(rebound, aio.Sandbox)
             self.assertEqual((await rebound.inspect()).state, "stopped")

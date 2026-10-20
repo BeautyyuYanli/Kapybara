@@ -26,6 +26,23 @@ class ResourceTests(unittest.TestCase):
         self.manager = sdk.pueue(sdk.local(), config_file=str(self.config),
                                  pueue_directory=str(self.directory))
 
+    def test_first_subscription_after_rebound_restart_uses_current_execution(self):
+        script = self.directory / "command.sh"
+        script.write_text("printf 7; exit 7")
+        process = self.manager.spawn(["sh", str(script)])
+        output = process.output
+        process.wait(timeout=5)
+        script.write_text("printf 9; exit 9")
+        self.manager.get(process.ref).restart()
+        self.assertEqual(process.wait(timeout=5).exit.code, 9)
+        chunks, outcome = test_sdk.collect(output.subscribe())
+        self.assertEqual(test_sdk.combined_output(chunks), b"9")
+        self.assertEqual(outcome.exit.code, 9)
+        self.assertEqual(process.inspect().state, "completed")
+        self.assertEqual(process.capabilities(), self.manager.capabilities())
+        self.assertTrue(self.manager.get(sdk.ProcessRef("pueue", process.ref.id)).capabilities()["stdin"])
+        process.remove()
+
     def test_bound_resource_pages_restart_controls_and_retention(self):
         info = self.manager.probe()
         self.assertIsInstance(info, sdk.ManagerInfo)
@@ -183,6 +200,27 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         test_sdk.PueueTests.setUp(self)
         self.manager = aio.pueue(aio.local(), config_file=str(self.config),
                                  pueue_directory=str(self.directory))
+
+    async def test_first_subscription_after_external_restart_uses_current_execution(self):
+        from test_async import collect
+        script = self.directory / "command.sh"
+        script.write_text("printf 7; exit 7")
+        process = await self.manager.spawn(["sh", str(script)])
+        output = process.output
+        await process.wait(timeout=5)
+        script.write_text("printf 9; exit 9")
+        restarted = await aio.local().exec(["pueue", "--config", str(self.config),
+                                            "restart", "--in-place", process.ref.id])
+        self.assertTrue(restarted.success)
+        self.assertEqual((await process.wait(timeout=5)).exit.code, 9)
+        subscription = await output.subscribe()
+        chunks, outcome = await collect(subscription)
+        self.assertEqual(test_sdk.combined_output(chunks), b"9")
+        self.assertEqual(outcome.exit.code, 9)
+        self.assertEqual((await process.inspect()).state, "completed")
+        self.assertEqual(process.capabilities(), self.manager.capabilities())
+        await subscription.aclose()
+        await process.remove()
 
     async def test_failed_to_spawn_is_delivered_as_completion_then_ends(self):
         await aio.local().exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])

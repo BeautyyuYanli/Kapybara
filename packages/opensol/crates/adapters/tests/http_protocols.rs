@@ -110,7 +110,7 @@ fn json_response(status: StatusCode, value: Value) -> Response<Body> {
 }
 
 fn sandbox(id: &str) -> Value {
-    json!({ "sandboxID": id, "templateID": "base", "clientID": "client", "envdVersion": "1.0.0", "envdAccessToken": "envd-secret", "domain": null, "state": "running" })
+    json!({ "sandboxID": id, "templateID": "base", "clientID": "client", "envdVersion": "1.0.0", "envdAccessToken": "envd-secret", "domain": null, "state": "running", "metadata": {"name": "native-name", "project": "native-project"} })
 }
 
 fn frame(flags: u8, payload: &[u8]) -> Vec<u8> {
@@ -333,6 +333,7 @@ fn reply(
                 assert_eq!(token, "page/2+token");
                 let mut value = sandbox("paused");
                 value["state"] = "paused".into();
+                value.as_object_mut().unwrap().remove("metadata");
                 json_response(StatusCode::OK, json!([value]))
             } else {
                 let mut response = json_response(StatusCode::OK, json!([sandbox("parent")]));
@@ -359,6 +360,11 @@ fn reply(
         ),
         ("POST", "/v2/sandboxes") => json_response(StatusCode::CREATED, sandbox("parent")),
         ("GET", "/sandboxes/parent") => json_response(StatusCode::OK, sandbox("parent")),
+        ("GET", "/sandboxes/bad-metadata") => {
+            let mut value = sandbox("bad-metadata");
+            value["metadata"] = json!({"name": 12});
+            json_response(StatusCode::OK, value)
+        }
         ("POST", "/v2/sandboxes/parent/connect") => {
             json_response(StatusCode::CREATED, sandbox("parent"))
         }
@@ -517,6 +523,64 @@ async fn envd_native_framing_bytes_and_finite_stdin() {
 }
 
 #[tokio::test]
+async fn envd_clones_hand_off_start_once_without_prefetch_or_replacing_it_with_connect() {
+    let fixture = Fixture::start().await;
+    let manager = fixture.envd().processes();
+    let process = manager
+        .spawn(SpawnRequest::new(Command::shell("true")))
+        .await
+        .unwrap();
+    let first = process.output();
+    let second = process.clone().output();
+    assert_eq!(fixture.records.lock().unwrap().len(), 1);
+    let (a, b) = futures::join!(first.subscribe(), second.subscribe());
+    let mut a = a.unwrap();
+    let mut b = b.unwrap();
+    assert!(matches!(
+        a.events.next().await.unwrap().unwrap(),
+        ProcessEvent::Output { .. }
+    ));
+    assert!(matches!(
+        b.events.next().await.unwrap().unwrap(),
+        ProcessEvent::Output { .. }
+    ));
+    assert_eq!(
+        opensol_core::wait_events(a.events, "envd")
+            .await
+            .unwrap()
+            .exit
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    assert_eq!(
+        opensol_core::wait_events(b.events, "envd")
+            .await
+            .unwrap()
+            .exit
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    let records = fixture.records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.path.ends_with("/Start"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.path.ends_with("/Connect"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     let fixture = Fixture::start().await;
     let envd = fixture.envd().processes();
@@ -531,10 +595,35 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     assert_eq!(listed.pty, None);
     let unknown = envd.get(listed);
     let before = fixture.records.lock().unwrap().len();
+    assert!(envd.capabilities().stdin && envd.capabilities().close_stdin);
+    let unknown_caps = unknown.capabilities();
+    assert!(!unknown_caps.stdin && !unknown_caps.close_stdin && !unknown_caps.binary_stdin);
+    assert!(!unknown_caps.pty && !unknown_caps.resize);
+    assert!(unknown_caps.kill && unknown_caps.list && unknown_caps.reconnect);
+    let terminal_caps = spawned_handle.capabilities();
+    assert!(
+        terminal_caps.stdin
+            && terminal_caps.binary_stdin
+            && terminal_caps.pty
+            && terminal_caps.resize
+    );
+    assert!(!terminal_caps.close_stdin);
+    assert_eq!(
+        envd.get(spawned_handle.reference().clone()).capabilities(),
+        terminal_caps
+    );
+    let plain = envd.get(ProcessRef::new("envd", "42", Some(false)));
+    let plain_caps = plain.capabilities();
+    assert!(plain_caps.stdin && plain_caps.close_stdin && plain_caps.binary_stdin);
+    assert!(!plain_caps.pty && !plain_caps.resize);
     for error in [
         unknown.send_input(vec![1]).await.unwrap_err(),
         unknown.close_stdin().await.unwrap_err(),
         unknown
+            .resize(PtySize { cols: 80, rows: 24 })
+            .await
+            .unwrap_err(),
+        plain
             .resize(PtySize { cols: 80, rows: 24 })
             .await
             .unwrap_err(),
@@ -772,6 +861,21 @@ async fn e2b_list_collects_native_pages_and_maps_running_and_paused_states() {
     assert!(manager.capabilities().list);
     let listed = manager.list().await.unwrap();
     assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name.as_deref(), Some("native-name"));
+    assert_eq!(
+        listed[0].labels.get("name").map(String::as_str),
+        Some("native-name")
+    );
+    assert_eq!(
+        listed[0].labels.get("project").map(String::as_str),
+        Some("native-project")
+    );
+    assert!(listed[1].name.is_none() && listed[1].labels.is_empty());
+    assert_eq!(
+        fixture.records.lock().unwrap().len(),
+        2,
+        "list must use its own metadata without per-item inspect"
+    );
     assert_eq!(
         (&*listed[0].sandbox.id, listed[0].state),
         ("parent", SandboxState::Running)
@@ -800,22 +904,54 @@ async fn e2b_list_collects_native_pages_and_maps_running_and_paused_states() {
 }
 
 #[tokio::test]
+async fn e2b_rejects_non_string_native_metadata() {
+    let fixture = Fixture::start().await;
+    let mut config = E2bConfig::new(Secret::new("api-secret"), "base");
+    config.api_endpoint = fixture.endpoint.clone();
+    let manager = E2bSandboxManager::new(config).unwrap().sandboxes();
+    assert_eq!(
+        manager
+            .get(SandboxRef::new("e2b", "bad-metadata"))
+            .inspect()
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::Backend
+    );
+}
+
+#[tokio::test]
 async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     let fixture = Fixture::start().await;
     let mut config = E2bConfig::new(Secret::new("api-secret"), "base");
     config.api_endpoint = fixture.endpoint.clone();
     config.envd_endpoint = Some(fixture.endpoint.clone());
+    config.metadata = [
+        ("name".into(), "config-name".into()),
+        ("project".into(), "config-project".into()),
+    ]
+    .into();
     assert!(!format!("{config:?}").contains("api-secret"));
     let backend = E2bSandboxManager::new(config.clone()).unwrap();
     let lifecycle = backend.sandboxes();
     let resource = lifecycle
         .create(CreateOptions {
             name: Some("friendly".into()),
-            ..Default::default()
+            labels: [
+                ("name".into(), "label-name".into()),
+                ("project".into(), "label-project".into()),
+            ]
+            .into(),
         })
         .await
         .unwrap();
     assert_eq!(resource.reference().id, "parent");
+    let inspected = resource.inspect().await.unwrap();
+    assert_eq!(inspected.name.as_deref(), Some("native-name"));
+    assert_eq!(
+        inspected.labels["project"], "native-project",
+        "read native metadata, never cached create options"
+    );
     assert_eq!(
         resource.inspect().await.unwrap().state,
         SandboxState::Running
@@ -859,6 +995,7 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     assert_eq!(creates.len(), 2);
     let create: Value = serde_json::from_slice(&creates[0].body).unwrap();
     assert_eq!(create["metadata"]["name"], "friendly");
+    assert_eq!(create["metadata"]["project"], "label-project");
     assert_eq!(create["autoPauseMemory"], true);
     let fork = records
         .iter()

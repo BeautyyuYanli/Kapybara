@@ -112,7 +112,12 @@ fn docker_error(error: bollard::errors::Error, operation: &str) -> Error {
     Error::new(kind, "docker", operation, "Docker Engine request failed")
 }
 
-fn sandbox_info(sandbox: SandboxRef, native_state: String) -> SandboxInfo {
+fn sandbox_info(
+    sandbox: SandboxRef,
+    native_state: String,
+    name: Option<String>,
+    labels: Option<HashMap<String, String>>,
+) -> SandboxInfo {
     let state = match native_state.as_str() {
         "running" => SandboxState::Running,
         "created" | "exited" | "paused" => SandboxState::Stopped,
@@ -122,6 +127,8 @@ fn sandbox_info(sandbox: SandboxRef, native_state: String) -> SandboxInfo {
     };
     SandboxInfo {
         sandbox,
+        name: name.map(|name| name.strip_prefix('/').unwrap_or(&name).to_owned()),
+        labels: labels.unwrap_or_default().into_iter().collect(),
         state,
         native_state,
     }
@@ -159,6 +166,8 @@ impl SandboxManagerAccess for DockerSandboxManager {
                         .state
                         .map(|state| state.to_string())
                         .unwrap_or_else(|| "unknown".into()),
+                    container.names.and_then(|names| names.into_iter().next()),
+                    container.labels,
                 ))
             })
             .collect()
@@ -207,7 +216,12 @@ impl SandboxManagerAccess for DockerSandboxManager {
             .and_then(|state| state.status)
             .map(|state| state.to_string())
             .unwrap_or_else(|| "unknown".into());
-        Ok(sandbox_info(resource.clone(), native))
+        Ok(sandbox_info(
+            resource.clone(),
+            native,
+            info.name,
+            info.config.and_then(|config| config.labels),
+        ))
     }
 
     async fn start(&self, resource: &SandboxRef) -> Result<()> {

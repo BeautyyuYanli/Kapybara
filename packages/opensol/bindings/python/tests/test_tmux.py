@@ -38,6 +38,10 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
             self.assertFalse(capabilities[name], name)
         self.assertEqual(capabilities["supported_signals"], [])
         bound = missing.get(sdk.ProcessRef("tmux", "opaque-unchecked"))
+        for capability in ("stdin", "binary_stdin", "pty", "resize"):
+            self.assertFalse(bound.capabilities()[capability])
+        with self.assertRaises(sdk.UnsupportedError):
+            bound.send_input(b"input")
         self.assertEqual(bound.output.capabilities(), dict(read=False, tail=False, subscribe=True,
                                                          historical_output=False, streaming_output=False))
         self.assertEqual(bound.terminal.capabilities(), dict(read=False, tail=True, screen=True))
@@ -73,6 +77,10 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         handle = process.output.subscribe()
 
         self.assertIs(process.ref.pty, True)
+        self.assertEqual(process.capabilities(), self.manager.capabilities())
+        unknown_mode = self.manager.get(sdk.ProcessRef("tmux", process.ref.id))
+        self.assertFalse(unknown_mode.capabilities()["stdin"])
+        self.assertFalse(unknown_mode.capabilities()["resize"])
         for _ in range(100):
             if "READY" in "\n".join(process.terminal.screen().lines):
                 break
@@ -108,6 +116,58 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         process.remove()
         with self.assertRaises(sdk.NotFoundError):
             "\n".join(process.terminal.screen().lines)
+
+    def test_pane_completion_precedes_os_exit_and_delivered_outcome_stays_fixed(self):
+        ready = Path(self.directory.name) / "pid"
+        release = Path(self.directory.name) / "release"
+
+        def kill_child():
+            # Ignoring SIGHUP lets the child survive PTY EOF and server teardown.
+            # Kill it explicitly on a timeout or assertion failure, before directory cleanup.
+            if ready.exists():
+                subprocess.run(["kill", "-KILL", ready.read_text()], capture_output=True, timeout=5)
+
+        self.addCleanup(kill_child)
+        process = self.manager.spawn([
+            "python3", "-c",
+            "import os,signal,sys,time; from pathlib import Path\n"
+            "ready,release=map(Path,sys.argv[1:])\n"
+            "temporary=ready.with_suffix('.tmp')\n"
+            "temporary.write_text(str(os.getpid())); temporary.replace(ready)\n"
+            "signal.signal(signal.SIGHUP,signal.SIG_IGN)\n"
+            "os.closerange(0,1024)\n"
+            "while not release.exists(): time.sleep(.01)\n"
+            "os._exit(23)\n",
+            str(ready), str(release),
+        ], pty=(80, 24))
+        subscription = process.output.subscribe()
+        self.addCleanup(subscription.close)
+        deadline = time.monotonic() + 5
+        while not ready.exists():
+            self.assertLess(time.monotonic(), deadline, "native process did not publish its PID")
+            time.sleep(.01)
+        pid = int(ready.read_text())
+
+        # The closed barrier keeps the OS process alive throughout all three completion APIs.
+        outcome = process.wait(timeout=2)
+        info = process.inspect()
+        event = subscription.next_event(timeout=2)
+        os.kill(pid, 0)
+        self.assertEqual(info.state, "completed")
+        for completed in (outcome, info.outcome, event.outcome):
+            self.assertIsNone(completed.exit)
+            self.assertEqual(completed.native_result, "Dead")
+
+        release.touch()
+        deadline = time.monotonic() + 5
+        while (later := process.wait(timeout=2)).exit is None:
+            self.assertLess(time.monotonic(), deadline, "native OS exit status did not arrive")
+            time.sleep(.01)
+        self.assertEqual(later.exit.code, 23)
+        self.assertIsNone(event.outcome.exit)
+        self.assertEqual(event.outcome.native_result, "Dead")
+        self.assertIsNone(subscription.next_event(timeout=1))
+        process.remove()
 
     def test_restart_reconnection_execution_binding_and_external_respawn(self):
         marker = str(Path(self.directory.name) / "execution")

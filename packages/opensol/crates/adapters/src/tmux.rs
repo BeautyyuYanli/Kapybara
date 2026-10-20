@@ -7,7 +7,7 @@
 //! Control requests never start the server, retry side effects, or alter its global options.
 //!
 //! State, wait, and Completed follow the native pane lifecycle. Pane Dead/EOF, OS process exit,
-//! and numeric exit-status readiness can occur separately. The SDK can report Exited and return
+//! and numeric exit-status readiness can occur separately. The SDK can report Completed and return
 //! from wait while the OS process is still working. `exit=None` proves neither success nor OS exit.
 //! Later `Process::wait` / `Process::inspect` calls may obtain the now-available OS status;
 //! a completed Python subscription always keeps its first outcome, including `exit=None`, without
@@ -26,7 +26,7 @@ use opensol_core::{
     OutputCapabilities, OutputSubscription, ProcessEvent, ProcessInfo, ProcessManagerCapabilities,
     ProcessOutcome, ProcessRef, ProcessState, PtySize, Result, SpawnRequest, TerminalCapabilities,
     TerminalPage, TerminalScreen,
-    raw::{OutputAccess, ProcessManagerAccess, TerminalAccess},
+    raw::{OutputAccess, ProcessManagerAccess, SpawnedProcess, TerminalAccess},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -345,7 +345,7 @@ impl Tmux {
         ProcessInfo {
             process: self.reference(&pane.identity),
             state: if dead {
-                ProcessState::Exited
+                ProcessState::Completed
             } else {
                 ProcessState::Running
             },
@@ -529,6 +529,16 @@ impl ProcessManagerAccess for Tmux {
         }
     }
 
+    fn process_capabilities(&self, process: &ProcessRef) -> ProcessManagerCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(self);
+        let terminal = process.pty == Some(true) && self.identity(process, "capabilities").is_ok();
+        capabilities.stdin &= terminal;
+        capabilities.binary_stdin &= terminal;
+        capabilities.pty &= terminal;
+        capabilities.resize &= terminal;
+        capabilities
+    }
+
     fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
         Some(Arc::new(self.clone()))
     }
@@ -584,7 +594,7 @@ impl ProcessManagerAccess for Tmux {
             .collect())
     }
 
-    async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription> {
+    async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedProcess> {
         request.validate("tmux")?;
         let size = request
             .pty
@@ -717,10 +727,10 @@ impl ProcessManagerAccess for Tmux {
             .ok()
             .and_then(|row| self.parse_pane(row.trim_end_matches('\n')))
             .ok_or_else(|| protocol("spawn"))?;
-        let process = self.reference(&pane.identity);
-        // Bind the execution observed in the creation queue, rather than a later rediscovery.
-        let events = self.subscription(pane.identity, pane.execution);
-        Ok(OutputSubscription::new(process, events))
+        Ok(SpawnedProcess {
+            reference: self.reference(&pane.identity),
+            initial_subscription: None,
+        })
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {

@@ -78,7 +78,8 @@ impl std::error::Error for Error {}
 
 pub type Result<Value> = std::result::Result<Value, Error>;
 
-/// Opaque sandbox identity, scoped to the configured provider account/namespace.
+/// Opaque identity within the original manager's target, account, endpoint and namespace/workspace.
+/// It carries neither credentials nor complete routing; backend validation cannot verify that scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxRef {
     pub backend: String,
@@ -119,6 +120,9 @@ pub enum SandboxState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub sandbox: SandboxRef,
+    /// Name and labels from this native response, never SDK creation metadata or a local cache.
+    pub name: Option<String>,
+    pub labels: BTreeMap<String, String>,
     pub state: SandboxState,
     pub native_state: String,
 }
@@ -184,6 +188,7 @@ impl SandboxManager {
         self.require(self.capabilities().list, "list")?;
         self.access.list().await
     }
+    /// Confirms the native create request and binds its result; does not promise readiness.
     pub async fn create(&self, options: CreateOptions) -> Result<Sandbox> {
         if options
             .name
@@ -240,6 +245,8 @@ impl SandboxManager {
 }
 
 /// A locally bound sandbox. State and lifetime remain native to the adapter.
+/// Mutations confirm successful native requests, not readiness or state convergence.
+/// Use inspect for observations; even Running does not guarantee an exec endpoint is reachable.
 #[derive(Clone)]
 pub struct Sandbox {
     manager: SandboxManager,
@@ -265,16 +272,19 @@ impl Sandbox {
     pub async fn inspect(&self) -> Result<SandboxInfo> {
         self.manager.inspect(&self.reference).await
     }
+    /// Confirms the native start request; inspect separately for the backend's running state.
     pub async fn start(&self) -> Result<()> {
         self.manager.start(&self.reference).await
     }
+    /// Confirms the native stop request, without a common state-convergence barrier.
     pub async fn stop(&self) -> Result<()> {
         self.manager.stop(&self.reference).await
     }
+    /// Confirms the native delete request; only a later NotFound confirms disappearance.
     pub async fn delete(&self) -> Result<()> {
         self.manager.delete(&self.reference).await
     }
-    /// Creates a child using the backend's native fork semantics.
+    /// Confirms a native fork and binds the child, without a common readiness guarantee.
     pub async fn fork(&self) -> Result<Sandbox> {
         self.manager.fork(&self.reference).await
     }
@@ -459,7 +469,8 @@ impl Connection {
     }
 }
 
-/// Process identity is opaque and scoped to the manager's target, not necessarily an OS PID.
+/// Identity within the original manager's target, credentials, Connection and adapter configuration;
+/// not a global locator or necessarily an OS PID. Backend validation cannot verify that scope.
 /// `pty` is a mode hint, not identity: `None` means native discovery did not report the mode.
 /// Adapters decide which operations require this hint; it is not authoritative cached state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -540,7 +551,8 @@ pub enum ProcessState {
     Queued,
     Running,
     Paused,
-    Exited,
+    /// The backend's managed task completed; OS exit and an exit status may still be unavailable.
+    Completed,
     Unknown,
 }
 
@@ -548,6 +560,7 @@ pub enum ProcessState {
 /// At least one field must be present. Neither a missing exit nor a native result implies success.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProcessOutcome {
+    /// Only native evidence of an OS exit code or signal; absence does not prove OS exit.
     pub exit: Option<ExitStatus>,
     /// Native result name only, never the provider's error body or task environment.
     pub native_result: Option<String>,
@@ -717,8 +730,9 @@ impl Output {
         require(self.capabilities().tail, self.backend(), "tail_output")?;
         self.access.tail(&self.reference, max_bytes).await
     }
-    /// Takes the unconsumed spawn stream once; later calls open independent native subscriptions.
-    /// Process/output clones share that single initial stream. No output is prefetched or archived.
+    /// Binds the native execution observable while this subscription is established.
+    /// Only nonreplaceable executions may supply an indispensable spawn stream, handed off once
+    /// across Process/Output clones. No output is prefetched or archived; extra calls subscribe anew.
     pub async fn subscribe(&self) -> Result<OutputSubscription> {
         self.reference
             .validate(self.backend(), "subscribe_output")?;
@@ -897,6 +911,7 @@ impl ProcessManager {
     pub fn backend(&self) -> &'static str {
         self.access.backend()
     }
+    /// Configured backend upper bound, not a guarantee for every discovered ProcessRef.
     pub fn capabilities(&self) -> ProcessManagerCapabilities {
         self.access.capabilities()
     }
@@ -911,17 +926,17 @@ impl ProcessManager {
         self.require(self.capabilities().list, "list")?;
         self.access.list().await
     }
-    /// Returns a bound task retaining its native initial stream for the first output subscription.
+    /// Binds the new task, retaining only an indispensable, nonreplaceable native Start stream.
     pub async fn spawn(&self, request: SpawnRequest) -> Result<Process> {
         request.validate(self.backend())?;
         let capabilities = self.capabilities();
         self.require(!request.stdin || capabilities.stdin, "spawn")?;
         self.require(request.pty.is_none() || capabilities.pty, "spawn")?;
-        let subscription = self.access.spawn(request).await?;
+        let spawned = self.access.spawn(request).await?;
         Ok(Process {
             manager: self.clone(),
-            reference: subscription.reference.clone(),
-            initial_subscription: Arc::new(Mutex::new(Some(subscription))),
+            reference: spawned.reference,
+            initial_subscription: Arc::new(Mutex::new(spawned.initial_subscription)),
         })
     }
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
@@ -939,47 +954,48 @@ impl ProcessManager {
     }
     async fn pause(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "pause")?;
-        self.require(self.capabilities().pause, "pause")?;
+        self.require(self.access.process_capabilities(process).pause, "pause")?;
         self.access.pause(process).await
     }
     async fn start(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "start")?;
-        self.require(self.capabilities().start, "start")?;
+        self.require(self.access.process_capabilities(process).start, "start")?;
         self.access.start(process).await
     }
     async fn restart(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "restart")?;
-        self.require(self.capabilities().restart, "restart")?;
+        self.require(self.access.process_capabilities(process).restart, "restart")?;
         self.access.restart(process).await
     }
     async fn kill(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "kill")?;
-        self.require(self.capabilities().kill, "kill")?;
+        self.require(self.access.process_capabilities(process).kill, "kill")?;
         self.access.kill(process).await
     }
     async fn remove(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "remove")?;
-        self.require(self.capabilities().remove, "remove")?;
+        self.require(self.access.process_capabilities(process).remove, "remove")?;
         self.access.remove(process).await
     }
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
         process.validate(self.backend(), "send_input")?;
-        let capabilities = self.capabilities();
+        let capabilities = self.access.process_capabilities(process);
         self.require(capabilities.stdin, "send_input")?;
-        self.require(process.pty != Some(true) || capabilities.pty, "send_input")?;
         self.access.send_input(process, data).await
     }
     async fn close_stdin(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "close_stdin")?;
-        let capabilities = self.capabilities();
+        let capabilities = self.access.process_capabilities(process);
         self.require(capabilities.close_stdin, "close_stdin")?;
-        self.require(process.pty != Some(true) || capabilities.pty, "close_stdin")?;
         self.access.close_stdin(process).await
     }
     async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
         process.validate(self.backend(), "signal")?;
         self.require(
-            self.capabilities().supported_signals.contains(&signal),
+            self.access
+                .process_capabilities(process)
+                .supported_signals
+                .contains(&signal),
             "signal",
         )?;
         self.access.signal(process, signal).await
@@ -987,9 +1003,8 @@ impl ProcessManager {
     async fn resize(&self, process: &ProcessRef, size: PtySize) -> Result<()> {
         process.validate(self.backend(), "resize")?;
         size.validate(self.backend(), "resize")?;
-        let capabilities = self.capabilities();
+        let capabilities = self.access.process_capabilities(process);
         self.require(capabilities.resize, "resize")?;
-        self.require(process.pty != Some(true) || capabilities.pty, "resize")?;
         self.access.resize(process, size).await
     }
     fn require(&self, supported: bool, operation: &str) -> Result<()> {
@@ -1026,6 +1041,11 @@ impl Process {
     pub fn reference(&self) -> &ProcessRef {
         &self.reference
     }
+    /// Local mode-aware subset of the manager's capabilities, without probing native state.
+    /// Support does not promise existence, permission, a running task or an open stdin channel.
+    pub fn capabilities(&self) -> ProcessManagerCapabilities {
+        self.manager.access.process_capabilities(&self.reference)
+    }
     pub async fn inspect(&self) -> Result<ProcessInfo> {
         self.manager.status(&self.reference).await
     }
@@ -1044,7 +1064,9 @@ impl Process {
     pub async fn restart(&self) -> Result<()> {
         self.manager.restart(&self.reference).await
     }
-    /// Acceptance does not imply that the process has exited.
+    /// Confirms the native control request, not OS exit or continued task retention.
+    /// Pueue/envd retain results only within native retention windows. Tmux destroys its pane;
+    /// subsequent inspect/wait/subscribe return NotFound, without a synthesized outcome.
     pub async fn kill(&self) -> Result<()> {
         self.manager.kill(&self.reference).await
     }
@@ -1055,8 +1077,7 @@ impl Process {
     pub async fn signal(&self, signal: Signal) -> Result<()> {
         self.manager.signal(&self.reference, signal).await
     }
-    /// Native mode requirements and payload restrictions are checked by the adapter.
-    /// An explicit terminal hint still requires the manager's declared PTY support.
+    /// Checks local process capabilities before dispatch; native payload restrictions still apply.
     pub async fn send_input(&self, data: Vec<u8>) -> Result<()> {
         self.manager.send_input(&self.reference, data).await
     }

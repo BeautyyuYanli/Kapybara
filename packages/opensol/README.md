@@ -42,7 +42,9 @@ Pueue 和 Tmux 包装已有的公共 `Connection`；envd 通过原生 RPC 同时
 
 ## 沙盒管理与单个沙盒
 
-`SandboxManager` 提供 backend、capabilities、create、get、list。create 返回绑定的 Sandbox，get(SandboxRef) 只本地绑定，不检查存在性或权限。单个 Sandbox 提供只读 ref，以及 inspect、start、stop、delete、fork；fork 返回新的 Sandbox。Rust 使用 `sandbox.reference()`，Python 使用 `sandbox.ref`。SandboxInfo 的 sandbox 字段是 SandboxRef，另有 state、native_state。绑定、clone 和丢弃对象都不改变原生沙盒生命周期。
+`SandboxManager` 提供 backend、capabilities、create、get、list。create 返回绑定的 Sandbox，get(SandboxRef) 只本地绑定，不检查存在性或权限。单个 Sandbox 提供只读 ref，以及 inspect、start、stop、delete、fork；fork 返回新的 Sandbox。Rust 使用 `sandbox.reference()`，Python 使用 `sandbox.ref`。SandboxInfo 的 sandbox 字段是 SandboxRef，另有 name、labels、state、native_state。绑定、clone 和丢弃对象都不改变原生沙盒生命周期。
+
+create/start/stop/delete/fork 成功只共同承诺对应原生请求成功返回，不提供统一的就绪、状态收敛或资源消失屏障。Docker create 产生停止容器；Kubernetes create 产生 CR，start/stop 修改 desired operatingMode，inspect 只信任当前 generation 的 observed conditions；OpenShell 可能继续 provisioning/starting/deleting；E2B 保留原生创建和内存 pause/resume。需等待状态时使用 inspect：Running 是后端的运行/就绪观察值，exec 端点仍可能因竞争或不可达而失败。带整体 `asyncio.timeout` 的启动、删除轮询见 [Python 范例](bindings/python/README.md#沙盒操作返回时点)及[可运行示例](examples/async_sandbox.py)。
 
 ```python
 import opensol as sdk
@@ -57,12 +59,23 @@ try:
     connection = backend.connection(saved)
     print(connection.exec(["true"]).success)
     for info in manager.list():
-        print(info.sandbox.id, info.state)
+        if info.labels.get("project") == "example":
+            print(info.name, manager.get(info.sandbox).inspect().state)
 finally:
     sandbox.delete()
 ```
 
 list 返回 `list[SandboxInfo]`（Rust 为 Vec），支持情况由 SandboxManagerCapabilities.list 声明。列表范围遵循当前连接和权限，创建配置中的镜像、模板和 labels 不作为隐式过滤条件：Docker 查询当前 Engine 的全部容器（含停止状态）；agent-sandbox 查询配置 namespace 的 Sandbox CR；E2B 查询当前 API key 可见的 running/paused 沙盒；OpenShell 查询配置 workspace。E2B 和 OpenShell 自动读取全部原生分页，错误不返回截断的成功列表；列表与后续 inspect 之间的状态变化由原生后端决定。E2B 的 GET /v2/sandboxes、state、nextToken 和 X-Next-Token 遵循[上游 OpenAPI](https://github.com/e2b-dev/E2B/blob/main/spec/openapi.yml)。
+
+name/labels 仅来自本次原生 list/inspect 响应；缺少 name 为 None，缺少标签为空映射，不从创建请求回填，也不在 list 后逐项 inspect。Python 属性只读，labels 每次返回副本。
+
+| 后端 | name | labels |
+| --- | --- | --- |
+| Docker | inspect Name / list 原生容器名称，移除开头 `/` | Config.Labels / list Labels |
+| agent-sandbox、OpenShell | metadata.name | metadata.labels |
+| E2B | metadata["name"] | 原生 metadata 全部项，含 name |
+
+E2B create 依次合并配置 metadata 和 CreateOptions.labels，显式 name 最后覆盖 metadata["name"]；读取同样映射，但名称不保证唯一。SandboxRef/ProcessRef 只在原管理器配置作用域有效：恢复时需相同目标、账号/凭据范围、endpoint、namespace/workspace、Connection 及相关配置。引用不携带凭据或完整路由，backend 校验不能证明目标相同。
 
 适配器分别实现 raw::SandboxManagerAccess、raw::ConnectionAccess、raw::ProcessManagerAccess；raw 沙盒操作接受 SandboxRef，create/fork 返回 SandboxRef，公共管理器将其绑定成 Sandbox。
 
@@ -100,12 +113,15 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 | pause / start | 原生暂停及开始；start 可强制启动排队任务 | 不支持 | 不支持 |
 | restart / remove | 原生原地重启、任务及日志移除 | 不支持 | 仅 dead pane；原生队列内检查，运行中 Conflict |
 | kill | 原生单任务 kill | 原生 SIGKILL | 销毁 pane 和任务；后续 NotFound，没有退出结果 |
+| 完成状态 | Done → Completed，Success/Failed 有真实退出码；Killed/FailedToSpawn 等可无 exit | 原生 End 提供真实退出码 | pane Dead/EOF → Completed；OS 状态可能稍后才可用 |
 | Output.read / tail | 配置 `pueue_directory` 后支持有界双向读取 | 不支持 | 不支持 |
 | Output.subscribe | 完成后交付保留日志 | 原生输出订阅 | 仅 Completed |
 | Terminal.read | 不支持 | 不支持 | 不支持，无可靠稳定游标 |
 | Terminal.tail / screen | 不支持 | 不支持 | 有界滚动历史 / 当前画面，均为原生文本行 |
 
-运行中、可重连、日志可回读、daemon 重启恢复是不同能力。对具体实例调用 `capabilities()`；不要仅根据后端名假定所有操作可用。`supported_signals` 返回明确的信号集合，Python 对应编号列表；生命周期的 `stop_preserves_memory` 仅在 E2B pause 的原生保证下为 true，Docker stop、Kubernetes Suspended 和 OpenShell 为 false。
+运行中、可重连、日志可回读、daemon 重启恢复是不同能力。`manager.capabilities()` 是当前配置的后端能力上限；`process.capabilities()` 按引用中已知模式本地裁剪，返回相同形状，list 等管理器字段仍表达上限。查询不做 I/O，不检查存在性、权限、状态或 stdin 是否仍可用，true 也不保证操作成功。公共任务操作使用同一份裁剪结果，在 I/O 前拒绝不支持的操作。`supported_signals` 返回明确的信号集合，Python 对应编号列表；生命周期的 `stop_preserves_memory` 仅在 E2B pause 的原生保证下为 true，Docker stop、Kubernetes Suspended 和 OpenShell 为 false。
+
+envd 模式 None 时 stdin/binary_stdin/close_stdin/pty/resize 均为 false；False 时允许 stdin/close_stdin，禁用 pty/resize；True 时允许 PTY 输入和 resize，禁用 close_stdin。未知模式不影响 inspect/wait/signal/kill/subscribe；spawn 的已知模式保存在引用中，保存并在原管理器上恢复可保留该提示。Pueue stdin 只需 task ID，未知模式仍可用；Tmux 的输入与 PTY 能力需要完整引用及 pty=True，并保留注入 Connection 的 stdin 上限。模式提示不是权威状态。
 
 `binary_stdin=true` 保证任意字节输入；请求大小限制仍由适配器检查。false 表示存在由适配器检查的字节内容限制。Pueue 在 Connection I/O 前拒绝无效 UTF-8 和 NUL，返回 Unsupported；envd 原样传递 bytes；Tmux 将每个字节经 `send-keys -H` 发送，超过 8192 字节在目标 I/O 前返回 InvalidArgument，由调用方显式拆分。`ProcessRef.pty` 是可保存的可选模式提示，由实际操作的适配器决定是否需要；Pueue send 只需 task ID，envd 输入路由及终端控制需要已知模式。
 
@@ -115,7 +131,8 @@ Docker、agent-sandbox、OpenShell 的 `fork` 返回 `Unsupported`，不以重�
 - SSH 远端和 Pueue 的 CLI/daemon 执行环境需要 `env`，以及支持 `-n 0 --` 的 `/usr/bin/nice`。该固定原生 helper 在环境覆盖后保持优先级不变，并保留包含 `=` 的可执行路径和非 POSIX 环境键；任务 PATH 不影响 helper 定位。
 - `cwd`、`env` 是请求字段，`stdin`、stdout、stderr 都使用字节。PTY、Pueue 合并输出分别标为 `Terminal`、`Combined`，不伪装成分离 stderr。
 - 第二层 `exec` 等待完成，不返回后台任务 ID。Rust 为 async I/O，Python 根入口为释放 GIL 的阻塞调用，`opensol.aio` 将同一 Rust Future 接入调用方的 asyncio loop；输出收集到内存，不适合无限输出。
-- 非零退出码属于正常 `ExecResult`，不是传输异常。信号退出可以没有数字退出码。管理任务的 wait 按后端原生任务生命周期确认完成，返回 `ProcessOutcome { exit: Option<ExitStatus>, native_result: Option<String> }`，至少一项可用；是否同时保证 OS 进程退出由具体后端决定。`ProcessInfo.outcome` 在该原生生命周期的非终态为 None，事件为 `Completed(ProcessOutcome)`。`Connection.exec` 继续返回带 ExitStatus 的 ExecResult。
+- 非零退出码属于正常 `ExecResult`，不是传输异常。信号退出可以没有数字退出码。`ProcessState::Completed`（Python/序列化为 `"completed"`）只确认原生受管任务完成。wait 返回 `ProcessOutcome { exit: Option<ExitStatus>, native_result: Option<String> }`，至少一项可用；exit 只保留原生可证实的 OS 退出码或信号，缺少 exit 不能推断成功或 OS 已退出。`ProcessInfo.outcome` 在非终态为 None，事件为 `Completed(ProcessOutcome)`。`Connection.exec` 继续返回带 ExitStatus 的 ExecResult。
+- `Process.kill()` 共同保证原生控制请求成功，不统一保证 OS 已退出或任务仍保留。Pueue/envd 的 inspect/wait 受原生任务保留和结果窗口限制；Tmux 销毁 pane，后续 inspect/wait/subscribe 为 NotFound，无合成 outcome。
 - SDK 错误分为 InvalidArgument、Unsupported、NotFound、Conflict、Permission、Timeout、Transport、Backend，并带 backend/operation。普通错误不回显供应商响应正文、命令输入或凭据。
 - `ExecRequest.timeout=None` 表示不设置整条命令的 SDK deadline；连接建立和原生控制请求仍可以有适配器级超时。零超时无效。
 - 公共客户端在进入适配器前检查 argv、工作目录和环境变量的 NUL 等约束、正超时、PTY 尺寸、输出 limit 和引用后端，并按 capabilities 拒绝不支持的 stdin、PTY、信号和可选操作。输入载荷、模式信息的必要性、状态竞争和 cursor 版本由适配器判断。
@@ -157,11 +174,11 @@ spawn 必须显式提供 PTY 尺寸；缺少 PTY 在创建任何资源前返回 
 
 指定 cwd 时，完整启动 argv 包含进入目录后才 exec 用户 argv 的固定 shell 门槛，任务环境在成功进入目录后应用，仍保留非 POSIX 环境键及包含 `=` 的可执行路径。相对 cwd 使用同一 Connection 目标的 `pwd -P` 解析为绝对路径，保留到后续执行。tmux 原生 chdir 失败会回退 HOME 或 `/`，因此每次初始执行和 restart 都重新进入该绝对目录，失败时实际启动进程以 125 退出，用户命令不会在回退目录执行。OS 退出状态就绪后可由 wait/inspect 读取该结果，不是 spawn 的同步目录预检查。tmux 保存完整启动 argv/cwd/env，后续 restart 不由 SDK 保存或重建任务配置。
 
-state、wait 和 Completed 均以原生 pane 生命周期为准：pane Dead/EOF 时映射 Exited 并可返回完成。pane Dead/EOF、OS 进程退出和数值退出状态就绪可以分离；wait 返回后 OS 进程仍可能继续工作，exit=None 不能推断 OS 进程成功或已退出。wait 轮询原生 pane 状态，超时仅停止等待。可用的真实退出码、原生数字信号以及可确认的 INT/KILL/TERM 名称对应编号保留在 exit，其他原生信号以 `SIG...` 名称保留在 native_result，无可用 OS 状态时仅报告 `Dead`。
+state、wait 和 Completed 均以原生 pane 生命周期为准：pane Dead/EOF 时映射 Completed 并可返回完成。pane Dead/EOF、OS 进程退出和数值退出状态就绪可以分离；wait 返回后 OS 进程仍可能继续工作，exit=None 不能推断 OS 进程成功或已退出。wait 轮询原生 pane 状态，超时仅停止等待。可用的真实退出码、原生数字信号以及可确认的 INT/KILL/TERM 名称对应编号保留在 exit，其他原生信号以 `SIG...` 名称保留在 native_result，无可用 OS 状态时仅报告 `Dead`。
 
 restart 只允许 dead pane，保留引用并更新原生执行代次；remove 在同一原生队列内按 dead 条件销毁任务，运行中返回 Conflict。kill 使用 kill-pane，销毁任务和画面，后续查询为 NotFound，不生成退出结果。server 消失返回连接错误，SDK 不恢复进程。
 
-初始与额外订阅在建立时绑定执行代次与原生 pane PID，只交付 Completed，不生成 Output 事件。消费与完成交付前核对代次；可检测的内部/外部 respawn 返回 Conflict，原生清理返回 NotFound。完成事件只交付一次，之后订阅结束；已交付事件的 outcome（包括 exit=None）保持不变；Process.wait/inspect 查询当前执行，后续可取得已就绪的状态。不承诺检测两次观察间无法分辨的外部修改。轮询没有独立后台任务，关闭或取消订阅不会 kill。
+每次订阅在 subscribe 建立时绑定执行代次与原生 pane PID，只交付 Completed，不生成 Output 事件。消费与完成交付前核对代次；可检测的内部/外部 respawn 返回 Conflict，原生清理返回 NotFound。完成事件只交付一次，之后订阅结束；已交付事件的 outcome（包括 exit=None）保持不变；Process.wait/inspect 查询当前执行，后续可取得已就绪的状态。不承诺检测两次观察间无法分辨的外部修改。轮询没有独立后台任务，关闭或取消订阅不会 kill。
 
 输入直接使用 `send-keys -H`，无 UTF-8 或 NUL 限制，不使用 paste buffer 或临时文件。为绕过 tmux 3.5 的 CLI 消息容量限制，一条经过完整身份保护的发送命令由原生 `source-file -` 从 stdin 读取，仍仅执行一次 send-keys；输入能力要求注入 Connection 支持 stdin，Local/SSH/Docker 均支持。空输入不发送按键；单次上限 8192 字节，超过上限在目标 I/O 前返回 InvalidArgument。PTY 行规仍控制目标如何接收字节，应用若需逐字节接收应自行切换 raw 模式。不会把输入解释为额外的 signal 操作，也不会重试结果不确定的输入。
 
@@ -281,16 +298,16 @@ asyncio.run(main())
 
 | 对象 | 公共入口 |
 | --- | --- |
-| `Process` | 引用、inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize；只读 output、terminal |
+| `Process` | 引用、capabilities、inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize；只读 output、terminal |
 | `Output` | capabilities、read、tail、subscribe；带 channel 的原始 bytes |
 | `Terminal` | capabilities、read、tail、screen；上游已渲染的文本行 |
 | `OutputSubscription` | 一次输出订阅；Rust 使用 events / wait_events，Python 使用 next_event / close 或 aclose |
 
-`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均可调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。公共 `spawn` 只返回 Process，内部保留 envd Start 的原始流及 Pueue/Tmux 初始执行标识，不增加 probe、状态查询或重连。第一次 `process.output.subscribe()` 接管该初始流；Process 和 Output 的 clone 共享这一个待接管的流，后续订阅走原生重连。Python 通过只读 `process.ref` 返回 ProcessRef，Rust 使用 `process.reference()`；订阅不公开任务引用。
+`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均可调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。公共 `spawn` 只返回 Process。Pueue/Tmux 不建立或保存初始订阅，每次 `process.output.subscribe()` 都绑定本次原生可观察的执行，spawn 对象、clone、已有 Output 视图和重新绑定对象遵循相同时点。envd 的执行不可 restart，保留必要 Start 原始流；第一次 subscribe 接管它，Process/Output clone 共享一次移交，并发接管至多一方取得 Start，其余走原生 Connect。两种流的输出覆盖范围遵循原生保留窗口，不承诺相同历史。Python 通过只读 `process.ref` 返回 ProcessRef，Rust 使用 `process.reference()`；订阅不公开任务引用。
 
 属性、视图构造及 capabilities 只做本地绑定，不 probe、查询、重连或采集。aio 的属性同步返回视图，I/O 方法都是 coroutine。Output 的 terminal channel 仍表示可含终端控制序列的 PTY 原始字节，与 Terminal 的文本表示独立；SDK 不在两种表示之间转换。
 
-`raw::ProcessManagerAccess` 的单任务操作继续接受 ProcessRef；spawn 返回原生初始订阅，由公共 manager 保存到 Process。适配器使用 `OutputSubscription::new(reference, events)` 构造订阅，其引用为私有字段。同步 output_access / terminal_access 钩子 clone 既有原生客户端，为视图提供独立的 `raw::OutputAccess` / `raw::TerminalAccess`。未供应 access 时也能取得视图，除尚未接管的初始订阅外，能力为 false，I/O 为 Unsupported。第三方可用 `Output::new(access, reference)` 或 `Terminal::new(access, reference)` 直接包装一种表示，无需实现另一种表示或 ProcessManager。
+`raw::ProcessManagerAccess` 的单任务操作继续接受 ProcessRef；spawn 返回 `raw::SpawnedProcess { reference, initial_subscription }`。执行可替换的后端必须返回 None，不可替换的后端可供应必需的初始流。适配器使用 `OutputSubscription::new(reference, events)` 构造订阅，其引用为私有字段。同步 process_capabilities 钩子只本地缩小管理器能力，公共查询和任务操作共用它；output_access / terminal_access 钩子 clone 既有原生客户端，为视图提供独立 access。未供应视图 access 时，除尚未接管的初始订阅外，能力为 false，I/O 为 Unsupported。第三方可用 `Output::new(access, reference)` 或 `Terminal::new(access, reference)` 独立包装一种表示。
 
 ```python
 manager = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml",
@@ -309,7 +326,7 @@ print(process.inspect().state, next_page.at_tail)
 
 两种表示分别查询能力。OutputCapabilities 的 read/tail/subscribe 独立；historical_output/streaming_output 只声明订阅交付，不代表分页。Pueue 配置目录时 read/tail 为 true，订阅为历史 true、实时 false；未配置目录时仍可订阅。envd 只有订阅及实时声明为 true，遵循原生保留窗口。Tmux 只有 Output.subscribe 和 Terminal.tail/screen 为 true。subscribe=true 不承诺历史重放、实时或无丢失重连。额外订阅只调用原生 Connect/重连，不 spawn，不丢弃初始 Start 流。
 
-`process.wait(timeout=...)` 查询原生任务当前执行的完成状态；订阅通过一次 Completed 事件交付其绑定执行的结果，随后结束。Pueue 的初始与额外订阅在建立时绑定可观测的原生执行，延迟消费也不跟随任务 ID 的重启或替换；wait/follow 前后发现执行改变返回 Conflict，任务清理返回 NotFound。正常的同一 Queued 执行开始仍可消费，已经交付的完成事件继续属于原来的执行；SDK 不归档被替换的旧日志。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
+`process.wait(timeout=...)` 查询原生任务当前执行的完成状态；订阅通过一次 Completed 事件交付其绑定执行的结果，随后结束。Pueue 在每次 subscribe 建立时绑定可观测的原生执行，延迟消费也不跟随任务 ID 的重启或替换；wait/follow 前后发现执行改变返回 Conflict，任务清理返回 NotFound。正常的同一 Queued 执行开始仍可消费，已经交付的完成事件继续属于原来的执行。与原生 restart 并发的 subscribe 可绑定操作期间观察到的执行，不提供跨进程原子快照；restart 已完成后新建订阅观察新执行。SDK 不归档被替换的旧日志。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
 
 OutputPage 包含 chunks、before/after、at_head/at_tail；TerminalPage 对应 lines 和 TerminalCursor。before/after 是本页前后边界：after 向前、before 向后读取相邻内容且不重复；反向页内仍按原生顺序返回。无 cursor 时 forward 从保留头部、backward 从本次观测尾部开始；tail 直接取得最后一页，不依赖 read 能力。空且已知位置的页允许两个边界相同，不能证明位置时边界为 None。at_head 无法确认时为 None，at_tail 只表示本次观测尾部，与任务完成无关。
 

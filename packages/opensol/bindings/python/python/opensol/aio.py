@@ -92,7 +92,10 @@ class SandboxManager:
 
 
 class Sandbox:
-    """Single sandbox operations; dropping this object never deletes the environment."""
+    """Native requests without a common readiness or state-convergence barrier.
+
+    Observe state with inspect; dropping this object never deletes the environment.
+    """
 
     def __init__(self, native: _native.AsyncSandbox) -> None:
         self._native = native
@@ -196,7 +199,7 @@ class ProcessManager:
         stdin: bool = False,
         pty: tuple[int, int] | None = None,
     ) -> Process:
-        """Create a task; its first output subscription takes the native initial stream."""
+        """Create a task, preserving an indispensable Start stream only on envd."""
         return Process(
             await self._native.spawn(argv, cwd=cwd, env=env, stdin=stdin, pty=pty)
         )
@@ -211,6 +214,10 @@ class Process:
     @property
     def ref(self) -> ProcessRef:
         return self._native.ref
+
+    def capabilities(self) -> _native.ProcessManagerCapabilities:
+        """Local mode-aware support, without probing existence, permissions or state."""
+        return self._native.capabilities()
 
     async def inspect(self) -> ProcessInfo:
         return await self._native.inspect()

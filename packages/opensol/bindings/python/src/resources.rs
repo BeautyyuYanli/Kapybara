@@ -429,6 +429,10 @@ pub(super) struct PyProcess {
 }
 #[pymethods]
 impl PyProcess {
+    /// Local mode-aware capabilities; does not probe existence, permissions or native state.
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities(py, self.inner.capabilities())
+    }
     #[getter]
     fn r#ref(&self) -> PyProcessRef {
         PyProcessRef {
@@ -527,6 +531,9 @@ pub(super) struct AsyncProcess {
 }
 #[pymethods]
 impl AsyncProcess {
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities(py, self.inner.capabilities())
+    }
     #[getter]
     fn r#ref(&self) -> PyProcessRef {
         PyProcessRef {

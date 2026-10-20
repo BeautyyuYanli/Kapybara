@@ -267,7 +267,7 @@ async fn native_tasks_preserve_argv_cwd_environment_short_exits_and_ownership() 
     let listed = manager.list().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].process, process.reference().clone());
-    assert_eq!(listed[0].state, ProcessState::Exited);
+    assert_eq!(listed[0].state, ProcessState::Completed);
     assert_eq!(
         server
             .manager()
@@ -461,6 +461,73 @@ async fn native_input_resize_snapshot_and_explicit_destruction() {
     assert_eq!(
         process.terminal().screen().await.unwrap_err().kind,
         ErrorKind::NotFound
+    );
+}
+
+#[tokio::test]
+async fn first_subscriptions_observe_the_current_execution_after_bound_or_external_restart() {
+    let server = Server::new();
+    let manager = server.manager();
+    let script = server.directory.path().join("command.sh");
+    for restart in ["process", "rebound", "native"] {
+        std::fs::write(&script, "exit 7").unwrap();
+        let process = manager
+            .spawn(terminal(Command::new("sh", [script.to_str().unwrap()])))
+            .await
+            .unwrap();
+        assert_eq!(process.capabilities(), manager.capabilities());
+        let output = process.output();
+        let cloned = process.clone();
+        let rebound = manager.get(process.reference().clone());
+        process.wait(Some(Duration::from_secs(5))).await.unwrap();
+        std::fs::write(&script, "exit 9").unwrap();
+        match restart {
+            "process" => process.restart().await.unwrap(),
+            "rebound" => rebound.restart().await.unwrap(),
+            _ => {
+                server.native(&["respawn-pane", "-t", &pane_id(process.reference())]);
+            }
+        }
+        // Numeric OS status can arrive after pane completion. Bind all subscriptions only once
+        // that evidence is present so this assertion tests their execution, not that native race.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process.wait(None).await.unwrap().exit.is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let cloned_output = cloned.output();
+        let rebound_output = rebound.output();
+        let (a, b, c) = futures::join!(
+            output.subscribe(),
+            cloned_output.subscribe(),
+            rebound_output.subscribe()
+        );
+        for subscription in [a.unwrap(), b.unwrap(), c.unwrap()] {
+            let outcome = opensol_core::wait_events(subscription.events, "tmux")
+                .await
+                .unwrap();
+            assert_eq!(outcome.exit.unwrap().code, Some(9), "restart via {restart}");
+        }
+        process.remove().await.unwrap();
+    }
+    let process = manager
+        .spawn(terminal(Command::new("sleep", ["30"])))
+        .await
+        .unwrap();
+    assert_eq!(
+        process.restart().await.unwrap_err().kind,
+        ErrorKind::Conflict
+    );
+    let mut subscription = process.output().subscribe().await.unwrap();
+    process.kill().await.unwrap();
+    assert_eq!(
+        subscription.events.next().await.unwrap().unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    assert!(
+        matches!(process.output().subscribe().await, Err(error) if error.kind == ErrorKind::NotFound)
     );
 }
 

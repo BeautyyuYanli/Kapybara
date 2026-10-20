@@ -127,12 +127,11 @@ fn response_error(operation: &str) -> Error {
 }
 
 fn sandbox_info(sandbox: native::Sandbox, operation: &str) -> Result<SandboxInfo> {
-    let name = sandbox
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.name.clone())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| response_error(operation))?;
+    let metadata = sandbox.metadata.ok_or_else(|| response_error(operation))?;
+    let name = metadata.name;
+    if name.is_empty() {
+        return Err(response_error(operation));
+    }
     let phase = sandbox
         .status
         .map(|status| status.phase)
@@ -150,7 +149,9 @@ fn sandbox_info(sandbox: native::Sandbox, operation: &str) -> Result<SandboxInfo
         _ => SandboxState::Unknown,
     };
     Ok(SandboxInfo {
-        sandbox: SandboxRef::new("openshell", name),
+        sandbox: SandboxRef::new("openshell", &name),
+        name: Some(name),
+        labels: metadata.labels.into_iter().collect(),
         state,
         native_state: native.as_str_name().into(),
     })

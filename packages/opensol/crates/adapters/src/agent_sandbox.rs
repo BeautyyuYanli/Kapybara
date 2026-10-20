@@ -154,6 +154,12 @@ fn sandbox_info(value: &Value, operation: &str) -> Result<SandboxInfo> {
         .filter(|name| !name.is_empty())
         .ok_or_else(|| response_error(operation))?;
     let sandbox = SandboxRef::new("agent-sandbox", name);
+    let labels = value
+        .pointer("/metadata/labels")
+        .map(|labels| serde_json::from_value(labels.clone()))
+        .transpose()
+        .map_err(|_| response_error(operation))?
+        .unwrap_or_default();
     let generation = value
         .pointer("/metadata/generation")
         .and_then(Value::as_u64);
@@ -205,6 +211,8 @@ fn sandbox_info(value: &Value, operation: &str) -> Result<SandboxInfo> {
     }
     Ok(SandboxInfo {
         sandbox,
+        name: Some(name.into()),
+        labels,
         state,
         native_state: native,
     })

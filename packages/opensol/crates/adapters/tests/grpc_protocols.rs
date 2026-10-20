@@ -88,6 +88,7 @@ impl NativeServer {
                     id: "uuid".into(),
                     name: "sandbox".into(),
                     workspace: "team".into(),
+                    labels: [("project".into(), "native".into())].into(),
                     ..Default::default()
                 }),
                 status: Some(openshell::SandboxStatus {
@@ -122,6 +123,7 @@ impl openshell::open_shell_server::OpenShell for NativeServer {
         } else {
             assert_eq!(request.page_token, "second-page");
             sandbox.metadata.as_mut().unwrap().name = "stopped".into();
+            sandbox.metadata.as_mut().unwrap().labels.clear();
             sandbox.status.as_mut().unwrap().phase = openshell::SandboxPhase::Stopped as i32;
             String::new()
         };
@@ -539,6 +541,10 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     let lifecycle = backend.sandboxes();
     let listed = lifecycle.list().await.unwrap();
     assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name.as_deref(), Some("sandbox"));
+    assert_eq!(listed[0].labels["project"], "native");
+    assert_eq!(listed[1].name.as_deref(), Some("stopped"));
+    assert!(listed[1].labels.is_empty());
     assert_eq!(
         (&*listed[0].sandbox.id, listed[0].state),
         ("sandbox", SandboxState::Running)
@@ -555,6 +561,7 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
         .await
         .unwrap();
     assert_eq!(resource.reference().id, "sandbox");
+    assert_eq!(resource.inspect().await.unwrap(), listed[0]);
     assert_eq!(
         resource.inspect().await.unwrap().state,
         SandboxState::Running

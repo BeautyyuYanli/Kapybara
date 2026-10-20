@@ -160,14 +160,16 @@ async fn kubectl_cr_lifecycle_preserves_observed_state_and_suspend_semantics() {
     let resource = lifecycle
         .create(CreateOptions {
             name: Some("demo".into()),
-            ..Default::default()
+            labels: [("project".into(), "created".into())].into(),
         })
         .await
         .unwrap();
-    assert_eq!(
-        resource.inspect().await.unwrap().state,
-        SandboxState::Running
-    );
+    fixture.state.lock().unwrap().resource.as_mut().unwrap()["metadata"]["labels"]["project"] =
+        "native".into();
+    let info = resource.inspect().await.unwrap();
+    assert_eq!(info.state, SandboxState::Running);
+    assert_eq!(info.name.as_deref(), Some("demo"));
+    assert_eq!(info.labels["project"], "native");
     assert_eq!(
         lifecycle.list().await.unwrap(),
         [resource.inspect().await.unwrap()]
@@ -209,6 +211,18 @@ async fn kubectl_cr_lifecycle_preserves_observed_state_and_suspend_semantics() {
     assert_eq!(error.kind, ErrorKind::Permission);
     assert!(!error.to_string().contains("kube-secret"));
     fixture.state.lock().unwrap().deny = false;
+    fixture.state.lock().unwrap().resource.as_mut().unwrap()["metadata"]["labels"] =
+        json!({"project": 12});
+    assert_eq!(
+        resource.inspect().await.unwrap_err().kind,
+        ErrorKind::Backend
+    );
+    assert_eq!(lifecycle.list().await.unwrap_err().kind, ErrorKind::Backend);
+    fixture.state.lock().unwrap().resource.as_mut().unwrap()["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("labels");
+    assert!(resource.inspect().await.unwrap().labels.is_empty());
     resource.delete().await.unwrap();
     assert!(lifecycle.list().await.unwrap().is_empty());
     assert_eq!(

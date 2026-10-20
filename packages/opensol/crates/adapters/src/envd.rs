@@ -18,7 +18,7 @@ use opensol_core::{
     ExitStatus, ManagerInfo, OutputCapabilities, OutputChannel, OutputSubscription, ProcessEvent,
     ProcessInfo, ProcessManager, ProcessManagerCapabilities, ProcessOutcome, ProcessRef,
     ProcessState, PtySize, Result, Signal, SpawnRequest,
-    raw::{ConnectionAccess, OutputAccess, ProcessManagerAccess},
+    raw::{ConnectionAccess, OutputAccess, ProcessManagerAccess, SpawnedProcess},
     wait_events,
 };
 use prost::Message;
@@ -389,6 +389,17 @@ impl ProcessManagerAccess for Envd {
         }
     }
 
+    fn process_capabilities(&self, process: &ProcessRef) -> ProcessManagerCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(self);
+        // The protocol cannot infer stdin versus PTY routing from the PID returned by List.
+        capabilities.stdin &= process.pty.is_some();
+        capabilities.binary_stdin &= process.pty.is_some();
+        capabilities.close_stdin &= process.pty == Some(false);
+        capabilities.pty &= process.pty == Some(true);
+        capabilities.resize &= process.pty == Some(true);
+        capabilities
+    }
+
     fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
         Some(Arc::new(self.clone()))
     }
@@ -431,9 +442,12 @@ impl ProcessManagerAccess for Envd {
         self.signal(process, Signal::Kill).await
     }
 
-    async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription> {
+    async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedProcess> {
         let (reference, events) = self.start_process(request).await?;
-        Ok(OutputSubscription::new(reference, events))
+        Ok(SpawnedProcess {
+            reference: reference.clone(),
+            initial_subscription: Some(OutputSubscription::new(reference, events)),
+        })
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {

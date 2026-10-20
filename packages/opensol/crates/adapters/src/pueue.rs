@@ -17,7 +17,7 @@ use opensol_core::{
     OutputCapabilities, OutputChannel, OutputCursor, OutputPage, OutputSubscription, ProcessEvent,
     ProcessInfo, ProcessManagerCapabilities, ProcessOutcome, ProcessRef, ProcessState,
     ReadDirection, Result, Signal, SpawnRequest,
-    raw::{OutputAccess, ProcessManagerAccess},
+    raw::{OutputAccess, ProcessManagerAccess, SpawnedProcess},
 };
 use serde_json::Value;
 
@@ -204,7 +204,7 @@ impl Pueue {
             "Queued" | "Stashed" | "Locked" => ProcessState::Queued,
             "Running" => ProcessState::Running,
             "Paused" => ProcessState::Paused,
-            "Done" => ProcessState::Exited,
+            "Done" => ProcessState::Completed,
             _ => ProcessState::Unknown,
         };
         let outcome = if native_state == "Done" {
@@ -312,8 +312,8 @@ impl Pueue {
         let after = after?;
         let state = self.task_info(process, &after)?;
         let changed = match operation {
-            "pause" => matches!(state.state, ProcessState::Paused | ProcessState::Exited),
-            "start" => matches!(state.state, ProcessState::Running | ProcessState::Exited),
+            "pause" => matches!(state.state, ProcessState::Paused | ProcessState::Completed),
+            "start" => matches!(state.state, ProcessState::Running | ProcessState::Completed),
             "restart" => before.get("status") != after.get("status"),
             // Native kill/signal acceptance need not synchronously change task state.
             "kill" | "signal" => true,
@@ -479,7 +479,7 @@ impl ProcessManagerAccess for Pueue {
         .await
     }
 
-    async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription> {
+    async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedProcess> {
         let mut args = vec!["add".into(), "--print-task-id".into()];
         if let Some(group) = &self.config.group {
             args.extend(["--group".into(), group.clone()]);
@@ -510,9 +510,10 @@ impl ProcessManagerAccess for Pueue {
             .filter(|id| id.parse::<u64>().is_ok())
             .ok_or_else(|| protocol_error("spawn"))?
             .to_string();
-        let process = ProcessRef::new("pueue", id, Some(false));
-        let events = self.output(&process).await?;
-        Ok(OutputSubscription::new(process, events))
+        Ok(SpawnedProcess {
+            reference: ProcessRef::new("pueue", id, Some(false)),
+            initial_subscription: None,
+        })
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
@@ -609,7 +610,7 @@ impl OutputAccess for Pueue {
 impl Pueue {
     async fn output(&self, process: &ProcessRef) -> Result<EventStream> {
         let id = self.id(process, "output")?;
-        // Capture now, not on the first poll: even an unconsumed initial subscription
+        // Capture now, not on the first poll: even an unconsumed subscription
         // belongs to this observed execution, not a future reuse of the same task ID.
         let execution = output::Execution::from_task(&self.task(process).await?, "output")?;
         let manager = self.clone();

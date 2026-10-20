@@ -16,6 +16,7 @@ use crate::{
 };
 
 /// Native lifecycle; provider-specific connection discovery stays on the backend object.
+/// Success confirms the native request, not readiness, reconciliation or resource disappearance.
 #[async_trait]
 pub trait SandboxManagerAccess: Send + Sync {
     fn backend(&self) -> &'static str;
@@ -85,11 +86,32 @@ pub trait TerminalAccess: Send + Sync {
     }
 }
 
+/// Spawn identity and an optional indispensable native stream, without SDK output collection.
+/// Replaceable executions must return `None`: subscriptions bind the execution at subscribe time.
+/// A backend without restart may retain its native Start stream for one shared, lazy handoff.
+pub struct SpawnedProcess {
+    pub reference: ProcessRef,
+    pub initial_subscription: Option<OutputSubscription>,
+}
+
 /// Native tasks and output subscriptions; dropping either client or stream never kills a task.
 #[async_trait]
 pub trait ProcessManagerAccess: Send + Sync {
     fn backend(&self) -> &'static str;
+    /// Configured upper bound, independent of any particular reference or native task state.
     fn capabilities(&self) -> ProcessManagerCapabilities;
+    /// Local narrowing only. Never probe state, permissions, existence or stdin availability.
+    /// Overrides must preserve the manager's upper bound and disable operations lacking mode data.
+    fn process_capabilities(&self, process: &ProcessRef) -> ProcessManagerCapabilities {
+        let mut capabilities = self.capabilities();
+        if process.pty == Some(true) && !capabilities.pty {
+            capabilities.stdin = false;
+            capabilities.binary_stdin = false;
+            capabilities.close_stdin = false;
+            capabilities.resize = false;
+        }
+        capabilities
+    }
     /// Local binding only: clone the native client/configuration without probing or reconnecting.
     fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
         None
@@ -103,8 +125,8 @@ pub trait ProcessManagerAccess: Send + Sync {
     async fn list(&self) -> Result<Vec<ProcessInfo>> {
         Err(Error::unsupported(self.backend(), "list"))
     }
-    /// Preserve the native initial stream; the public Process hands it to its first subscriber.
-    async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription>;
+    /// Return the reference and only an indispensable, nonreplaceable initial stream.
+    async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedProcess>;
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo>;
     /// Return a confirmed terminal outcome, even when the native task has no OS exit status.
     async fn wait(&self, process: &ProcessRef, timeout: Option<Duration>)

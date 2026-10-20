@@ -48,6 +48,8 @@ async fn invalid_text_and_nul_are_unsupported_before_connection_io() {
     );
     for pty in [None, Some(false)] {
         let process = manager.get(ProcessRef::new("pueue", "1", pty));
+        assert!(process.capabilities().stdin);
+        assert!(!process.capabilities().pty && !process.capabilities().binary_stdin);
         for data in [vec![0xff], b"text\0input".to_vec(), vec![0, 0xff]] {
             let error = process.send_input(data).await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::Unsupported);
