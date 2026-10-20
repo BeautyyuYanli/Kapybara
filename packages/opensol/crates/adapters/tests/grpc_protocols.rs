@@ -18,13 +18,13 @@ use futures::{Stream, stream};
 use opensol_adapters::{
     grpc::GrpcConfig,
     openshell::{
-        OpenShellCreate, OpenShellLifecycle,
+        OpenShellCreate, OpenShellSandboxManager,
         protocol::{datamodel::v1 as datamodel, v1 as openshell},
     },
     sandboxd::{Sandboxd, protocol as sandboxd},
     secret::Secret,
 };
-use opensol_core::{Command, Connection, CreateOptions, ErrorKind, ExecRequest, ResourceState};
+use opensol_core::{Command, Connection, CreateOptions, ErrorKind, ExecRequest, SandboxState};
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{
@@ -103,6 +103,34 @@ impl NativeServer {
 
 #[tonic::async_trait]
 impl openshell::open_shell_server::OpenShell for NativeServer {
+    async fn list_sandboxes(
+        &self,
+        request: Request<openshell::ListSandboxesRequest>,
+    ) -> std::result::Result<Response<openshell::ListSandboxesResponse>, Status> {
+        authenticate(&request);
+        let request = request.into_inner();
+        assert_eq!(
+            request.workspace_scope.unwrap().selection,
+            Some(datamodel::workspace_selector::Selection::Workspace(
+                "team".into()
+            ))
+        );
+        assert!(request.page_size > 0 && request.label_selector.is_empty());
+        let mut sandbox = self.sandbox().sandbox.unwrap();
+        let next_page_token = if request.page_token.is_empty() {
+            "second-page".into()
+        } else {
+            assert_eq!(request.page_token, "second-page");
+            sandbox.metadata.as_mut().unwrap().name = "stopped".into();
+            sandbox.status.as_mut().unwrap().phase = openshell::SandboxPhase::Stopped as i32;
+            String::new()
+        };
+        Ok(Response::new(openshell::ListSandboxesResponse {
+            sandboxes: vec![sandbox],
+            next_page_token,
+        }))
+    }
+
     async fn create_sandbox(
         &self,
         request: Request<openshell::CreateSandboxRequest>,
@@ -498,7 +526,7 @@ async fn sandboxd_execute_bytes_arguments_deadline_and_unsupported_stdin() {
 #[tokio::test]
 async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     let fixture = Fixture::start().await;
-    let backend = OpenShellLifecycle::connect(
+    let backend = OpenShellSandboxManager::connect(
         fixture.config.clone(),
         "team",
         OpenShellCreate {
@@ -508,7 +536,17 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     )
     .await
     .unwrap();
-    let lifecycle = backend.lifecycle();
+    let lifecycle = backend.sandboxes();
+    let listed = lifecycle.list().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        (&*listed[0].sandbox.id, listed[0].state),
+        ("sandbox", SandboxState::Running)
+    );
+    assert_eq!(
+        (&*listed[1].sandbox.id, listed[1].state),
+        ("stopped", SandboxState::Stopped)
+    );
     let resource = lifecycle
         .create(CreateOptions {
             name: Some("sandbox".into()),
@@ -516,18 +554,18 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
         })
         .await
         .unwrap();
-    assert_eq!(resource.id, "sandbox");
+    assert_eq!(resource.reference().id, "sandbox");
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Running
+        resource.inspect().await.unwrap().state,
+        SandboxState::Running
     );
-    lifecycle.stop(&resource).await.unwrap();
+    resource.stop().await.unwrap();
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Stopped
+        resource.inspect().await.unwrap().state,
+        SandboxState::Stopped
     );
-    lifecycle.start(&resource).await.unwrap();
-    let connection = backend.connection(&resource).unwrap();
+    resource.start().await.unwrap();
+    let connection = backend.connection(resource.reference()).unwrap();
     let mut command = Command::new("printf", ["%s", "' $()"]);
     command.cwd = Some("/work".into());
     command.env.insert("KEY".into(), "value".into());
@@ -563,10 +601,10 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     assert_eq!(error.kind, ErrorKind::Permission);
     assert!(!error.to_string().contains("grpc-secret"));
     assert_eq!(
-        lifecycle.fork(&resource).await.unwrap_err().kind,
+        resource.fork().await.unwrap_err().kind,
         ErrorKind::Unsupported
     );
-    lifecycle.delete(&resource).await.unwrap();
+    resource.delete().await.unwrap();
     let state = fixture.state.lock().unwrap();
     assert_eq!(state.creates.len(), 1);
     assert_eq!(state.commands.len(), 3);

@@ -9,8 +9,8 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, Response, StatusCode},
 };
-use opensol_adapters::agent_sandbox::{AgentSandboxConfig, AgentSandboxLifecycle};
-use opensol_core::{CreateOptions, ErrorKind, Lifecycle, ResourceState};
+use opensol_adapters::agent_sandbox::{AgentSandboxConfig, AgentSandboxManager};
+use opensol_core::{CreateOptions, ErrorKind, SandboxManager, SandboxState};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -43,7 +43,7 @@ fn response(status: StatusCode, value: Value) -> Response<Body> {
 }
 
 fn resource_list() -> Value {
-    json!({ "kind": "APIResourceList", "apiVersion": "v1", "groupVersion": "agents.x-k8s.io/v1beta1", "resources": [{ "name": "sandboxes", "singularName": "sandbox", "namespaced": true, "kind": "Sandbox", "verbs": ["get", "create", "patch", "delete"] }] })
+    json!({ "kind": "APIResourceList", "apiVersion": "v1", "groupVersion": "agents.x-k8s.io/v1beta1", "resources": [{ "name": "sandboxes", "singularName": "sandbox", "namespaced": true, "kind": "Sandbox", "verbs": ["get", "list", "create", "patch", "delete"] }] })
 }
 
 impl Fixture {
@@ -79,6 +79,9 @@ impl Fixture {
                 let mut state = stored.lock().unwrap();
                 if state.deny { return response(StatusCode::FORBIDDEN, json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "Forbidden", "message": "kube-secret", "code": 403 })); }
                 match (parts.method.as_str(), path) {
+                    ("GET", "/apis/agents.x-k8s.io/v1beta1/namespaces/work/sandboxes") => {
+                        response(StatusCode::OK, json!({"kind": "SandboxList", "apiVersion": "agents.x-k8s.io/v1beta1", "metadata": {"resourceVersion": "1"}, "items": state.resource.iter().collect::<Vec<_>>() }))
+                    },
                     ("POST", "/apis/agents.x-k8s.io/v1beta1/namespaces/work/sandboxes") => {
                         state.create_attempts.push(input.clone());
                         if state.resource.is_some() {
@@ -134,7 +137,7 @@ impl Fixture {
         resource["status"]["conditions"] = json!([{ "type": condition, "status": "True", "reason": reason, "observedGeneration": generation }]);
     }
 
-    fn lifecycle(&self, template: Value) -> (TempDir, Lifecycle) {
+    fn sandboxes(&self, template: Value) -> (TempDir, SandboxManager) {
         let directory = TempDir::new().unwrap();
         let kubeconfig = directory.path().join("config");
         std::fs::write(&kubeconfig, format!("apiVersion: v1\nkind: Config\nclusters:\n- name: fixture\n  cluster:\n    server: {}\ncontexts:\n- name: fixture\n  context:\n    cluster: fixture\n    user: fixture\ncurrent-context: fixture\nusers:\n- name: fixture\n  user: {{}}\n", self.endpoint)).unwrap();
@@ -142,7 +145,7 @@ impl Fixture {
         config.kubeconfig = Some(kubeconfig);
         (
             directory,
-            Lifecycle::new(AgentSandboxLifecycle::new(config).unwrap()),
+            SandboxManager::new(AgentSandboxManager::new(config).unwrap()),
         )
     }
 }
@@ -151,7 +154,9 @@ impl Fixture {
 async fn kubectl_cr_lifecycle_preserves_observed_state_and_suspend_semantics() {
     let fixture = Fixture::start().await;
     let template = json!({ "spec": { "containers": [{ "name": "main", "image": "python:3.14", "command": ["sleep", "infinity"] }] } });
-    let (_directory, lifecycle) = fixture.lifecycle(template.clone());
+    let (_directory, lifecycle) = fixture.sandboxes(template.clone());
+    assert!(lifecycle.capabilities().list);
+    assert!(lifecycle.list().await.unwrap().is_empty());
     let resource = lifecycle
         .create(CreateOptions {
             name: Some("demo".into()),
@@ -160,41 +165,54 @@ async fn kubectl_cr_lifecycle_preserves_observed_state_and_suspend_semantics() {
         .await
         .unwrap();
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Running
+        resource.inspect().await.unwrap().state,
+        SandboxState::Running
     );
-    lifecycle.stop(&resource).await.unwrap();
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Pending
+        lifecycle.list().await.unwrap(),
+        [resource.inspect().await.unwrap()]
+    );
+    resource.stop().await.unwrap();
+    assert_eq!(
+        resource.inspect().await.unwrap().state,
+        SandboxState::Pending
     );
     fixture.observed("Suspended", "PodTerminated");
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Stopped
+        lifecycle.list().await.unwrap()[0].state,
+        SandboxState::Stopped
     );
-    lifecycle.start(&resource).await.unwrap();
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Pending
+        resource.inspect().await.unwrap().state,
+        SandboxState::Stopped
+    );
+    resource.start().await.unwrap();
+    assert_eq!(
+        resource.inspect().await.unwrap().state,
+        SandboxState::Pending
     );
     fixture.observed("Ready", "DependenciesReady");
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Running
+        resource.inspect().await.unwrap().state,
+        SandboxState::Running
     );
     assert_eq!(
-        lifecycle.fork(&resource).await.unwrap_err().kind,
+        resource.fork().await.unwrap_err().kind,
         ErrorKind::Unsupported
     );
     fixture.state.lock().unwrap().deny = true;
-    let error = lifecycle.inspect(&resource).await.unwrap_err();
+    assert_eq!(
+        lifecycle.list().await.unwrap_err().kind,
+        ErrorKind::Permission
+    );
+    let error = resource.inspect().await.unwrap_err();
     assert_eq!(error.kind, ErrorKind::Permission);
     assert!(!error.to_string().contains("kube-secret"));
     fixture.state.lock().unwrap().deny = false;
-    lifecycle.delete(&resource).await.unwrap();
+    resource.delete().await.unwrap();
+    assert!(lifecycle.list().await.unwrap().is_empty());
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap_err().kind,
+        resource.inspect().await.unwrap_err().kind,
         ErrorKind::NotFound
     );
     let state = fixture.state.lock().unwrap();
@@ -212,7 +230,7 @@ async fn kubectl_cr_lifecycle_preserves_observed_state_and_suspend_semantics() {
 async fn kubectl_retry_after_reuses_the_explicit_generated_resource_name() {
     let fixture = Fixture::start().await;
     fixture.state.lock().unwrap().retry_after = true;
-    let (_directory, lifecycle) = fixture.lifecycle(
+    let (_directory, lifecycle) = fixture.sandboxes(
         json!({ "spec": { "containers": [{ "name": "main", "image": "python:3.14" }] } }),
     );
     let error = lifecycle

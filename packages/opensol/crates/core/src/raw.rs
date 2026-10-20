@@ -8,31 +8,34 @@ use async_trait::async_trait;
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    ConnectionCapabilities, CreateOptions, Error, ExecRequest, ExecResult, LifecycleCapabilities,
-    ManagerInfo, OutputCapabilities, OutputCursor, OutputPage, OutputSubscription,
-    ProcessCapabilities, ProcessInfo, ProcessOutcome, ProcessRef, PtySize, ReadDirection,
-    ResourceInfo, ResourceRef, Result, Signal, SpawnRequest, TerminalCapabilities, TerminalCursor,
-    TerminalPage, TerminalScreen,
+    ConnectionCapabilities, CreateOptions, Error, ExecRequest, ExecResult, ManagerInfo,
+    OutputCapabilities, OutputCursor, OutputPage, OutputSubscription, ProcessInfo,
+    ProcessManagerCapabilities, ProcessOutcome, ProcessRef, PtySize, ReadDirection, Result,
+    SandboxInfo, SandboxManagerCapabilities, SandboxRef, Signal, SpawnRequest,
+    TerminalCapabilities, TerminalCursor, TerminalPage, TerminalScreen,
 };
 
 /// Native lifecycle; provider-specific connection discovery stays on the backend object.
 #[async_trait]
-pub trait LifecycleAccess: Send + Sync {
+pub trait SandboxManagerAccess: Send + Sync {
     fn backend(&self) -> &'static str;
-    fn capabilities(&self) -> LifecycleCapabilities;
-    async fn create(&self, options: CreateOptions) -> Result<ResourceRef>;
-    async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo>;
-    async fn start(&self, resource: &ResourceRef) -> Result<()>;
-    async fn stop(&self, resource: &ResourceRef) -> Result<()>;
-    async fn delete(&self, resource: &ResourceRef) -> Result<()>;
-    async fn fork(&self, _resource: &ResourceRef) -> Result<ResourceRef> {
+    fn capabilities(&self) -> SandboxManagerCapabilities;
+    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        Err(Error::unsupported(self.backend(), "list"))
+    }
+    async fn create(&self, options: CreateOptions) -> Result<SandboxRef>;
+    async fn inspect(&self, resource: &SandboxRef) -> Result<SandboxInfo>;
+    async fn start(&self, resource: &SandboxRef) -> Result<()>;
+    async fn stop(&self, resource: &SandboxRef) -> Result<()>;
+    async fn delete(&self, resource: &SandboxRef) -> Result<()>;
+    async fn fork(&self, _resource: &SandboxRef) -> Result<SandboxRef> {
         Err(Error::unsupported(self.backend(), "fork"))
     }
 }
 
 /// Completed commands on a fixed target. A nonzero exit is a result, not an SDK error.
 #[async_trait]
-pub trait ExecAccess: Send + Sync {
+pub trait ConnectionAccess: Send + Sync {
     fn backend(&self) -> &'static str;
     fn capabilities(&self) -> ConnectionCapabilities;
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult>;
@@ -84,9 +87,9 @@ pub trait TerminalAccess: Send + Sync {
 
 /// Native tasks and output subscriptions; dropping either client or stream never kills a task.
 #[async_trait]
-pub trait ProcessAccess: Send + Sync {
+pub trait ProcessManagerAccess: Send + Sync {
     fn backend(&self) -> &'static str;
-    fn capabilities(&self) -> ProcessCapabilities;
+    fn capabilities(&self) -> ProcessManagerCapabilities;
     /// Local binding only: clone the native client/configuration without probing or reconnecting.
     fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
         None
@@ -100,6 +103,7 @@ pub trait ProcessAccess: Send + Sync {
     async fn list(&self) -> Result<Vec<ProcessInfo>> {
         Err(Error::unsupported(self.backend(), "list"))
     }
+    /// Preserve the native initial stream; the public Process hands it to its first subscriber.
     async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription>;
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo>;
     /// Return a confirmed terminal outcome, even when the native task has no OS exit status.

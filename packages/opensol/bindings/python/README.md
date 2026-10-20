@@ -17,19 +17,19 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 
 ## 三层对象
 
-- `Lifecycle`：`create/inspect/start/stop/delete/fork`。`ResourceRef(backend, id)` 可由调用方保存并重建，不包含凭据。
+- `SandboxManager`：`create/get/list`。create 返回 Sandbox；get(SandboxRef) 本地绑定，list 返回 SandboxInfo 列表。单个 Sandbox 提供 ref、inspect/start/stop/delete/fork，fork 返回子 Sandbox。`SandboxRef(backend, id)` 可保存并重建，不包含凭据；SandboxInfo.sandbox 为该引用。
 - `Connection`：`exec(argv, cwd=..., env=..., stdin=b"", timeout=...)`、显式 `.shell(script)`。返回 `ExecResult`，不返回后台任务 ID。
 - `ProcessManager`：除构造、backend 和 capabilities 外，只提供 `probe/list/get/spawn`。`get(ProcessRef(backend, id, pty=None))` 本地绑定轻量 Process 资源，单任务操作经由该资源执行；存在性与权限由后续 I/O 检查。
 
-每层都提供 `.backend` 和 `.capabilities()`，查询不做 I/O。能力字典除布尔项外，`ProcessCapabilities.supported_signals` 是信号编号列表；`LifecycleCapabilities.stop_preserves_memory` 表达 stop 是否保留进程内存，E2B 为 true，Docker、Kubernetes 与 OpenShell 为 false。工厂不需要全局注册：
+每层都提供 `.backend` 和 `.capabilities()`，查询不做 I/O。能力字典除布尔项外，`ProcessManagerCapabilities.supported_signals` 是信号编号列表；`SandboxManagerCapabilities.stop_preserves_memory` 表达 stop 是否保留进程内存，E2B 为 true，Docker、Kubernetes 与 OpenShell 为 false。工厂不需要全局注册：
 
 | 工厂 | 返回 |
 | --- | --- |
 | `local()`、`ssh(destination, ...)`、`docker_connection(container)` | `Connection` |
-| `docker(image, ...)` | `Docker`：`.lifecycle`、`.connection(resource)` |
-| `e2b(api_key, ...)` | `E2b`：`.lifecycle`、`.envd(resource)` |
-| `openshell(endpoint, workspace=..., workload_template=..., ...)` | `OpenShell`：`.lifecycle`、`.connection(resource)` |
-| `agent_sandbox(namespace, pod_template_json, ...)` | `Lifecycle` |
+| `docker(image, ...)` | `Docker`：`.sandboxes`、`.connection(resource)` |
+| `e2b(api_key, ...)` | `E2b`：`.sandboxes`、`.envd(resource)` |
+| `openshell(endpoint, workspace=..., workload_template=..., ...)` | `OpenShell`：`.sandboxes`、`.connection(resource)` |
+| `agent_sandbox(namespace, pod_template_json, ...)` | `SandboxManager` |
 | `openshell_connection(endpoint, sandbox, ...)`、`sandboxd(endpoint, ...)` | `Connection` |
 | `pueue(connection, config_file=..., ...)` | `ProcessManager`，包装注入的连接 |
 | `tmux(connection, *, socket_path, session_prefix="opensol", program="tmux")` | `ProcessManager`，连接目标机器上已有的 tmux >= 3.5 server |
@@ -37,17 +37,37 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 
 Docker HostConfig、Kubernetes PodTemplate/PVC 参数分别通过原生 JSON 字符串传递，不把供应商字段混入公共 `create()`。OpenShell 可选命名 workload template，或通过 `spec_protobuf` 传原生 SandboxSpec 编码；TLS 参数为 PEM 内容，不是文件路径。支持的信号编号为 2、9、15，具体后端仍可能返回 Unsupported。
 
-`aio` 中的配置型工厂（local、ssh、docker、docker_connection、pueue、tmux、envd、e2b、agent_sandbox）是普通函数；`aio.sandboxd`、`aio.openshell`、`aio.openshell_connection` 建立网络连接，需要 await。后端 `.lifecycle` 提供异步生命周期；Docker/OpenShell 的 `.connection(resource)` 是无需 I/O 的普通方法；E2b 的 `.envd(resource)` 只读发现需要 await。envd 的 `.connection` / `.processes` 分别返回异步接口。同步入口的所有 I/O 都是阻塞调用。
+`aio` 中的配置型工厂（local、ssh、docker、docker_connection、pueue、tmux、envd、e2b、agent_sandbox）是普通函数；`aio.sandboxd`、`aio.openshell`、`aio.openshell_connection` 建立网络连接，需要 await。后端 `.sandboxes` 提供异步生命周期；Docker/OpenShell 的 `.connection(resource)` 是无需 I/O 的普通方法；E2b 的 `.envd(resource)` 只读发现需要 await。envd 的 `.connection` / `.processes` 分别返回异步接口。同步入口的所有 I/O 都是阻塞调用。
 
 后端对象保留原始 Engine/gateway/HTTP 客户端、凭据、作用域与超时，不重复转发生命周期方法。E2B 的 envd_endpoint、sandbox_domain、request_timeout 在 `e2b()` 配置，连接资源时无需再次提供 API key 或 endpoint。工厂不隐式 create/start/probe、不恢复暂停沙盒、不启动 daemon。公共参数校验和能力检查复用 Rust 客户端，Python 仅做语言参数、awaitable 和异常转换。
 
-`aio` 的 Connection、Lifecycle、ProcessManager、Process、Output、Terminal 与 OutputSubscription 的所有 I/O 方法，以及网络工厂，都是显式的 `async def`。调用只创建 coroutine；执行 coroutine 时才进行参数转换、创建并 await 现有原生 Future。coroutine 可在 loop 启动前创建，也可直接传给 `asyncio.create_task()`；在首次执行前取消 Task 不发起 I/O。公开签名标注 await 后的 DTO 或 None，原生 `_native.pyi` 的内部 Future 桥接仍标注 Awaitable。配置工厂、get/connection 本地绑定、output/terminal 属性和 capabilities 不需要 await。
+`aio` 的 Connection、SandboxManager、Sandbox、ProcessManager、Process、Output、Terminal 与 OutputSubscription 的所有 I/O 方法，以及网络工厂，都是显式的 `async def`。调用只创建 coroutine；执行 coroutine 时才进行参数转换、创建并 await 现有原生 Future。coroutine 可在 loop 启动前创建，也可直接传给 `asyncio.create_task()`；在首次执行前取消 Task 不发起 I/O。公开签名标注 await 后的 DTO 或 None，原生 `_native.pyi` 的内部 Future 桥接仍标注 Awaitable。配置工厂、get/connection 本地绑定、output/terminal 属性和 capabilities 不需要 await。
+
+## 沙盒发现与绑定
+
+```python
+import opensol as sdk
+
+backend = sdk.docker("my-image", command=["sleep", "infinity"])
+manager = backend.sandboxes
+sandbox = manager.create()
+try:
+    saved = sandbox.ref
+    rebound = manager.get(saved)
+    rebound.start()
+    print(rebound.inspect().state)
+    print([(info.sandbox.id, info.state) for info in manager.list()])
+finally:
+    sandbox.delete()
+```
+
+同步与 aio 形状相同；aio 的 create/list 和 Sandbox 的 inspect/start/stop/delete/fork 需要 await，get、ref 和 capabilities 保持同步。list 能力通过 `manager.capabilities()["list"]` 声明；Docker 包含当前 Engine 的停止容器，agent-sandbox 限定 namespace，E2B 限定 API key 可见范围且包含 running/paused，OpenShell 限定 workspace。原生分页由适配器读取完毕后返回，创建配置不作为隐式列表过滤条件。SandboxRef 可保存、重建；后端的 connection/envd 入口接受 `sandbox.ref`。
 
 ## 原生任务和输出资源
 
 进程任务由实际的 pueued/envd/tmux 创建、持有和回收。OpenSOL 不托管 daemon，不增加执行队列或后台日志服务。`probe()` 做真实管理请求，返回 ManagerInfo；Pueue 可报告 CLI 版本，Tmux 可报告 client/server version，无法确认的版本为 None。`list()` 只返回原生当前保留的 ProcessInfo，不回传任务环境；Pueue 的 group 用于创建默认值和 list 过滤，不是权限边界。ProcessRef.pty 是可保存的 `bool | None` 模式提示，由适配器决定操作是否需要模式；envd List 返回 None，spawn 返回 True/False，Pueue 返回 False，Tmux 返回 True。envd 未知模式仍可 inspect、signal、kill、wait 和订阅，但 send_input、close_stdin、resize 返回 UnsupportedError，不发送猜测的 RPC；应保存 spawn 引用，或在已知模式时显式传 pty 参数。Pueue send 只需 task ID，重建的 `ProcessRef("pueue", id)` 仍可发送输入。
 
-同步资源方法是阻塞调用；异步资源的相同 I/O 方法可 await，DTO 与异常相同。`get(ref)` 本地绑定任务，Process 与 OutputSubscription 的只读 `.ref` 均返回 ProcessRef，不做 I/O：
+同步资源方法是阻塞调用；异步资源的相同 I/O 方法可 await，DTO 与异常相同。`get(ref)` 本地绑定任务，Process 的只读 `.ref` 返回 ProcessRef，不做 I/O；订阅不公开任务引用：
 
 ```python
 from opensol import aio, OutputCursor
@@ -56,7 +76,7 @@ async def read_pages(config_file, pueue_directory):
     manager = aio.pueue(aio.local(), config_file=config_file,
                          pueue_directory=pueue_directory)
     await manager.probe()
-    process, subscription = await manager.spawn(["python3", "-c", "print('resource')"])
+    process = await manager.spawn(["python3", "-c", "print('resource')"])
     await process.wait(timeout=5)
     page = await process.output.read(max_bytes=4096)
     for chunk in page.chunks:
@@ -66,12 +86,11 @@ async def read_pages(config_file, pueue_directory):
     previous = await process.output.read(cursor=page.before, direction="backward")
     tail = await process.output.tail(max_bytes=1024)
     print(page.at_tail, (await process.inspect()).state)
-    await subscription.aclose()
 ```
 
-Process 提供 inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize，以及只读 output/terminal 视图。这些任务操作委托原生管理器，不缓存状态；订阅的 outcome 缓存仅属于原来的那次订阅。Pueue start 可强制启动 Queued/Stashed 并绕过队列限制和依赖；restart 仅用于终结任务，原地保留 ID、覆盖上次日志。remove 尊重原生状态/依赖，不暗中 kill；kill 回执不等于已经终结，仍需 inspect/wait。envd 只有原生 kill，pause/start/restart/remove 返回 Unsupported。
+Process 提供 inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize，以及只读 output/terminal 视图。这些任务操作委托原生管理器，不缓存状态；订阅通过完成事件交付其绑定执行的结果。Pueue start 可强制启动 Queued/Stashed 并绕过队列限制和依赖；restart 仅用于终结任务，原地保留 ID、覆盖上次日志。remove 尊重原生状态/依赖，不暗中 kill；kill 回执不等于已经终结，仍需 inspect/wait。envd 只有原生 kill，pause/start/restart/remove 返回 Unsupported。
 
-`Process.wait()` 和 `OutputSubscription.wait()` 返回共享的 `ProcessOutcome`，表示后端原生任务生命周期的完成，至少有 exit 或 native_result 一项可用；是否同时保证 OS 进程退出由具体后端决定。`outcome.exit` 是 `ExitStatus | None`，`outcome.native_result` 是脱敏的原生结果名称。Pueue Success/Failed 保留真实退出码，Killed、FailedToSpawn 等可以没有退出码；任务终态通过正常值返回。`ProcessInfo.outcome` 表达该原生生命周期的终态，非终态为 None；envd 通过原生完成事件提供含真实 ExitStatus 的 outcome。`Connection.exec()` 的 ExecResult 和 ExitStatus 保持原有含义。
+`Process.wait(timeout=...)` 和订阅的完成事件提供同一种 `ProcessOutcome`，表示后端原生任务生命周期的完成，至少有 exit 或 native_result 一项可用；是否同时保证 OS 进程退出由具体后端决定。`outcome.exit` 是 `ExitStatus | None`，`outcome.native_result` 是脱敏的原生结果名称。Pueue Success/Failed 保留真实退出码，Killed、FailedToSpawn 等可以没有退出码；任务终态通过正常值返回。`ProcessInfo.outcome` 表达该原生生命周期的终态，非终态为 None；envd 通过原生完成事件提供含真实 ExitStatus 的 outcome。`Connection.exec()` 的 ExecResult 和 ExitStatus 保持原有含义。
 
 `process.output` 表示带 channel 的原始 bytes，提供 `capabilities()`、`read(cursor=None, direction="forward", max_bytes=65536)`、`tail(max_bytes=65536)` 和 `subscribe()`。OutputPage 的只读属性是 chunks、before/after、at_head/at_tail；chunks.data 不做 UTF-8 解码。before/after 分别是本页之前/之后的边界：before 向后、after 向前读取相邻内容，页内始终保持原生顺序。无 cursor 时 forward 从保留头部、backward 从观测尾部开始；tail 取得最后一页。at_tail 与任务是否完成无关，at_head 无法确认时为 None；不能证明位置时 cursor 为 None。额外订阅调用原生重连，返回独立 OutputSubscription；页与订阅不推进对方的位置。
 
@@ -94,15 +113,12 @@ from opensol import aio
 
 async def terminal_job(connection, socket_path):
     manager = aio.tmux(connection, socket_path=socket_path)
-    process, subscription = await manager.spawn(["python3", "-c", "print('screen')"], pty=(80, 24))
-    try:
-        outcome = await process.wait(timeout=5)
-        screen = await process.terminal.screen()  # TerminalScreen，cols / rows / lines。
-        history = await process.terminal.tail(lines=200)  # 仅有限滚动历史。
-        await process.remove()  # 仅 dead pane 可移除；运行中返回 ConflictError。
-        return outcome, screen
-    finally:
-        await subscription.aclose()
+    process = await manager.spawn(["python3", "-c", "print('screen')"], pty=(80, 24))
+    outcome = await process.wait(timeout=5)
+    screen = await process.terminal.screen()  # TerminalScreen，cols / rows / lines。
+    history = await process.terminal.tail(lines=200)  # 仅有限滚动历史。
+    await process.remove()  # 仅 dead pane 可移除；运行中返回 ConflictError。
+    return outcome, screen
 ```
 
 每任务为独立 session/window/pane，ProcessRef.id 是可保存的不透明完整身份，pty=True。list 只发现配置前缀内带有效归属的任务；前缀不是安全隔离，调用方不得修改归属选项或重组被管理 session。spawn 必须传 `pty=(cols, rows)`，未传时在资源创建前返回 UnsupportedError。restart 仅对 dead pane 生效，保留任务身份、开始新代次；remove 在原生队列中检查 dead 条件，不暗中 kill。kill 销毁 pane、任务和画面，后续 inspect/wait/Terminal 查询返回 NotFoundError，不伪造退出结果。
@@ -117,7 +133,7 @@ send_input 接受任意 bytes，经原生 `send-keys -H` 发送，不经过 past
 
 Tmux 的 state、wait 和 Completed 均以原生 pane 生命周期为准，pane Dead/EOF 即可使 `ProcessInfo.state="exited"` 并返回完成。pane Dead/EOF、OS 进程退出和数值退出状态就绪可以分离；wait 返回后 OS 进程仍可能继续工作，`exit=None` 不能推断 OS 进程成功或已退出。可用的退出码和可确认的便携信号编号保留在 outcome.exit；其他信号保留 `SIG...` 名称，无可用 OS 状态时保留 Dead。
 
-初始及额外订阅在建立时绑定原生执行代次和 PID，仅交付 Completed，不生成 Output 事件。可检测的内部或外部 respawn 返回 ConflictError，任务清理返回 NotFoundError。已完成的订阅始终保留首次结果，包括 `exit=None`，不会随 OS 状态就绪而补填；`Process.wait()` / `Process.inspect()` 查询当前执行，后续可取得已就绪的状态。关闭/取消订阅或 wait 不终止任务，server 消失后 SDK 不恢复进程。详见[后端契约](../../README.md#tmux)。
+初始及额外订阅在建立时绑定原生执行代次和 PID，仅交付 Completed，不生成 Output 事件。可检测的内部或外部 respawn 返回 ConflictError，任务清理返回 NotFoundError。完成事件只交付一次，之后订阅结束；已交付事件的结果（包括 `exit=None`）保持不变；`Process.wait()` / `Process.inspect()` 查询当前执行，后续可取得已就绪的状态。关闭/取消订阅或 wait 不终止任务，server 消失后 SDK 不恢复进程。详见[后端契约](../../README.md#tmux)。
 
 ## 完成式命令
 
@@ -161,40 +177,41 @@ import opensol as sdk
 
 key = os.environ["E2B_API_KEY"]
 backend = sdk.e2b(key)
-lifecycle = backend.lifecycle
-resource = lifecycle.create()
+sandbox = backend.sandboxes.create()
 try:
-    native = backend.envd(resource)
+    native = backend.envd(sandbox.ref)
     result = native.connection.exec(["printf", "%s", "short command"], timeout=10)
-    process, subscription = native.processes.spawn(["python3", "-c", "print('managed')"])
+    process = native.processes.spawn(["python3", "-c", "print('managed')"])
+    subscription = process.output.subscribe()
     while (event := subscription.next_event(timeout=10)) is not None:
         if event.outcome is not None:
             break
         print(event.channel, event.data)
 finally:
-    lifecycle.delete(resource)
+    sandbox.delete()
 ```
 
-envd 的两种公共视图独立使用。`backend.envd(resource)` 只读发现连接配置，不隐式恢复暂停沙盒；aio 对应 `await backend.envd(resource)`。直接 `envd(endpoint, access_token=...)` 不需要 E2B 生命周期。
+envd 的两种公共视图独立使用。`backend.envd(sandbox.ref)` 只读发现连接配置，不隐式恢复暂停沙盒；aio 对应 `await backend.envd(sandbox.ref)`。直接 `envd(endpoint, access_token=...)` 不需要 E2B 生命周期。
 
 ## 输出订阅与取消
 
 `OutputSubscription.next_event(timeout=...)` 返回一条字节输出或完成事件；订阅结束后返回 None。正常输出事件 `.channel` 为 stdout/stderr/terminal/combined，`.data` 为 bytes，`.outcome` 为 None；完成事件 `.outcome` 是 ProcessOutcome，channel 为 None、data 为空 bytes。缺少完成证据的意外断流报告 TransportError。Pueue 在读取可用日志后交付完成事件；权限、传输、协议和日志读取失败仍返回 SDK 异常。
 
-同步 `process, subscription = manager.spawn(...)` 和 aio 的 `process, subscription = await manager.spawn(...)` 均返回 `(Process, OutputSubscription)`。公共 manager 用原生引用本地构造任务对象，保留 envd Start 的原始流及 Pueue/Tmux 的初始执行标识，不增加 probe、状态查询或重连。两者的 `.ref` 表示同一任务；`manager.get(saved_ref)` 只绑定任务，不消费订阅。
+同步 `process = manager.spawn(...)` 和 aio 的 `process = await manager.spawn(...)` 均只返回 Process。公共 manager 用原生引用本地构造任务对象，内部保留 envd Start 的原始流及 Pueue/Tmux 的初始执行标识。第一次 `process.output.subscribe()` 接管该流，不增加 probe、状态查询或重连；不同 output 视图共享这一个初始流，后续 subscribe 调用原生重连。初始流只保留到接管或最后一个持有它的 Process/Output 被丢弃，不预取、归档或后台采集输出。任务引用通过 `process.ref` 保存，订阅不公开 `.ref`；`manager.get(saved_ref)` 只绑定任务，其订阅走原生重连。
 
-`subscription.next_event()` 的等待超时只中止本次等待，保留订阅，可以继续读取。`subscription.wait(timeout=None)` 消费并丢弃剩余输出，返回并缓存这次订阅的 ProcessOutcome；需要日志时先逐条读取。有限 timeout 必须正数且有限，用单调时钟为整个调用计时，包括消费锁排队、每个原生事件和完成交付；持续输出不会重新计时。同步等待释放 GIL，超时为带 backend/operation 的 SDK TimeoutError，不关闭订阅、发信号或取消任务，之后可继续 wait/next_event。同一任务 ID 重启后，已有订阅的完成缓存仍属于原来的执行，Process.wait 则查询原生管理器。同步 close 释放订阅、唤醒阻塞读取，但不杀死进程。可保存 `.ref`，再用 `manager.get(saved_ref).output.subscribe()` 按原生能力重新订阅。每个订阅的事件读取串行化；并发消费应在应用层扇出。
+`subscription.next_event(timeout=...)` 的超时只中止本次读取，保留订阅，可以继续读取。只关心任务完成时调用 `process.wait(timeout=...)`；需要输出时消费订阅，从完成事件的 outcome 获取结果。完成事件交付后 next_event 返回 None，订阅不提供 wait 或完成结果查询接口。同步读取释放 GIL，close 释放订阅并唤醒阻塞读取，不杀死进程。可保存 `process.ref`，再用 `manager.get(saved_ref).output.subscribe()` 按原生能力重新订阅。每个订阅的事件读取串行化；并发消费由应用层扇出。
 
-Pueue 的初始与额外订阅在原生订阅建立时记录 created/enqueued/start 执行标识，复用分页输出的规则。同一 Queued 执行开始是合法转换，无法确认同次执行的 Stashed 转换、原地重启或 task ID 替换返回 ConflictError，原生任务清理返回 NotFoundError；即使一直未消费的旧订阅也不返回新执行的输出或结果。SDK 在消费前、wait 后和 follow 后核对，收齐并确认同次执行后才交付日志与完成事件；已交付的完成缓存不再查询当前任务。检查依赖原生可观测标识，不增加日志归档或后台监控，也不能恢复已经被原生覆盖的旧日志。aio 的绑定发生在 `await manager.spawn()` / `await process.output.subscribe()` 建立原生订阅时。
+Pueue 的初始与额外订阅在原生订阅建立时记录 created/enqueued/start 执行标识，复用分页输出的规则。同一 Queued 执行开始是合法转换，无法确认同次执行的 Stashed 转换、原地重启或 task ID 替换返回 ConflictError，原生任务清理返回 NotFoundError；即使一直未消费的旧订阅也不返回新执行的输出或结果。SDK 在消费前、wait 后和 follow 后核对，收齐并确认同次执行后才交付日志与完成事件；完成事件交付后订阅结束，不再查询当前任务。检查依赖原生可观测标识，不增加日志归档或后台监控，也不能恢复已经被原生覆盖的旧日志。aio 的绑定发生在 `await manager.spawn()` / `await process.output.subscribe()` 建立原生订阅时。
 
-异步订阅使用 `await subscription.next_event(timeout=...)`、`await subscription.wait(timeout=...)` 和 `await subscription.aclose()`，并支持 `async for`。next_event 的 timeout 从该读取获得消费权后开始；wait 的总时限包括这段排队时间及 Rust awaitable。取消读取、取消 wait 或超时不会关闭订阅；Rust 已消费但 Python 尚未收到的事件或终结错误仍保留，下次读取保持顺序。wait 已消费并丢弃的输出不回滚。每个订阅至多保留一条待交付事件，不预取或后台分发。aclose 可重复调用并唤醒阻塞读取；它不发信号，不删除环境。
+异步订阅使用 `await subscription.next_event(timeout=...)` 和 `await subscription.aclose()`，并支持 `async for`。next_event 的 timeout 从该读取获得消费权后开始。取消读取或超时不会关闭订阅；Rust 已消费但 Python 尚未收到的事件或终结错误仍保留，下次读取保持顺序。每个订阅至多保留一条待交付事件，不预取或后台分发。aclose 可重复调用并唤醒阻塞读取；它不发信号，不删除环境。
 
 ```python
 from opensol import aio
 
 async def watch(config_file):
     manager = aio.pueue(aio.local(), config_file=config_file)
-    process, subscription = await manager.spawn(["python3", "-c", "print('managed')"])
+    process = await manager.spawn(["python3", "-c", "print('managed')"])
+    subscription = await process.output.subscribe()
     try:
         async for event in subscription:
             if event.outcome is not None:
@@ -208,7 +225,7 @@ async def watch(config_file):
 
 coroutine 开始执行后，取消 exec、create、spawn 等操作仅取消客户端等待，原生清理能力由后端决定；这不证明远端未执行或已经停止。SDK 不自动重试结果不确定的副作用操作。需要终止请显式 signal，需要销毁请显式 delete；丢弃客户端或订阅不会自动删除环境。
 
-`process.wait(timeout=...)` 超时不代表进程已终止。明确停止请用 `process.kill()` 或支持的 signal；删除环境请显式 `Lifecycle.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
+`process.wait(timeout=...)` 超时不代表进程已终止。明确停止请用 `process.kill()` 或支持的 signal；删除环境请显式 `sandbox.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
 
 Pueue 订阅完成后才返回合并日志，并要求 CLI 与 daemon 在同一执行环境、`client.read_local_logs: true`；独立资源查询可读取运行中的原生日志。它不支持 PTY 或关闭 stdin；输入限 UTF-8 且无 NUL，在 Connection I/O 前按 UnsupportedError 拒绝不符合的载荷。`binary_stdin=true` 保证任意 bytes，false 表示具体限制由适配器判断。envd 原样传递 bytes，可以实时输出和 PTY，但不承诺完整历史或 daemon 重启恢复。详见[能力矩阵](../../README.md#第三层的独立能力)。
 

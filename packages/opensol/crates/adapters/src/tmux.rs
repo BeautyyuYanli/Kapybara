@@ -23,10 +23,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    OutputCapabilities, OutputSubscription, ProcessCapabilities, ProcessEvent, ProcessInfo,
+    OutputCapabilities, OutputSubscription, ProcessEvent, ProcessInfo, ProcessManagerCapabilities,
     ProcessOutcome, ProcessRef, ProcessState, PtySize, Result, SpawnRequest, TerminalCapabilities,
     TerminalPage, TerminalScreen,
-    raw::{OutputAccess, ProcessAccess, TerminalAccess},
+    raw::{OutputAccess, ProcessManagerAccess, TerminalAccess},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -508,13 +508,13 @@ fn supported_version(version: &str) -> bool {
 }
 
 #[async_trait]
-impl ProcessAccess for Tmux {
+impl ProcessManagerAccess for Tmux {
     fn backend(&self) -> &'static str {
         "tmux"
     }
-    fn capabilities(&self) -> ProcessCapabilities {
+    fn capabilities(&self) -> ProcessManagerCapabilities {
         let stdin = self.connection.capabilities().stdin;
-        ProcessCapabilities {
+        ProcessManagerCapabilities {
             list: true,
             restart: true,
             kill: true,
@@ -720,10 +720,7 @@ impl ProcessAccess for Tmux {
         let process = self.reference(&pane.identity);
         // Bind the execution observed in the creation queue, rather than a later rediscovery.
         let events = self.subscription(pane.identity, pane.execution);
-        Ok(OutputSubscription {
-            reference: process,
-            events,
-        })
+        Ok(OutputSubscription::new(process, events))
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
@@ -839,10 +836,10 @@ impl OutputAccess for Tmux {
     async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         let identity = self.identity(process, "output")?;
         let pane = self.pane(&identity, "output").await?;
-        Ok(OutputSubscription {
-            reference: process.clone(),
-            events: self.subscription(identity, pane.execution),
-        })
+        Ok(OutputSubscription::new(
+            process.clone(),
+            self.subscription(identity, pane.execution),
+        ))
     }
 }
 

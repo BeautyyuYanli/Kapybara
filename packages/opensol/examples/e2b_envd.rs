@@ -4,21 +4,21 @@ use std::{io::Write, time::Duration};
 
 use futures::StreamExt;
 use opensol_adapters::{
-    e2b::{E2bConfig, E2bLifecycle},
+    e2b::{E2bConfig, E2bSandboxManager},
     secret::Secret,
 };
 use opensol_core::{Command, CreateOptions, ExecRequest, ProcessEvent, SpawnRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backend = E2bLifecycle::new(E2bConfig::new(
+    let backend = E2bSandboxManager::new(E2bConfig::new(
         Secret::new(std::env::var("E2B_API_KEY")?),
         std::env::var("E2B_TEMPLATE").unwrap_or_else(|_| "base".into()),
     ))?;
-    let lifecycle = backend.lifecycle();
+    let lifecycle = backend.sandboxes();
     let resource = lifecycle.create(CreateOptions::default()).await?;
     let execution = async {
-        let native = backend.envd(&resource).await?;
+        let native = backend.envd(resource.reference()).await?;
         let result = native
             .connection()
             .exec(ExecRequest {
@@ -28,12 +28,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         std::io::stdout().write_all(&result.stdout)?;
-        let (process, mut subscription) = native
+        let process = native
             .processes()
             .spawn(SpawnRequest::new(Command::shell(
                 "printf 'managed process\\n'",
             )))
             .await?;
+        let mut subscription = process.output().subscribe().await?;
         eprintln!("native process ID: {}", process.reference().id);
         // envd supplies native byte subscriptions, without paginated logs or rendered text.
         eprintln!("output capabilities: {:?}", process.output().capabilities());
@@ -46,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, Box<dyn std::error::Error>>(())
     }
     .await;
-    let deletion = lifecycle.delete(&resource).await;
+    let deletion = resource.delete().await;
     execution?;
     deletion?;
     Ok(())

@@ -5,7 +5,7 @@ use std::{io::Write, time::Duration};
 
 use futures::StreamExt;
 use opensol_adapters::{
-    docker::{DockerConfig, DockerLifecycle},
+    docker::{DockerConfig, DockerSandboxManager},
     pueue::{Pueue, PueueConfig},
 };
 use opensol_core::{
@@ -14,16 +14,16 @@ use opensol_core::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backend = DockerLifecycle::connect_defaults(DockerConfig {
+    let backend = DockerSandboxManager::connect_defaults(DockerConfig {
         image: std::env::var("PUEUE_IMAGE")?,
         command: vec!["pueued".into()],
         ..Default::default()
     })?;
-    let lifecycle = backend.lifecycle();
+    let lifecycle = backend.sandboxes();
     let resource = lifecycle.create(CreateOptions::default()).await?;
     let execution = async {
-        lifecycle.start(&resource).await?;
-        let connection = backend.connection(&resource)?;
+        resource.start().await?;
+        let connection = backend.connection(resource.reference())?;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let result = connection
@@ -45,12 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         };
         let manager = ProcessManager::new(Pueue::new(connection, config)?);
-        let (process, mut subscription) = manager
+        let process = manager
             .spawn(SpawnRequest::new(Command::new(
                 "printf",
                 ["%s", "Docker + Pueue\n"],
             )))
             .await?;
+        let mut subscription = process.output().subscribe().await?;
         eprintln!("native task ID: {}", process.reference().id);
         while let Some(event) = subscription.events.next().await {
             match event? {
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, Box<dyn std::error::Error>>(())
     }
     .await;
-    let deletion = lifecycle.delete(&resource).await;
+    let deletion = resource.delete().await;
     execution?;
     deletion?;
     Ok(())

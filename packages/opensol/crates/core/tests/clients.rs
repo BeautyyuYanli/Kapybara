@@ -8,7 +8,9 @@ use std::{
 use async_trait::async_trait;
 use futures::{StreamExt, executor::block_on, stream};
 use opensol_core::{
-    raw::{ExecAccess, LifecycleAccess, OutputAccess, ProcessAccess, TerminalAccess},
+    raw::{
+        ConnectionAccess, OutputAccess, ProcessManagerAccess, SandboxManagerAccess, TerminalAccess,
+    },
     *,
 };
 
@@ -31,7 +33,7 @@ impl Backend {
 }
 
 #[async_trait]
-impl ExecAccess for Backend {
+impl ConnectionAccess for Backend {
     fn backend(&self) -> &'static str {
         "extension"
     }
@@ -130,33 +132,33 @@ fn connection_checks_shared_arguments_and_capabilities_before_dispatch() {
 }
 
 #[async_trait]
-impl LifecycleAccess for Backend {
+impl SandboxManagerAccess for Backend {
     fn backend(&self) -> &'static str {
         "extension"
     }
-    fn capabilities(&self) -> LifecycleCapabilities {
-        LifecycleCapabilities {
+    fn capabilities(&self) -> SandboxManagerCapabilities {
+        SandboxManagerCapabilities {
             create: true,
             inspect: true,
             ..Default::default()
         }
     }
-    async fn create(&self, _options: CreateOptions) -> Result<ResourceRef> {
+    async fn create(&self, _options: CreateOptions) -> Result<SandboxRef> {
         self.entered("create")
     }
-    async fn inspect(&self, _resource: &ResourceRef) -> Result<ResourceInfo> {
+    async fn inspect(&self, _resource: &SandboxRef) -> Result<SandboxInfo> {
         self.entered("inspect")
     }
-    async fn start(&self, _resource: &ResourceRef) -> Result<()> {
+    async fn start(&self, _resource: &SandboxRef) -> Result<()> {
         self.entered("start")
     }
-    async fn stop(&self, _resource: &ResourceRef) -> Result<()> {
+    async fn stop(&self, _resource: &SandboxRef) -> Result<()> {
         self.entered("stop")
     }
-    async fn delete(&self, _resource: &ResourceRef) -> Result<()> {
+    async fn delete(&self, _resource: &SandboxRef) -> Result<()> {
         self.entered("delete")
     }
-    async fn fork(&self, _resource: &ResourceRef) -> Result<ResourceRef> {
+    async fn fork(&self, _resource: &SandboxRef) -> Result<SandboxRef> {
         self.entered("fork")
     }
 }
@@ -165,27 +167,35 @@ impl LifecycleAccess for Backend {
 fn lifecycle_checks_reference_and_optional_operations_without_native_calls() {
     block_on(async {
         let adapter = Backend::default();
-        let client = Lifecycle::new(adapter.clone());
+        let client = SandboxManager::new(adapter.clone());
         for resource in [
-            ResourceRef::new("other", "id"),
-            ResourceRef::new("extension", ""),
-            ResourceRef::new("extension", "bad\0id"),
+            SandboxRef::new("other", "id"),
+            SandboxRef::new("extension", ""),
+            SandboxRef::new("extension", "bad\0id"),
         ] {
             assert_eq!(
-                client.inspect(&resource).await.unwrap_err().kind,
+                client
+                    .get(resource.clone())
+                    .inspect()
+                    .await
+                    .unwrap_err()
+                    .kind,
                 ErrorKind::InvalidArgument
             );
             assert_eq!(
-                client.fork(&resource).await.unwrap_err().kind,
+                client.get(resource.clone()).fork().await.unwrap_err().kind,
                 ErrorKind::InvalidArgument
             );
         }
-        let resource = ResourceRef::new("extension", "id");
+        let resource = SandboxRef::new("extension", "id");
+        let sandbox = client.get(resource.clone());
+        assert_eq!(sandbox.reference(), &resource);
         for error in [
-            client.start(&resource).await.unwrap_err(),
-            client.stop(&resource).await.unwrap_err(),
-            client.delete(&resource).await.unwrap_err(),
-            client.fork(&resource).await.unwrap_err(),
+            client.list().await.unwrap_err(),
+            client.get(resource.clone()).start().await.unwrap_err(),
+            client.get(resource.clone()).stop().await.unwrap_err(),
+            client.get(resource.clone()).delete().await.unwrap_err(),
+            client.get(resource.clone()).fork().await.unwrap_err(),
         ] {
             assert_eq!(error.kind, ErrorKind::Unsupported);
         }
@@ -207,7 +217,13 @@ fn lifecycle_checks_reference_and_optional_operations_without_native_calls() {
             ErrorKind::Transport
         );
         assert_eq!(
-            client.clone().inspect(&resource).await.unwrap_err().kind,
+            client
+                .clone()
+                .get(resource.clone())
+                .inspect()
+                .await
+                .unwrap_err()
+                .kind,
             ErrorKind::Transport
         );
         assert_eq!(*adapter.calls.lock().unwrap(), ["create", "inspect"]);
@@ -215,12 +231,12 @@ fn lifecycle_checks_reference_and_optional_operations_without_native_calls() {
 }
 
 #[async_trait]
-impl ProcessAccess for Backend {
+impl ProcessManagerAccess for Backend {
     fn backend(&self) -> &'static str {
         "extension"
     }
-    fn capabilities(&self) -> ProcessCapabilities {
-        ProcessCapabilities {
+    fn capabilities(&self) -> ProcessManagerCapabilities {
+        ProcessManagerCapabilities {
             stdin: true,
             close_stdin: true,
             resize: true,
@@ -235,9 +251,9 @@ impl ProcessAccess for Backend {
     }
     async fn spawn(&self, _request: SpawnRequest) -> Result<OutputSubscription> {
         self.calls.lock().unwrap().push("spawn");
-        Ok(OutputSubscription {
-            reference: ProcessRef::new("extension", "task", Some(false)),
-            events: Box::pin(stream::iter([
+        Ok(OutputSubscription::new(
+            ProcessRef::new("extension", "task", Some(false)),
+            Box::pin(stream::iter([
                 Ok(ProcessEvent::Output {
                     channel: OutputChannel::Combined,
                     data: vec![0xff],
@@ -247,7 +263,7 @@ impl ProcessAccess for Backend {
                     native_result: None,
                 })),
             ])),
-        })
+        ))
     }
     async fn list(&self) -> Result<Vec<ProcessInfo>> {
         self.entered("list")
@@ -318,15 +334,15 @@ impl OutputAccess for Backend {
     }
     async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         self.calls.lock().unwrap().push("reconnect");
-        Ok(OutputSubscription {
-            reference: process.clone(),
-            events: Box::pin(stream::iter([Ok(ProcessEvent::Completed(
+        Ok(OutputSubscription::new(
+            process.clone(),
+            Box::pin(stream::iter([Ok(ProcessEvent::Completed(
                 ProcessOutcome {
                     exit: None,
                     native_result: Some("Killed".into()),
                 },
             ))])),
-        })
+        ))
     }
 }
 
@@ -493,13 +509,24 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
             matches!(manager.spawn(request).await, Err(error) if error.kind == ErrorKind::Unsupported)
         );
         assert!(adapter.calls.lock().unwrap().is_empty());
-        let (bound, mut subscription) = manager
+        let bound = manager
             .spawn(SpawnRequest::new(Command::shell("true")))
             .await
             .unwrap();
-        assert_eq!(bound.reference(), &subscription.reference);
+        assert_eq!(
+            bound.reference(),
+            &ProcessRef::new("extension", "task", Some(false))
+        );
         assert_eq!(*adapter.calls.lock().unwrap(), ["spawn"]);
         drop(manager);
+        let output = bound.output();
+        assert!(output.capabilities().subscribe);
+        let mut subscription = bound.clone().output().subscribe().await.unwrap();
+        assert!(!output.capabilities().subscribe);
+        assert!(
+            matches!(output.subscribe().await, Err(error) if error.kind == ErrorKind::Unsupported)
+        );
+        assert_eq!(*adapter.calls.lock().unwrap(), ["spawn"]);
         assert_eq!(
             subscription.events.next().await.unwrap().unwrap(),
             ProcessEvent::Output {
@@ -534,6 +561,42 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
 }
 
 #[test]
+fn spawned_process_views_share_the_initial_stream_before_native_reconnect() {
+    block_on(async {
+        let adapter = Backend {
+            reconnect: true,
+            ..Default::default()
+        };
+        let process = ProcessManager::new(adapter.clone())
+            .spawn(SpawnRequest::new(Command::shell("true")))
+            .await
+            .unwrap();
+        let first = process.output();
+        let second = process.clone().output();
+        drop(process);
+        let (initial, extra) = futures::join!(first.subscribe(), second.subscribe());
+        assert_eq!(
+            wait_events(initial.unwrap().events, "extension")
+                .await
+                .unwrap()
+                .exit
+                .unwrap()
+                .code,
+            Some(7)
+        );
+        assert_eq!(
+            wait_events(extra.unwrap().events, "extension")
+                .await
+                .unwrap()
+                .native_result
+                .as_deref(),
+            Some("Killed")
+        );
+        assert_eq!(*adapter.calls.lock().unwrap(), ["spawn", "reconnect"]);
+    });
+}
+
+#[test]
 fn additional_subscriptions_use_native_reconnect_and_preserve_identity() {
     block_on(async {
         let adapter = Backend {
@@ -546,7 +609,7 @@ fn additional_subscriptions_use_native_reconnect_and_preserve_identity() {
         drop(manager);
         assert!(adapter.calls.lock().unwrap().is_empty());
         let handle = process.output().subscribe().await.unwrap();
-        assert_eq!(handle.reference, reference);
+        assert_eq!(process.reference(), &reference);
         assert_eq!(
             wait_events(handle.events, "extension").await.unwrap(),
             ProcessOutcome {

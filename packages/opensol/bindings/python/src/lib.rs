@@ -17,14 +17,15 @@ use futures::{
     future::{AbortHandle, Abortable},
 };
 use opensol_adapters::{
-    agent_sandbox::{AgentSandboxConfig, AgentSandboxLifecycle},
-    docker::{DockerConfig, DockerConnection, DockerLifecycle},
-    e2b::{E2bConfig, E2bLifecycle},
+    agent_sandbox::{AgentSandboxConfig, AgentSandboxManager},
+    docker::{DockerConfig, DockerConnection, DockerSandboxManager},
+    e2b::{E2bConfig, E2bSandboxManager},
     envd::{Envd, EnvdConfig},
     grpc::GrpcConfig,
     local::Local,
     openshell::{
-        OpenShellConnection, OpenShellCreate, OpenShellLifecycle, protocol as openshell_protocol,
+        OpenShellConnection, OpenShellCreate, OpenShellSandboxManager,
+        protocol as openshell_protocol,
     },
     pueue::{Pueue, PueueConfig},
     sandboxd::Sandboxd,
@@ -34,8 +35,8 @@ use opensol_adapters::{
 };
 use opensol_core::{
     Command, Connection, CreateOptions, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
-    ExitStatus, Lifecycle, OutputChannel, OutputSubscription, ProcessEvent, ProcessInfo,
-    ProcessManager, ProcessOutcome, ProcessRef, PtySize, ResourceInfo, ResourceRef, Result, Signal,
+    ExitStatus, OutputChannel, OutputSubscription, ProcessEvent, ProcessInfo, ProcessManager,
+    ProcessOutcome, ProcessRef, PtySize, Result, SandboxInfo, SandboxManager, SandboxRef, Signal,
     SpawnRequest,
 };
 use prost::Message;
@@ -189,18 +190,18 @@ fn capabilities<'py>(
     Ok(result)
 }
 
-#[pyclass(name = "ResourceRef", frozen)]
+#[pyclass(name = "SandboxRef", frozen)]
 #[derive(Clone)]
-struct PyResourceRef {
-    inner: ResourceRef,
+struct PySandboxRef {
+    inner: SandboxRef,
 }
 
 #[pymethods]
-impl PyResourceRef {
+impl PySandboxRef {
     #[new]
     fn new(backend: String, id: String) -> Self {
         Self {
-            inner: ResourceRef::new(&backend, id),
+            inner: SandboxRef::new(&backend, id),
         }
     }
     #[getter]
@@ -212,7 +213,7 @@ impl PyResourceRef {
         &self.inner.id
     }
     fn __repr__(&self) -> String {
-        format!("ResourceRef({:?}, {:?})", self.inner.backend, self.inner.id)
+        format!("SandboxRef({:?}, {:?})", self.inner.backend, self.inner.id)
     }
 }
 
@@ -345,17 +346,17 @@ impl PyExecResult {
     }
 }
 
-#[pyclass(name = "ResourceInfo", frozen)]
-struct PyResourceInfo {
-    inner: ResourceInfo,
+#[pyclass(name = "SandboxInfo", frozen)]
+struct PySandboxInfo {
+    inner: SandboxInfo,
 }
 
 #[pymethods]
-impl PyResourceInfo {
+impl PySandboxInfo {
     #[getter]
-    fn resource(&self) -> PyResourceRef {
-        PyResourceRef {
-            inner: self.inner.resource.clone(),
+    fn sandbox(&self) -> PySandboxRef {
+        PySandboxRef {
+            inner: self.inner.sandbox.clone(),
         }
     }
     #[getter]
@@ -460,13 +461,13 @@ impl PyConnection {
 }
 
 /// Closing/dropping this wrapper never deletes native environments.
-#[pyclass(name = "Lifecycle", frozen)]
-struct PyLifecycle {
-    inner: Lifecycle,
+#[pyclass(name = "SandboxManager", frozen)]
+struct PySandboxManager {
+    inner: SandboxManager,
 }
 
 #[pymethods]
-impl PyLifecycle {
+impl PySandboxManager {
     #[getter]
     fn backend(&self) -> &'static str {
         self.inner.backend()
@@ -474,14 +475,30 @@ impl PyLifecycle {
     fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         capabilities(py, self.inner.capabilities())
     }
-
+    fn get(&self, sandbox: PyRef<'_, PySandboxRef>) -> PySandbox {
+        PySandbox {
+            inner: self.inner.get(sandbox.inner.clone()),
+        }
+    }
+    fn list(&self, py: Python<'_>) -> PyResult<Vec<PySandboxInfo>> {
+        let client = self.inner.clone();
+        let runtime = runtime()?;
+        py.detach(move || runtime.block_on(client.list()))
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|inner| PySandboxInfo { inner })
+                    .collect()
+            })
+            .map_err(exception)
+    }
     #[pyo3(signature = (*, name=None, labels=None))]
     fn create(
         &self,
         py: Python<'_>,
         name: Option<String>,
         labels: Option<BTreeMap<String, String>>,
-    ) -> PyResult<PyResourceRef> {
+    ) -> PyResult<PySandbox> {
         let client = self.inner.clone();
         let runtime = runtime()?;
         py.detach(move || {
@@ -490,53 +507,55 @@ impl PyLifecycle {
                 labels: labels.unwrap_or_default(),
             }))
         })
-        .map(|inner| PyResourceRef { inner })
+        .map(|inner| PySandbox { inner })
         .map_err(exception)
     }
+}
 
-    fn inspect(
-        &self,
-        py: Python<'_>,
-        resource: PyRef<'_, PyResourceRef>,
-    ) -> PyResult<PyResourceInfo> {
-        let resource = resource.inner.clone();
+/// Locally bound sandbox; dropping it does not delete the native environment.
+#[pyclass(name = "Sandbox", frozen)]
+struct PySandbox {
+    inner: opensol_core::Sandbox,
+}
+
+#[pymethods]
+impl PySandbox {
+    #[getter]
+    fn r#ref(&self) -> PySandboxRef {
+        PySandboxRef {
+            inner: self.inner.reference().clone(),
+        }
+    }
+    fn inspect(&self, py: Python<'_>) -> PyResult<PySandboxInfo> {
         let client = self.inner.clone();
         let runtime = runtime()?;
-        py.detach(move || runtime.block_on(client.inspect(&resource)))
-            .map(|inner| PyResourceInfo { inner })
+        py.detach(move || runtime.block_on(client.inspect()))
+            .map(|inner| PySandboxInfo { inner })
             .map_err(exception)
     }
-
-    fn start(&self, py: Python<'_>, resource: PyRef<'_, PyResourceRef>) -> PyResult<()> {
-        let resource = resource.inner.clone();
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.inner.clone();
         let runtime = runtime()?;
-        py.detach(move || runtime.block_on(client.start(&resource)))
+        py.detach(move || runtime.block_on(client.start()))
             .map_err(exception)
     }
-
-    fn stop(&self, py: Python<'_>, resource: PyRef<'_, PyResourceRef>) -> PyResult<()> {
-        let resource = resource.inner.clone();
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.inner.clone();
         let runtime = runtime()?;
-        py.detach(move || runtime.block_on(client.stop(&resource)))
+        py.detach(move || runtime.block_on(client.stop()))
             .map_err(exception)
     }
-
-    fn delete(&self, py: Python<'_>, resource: PyRef<'_, PyResourceRef>) -> PyResult<()> {
-        let resource = resource.inner.clone();
+    fn delete(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.inner.clone();
         let runtime = runtime()?;
-        py.detach(move || runtime.block_on(client.delete(&resource)))
+        py.detach(move || runtime.block_on(client.delete()))
             .map_err(exception)
     }
-
-    fn fork(&self, py: Python<'_>, resource: PyRef<'_, PyResourceRef>) -> PyResult<PyResourceRef> {
-        let resource = resource.inner.clone();
+    fn fork(&self, py: Python<'_>) -> PyResult<PySandbox> {
         let client = self.inner.clone();
         let runtime = runtime()?;
-        py.detach(move || runtime.block_on(client.fork(&resource)))
-            .map(|inner| PyResourceRef { inner })
+        py.detach(move || runtime.block_on(client.fork()))
+            .map(|inner| PySandbox { inner })
             .map_err(exception)
     }
 }
@@ -583,14 +602,12 @@ impl PyProcessEvent {
 
 struct SubscriptionState {
     events: Option<EventStream>,
-    // Completion belongs to this subscription's execution, even if its task ID is restarted.
-    outcome: Option<ProcessOutcome>,
 }
 
 /// One output subscription. close releases it without killing the remote process.
 #[pyclass(name = "OutputSubscription", frozen)]
 struct PyOutputSubscription {
-    reference: ProcessRef,
+    backend: String,
     state: Arc<tokio::sync::Mutex<SubscriptionState>>,
     abort: AbortHandle,
     closed: Arc<AtomicBool>,
@@ -600,10 +617,9 @@ impl From<OutputSubscription> for PyOutputSubscription {
     fn from(subscription: OutputSubscription) -> Self {
         let (abort, registration) = AbortHandle::new_pair();
         Self {
-            reference: subscription.reference,
+            backend: subscription.backend().to_owned(),
             state: Arc::new(tokio::sync::Mutex::new(SubscriptionState {
                 events: Some(Box::pin(Abortable::new(subscription.events, registration))),
-                outcome: None,
             })),
             abort,
             closed: Arc::new(AtomicBool::new(false)),
@@ -612,8 +628,8 @@ impl From<OutputSubscription> for PyOutputSubscription {
 }
 
 /// Call with consumption ownership held. Cancellation while awaiting the native stream
-/// leaves it attached; completion is cached only for this subscription's execution.
-/// Callers apply nonterminal wait timeouts outside this function, so returned errors
+/// leaves it attached; completion is delivered once for this subscription's execution.
+/// Callers apply nonterminal read timeouts outside this function, so returned errors
 /// are terminal stream failures that aio must reserve until Python acknowledges them.
 async fn subscription_event(
     state: &mut SubscriptionState,
@@ -626,8 +642,7 @@ async fn subscription_event(
     let event = events.next().await;
     match event {
         Some(Ok(event)) => {
-            if let ProcessEvent::Completed(outcome) = &event {
-                state.outcome = Some(outcome.clone());
+            if matches!(event, ProcessEvent::Completed(_)) {
                 state.events = None;
             }
             Ok(Some(event))
@@ -638,7 +653,7 @@ async fn subscription_event(
         }
         None => {
             state.events = None;
-            if state.outcome.is_none() && !closed.load(Ordering::Acquire) {
+            if !closed.load(Ordering::Acquire) {
                 Err(Error::new(
                     ErrorKind::Transport,
                     backend,
@@ -663,18 +678,11 @@ fn subscription_timeout(backend: &str, operation: &str) -> Error {
 
 #[pymethods]
 impl PyOutputSubscription {
-    #[getter]
-    fn r#ref(&self) -> PyProcessRef {
-        PyProcessRef {
-            inner: self.reference.clone(),
-        }
-    }
-
     #[pyo3(signature = (*, timeout=None))]
     fn next_event(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<PyProcessEvent>> {
         let timeout = crate::timeout(timeout)?;
         let state = self.state.clone();
-        let backend = self.reference.backend.clone();
+        let backend = self.backend.clone();
         let closed = self.closed.clone();
         let runtime = runtime()?;
         py.detach(move || {
@@ -690,61 +698,6 @@ impl PyOutputSubscription {
             })
         })
         .map(|event| event.map(|inner| PyProcessEvent { inner }))
-        .map_err(exception)
-    }
-
-    #[pyo3(signature = (*, timeout=None))]
-    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<PyProcessOutcome> {
-        let timeout = crate::timeout(timeout)?;
-        let deadline = timeout
-            .map(|duration| {
-                tokio::time::Instant::now()
-                    .checked_add(duration)
-                    .ok_or_else(|| {
-                        exception(Error::invalid("python", "wait", "timeout is too large"))
-                    })
-            })
-            .transpose()?;
-        let state = self.state.clone();
-        let backend = self.reference.backend.clone();
-        let closed = self.closed.clone();
-        let runtime = runtime()?;
-        py.detach(move || {
-            runtime.block_on(async {
-                // The single deadline covers acquiring consumption ownership as well as
-                // every event. Ready output must not starve the timer or renew the budget.
-                let consume = async {
-                    let mut state = state.lock().await;
-                    loop {
-                        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                        {
-                            return Err(subscription_timeout(&backend, "wait"));
-                        }
-                        if let Some(outcome) = state.outcome.clone() {
-                            return Ok(outcome);
-                        }
-                        if subscription_event(&mut state, &closed, &backend)
-                            .await?
-                            .is_none()
-                        {
-                            return Err(Error::new(
-                                ErrorKind::Transport,
-                                &backend,
-                                "wait",
-                                "subscription is closed; completion is unknown",
-                            ));
-                        }
-                    }
-                };
-                match deadline {
-                    Some(deadline) => tokio::time::timeout_at(deadline, consume)
-                        .await
-                        .map_err(|_| subscription_timeout(&backend, "wait"))?,
-                    None => consume.await,
-                }
-            })
-        })
-        .map(|inner| PyProcessOutcome { inner })
         .map_err(exception)
     }
 
@@ -805,7 +758,7 @@ impl PyProcessManager {
     }
 
     #[pyo3(signature = (argv, *, cwd=None, env=None, stdin=false, pty=None))]
-    /// Create a bound task and its native initial output subscription without another request.
+    /// Create a bound task; its first output subscription takes the native initial stream.
     fn spawn(
         &self,
         py: Python<'_>,
@@ -814,7 +767,7 @@ impl PyProcessManager {
         env: Option<BTreeMap<String, String>>,
         stdin: bool,
         pty: Option<(u32, u32)>,
-    ) -> PyResult<(resources::PyProcess, PyOutputSubscription)> {
+    ) -> PyResult<resources::PyProcess> {
         let request = SpawnRequest {
             command: command(argv, cwd, env),
             stdin,
@@ -823,9 +776,7 @@ impl PyProcessManager {
         let client = self.inner.clone();
         let runtime = runtime()?;
         py.detach(move || runtime.block_on(client.spawn(request)))
-            .map(|(process, subscription)| {
-                (resources::PyProcess { inner: process }, subscription.into())
-            })
+            .map(|process| resources::PyProcess { inner: process })
             .map_err(exception)
     }
 }
@@ -855,18 +806,18 @@ impl PyEnvd {
 /// Provider context retained for lifecycle operations and local connection binding.
 #[pyclass(name = "Docker", frozen)]
 struct PyDocker {
-    inner: DockerLifecycle,
+    inner: DockerSandboxManager,
 }
 
 #[pymethods]
 impl PyDocker {
     #[getter]
-    fn lifecycle(&self) -> PyLifecycle {
-        PyLifecycle {
-            inner: self.inner.lifecycle(),
+    fn sandboxes(&self) -> PySandboxManager {
+        PySandboxManager {
+            inner: self.inner.sandboxes(),
         }
     }
-    fn connection(&self, resource: PyRef<'_, PyResourceRef>) -> PyResult<PyConnection> {
+    fn connection(&self, resource: PyRef<'_, PySandboxRef>) -> PyResult<PyConnection> {
         self.inner
             .connection(&resource.inner)
             .map(|inner| PyConnection { inner })
@@ -877,18 +828,18 @@ impl PyDocker {
 /// E2B configuration and credentials are reused for read-only envd discovery.
 #[pyclass(name = "E2b", frozen)]
 struct PyE2b {
-    inner: E2bLifecycle,
+    inner: E2bSandboxManager,
 }
 
 #[pymethods]
 impl PyE2b {
     #[getter]
-    fn lifecycle(&self) -> PyLifecycle {
-        PyLifecycle {
-            inner: self.inner.lifecycle(),
+    fn sandboxes(&self) -> PySandboxManager {
+        PySandboxManager {
+            inner: self.inner.sandboxes(),
         }
     }
-    fn envd(&self, py: Python<'_>, resource: PyRef<'_, PyResourceRef>) -> PyResult<PyEnvd> {
+    fn envd(&self, py: Python<'_>, resource: PyRef<'_, PySandboxRef>) -> PyResult<PyEnvd> {
         let client = self.inner.clone();
         let resource = resource.inner.clone();
         let runtime = runtime()?;
@@ -899,7 +850,7 @@ impl PyE2b {
     fn _aio_envd<'py>(
         &self,
         py: Python<'py>,
-        resource: PyRef<'_, PyResourceRef>,
+        resource: PyRef<'_, PySandboxRef>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         let resource = resource.inner.clone();
@@ -916,18 +867,18 @@ impl PyE2b {
 /// Keeps the established gateway channel, credentials and workspace for child connections.
 #[pyclass(name = "OpenShell", frozen)]
 struct PyOpenShell {
-    inner: OpenShellLifecycle,
+    inner: OpenShellSandboxManager,
 }
 
 #[pymethods]
 impl PyOpenShell {
     #[getter]
-    fn lifecycle(&self) -> PyLifecycle {
-        PyLifecycle {
-            inner: self.inner.lifecycle(),
+    fn sandboxes(&self) -> PySandboxManager {
+        PySandboxManager {
+            inner: self.inner.sandboxes(),
         }
     }
-    fn connection(&self, resource: PyRef<'_, PyResourceRef>) -> PyResult<PyConnection> {
+    fn connection(&self, resource: PyRef<'_, PySandboxRef>) -> PyResult<PyConnection> {
         self.inner
             .connection(&resource.inner)
             .map(|inner| PyConnection { inner })
@@ -1052,7 +1003,7 @@ fn docker(
         working_dir,
         host_config,
     };
-    DockerLifecycle::connect_defaults(config)
+    DockerSandboxManager::connect_defaults(config)
         .map(|inner| PyDocker { inner })
         .map_err(exception)
 }
@@ -1093,7 +1044,7 @@ fn e2b(
     config.envd_endpoint = envd_endpoint;
     config.sandbox_domain = sandbox_domain.into();
     config.request_timeout = timeout(Some(request_timeout))?.expect("positive timeout");
-    E2bLifecycle::new(config)
+    E2bSandboxManager::new(config)
         .map(|inner| PyE2b { inner })
         .map_err(exception)
 }
@@ -1108,7 +1059,7 @@ fn agent_sandbox(
     program: &str,
     service: bool,
     volume_claim_templates_json: Option<&str>,
-) -> PyResult<PyLifecycle> {
+) -> PyResult<PySandboxManager> {
     let template = serde_json::from_str(pod_template_json).map_err(|_| {
         exception(Error::invalid(
             "agent-sandbox",
@@ -1130,9 +1081,9 @@ fn agent_sandbox(
             ))
         })?;
     }
-    AgentSandboxLifecycle::new(config)
-        .map(|inner| PyLifecycle {
-            inner: Lifecycle::new(inner),
+    AgentSandboxManager::new(config)
+        .map(|inner| PySandboxManager {
+            inner: SandboxManager::new(inner),
         })
         .map_err(exception)
 }
@@ -1226,7 +1177,7 @@ fn openshell(
         client_key,
     )?;
     let runtime = runtime()?;
-    py.detach(move || runtime.block_on(OpenShellLifecycle::connect(config, workspace, create)))
+    py.detach(move || runtime.block_on(OpenShellSandboxManager::connect(config, workspace, create)))
         .map(|inner| PyOpenShell { inner })
         .map_err(exception)
 }
@@ -1267,15 +1218,16 @@ fn openshell_connection(
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     aio::register(module)?;
     resources::register(module)?;
-    module.add_class::<PyResourceRef>()?;
+    module.add_class::<PySandboxRef>()?;
     module.add_class::<PyProcessRef>()?;
     module.add_class::<PyExitStatus>()?;
     module.add_class::<PyProcessOutcome>()?;
     module.add_class::<PyExecResult>()?;
-    module.add_class::<PyResourceInfo>()?;
+    module.add_class::<PySandboxInfo>()?;
     module.add_class::<PyProcessInfo>()?;
     module.add_class::<PyConnection>()?;
-    module.add_class::<PyLifecycle>()?;
+    module.add_class::<PySandboxManager>()?;
+    module.add_class::<PySandbox>()?;
     module.add_class::<PyProcessManager>()?;
     module.add_class::<PyOutputSubscription>()?;
     module.add_class::<PyProcessEvent>()?;

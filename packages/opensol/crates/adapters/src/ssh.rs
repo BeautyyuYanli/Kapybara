@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, Result,
-    raw::ExecAccess,
+    raw::ConnectionAccess,
 };
 
 use crate::{
@@ -60,7 +60,7 @@ impl Ssh {
 }
 
 #[async_trait]
-impl ExecAccess for Ssh {
+impl ConnectionAccess for Ssh {
     fn backend(&self) -> &'static str {
         "ssh"
     }

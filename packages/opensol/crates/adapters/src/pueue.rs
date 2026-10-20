@@ -14,10 +14,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    OutputCapabilities, OutputChannel, OutputCursor, OutputPage, OutputSubscription,
-    ProcessCapabilities, ProcessEvent, ProcessInfo, ProcessOutcome, ProcessRef, ProcessState,
+    OutputCapabilities, OutputChannel, OutputCursor, OutputPage, OutputSubscription, ProcessEvent,
+    ProcessInfo, ProcessManagerCapabilities, ProcessOutcome, ProcessRef, ProcessState,
     ReadDirection, Result, Signal, SpawnRequest,
-    raw::{OutputAccess, ProcessAccess},
+    raw::{OutputAccess, ProcessManagerAccess},
 };
 use serde_json::Value;
 
@@ -358,13 +358,13 @@ fn protocol_error(operation: &str) -> Error {
 }
 
 #[async_trait]
-impl ProcessAccess for Pueue {
+impl ProcessManagerAccess for Pueue {
     fn backend(&self) -> &'static str {
         "pueue"
     }
 
-    fn capabilities(&self) -> ProcessCapabilities {
-        ProcessCapabilities {
+    fn capabilities(&self) -> ProcessManagerCapabilities {
+        ProcessManagerCapabilities {
             list: true,
             pause: true,
             start: true,
@@ -512,10 +512,7 @@ impl ProcessAccess for Pueue {
             .to_string();
         let process = ProcessRef::new("pueue", id, Some(false));
         let events = self.output(&process).await?;
-        Ok(OutputSubscription {
-            reference: process,
-            events,
-        })
+        Ok(OutputSubscription::new(process, events))
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
@@ -602,10 +599,10 @@ impl OutputAccess for Pueue {
             .await
     }
     async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
-        Ok(OutputSubscription {
-            reference: process.clone(),
-            events: self.output(process).await?,
-        })
+        Ok(OutputSubscription::new(
+            process.clone(),
+            self.output(process).await?,
+        ))
     }
 }
 

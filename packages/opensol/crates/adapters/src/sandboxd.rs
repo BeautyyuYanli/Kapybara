@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use opensol_core::{
-    ConnectionCapabilities, ExecRequest, ExecResult, ExitStatus, Result, raw::ExecAccess,
+    ConnectionCapabilities, ExecRequest, ExecResult, ExitStatus, Result, raw::ConnectionAccess,
 };
 use tonic::transport::Channel;
 
@@ -37,7 +37,7 @@ impl Sandboxd {
 }
 
 #[async_trait]
-impl ExecAccess for Sandboxd {
+impl ConnectionAccess for Sandboxd {
     fn backend(&self) -> &'static str {
         "sandboxd"
     }

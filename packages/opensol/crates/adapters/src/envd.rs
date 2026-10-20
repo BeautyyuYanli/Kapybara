@@ -14,11 +14,11 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{Buf, BytesMut};
 use futures::{Stream, StreamExt};
 use opensol_core::{
-    Connection, ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, ExitStatus,
-    ManagerInfo, OutputCapabilities, OutputChannel, OutputSubscription, ProcessCapabilities,
-    ProcessEvent, ProcessInfo, ProcessManager, ProcessOutcome, ProcessRef, ProcessState, PtySize,
-    Result, Signal, SpawnRequest,
-    raw::{ExecAccess, OutputAccess, ProcessAccess},
+    Connection, ConnectionCapabilities, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
+    ExitStatus, ManagerInfo, OutputCapabilities, OutputChannel, OutputSubscription, ProcessEvent,
+    ProcessInfo, ProcessManager, ProcessManagerCapabilities, ProcessOutcome, ProcessRef,
+    ProcessState, PtySize, Result, Signal, SpawnRequest,
+    raw::{ConnectionAccess, OutputAccess, ProcessManagerAccess},
     wait_events,
 };
 use prost::Message;
@@ -288,7 +288,7 @@ impl Envd {
         mut raw: RawStream,
         pty: Option<bool>,
         start: bool,
-    ) -> Result<OutputSubscription> {
+    ) -> Result<(ProcessRef, EventStream)> {
         let method = if start { "Start" } else { "Connect" };
         let first = deadline(Some(self.request_timeout), "envd", method, async {
             raw.next().await.ok_or_else(|| protocol_error(method))?
@@ -338,20 +338,43 @@ impl Envd {
             }
             if !exited { Err(Error::new(ErrorKind::Transport, "envd", method, "process stream ended before exit status"))?; }
         });
-        Ok(OutputSubscription {
-            reference: ProcessRef::new("envd", pid.to_string(), pty),
-            events,
-        })
+        Ok((ProcessRef::new("envd", pid.to_string(), pty), events))
+    }
+
+    async fn start_process(&self, request: SpawnRequest) -> Result<(ProcessRef, EventStream)> {
+        let config = protocol::ProcessConfig {
+            cmd: request.command.argv[0].clone(),
+            args: request.command.argv[1..].to_vec(),
+            envs: request.command.env.into_iter().collect(),
+            cwd: request.command.cwd,
+        };
+        let message = protocol::StartRequest {
+            process: Some(config),
+            pty: request.pty.map(|size| protocol::Pty {
+                size: Some(protocol::pty::Size {
+                    cols: size.cols,
+                    rows: size.rows,
+                }),
+            }),
+            tag: None,
+            stdin: Some(request.stdin),
+        };
+        self.handle(
+            self.stream("Start", message).await?,
+            Some(request.pty.is_some()),
+            true,
+        )
+        .await
     }
 }
 
 #[async_trait]
-impl ProcessAccess for Envd {
+impl ProcessManagerAccess for Envd {
     fn backend(&self) -> &'static str {
         "envd"
     }
-    fn capabilities(&self) -> ProcessCapabilities {
-        ProcessCapabilities {
+    fn capabilities(&self) -> ProcessManagerCapabilities {
+        ProcessManagerCapabilities {
             list: true,
             kill: true,
             stdin: true,
@@ -409,29 +432,8 @@ impl ProcessAccess for Envd {
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<OutputSubscription> {
-        let config = protocol::ProcessConfig {
-            cmd: request.command.argv[0].clone(),
-            args: request.command.argv[1..].to_vec(),
-            envs: request.command.env.into_iter().collect(),
-            cwd: request.command.cwd,
-        };
-        let message = protocol::StartRequest {
-            process: Some(config),
-            pty: request.pty.map(|size| protocol::Pty {
-                size: Some(protocol::pty::Size {
-                    cols: size.cols,
-                    rows: size.rows,
-                }),
-            }),
-            tag: None,
-            stdin: Some(request.stdin),
-        };
-        self.handle(
-            self.stream("Start", message).await?,
-            Some(request.pty.is_some()),
-            true,
-        )
-        .await
+        let (reference, events) = self.start_process(request).await?;
+        Ok(OutputSubscription::new(reference, events))
     }
 
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
@@ -549,7 +551,7 @@ impl OutputAccess for Envd {
     }
     async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         let selector = self.selector(process, "reconnect")?;
-        let handle = self
+        let (reference, events) = self
             .handle(
                 self.stream(
                     "Connect",
@@ -562,15 +564,15 @@ impl OutputAccess for Envd {
                 false,
             )
             .await?;
-        if handle.reference.id != process.id {
+        if reference.id != process.id {
             return Err(protocol_error("Connect"));
         }
-        Ok(handle)
+        Ok(OutputSubscription::new(reference, events))
     }
 }
 
 #[async_trait]
-impl ExecAccess for Envd {
+impl ConnectionAccess for Envd {
     fn backend(&self) -> &'static str {
         "envd"
     }
@@ -586,10 +588,7 @@ impl ExecAccess for Envd {
         deadline(request.timeout, "envd", "exec", async {
             let mut spawn = SpawnRequest::new(request.command);
             spawn.stdin = !request.stdin.is_empty();
-            let OutputSubscription {
-                reference: process,
-                mut events,
-            } = self.spawn(spawn).await?;
+            let (process, mut events) = self.start_process(spawn).await?;
             let write = async {
                 if !request.stdin.is_empty() {
                     self.send_input(&process, request.stdin).await?;

@@ -159,7 +159,7 @@ class PueueTests(unittest.TestCase):
         self.fail("native task did not start")
 
     def test_task_output_identity_and_reconnect(self):
-        process, handle = self.manager.spawn(
+        process = self.manager.spawn(
             [
                 "python3",
                 "-c",
@@ -171,16 +171,16 @@ class PueueTests(unittest.TestCase):
             cwd=str(self.directory),
             env={"SDK_TEST": "x '$()\n你好"},
         )
+        handle = process.output.subscribe()
         self.assertIsInstance(process, sdk.Process)
         self.assertIsInstance(handle, sdk.OutputSubscription)
-        reference = handle.ref
+        reference = process.ref
         self.assertIsInstance(reference, sdk.ProcessRef)
         self.assertEqual(process.ref.id, reference.id)
         output, outcome = collect(handle)
         self.assertEqual(combined_output(output), b"\x00\xffouterr")
         self.assertIsInstance(outcome, sdk.ProcessOutcome)
         self.assertEqual((outcome.exit.code, outcome.native_result), (7, "Failed"))
-        self.assertEqual(handle.wait().exit.code, 7)
         restored = sdk.ProcessRef(reference.backend, reference.id)
         self.assertEqual(self.manager.get(restored).inspect().state, "exited")
         self.assertEqual(self.manager.get(restored).wait(timeout=2).exit.code, 7)
@@ -192,11 +192,12 @@ class PueueTests(unittest.TestCase):
         self.assertFalse(capabilities["streaming_output"])
 
     def test_stdin_polling_timeouts_and_unsupported_capabilities(self):
-        process, handle = self.manager.spawn(
+        process = self.manager.spawn(
             ["/bin/sh", "-c", "read -r value; printf '%s' \"$value\""],
             stdin=True,
         )
-        self.running(handle.ref)
+        handle = process.output.subscribe()
+        self.running(process.ref)
         with self.assertRaises(sdk.TimeoutError):
             handle.next_event(timeout=0.03)
         with self.assertRaises(sdk.TimeoutError):
@@ -210,15 +211,16 @@ class PueueTests(unittest.TestCase):
             process.close_stdin()
         with self.assertRaises(sdk.UnsupportedError):
             self.manager.spawn(["true"], pty=(80, 24))
-        restored = sdk.ProcessRef("pueue", handle.ref.id)
+        restored = sdk.ProcessRef("pueue", process.ref.id)
         self.manager.get(restored).send_input(b"hello '$()\n")
         output, outcome = collect(handle)
         self.assertEqual(combined_output(output), b"hello '$()")
         self.assertTrue(outcome.exit.success)
 
     def test_close_wakes_blocked_reader_without_killing_task(self):
-        process, handle = self.manager.spawn(["sleep", "5"])
-        self.running(handle.ref)
+        process = self.manager.spawn(["sleep", "5"])
+        handle = process.output.subscribe()
+        self.running(process.ref)
         started = threading.Event()
         results = []
 
@@ -238,8 +240,7 @@ class PueueTests(unittest.TestCase):
         self.assertFalse(reader.is_alive())
         self.assertEqual(results, [None])
         self.assertEqual(process.inspect().state, "running")
-        with self.assertRaises(sdk.TransportError):
-            handle.wait()
+        self.assertIsNone(handle.next_event())
         process.signal(9)
         outcome = process.wait(timeout=3)
         self.assertIsNone(outcome.exit)
@@ -422,33 +423,19 @@ class EnvdBindingTests(unittest.TestCase):
         self.endpoint = f"http://127.0.0.1:{server.server_port}"
         self.native = sdk.envd(self.endpoint)
 
-    def test_unexpected_end_does_not_cache_a_completion(self):
-        process, handle = self.native.processes.spawn(["disconnect"])
+    def test_unexpected_end_is_an_error_then_ends_the_subscription(self):
+        process = self.native.processes.spawn(["disconnect"])
+        handle = process.output.subscribe()
         with self.assertRaises(sdk.TransportError):
             handle.next_event(timeout=2)
-        with self.assertRaises(sdk.TransportError):
-            handle.wait()
+        self.assertIsNone(handle.next_event())
         handle.close()
 
-    def test_subscription_wait_has_one_deadline_despite_continuous_native_output(self):
-        process, handle = self.native.processes.spawn(["stream-program"], stdin=True)
-        for timeout in (0, -1, float("inf"), float("nan")):
-            with self.assertRaises(sdk.InvalidArgumentError):
-                handle.wait(timeout=timeout)
-        started = time.monotonic()
-        with self.assertRaises(sdk.TimeoutError) as caught:
-            handle.wait(timeout=.12)
-        self.assertLess(time.monotonic() - started, .8)
-        self.assertEqual((caught.exception.backend, caught.exception.operation), ("envd", "wait"))
-        self.assertEqual(process.inspect().state, "running")
-        process.close_stdin()
-        self.assertEqual(handle.wait(timeout=2).exit.code, 7)
-        self.assertEqual(handle.wait(timeout=1).exit.code, 7)
-        handle.close()
 
     def test_initial_stream_and_additional_subscription_use_start_and_connect(self):
         manager = self.native.processes
-        process, initial = manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+        process = manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+        initial = process.output.subscribe()
 
         self.assertEqual(initial.next_event(timeout=2).data, b"\x00\xffterminal")
         self.assertEqual([method for method, _ in self.records], ["Start"])
@@ -457,7 +444,7 @@ class EnvdBindingTests(unittest.TestCase):
         offline = sdk.envd("http://127.0.0.1:1").processes.get(restored)
         self.assertIsInstance(offline, sdk.Process)
         replay = manager.get(restored).output.subscribe()
-        self.assertEqual((replay.ref.id, replay.ref.pty), (restored.id, True))
+        self.assertFalse(hasattr(replay, "ref"))
         self.assertEqual(replay.next_event(timeout=2).data, b"\x00\xffterminal")
         process.send_input(b"\x00\xffreconnected\x04")
         original_output, original_outcome = collect(initial)
@@ -466,7 +453,6 @@ class EnvdBindingTests(unittest.TestCase):
         self.assertTrue(all(channel == "terminal" for channel, _ in replay_output))
         self.assertEqual(b"".join(data for _, data in replay_output), b"\x00\xffreconnected\x04")
         self.assertEqual((original_outcome.exit.code, replay_outcome.exit.code), (7, 7))
-        self.assertEqual(replay.wait().exit.code, 7)
         connected = [message for method, message in self.records if method == "Connect"]
         self.assertEqual([message.process.pid for message in connected], [int(restored.id)])
         initial.close()
@@ -474,8 +460,9 @@ class EnvdBindingTests(unittest.TestCase):
 
     def test_binary_process_stdin_and_close_stdin(self):
         manager = self.native.processes
-        process, handle = manager.spawn(["stdin-program"], stdin=True)
-        self.assertFalse(handle.ref.pty)
+        process = manager.spawn(["stdin-program"], stdin=True)
+        handle = process.output.subscribe()
+        self.assertFalse(process.ref.pty)
         data = b"\x00\xff\x80input\n"
         process.send_input(data)
         process.close_stdin()
@@ -488,21 +475,22 @@ class EnvdBindingTests(unittest.TestCase):
         self.assertTrue(start.stdin)
         self.assertFalse(start.HasField("pty"))
         sent = next(message for method, message in self.records if method == "SendInput")
-        self.assertEqual(sent.process.pid, int(handle.ref.id))
+        self.assertEqual(sent.process.pid, int(process.ref.id))
         self.assertEqual(sent.input.WhichOneof("input"), "stdin")
         self.assertEqual(sent.input.stdin, data)
         closed = next(message for method, message in self.records if method == "CloseStdin")
-        self.assertEqual(closed.process.pid, int(handle.ref.id))
+        self.assertEqual(closed.process.pid, int(process.ref.id))
 
     def test_pty_dimensions_terminal_bytes_binary_input_and_resize(self):
         manager = self.native.processes
-        process, handle = manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
-        self.assertTrue(handle.ref.pty)
+        process = manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
+        handle = process.output.subscribe()
+        self.assertTrue(process.ref.pty)
         event = handle.next_event(timeout=2)
         self.assertEqual(event.channel, "terminal")
         self.assertEqual(event.data, b"\x00\xffterminal")
         listed = manager.list()[0].process
-        self.assertEqual(listed.id, handle.ref.id)
+        self.assertEqual(listed.id, process.ref.id)
         self.assertIsNone(listed.pty)
         self.assertIsNone(sdk.ProcessRef("envd", listed.id).pty)
         unknown = manager.get(listed)
@@ -523,11 +511,11 @@ class EnvdBindingTests(unittest.TestCase):
         start = next(message for method, message in self.records if method == "Start")
         self.assertEqual((start.pty.size.cols, start.pty.size.rows), (93, 27))
         sent = next(message for method, message in self.records if method == "SendInput")
-        self.assertEqual(sent.process.pid, int(handle.ref.id))
+        self.assertEqual(sent.process.pid, int(process.ref.id))
         self.assertEqual(sent.input.WhichOneof("input"), "pty")
         self.assertEqual(sent.input.pty, data)
         update = next(message for method, message in self.records if method == "Update")
-        self.assertEqual(update.process.pid, int(handle.ref.id))
+        self.assertEqual(update.process.pid, int(process.ref.id))
         self.assertEqual((update.pty.size.cols, update.pty.size.rows), (121, 43))
 
 
@@ -535,17 +523,25 @@ class DockerTests(unittest.TestCase):
     def test_lifecycle_explicit_cleanup_and_binary_exec(self):
         image = os.environ["OPENSOL_TEST_IMAGE"]
         backend = sdk.docker(image, command=["sleep", "infinity"])
-        creator = backend.lifecycle
+        creator = backend.sandboxes
         resource = creator.create()
-        admin = sdk.docker(image).lifecycle
+        admin = sdk.docker(image).sandboxes
         try:
-            self.assertEqual(creator.inspect(resource).state, "stopped")
-            connection = backend.connection(resource)
-            self.assertEqual(creator.inspect(resource).state, "stopped", "binding must not start resources")
-            creator.start(resource)
+            self.assertIsInstance(resource, sdk.Sandbox)
+            self.assertIsInstance(resource.ref, sdk.SandboxRef)
+            self.assertTrue(creator.capabilities()["list"])
+            listed = next(info for info in creator.list() if info.sandbox.id == resource.ref.id)
+            self.assertIsInstance(listed, sdk.SandboxInfo)
+            self.assertEqual(listed.state, "stopped")
+            with self.assertRaises(AttributeError):
+                resource.ref = sdk.SandboxRef("docker", "other")
+            self.assertEqual(resource.inspect().state, "stopped")
+            connection = backend.connection(resource.ref)
+            self.assertEqual(resource.inspect().state, "stopped", "binding must not start resources")
+            resource.start()
             del creator, backend
             gc.collect()
-            self.assertEqual(admin.inspect(resource).state, "running")
+            self.assertEqual(admin.get(resource.ref).inspect().state, "running")
             result = connection.exec(
                 [
                     "python3",
@@ -557,20 +553,20 @@ class DockerTests(unittest.TestCase):
             )
             self.assertEqual(result.stdout, b"\x00\xffDocker")
             self.assertEqual(result.exit_code, 7)
-            self.assertTrue(sdk.docker_connection(resource.id).exec(["true"]).success)
+            self.assertTrue(sdk.docker_connection(resource.ref.id).exec(["true"]).success)
             with self.assertRaises(sdk.UnsupportedError):
-                admin.fork(resource)
-            admin.stop(resource)
-            self.assertEqual(admin.inspect(resource).state, "stopped")
-            admin.start(resource)
-            self.assertEqual(admin.inspect(resource).state, "running")
+                admin.get(resource.ref).fork()
+            admin.get(resource.ref).stop()
+            self.assertEqual(admin.get(resource.ref).inspect().state, "stopped")
+            admin.get(resource.ref).start()
+            self.assertEqual(admin.get(resource.ref).inspect().state, "running")
         finally:
-            admin.delete(resource)
+            admin.get(resource.ref).delete()
         with self.assertRaises(sdk.NotFoundError):
-            admin.inspect(resource)
+            admin.get(resource.ref).inspect()
 
 
-class LifecycleBindingTests(unittest.TestCase):
+class SandboxManagerBindingTests(unittest.TestCase):
     def test_native_e2b_http_fixture_resource_and_error_conversion(self):
         records = []
 
@@ -612,24 +608,24 @@ class LifecycleBindingTests(unittest.TestCase):
         endpoint = f"http://127.0.0.1:{server.server_port}"
         try:
             backend = sdk.e2b("api-secret", api_endpoint=endpoint, envd_endpoint=endpoint)
-            lifecycle = backend.lifecycle
+            lifecycle = backend.sandboxes
             resource = lifecycle.create(name="label", labels={"owner": "test"})
-            self.assertIsInstance(resource, sdk.ResourceRef)
-            self.assertEqual((resource.backend, resource.id), ("e2b", "parent"))
-            self.assertEqual(lifecycle.inspect(resource).state, "running")
-            lifecycle.stop(resource)
-            lifecycle.start(resource)
-            self.assertEqual(lifecycle.fork(resource).id, "child")
+            self.assertIsInstance(resource, sdk.Sandbox)
+            self.assertEqual((resource.ref.backend, resource.ref.id), ("e2b", "parent"))
+            self.assertEqual(resource.inspect().state, "running")
+            resource.stop()
+            resource.start()
+            self.assertEqual(resource.fork().ref.id, "child")
             before = len(records)
-            native = backend.envd(resource)
+            native = backend.envd(resource.ref)
             self.assertEqual([(method, path) for method, path, *_ in records[before:]],
                              [("GET", "/sandboxes/parent")])
             self.assertIsInstance(native, sdk.Envd)
             self.assertIsInstance(native.connection, sdk.Connection)
             self.assertIsInstance(native.processes, sdk.ProcessManager)
-            lifecycle.delete(resource)
+            resource.delete()
             with self.assertRaises(sdk.NotFoundError) as caught:
-                lifecycle.inspect(sdk.ResourceRef("e2b", "missing"))
+                lifecycle.get(sdk.SandboxRef("e2b", "missing")).inspect()
             self.assertEqual(caught.exception.backend, "e2b")
             self.assertEqual(caught.exception.operation, "inspect")
             self.assertNotIn("api-secret", str(caught.exception))

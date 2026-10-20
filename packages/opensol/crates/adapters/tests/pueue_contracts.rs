@@ -11,14 +11,14 @@ use async_trait::async_trait;
 use opensol_adapters::pueue::{Pueue, PueueConfig};
 use opensol_core::{
     Connection, ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, ProcessManager,
-    ProcessRef, Result, raw::ExecAccess,
+    ProcessRef, Result, raw::ConnectionAccess,
 };
 
 #[derive(Clone, Default)]
 struct UnavailableConnection(Arc<AtomicUsize>);
 
 #[async_trait]
-impl ExecAccess for UnavailableConnection {
+impl ConnectionAccess for UnavailableConnection {
     fn backend(&self) -> &'static str {
         "unavailable"
     }

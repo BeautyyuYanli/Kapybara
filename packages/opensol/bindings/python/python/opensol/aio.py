@@ -10,8 +10,6 @@ Closing a subscription never signals the process or deletes its environment.
 from __future__ import annotations
 
 import asyncio
-import builtins
-import math
 from collections.abc import AsyncIterator, Sequence
 from typing import Literal
 
@@ -28,8 +26,8 @@ from ._native import (
     ProcessInfo,
     ProcessOutcome,
     ProcessRef,
-    ResourceInfo,
-    ResourceRef,
+    SandboxInfo,
+    SandboxRef,
 )
 
 
@@ -69,42 +67,58 @@ class Connection:
         return await self._native.shell(script, cwd=cwd, env=env, stdin=stdin, timeout=timeout)
 
 
-class Lifecycle:
-    """Explicit native resource operations; dropping a client never deletes resources."""
+class SandboxManager:
+    """Create, discover and locally bind sandboxes within one backend scope."""
 
-    def __init__(self, native: _native.AsyncLifecycle) -> None:
+    def __init__(self, native: _native.AsyncSandboxManager) -> None:
         self._native = native
 
     @property
     def backend(self) -> str:
         return self._native.backend
 
-    def capabilities(self) -> _native.LifecycleCapabilities:
+    def capabilities(self) -> _native.SandboxManagerCapabilities:
         return self._native.capabilities()
 
-    async def create(
-        self, *, name: str | None = None, labels: dict[str, str] | None = None,
-    ) -> ResourceRef:
-        return await self._native.create(name=name, labels=labels)
+    def get(self, sandbox: SandboxRef) -> Sandbox:
+        """Bind locally; existence and permissions are checked on later I/O."""
+        return Sandbox(self._native.get(sandbox))
 
-    async def inspect(self, resource: ResourceRef) -> ResourceInfo:
-        return await self._native.inspect(resource)
+    async def list(self) -> list[SandboxInfo]:
+        return await self._native.list()
 
-    async def start(self, resource: ResourceRef) -> None:
-        await self._native.start(resource)
+    async def create(self, *, name: str | None = None, labels: dict[str, str] | None = None) -> Sandbox:
+        return Sandbox(await self._native.create(name=name, labels=labels))
 
-    async def stop(self, resource: ResourceRef) -> None:
-        await self._native.stop(resource)
 
-    async def delete(self, resource: ResourceRef) -> None:
-        await self._native.delete(resource)
+class Sandbox:
+    """Single sandbox operations; dropping this object never deletes the environment."""
 
-    async def fork(self, resource: ResourceRef) -> ResourceRef:
-        return await self._native.fork(resource)
+    def __init__(self, native: _native.AsyncSandbox) -> None:
+        self._native = native
+
+    @property
+    def ref(self) -> SandboxRef:
+        return self._native.ref
+
+    async def inspect(self) -> SandboxInfo:
+        return await self._native.inspect()
+
+    async def start(self) -> None:
+        await self._native.start()
+
+    async def stop(self) -> None:
+        await self._native.stop()
+
+    async def delete(self) -> None:
+        await self._native.delete()
+
+    async def fork(self) -> Sandbox:
+        return Sandbox(await self._native.fork())
 
 
 class OutputSubscription(AsyncIterator[ProcessEvent]):
-    """One subscription; ``wait`` discards output, ``aclose`` only detaches.
+    """One subscription; completion arrives as an event, ``aclose`` only detaches.
 
     The asyncio lock is owned by the Python coroutine, so it is released on
     cancellation. Rust keeps its single reserved event until the resumed Python
@@ -114,10 +128,6 @@ class OutputSubscription(AsyncIterator[ProcessEvent]):
     def __init__(self, native: _native.AsyncOutputSubscription) -> None:
         self._native = native
         self._reader = asyncio.Lock()
-
-    @property
-    def ref(self) -> ProcessRef:
-        return self._native.ref
 
     async def next_event(self, *, timeout: float | None = None) -> ProcessEvent | None:
         """Read one event; timeout/cancellation leaves the subscription usable.
@@ -139,31 +149,6 @@ class OutputSubscription(AsyncIterator[ProcessEvent]):
                 raise
             self._native._commit()
             return event
-
-    async def wait(self, *, timeout: float | None = None) -> ProcessOutcome:
-        """Discard output until completion; timeout covers this entire call, including locks."""
-        def error(cls, kind, message):
-            result = cls(message)
-            result.backend, result.operation, result.kind = self.ref.backend, "wait", kind
-            return result
-
-        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
-            raise error(_native.InvalidArgumentError, "InvalidArgument", "timeout must be finite and positive, or None")
-        loop = asyncio.get_running_loop()
-        deadline = None if timeout is None else loop.time() + timeout
-        try:
-            async with asyncio.timeout_at(deadline):
-                while True:
-                    # A continuously ready subscription must still respect the same deadline.
-                    if deadline is not None and loop.time() >= deadline:
-                        raise builtins.TimeoutError
-                    event = await self.next_event()
-                    if event is None:
-                        return await self._native._outcome()
-                    if event.outcome is not None:
-                        return event.outcome
-        except builtins.TimeoutError:
-            raise error(_native.TimeoutError, "Timeout", "output wait timed out") from None
 
     async def aclose(self) -> None:
         """Detach and wake blocked readers; safe to call repeatedly."""
@@ -189,7 +174,7 @@ class ProcessManager:
     def backend(self) -> str:
         return self._native.backend
 
-    def capabilities(self) -> _native.ProcessCapabilities:
+    def capabilities(self) -> _native.ProcessManagerCapabilities:
         return self._native.capabilities()
 
     def get(self, process: ProcessRef) -> Process:
@@ -210,12 +195,11 @@ class ProcessManager:
         env: dict[str, str] | None = None,
         stdin: bool = False,
         pty: tuple[int, int] | None = None,
-    ) -> tuple[Process, OutputSubscription]:
-        """Create a task and retain its native initial stream without querying or reconnecting."""
-        process, subscription = (
+    ) -> Process:
+        """Create a task; its first output subscription takes the native initial stream."""
+        return Process(
             await self._native.spawn(argv, cwd=cwd, env=env, stdin=stdin, pty=pty)
         )
-        return Process(process), OutputSubscription(subscription)
 
 
 class Process:
@@ -332,10 +316,10 @@ class Docker:
         self._native = native
 
     @property
-    def lifecycle(self) -> Lifecycle:
-        return Lifecycle(_native._async_lifecycle(self._native.lifecycle))
+    def sandboxes(self) -> SandboxManager:
+        return SandboxManager(_native._async_sandboxes(self._native.sandboxes))
 
-    def connection(self, resource: ResourceRef) -> Connection:
+    def connection(self, resource: SandboxRef) -> Connection:
         return Connection(_native._async_connection(self._native.connection(resource)))
 
 
@@ -346,10 +330,10 @@ class E2b:
         self._native = native
 
     @property
-    def lifecycle(self) -> Lifecycle:
-        return Lifecycle(_native._async_lifecycle(self._native.lifecycle))
+    def sandboxes(self) -> SandboxManager:
+        return SandboxManager(_native._async_sandboxes(self._native.sandboxes))
 
-    async def envd(self, resource: ResourceRef) -> Envd:
+    async def envd(self, resource: SandboxRef) -> Envd:
         return Envd(await self._native._aio_envd(resource))
 
 
@@ -360,10 +344,10 @@ class OpenShell:
         self._native = native
 
     @property
-    def lifecycle(self) -> Lifecycle:
-        return Lifecycle(_native._async_lifecycle(self._native.lifecycle))
+    def sandboxes(self) -> SandboxManager:
+        return SandboxManager(_native._async_sandboxes(self._native.sandboxes))
 
-    def connection(self, resource: ResourceRef) -> Connection:
+    def connection(self, resource: SandboxRef) -> Connection:
         return Connection(_native._async_connection(self._native.connection(resource)))
 
 
@@ -475,9 +459,9 @@ def agent_sandbox(
     program: str = "kubectl",
     service: bool = True,
     volume_claim_templates_json: str | None = None,
-) -> Lifecycle:
-    return Lifecycle(
-        _native._async_lifecycle(
+) -> SandboxManager:
+    return SandboxManager(
+        _native._async_sandboxes(
             _native.agent_sandbox(
                 namespace, pod_template_json, context=context, kubeconfig=kubeconfig,
                 program=program, service=service,
@@ -544,7 +528,7 @@ async def openshell_connection(
 
 
 __all__ = [
-    "Connection", "Lifecycle", "ProcessManager", "OutputSubscription", "Process", "Output", "Terminal", "Envd",
+    "Connection", "SandboxManager", "Sandbox", "ProcessManager", "OutputSubscription", "Process", "Output", "Terminal", "Envd",
     "Docker", "E2b", "OpenShell",
     "local", "ssh", "docker", "docker_connection", "pueue", "tmux", "envd", "e2b",
     "agent_sandbox", "sandboxd", "openshell", "openshell_connection",

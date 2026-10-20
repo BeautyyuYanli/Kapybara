@@ -65,13 +65,14 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
 
     def test_sync_binary_input_resize_screen_and_completion_only_subscription(self):
         payload = bytes(range(256)) * 32
-        process, handle = self.manager.spawn(["python3", "-u", "-c",
+        process = self.manager.spawn(["python3", "-u", "-c",
             "import os,tty,hashlib; tty.setraw(0); print('READY',flush=True); data=b''\n"
             "while len(data)<8192: data+=os.read(0,8192-len(data))\n"
             "print(hashlib.sha256(data).hexdigest(), os.get_terminal_size(0),flush=True); raise SystemExit(7)"],
             stdin=True, pty=(101, 29))
+        handle = process.output.subscribe()
 
-        self.assertIs(handle.ref.pty, True)
+        self.assertIs(process.ref.pty, True)
         for _ in range(100):
             if "READY" in "\n".join(process.terminal.screen().lines):
                 break
@@ -96,7 +97,6 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         self.assertEqual(event.data, b"")
         self.assertEqual(event.outcome.exit.code, 7)
         self.assertIsNone(handle.next_event(timeout=1))
-        self.assertEqual(handle.wait().exit.code, 7)
         screen = process.terminal.screen()
         self.assertIsInstance(screen, sdk.TerminalScreen)
         self.assertEqual((screen.cols, screen.rows, len(screen.lines)), (107, 33, 33))
@@ -104,34 +104,35 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         self.assertIn(hashlib.sha256(payload).hexdigest(), output)
         self.assertIn("columns=107, lines=33", output)
         self.assertEqual(process.wait(timeout=5).exit.code, 7)
-        self.assertEqual(self.manager.list()[0].process.id, handle.ref.id)
+        self.assertEqual(self.manager.list()[0].process.id, process.ref.id)
         process.remove()
         with self.assertRaises(sdk.NotFoundError):
             "\n".join(process.terminal.screen().lines)
 
-    def test_restart_reconnection_execution_cache_and_external_respawn(self):
+    def test_restart_reconnection_execution_binding_and_external_respawn(self):
         marker = str(Path(self.directory.name) / "execution")
-        process, handle = self.manager.spawn(["python3", "-c",
+        process = self.manager.spawn(["python3", "-c",
             "from pathlib import Path; import sys; p=Path(sys.argv[1]); old=p.exists(); p.touch(); "
             "print('new-screen' if old else 'old-screen'); sys.exit(9 if old else 7)", marker], pty=(80, 24))
+        handle = process.output.subscribe()
 
-        self.assertEqual(handle.wait().exit.code, 7)
+        self.assertEqual(handle.next_event(timeout=5).outcome.exit.code, 7)
         original = process.output.subscribe()
         process.restart()
         with self.assertRaises(sdk.ConflictError):
-            original.wait()
-        self.assertEqual(handle.wait().exit.code, 7)
+            original.next_event(timeout=5)
+        self.assertIsNone(handle.next_event())
         self.assertEqual(process.wait(timeout=5).exit.code, 9)
         self.assertIn("new-screen", "\n".join(process.terminal.screen().lines))
         rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(
-            sdk.ProcessRef("tmux", handle.ref.id))
-        self.assertEqual(rebound.output.subscribe().wait().exit.code, 9)
+            sdk.ProcessRef("tmux", process.ref.id))
+        self.assertEqual(rebound.output.subscribe().next_event(timeout=5).outcome.exit.code, 9)
         old = rebound.output.subscribe()
-        pane = json.loads(handle.ref.id)["pane"]
+        pane = json.loads(process.ref.id)["pane"]
         subprocess.run(["tmux", "-N", "-S", self.socket, "respawn-pane", "-t", pane,
                         "sleep", "30"], check=True, capture_output=True)
         with self.assertRaises(sdk.ConflictError):
-            old.wait()
+            old.next_event(timeout=5).outcome
         current = rebound.output.subscribe()
         current.close()
         self.assertEqual(rebound.inspect().state, "running")
@@ -147,13 +148,14 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         cwd.mkdir()
         program = cwd / "run=python3;"
         program.symlink_to("/usr/bin/python3")
-        process, handle = self.manager.spawn(["./run=python3;", "-c",
+        process = self.manager.spawn(["./run=python3;", "-c",
             "import os,sys; assert os.getcwd()==sys.argv[1]; assert os.environ['SDK-TEST']==sys.argv[2]; "
             "assert os.environ['PATH']=='/task-only'; print('relative-screen'); sys.exit(7)",
             str(cwd), "x '$()\n;"], cwd=os.path.relpath(cwd),
             env={"SDK-TEST": "x '$()\n;", "PATH": "/task-only"}, pty=(80, 24))
-        self.assertEqual(handle.wait().exit.code, 7)
-        rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(handle.ref)
+        handle = process.output.subscribe()
+        self.assertEqual(handle.next_event(timeout=5).outcome.exit.code, 7)
+        rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(process.ref)
         rebound.restart()
         self.assertEqual(rebound.wait(timeout=5).exit.code, 7)
         self.assertIn("relative-screen", "\n".join(rebound.terminal.screen().lines))
@@ -164,9 +166,10 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         rebound.remove()
 
     def test_capture_is_rendered_screen_and_never_a_log(self):
-        process, handle = self.manager.spawn(["python3", "-c",
+        process = self.manager.spawn(["python3", "-c",
             "import sys; sys.stdout.write('old-content\\x1b[2J\\x1b[HOPENSOL_TMUX_NOT_FOUND\\n'); sys.stdout.flush()"],
             pty=(80, 24))
+        handle = process.output.subscribe()
 
         self.assertEqual(process.wait(timeout=5).exit.code, 0)
         screen = "\n".join(process.terminal.screen().lines)
@@ -176,12 +179,13 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         process.remove()
 
     def test_native_history_bounds_active_alternate_grid_and_exact_text_lines(self):
-        process, handle = self.manager.spawn(["python3", "-u", "-c",
+        process = self.manager.spawn(["python3", "-u", "-c",
             "import os,tty; tty.setraw(0); "
             "os.write(1, ''.join(f'line-{i:03}  \\r\\n' for i in range(50)).encode()); "
             "os.write(1, 'wide:界 é sep:\u2028end  READY'.encode()); os.read(0,1); "
             "os.write(1,b'\\x1b[?1049hALT-READY'); os.read(0,1); "
             "os.write(1,b'\\x1b[?1049l'); os.read(0,1)"], stdin=True, pty=(40, 6))
+        handle = process.output.subscribe()
         pane = json.loads(process.ref.id)["pane"]
 
         def native(*args):
@@ -230,7 +234,7 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         self.assertEqual(process.terminal.tail().lines, [])
         self.assertEqual(process.terminal.screen().lines, screen.lines)
         process.send_input(b"c")
-        handle.wait(timeout=5)
+        handle.next_event(timeout=5).outcome
         process.remove()
 
 
@@ -238,10 +242,11 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
     async def test_async_input_snapshot_wait_cancellation_and_close(self):
         manager = aio.tmux(aio.local(), socket_path=self.socket)
         self.assertEqual((await manager.probe()).backend, "tmux")
-        process, handle = await manager.spawn(["python3", "-u", "-c",
+        process = await manager.spawn(["python3", "-u", "-c",
             "import os,tty; tty.setraw(0); print('READY',flush=True); data=b''\n"
             "while len(data)<4: data+=os.read(0,4-len(data))\nprint(data.hex(),flush=True)"],
             stdin=True, pty=(80, 24))
+        handle = await process.output.subscribe()
 
         for _ in range(100):
             if "READY" in "\n".join((await process.terminal.screen()).lines):
@@ -264,14 +269,14 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
         replacement = await process.output.subscribe()
         await process.resize(90, 30)
         await process.send_input(b"\x00\xff\nA")
-        self.assertEqual((await replacement.wait()).exit.code, 0)
+        self.assertEqual(((await replacement.next_event(timeout=5)).outcome).exit.code, 0)
         self.assertIn("00ff0a41", "\n".join((await process.terminal.screen()).lines))
         self.assertEqual((await process.wait(timeout=5)).exit.code, 0)
-        self.assertEqual((await manager.list())[0].process.id, handle.ref.id)
+        self.assertEqual((await manager.list())[0].process.id, process.ref.id)
         stale = await process.output.subscribe()
         await process.restart()
         with self.assertRaises(sdk.ConflictError):
-            await stale.wait()
+            (await stale.next_event(timeout=5)).outcome
         await process.kill()
         with self.assertRaises(sdk.NotFoundError):
             await process.inspect()
@@ -280,22 +285,23 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_injected_docker_connection_uses_its_native_server_and_files(self):
         backend = sdk.docker(os.environ["OPENSOL_TEST_IMAGE"], command=["sleep", "infinity"], working_dir="/")
-        resource = backend.lifecycle.create()
+        resource = backend.sandboxes.create()
         try:
-            backend.lifecycle.start(resource)
-            target = backend.connection(resource)
+            resource.start()
+            target = backend.connection(resource.ref)
             self.assertEqual(target.exec(["pwd", "-P"]).stdout, b"/\n")
             self.assertTrue(target.exec(["mkdir", "-p", self.directory.name]).success)
             self.assertTrue(target.exec(["tmux", "-S", self.socket, "-f", "/dev/null", "new-session", "-d",
                                          "-s", "remote-user", "sleep", "infinity"]).success)
-            manager = aio.tmux(aio.docker_connection(resource.id), socket_path=self.socket)
+            manager = aio.tmux(aio.docker_connection(resource.ref.id), socket_path=self.socket)
             self.assertEqual((await manager.probe()).backend, "tmux")
-            process, handle = await manager.spawn(["python3", "-u", "-c",
+            process = await manager.spawn(["python3", "-u", "-c",
                 "from pathlib import Path; import os,tty; tty.setraw(0); print('remote-ready',flush=True); data=b''\n"
                 "while len(data)<4: data+=os.read(0,4-len(data))\n"
                 "Path('target-file').write_text(os.environ['TASK']+data.hex()); print('remote-screen',flush=True)"],
                 cwd=os.path.relpath(self.directory.name, start="/"),
                 env={"TASK": "remote"}, stdin=True, pty=(80, 24))
+            handle = await process.output.subscribe()
 
             for _ in range(100):
                 if "remote-ready" in "\n".join((await process.terminal.screen()).lines):
@@ -304,7 +310,7 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("remote raw terminal did not become ready")
             await process.send_input(b"\x00\xff\nA")
-            self.assertEqual((await handle.wait()).exit.code, 0)
+            self.assertEqual(((await handle.next_event(timeout=5)).outcome).exit.code, 0)
             self.assertIn("remote-screen", "\n".join((await process.terminal.screen()).lines))
             self.assertFalse((Path(self.directory.name) / "target-file").exists())
             self.assertEqual(target.exec(["cat", str(Path(self.directory.name) / "target-file")]).stdout, b"remote00ff0a41")
@@ -312,4 +318,4 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
             await process.remove()
             await handle.aclose()
         finally:
-            backend.lifecycle.delete(resource)
+            resource.delete()

@@ -16,13 +16,13 @@ use axum::{
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use opensol_adapters::{
-    e2b::{E2bConfig, E2bLifecycle},
+    e2b::{E2bConfig, E2bSandboxManager},
     envd::{Envd, EnvdConfig, protocol},
     secret::Secret,
 };
 use opensol_core::{
     Command, CreateOptions, ErrorKind, ExecRequest, OutputChannel, Process, ProcessEvent,
-    ProcessRef, PtySize, ResourceRef, ResourceState, Signal, SpawnRequest,
+    ProcessRef, PtySize, SandboxRef, SandboxState, Signal, SpawnRequest,
 };
 use prost::Message;
 use serde_json::{Value, json};
@@ -32,6 +32,7 @@ use tokio::sync::Notify;
 struct Recorded {
     method: String,
     path: String,
+    query: String,
     headers: HeaderMap,
     body: Vec<u8>,
 }
@@ -66,6 +67,7 @@ impl Fixture {
                 let record = Recorded {
                     method: parts.method.to_string(),
                     path: parts.uri.path().into(),
+                    query: parts.uri.query().unwrap_or_default().into(),
                     headers: parts.headers,
                     body,
                 };
@@ -317,6 +319,29 @@ fn reply(
         serde_json::from_slice(&record.body).unwrap()
     };
     match (record.method.as_str(), record.path.as_str()) {
+        ("GET", "/v2/sandboxes") => {
+            let url = reqwest::Url::parse(&format!("http://fixture/?{}", record.query)).unwrap();
+            let query = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                query.get("state").map(|value| value.as_ref()),
+                Some("running,paused")
+            );
+            assert_eq!(query.get("limit").map(|value| value.as_ref()), Some("100"));
+            if let Some(token) = query.get("nextToken") {
+                assert_eq!(token, "page/2+token");
+                let mut value = sandbox("paused");
+                value["state"] = "paused".into();
+                json_response(StatusCode::OK, json!([value]))
+            } else {
+                let mut response = json_response(StatusCode::OK, json!([sandbox("parent")]));
+                response
+                    .headers_mut()
+                    .insert("x-next-token", "page/2+token".parse().unwrap());
+                response
+            }
+        }
         ("POST", "/v2/sandboxes") if body["templateID"] == "body-timeout" => {
             let chunks = stream::once(async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -361,9 +386,9 @@ async fn e2b_body_deadline_is_timeout_not_malformed_json() {
     let mut config = E2bConfig::new(Secret::new("api-secret"), "body-timeout");
     config.api_endpoint = fixture.endpoint.clone();
     config.request_timeout = Duration::from_millis(50);
-    let error = E2bLifecycle::new(config)
+    let error = E2bSandboxManager::new(config)
         .unwrap()
-        .lifecycle()
+        .sandboxes()
         .create(CreateOptions::default())
         .await
         .unwrap_err();
@@ -387,7 +412,7 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
     let process = Process::new(envd.clone(), listed[0].process.clone());
     assert_eq!(process.inspect().await.unwrap().process.id, "42");
     let handle = process.output().subscribe().await.unwrap();
-    assert_eq!(handle.reference.pty, None);
+    assert_eq!(process.reference().pty, None);
     assert_eq!(
         opensol_core::wait_events(handle.events, "envd")
             .await
@@ -498,10 +523,11 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     let mut request = SpawnRequest::new(Command::new("program", Vec::<String>::new()));
     request.stdin = true;
     request.pty = Some(PtySize { cols: 90, rows: 30 });
-    let (_, mut handle) = envd.spawn(request).await.unwrap();
-    assert_eq!(handle.reference.pty, Some(true));
+    let spawned_handle = envd.spawn(request).await.unwrap();
+    let mut handle = spawned_handle.output().subscribe().await.unwrap();
+    assert_eq!(spawned_handle.reference().pty, Some(true));
     let listed = envd.list().await.unwrap().remove(0).process;
-    assert_eq!(listed.id, handle.reference.id);
+    assert_eq!(listed.id, spawned_handle.reference().id);
     assert_eq!(listed.pty, None);
     let unknown = envd.get(listed);
     let before = fixture.records.lock().unwrap().len();
@@ -519,27 +545,27 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     assert!(
         matches!(handle.events.next().await.unwrap().unwrap(), ProcessEvent::Output { channel: OutputChannel::Terminal, data } if data == [0xff, 0, b'T'])
     );
-    envd.get(handle.reference.clone())
+    envd.get(spawned_handle.reference().clone())
         .send_input(vec![0xff, 4])
         .await
         .unwrap();
-    envd.get(handle.reference.clone())
+    envd.get(spawned_handle.reference().clone())
         .resize(PtySize {
             cols: 100,
             rows: 40,
         })
         .await
         .unwrap();
-    envd.get(handle.reference.clone())
+    envd.get(spawned_handle.reference().clone())
         .signal(Signal::Kill)
         .await
         .unwrap();
-    envd.get(handle.reference.clone())
+    envd.get(spawned_handle.reference().clone())
         .signal(Signal::Terminate)
         .await
         .unwrap();
     assert_eq!(
-        envd.get(handle.reference.clone())
+        envd.get(spawned_handle.reference().clone())
             .close_stdin()
             .await
             .unwrap_err()
@@ -547,7 +573,7 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
         ErrorKind::Unsupported
     );
     assert_eq!(
-        envd.get(handle.reference.clone())
+        envd.get(spawned_handle.reference().clone())
             .signal(Signal::Interrupt)
             .await
             .unwrap_err()
@@ -738,14 +764,50 @@ async fn envd_errors_do_not_become_success_or_implicit_kills() {
 }
 
 #[tokio::test]
+async fn e2b_list_collects_native_pages_and_maps_running_and_paused_states() {
+    let fixture = Fixture::start().await;
+    let mut config = E2bConfig::new(Secret::new("api-secret"), "base");
+    config.api_endpoint = fixture.endpoint.clone();
+    let manager = E2bSandboxManager::new(config).unwrap().sandboxes();
+    assert!(manager.capabilities().list);
+    let listed = manager.list().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        (&*listed[0].sandbox.id, listed[0].state),
+        ("parent", SandboxState::Running)
+    );
+    assert_eq!(
+        (&*listed[1].sandbox.id, listed[1].state),
+        ("paused", SandboxState::Stopped)
+    );
+    assert_eq!(
+        manager
+            .get(listed[0].sandbox.clone())
+            .inspect()
+            .await
+            .unwrap(),
+        listed[0]
+    );
+    let records = fixture.records.lock().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.path == "/v2/sandboxes")
+            .count(),
+        2
+    );
+    assert!(records.iter().all(|record| record.method == "GET"));
+}
+
+#[tokio::test]
 async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     let fixture = Fixture::start().await;
     let mut config = E2bConfig::new(Secret::new("api-secret"), "base");
     config.api_endpoint = fixture.endpoint.clone();
     config.envd_endpoint = Some(fixture.endpoint.clone());
     assert!(!format!("{config:?}").contains("api-secret"));
-    let backend = E2bLifecycle::new(config.clone()).unwrap();
-    let lifecycle = backend.lifecycle();
+    let backend = E2bSandboxManager::new(config.clone()).unwrap();
+    let lifecycle = backend.sandboxes();
     let resource = lifecycle
         .create(CreateOptions {
             name: Some("friendly".into()),
@@ -753,15 +815,15 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
         })
         .await
         .unwrap();
-    assert_eq!(resource.id, "parent");
+    assert_eq!(resource.reference().id, "parent");
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap().state,
-        ResourceState::Running
+        resource.inspect().await.unwrap().state,
+        SandboxState::Running
     );
-    lifecycle.stop(&resource).await.unwrap();
-    lifecycle.start(&resource).await.unwrap();
-    assert_eq!(lifecycle.fork(&resource).await.unwrap().id, "child");
-    let native = backend.envd(&resource).await.unwrap();
+    resource.stop().await.unwrap();
+    resource.start().await.unwrap();
+    assert_eq!(resource.fork().await.unwrap().reference().id, "child");
+    let native = backend.envd(resource.reference()).await.unwrap();
     assert_eq!(
         native
             .connection()
@@ -772,17 +834,18 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
             .code,
         Some(7)
     );
-    lifecycle.delete(&resource).await.unwrap();
+    resource.delete().await.unwrap();
     let error = lifecycle
-        .fork(&ResourceRef::new("e2b", "fork-fail"))
+        .get(SandboxRef::new("e2b", "fork-fail"))
+        .fork()
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Backend);
     assert!(!format!("{error:?}").contains("api-secret"));
     config.template = "http-fail".into();
-    let error = E2bLifecycle::new(config)
+    let error = E2bSandboxManager::new(config)
         .unwrap()
-        .lifecycle()
+        .sandboxes()
         .create(CreateOptions::default())
         .await
         .unwrap_err();

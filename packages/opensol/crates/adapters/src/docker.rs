@@ -18,14 +18,16 @@ use bollard::{
     models::{ContainerCreateBody, ExecConfig, HostConfig},
     query_parameters::{
         CreateContainerOptions, CreateContainerOptionsBuilder, InspectContainerOptions,
-        RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptions,
+        ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
+        StopContainerOptions,
     },
 };
 use futures::StreamExt;
 use opensol_core::{
     Connection, ConnectionCapabilities, CreateOptions, Error, ErrorKind, ExecRequest, ExecResult,
-    ExitStatus, Lifecycle, LifecycleCapabilities, ResourceInfo, ResourceRef, ResourceState, Result,
-    raw::{ExecAccess, LifecycleAccess},
+    ExitStatus, Result, SandboxInfo, SandboxManager, SandboxManagerCapabilities, SandboxRef,
+    SandboxState,
+    raw::{ConnectionAccess, SandboxManagerAccess},
 };
 use tokio::io::AsyncWriteExt;
 
@@ -55,12 +57,12 @@ impl std::fmt::Debug for DockerConfig {
 
 /// Owns an Engine client, not the lifetime of containers it creates.
 #[derive(Clone)]
-pub struct DockerLifecycle {
+pub struct DockerSandboxManager {
     client: Arc<Docker>,
     config: DockerConfig,
 }
 
-impl DockerLifecycle {
+impl DockerSandboxManager {
     pub fn new(client: Docker, config: DockerConfig) -> Result<Self> {
         if config.image.is_empty() {
             return Err(Error::invalid("docker", "configure", "image is required"));
@@ -78,12 +80,12 @@ impl DockerLifecycle {
         )
     }
 
-    pub fn lifecycle(&self) -> Lifecycle {
-        Lifecycle::new(self.clone())
+    pub fn sandboxes(&self) -> SandboxManager {
+        SandboxManager::new(self.clone())
     }
 
     /// Bind a container using the same Engine client, without checking or starting it.
-    pub fn connection(&self, resource: &ResourceRef) -> Result<Connection> {
+    pub fn connection(&self, resource: &SandboxRef) -> Result<Connection> {
         resource.validate("docker", "connect")?;
         Ok(Connection::new(DockerConnection {
             client: self.client.clone(),
@@ -110,16 +112,59 @@ fn docker_error(error: bollard::errors::Error, operation: &str) -> Error {
     Error::new(kind, "docker", operation, "Docker Engine request failed")
 }
 
+fn sandbox_info(sandbox: SandboxRef, native_state: String) -> SandboxInfo {
+    let state = match native_state.as_str() {
+        "running" => SandboxState::Running,
+        "created" | "exited" | "paused" => SandboxState::Stopped,
+        "dead" => SandboxState::Failed,
+        "restarting" | "removing" => SandboxState::Pending,
+        _ => SandboxState::Unknown,
+    };
+    SandboxInfo {
+        sandbox,
+        state,
+        native_state,
+    }
+}
+
 #[async_trait]
-impl LifecycleAccess for DockerLifecycle {
+impl SandboxManagerAccess for DockerSandboxManager {
     fn backend(&self) -> &'static str {
         "docker"
     }
-    fn capabilities(&self) -> LifecycleCapabilities {
-        LifecycleCapabilities::BASIC
+    fn capabilities(&self) -> SandboxManagerCapabilities {
+        SandboxManagerCapabilities::BASIC
     }
 
-    async fn create(&self, options: CreateOptions) -> Result<ResourceRef> {
+    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        self.client
+            .list_containers(Some(
+                ListContainersOptionsBuilder::default().all(true).build(),
+            ))
+            .await
+            .map_err(|error| docker_error(error, "list"))?
+            .into_iter()
+            .map(|container| {
+                let id = container.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Backend,
+                        "docker",
+                        "list",
+                        "invalid container identity",
+                    )
+                })?;
+                Ok(sandbox_info(
+                    SandboxRef::new("docker", id),
+                    container
+                        .state
+                        .map(|state| state.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                ))
+            })
+            .collect()
+    }
+
+    async fn create(&self, options: CreateOptions) -> Result<SandboxRef> {
         let query: Option<CreateContainerOptions> = options
             .name
             .as_deref()
@@ -148,10 +193,10 @@ impl LifecycleAccess for DockerLifecycle {
             .create_container(query, config)
             .await
             .map_err(|error| docker_error(error, "create"))?;
-        Ok(ResourceRef::new("docker", response.id))
+        Ok(SandboxRef::new("docker", response.id))
     }
 
-    async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
+    async fn inspect(&self, resource: &SandboxRef) -> Result<SandboxInfo> {
         let info = self
             .client
             .inspect_container(&resource.id, None::<InspectContainerOptions>)
@@ -162,35 +207,24 @@ impl LifecycleAccess for DockerLifecycle {
             .and_then(|state| state.status)
             .map(|state| state.to_string())
             .unwrap_or_else(|| "unknown".into());
-        let state = match native.as_str() {
-            "running" => ResourceState::Running,
-            "created" | "exited" | "paused" => ResourceState::Stopped,
-            "dead" => ResourceState::Failed,
-            "restarting" | "removing" => ResourceState::Pending,
-            _ => ResourceState::Unknown,
-        };
-        Ok(ResourceInfo {
-            resource: resource.clone(),
-            state,
-            native_state: native,
-        })
+        Ok(sandbox_info(resource.clone(), native))
     }
 
-    async fn start(&self, resource: &ResourceRef) -> Result<()> {
+    async fn start(&self, resource: &SandboxRef) -> Result<()> {
         self.client
             .start_container(&resource.id, None::<StartContainerOptions>)
             .await
             .map_err(|error| docker_error(error, "start"))
     }
 
-    async fn stop(&self, resource: &ResourceRef) -> Result<()> {
+    async fn stop(&self, resource: &SandboxRef) -> Result<()> {
         self.client
             .stop_container(&resource.id, None::<StopContainerOptions>)
             .await
             .map_err(|error| docker_error(error, "stop"))
     }
 
-    async fn delete(&self, resource: &ResourceRef) -> Result<()> {
+    async fn delete(&self, resource: &SandboxRef) -> Result<()> {
         self.client
             .remove_container(
                 &resource.id,
@@ -211,7 +245,7 @@ pub struct DockerConnection {
 impl DockerConnection {
     pub fn new(client: Docker, container: impl Into<String>) -> Result<Self> {
         let container = container.into();
-        ResourceRef::new("docker", &container).validate("docker", "connect")?;
+        SandboxRef::new("docker", &container).validate("docker", "connect")?;
         Ok(Self {
             client: Arc::new(client),
             container,
@@ -227,7 +261,7 @@ impl DockerConnection {
 }
 
 #[async_trait]
-impl ExecAccess for DockerConnection {
+impl ConnectionAccess for DockerConnection {
     fn backend(&self) -> &'static str {
         "docker"
     }

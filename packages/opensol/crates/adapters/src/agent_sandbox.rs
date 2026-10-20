@@ -9,8 +9,8 @@ use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
-    Command, Connection, CreateOptions, Error, ErrorKind, ExecRequest, LifecycleCapabilities,
-    ResourceInfo, ResourceRef, ResourceState, Result, raw::LifecycleAccess,
+    Command, Connection, CreateOptions, Error, ErrorKind, ExecRequest, Result, SandboxInfo,
+    SandboxManagerCapabilities, SandboxRef, SandboxState, raw::SandboxManagerAccess,
 };
 use serde_json::{Value, json};
 
@@ -55,11 +55,11 @@ impl std::fmt::Debug for AgentSandboxConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct AgentSandboxLifecycle {
+pub struct AgentSandboxManager {
     config: AgentSandboxConfig,
 }
 
-impl AgentSandboxLifecycle {
+impl AgentSandboxManager {
     pub fn new(config: AgentSandboxConfig) -> Result<Self> {
         if config.namespace.is_empty()
             || config.namespace.starts_with('-')
@@ -128,7 +128,7 @@ impl AgentSandboxLifecycle {
         ))
     }
 
-    async fn set_mode(&self, resource: &ResourceRef, mode: &str, operation: &str) -> Result<()> {
+    async fn set_mode(&self, resource: &SandboxRef, mode: &str, operation: &str) -> Result<()> {
         self.run(
             vec![
                 "patch".into(),
@@ -147,16 +147,102 @@ impl AgentSandboxLifecycle {
     }
 }
 
+fn sandbox_info(value: &Value, operation: &str) -> Result<SandboxInfo> {
+    let name = value
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| response_error(operation))?;
+    let sandbox = SandboxRef::new("agent-sandbox", name);
+    let generation = value
+        .pointer("/metadata/generation")
+        .and_then(Value::as_u64);
+    let mut state = SandboxState::Pending;
+    let mut native = "Reconciling".to_string();
+    if let Some(conditions) = value
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+    {
+        for condition in conditions {
+            if generation.is_none()
+                || condition.get("observedGeneration").and_then(Value::as_u64) != generation
+            {
+                continue;
+            }
+            let kind = condition.get("type").and_then(Value::as_str).unwrap_or("");
+            let status = condition
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let reason = condition
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match (kind, status, reason) {
+                ("Ready", "True", _) => {
+                    state = SandboxState::Running;
+                    native = "Ready".into();
+                }
+                ("Suspended", "True", _) => {
+                    state = SandboxState::Stopped;
+                    native = "Suspended".into();
+                }
+                ("Finished", "True", "PodSucceeded") => {
+                    state = SandboxState::Completed;
+                    native = "PodSucceeded".into();
+                }
+                ("Finished", "True", "PodFailed") => {
+                    state = SandboxState::Failed;
+                    native = "PodFailed".into();
+                }
+                ("Ready", "False", "InvalidConfiguration" | "ReconcilerError") => {
+                    state = SandboxState::Failed;
+                    native = reason.into();
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(SandboxInfo {
+        sandbox,
+        state,
+        native_state: native,
+    })
+}
+
 #[async_trait]
-impl LifecycleAccess for AgentSandboxLifecycle {
+impl SandboxManagerAccess for AgentSandboxManager {
     fn backend(&self) -> &'static str {
         "agent-sandbox"
     }
-    fn capabilities(&self) -> LifecycleCapabilities {
-        LifecycleCapabilities::BASIC
+    fn capabilities(&self) -> SandboxManagerCapabilities {
+        SandboxManagerCapabilities::BASIC
     }
 
-    async fn create(&self, options: CreateOptions) -> Result<ResourceRef> {
+    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        let output = self
+            .run(
+                vec![
+                    "get".into(),
+                    "-o=json".into(),
+                    "--".into(),
+                    "sandboxes.agents.x-k8s.io".into(),
+                ],
+                Vec::new(),
+                "list",
+            )
+            .await?;
+        let value: Value = serde_json::from_slice(&output).map_err(|_| response_error("list"))?;
+        value
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| response_error("list"))?
+            .iter()
+            .map(|sandbox| sandbox_info(sandbox, "list"))
+            .collect()
+    }
+
+    async fn create(&self, options: CreateOptions) -> Result<SandboxRef> {
         let name = options
             .name
             .unwrap_or_else(|| format!("opensol-{}", uuid::Uuid::new_v4().simple()));
@@ -178,10 +264,10 @@ impl LifecycleAccess for AgentSandboxLifecycle {
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| response_error("create"))?;
-        Ok(ResourceRef::new("agent-sandbox", name))
+        Ok(SandboxRef::new("agent-sandbox", name))
     }
 
-    async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
+    async fn inspect(&self, resource: &SandboxRef) -> Result<SandboxInfo> {
         let output = self
             .run(
                 vec![
@@ -197,70 +283,21 @@ impl LifecycleAccess for AgentSandboxLifecycle {
             .await?;
         let value: Value =
             serde_json::from_slice(&output).map_err(|_| response_error("inspect"))?;
-        let generation = value
-            .pointer("/metadata/generation")
-            .and_then(Value::as_u64);
-        let mut state = ResourceState::Pending;
-        let mut native = "Reconciling".to_string();
-        if let Some(conditions) = value
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-        {
-            for condition in conditions {
-                if generation.is_none()
-                    || condition.get("observedGeneration").and_then(Value::as_u64) != generation
-                {
-                    continue;
-                }
-                let kind = condition.get("type").and_then(Value::as_str).unwrap_or("");
-                let status = condition
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let reason = condition
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                match (kind, status, reason) {
-                    ("Ready", "True", _) => {
-                        state = ResourceState::Running;
-                        native = "Ready".into();
-                    }
-                    ("Suspended", "True", _) => {
-                        state = ResourceState::Stopped;
-                        native = "Suspended".into();
-                    }
-                    ("Finished", "True", "PodSucceeded") => {
-                        state = ResourceState::Completed;
-                        native = "PodSucceeded".into();
-                    }
-                    ("Finished", "True", "PodFailed") => {
-                        state = ResourceState::Failed;
-                        native = "PodFailed".into();
-                    }
-                    ("Ready", "False", "InvalidConfiguration" | "ReconcilerError") => {
-                        state = ResourceState::Failed;
-                        native = reason.into();
-                    }
-                    _ => {}
-                }
-            }
+        let info = sandbox_info(&value, "inspect")?;
+        if info.sandbox != *resource {
+            return Err(response_error("inspect"));
         }
-        Ok(ResourceInfo {
-            resource: resource.clone(),
-            state,
-            native_state: native,
-        })
+        Ok(info)
     }
 
-    async fn start(&self, resource: &ResourceRef) -> Result<()> {
+    async fn start(&self, resource: &SandboxRef) -> Result<()> {
         self.set_mode(resource, "Running", "start").await
     }
-    async fn stop(&self, resource: &ResourceRef) -> Result<()> {
+    async fn stop(&self, resource: &SandboxRef) -> Result<()> {
         self.set_mode(resource, "Suspended", "stop").await
     }
 
-    async fn delete(&self, resource: &ResourceRef) -> Result<()> {
+    async fn delete(&self, resource: &SandboxRef) -> Result<()> {
         self.run(
             vec![
                 "delete".into(),

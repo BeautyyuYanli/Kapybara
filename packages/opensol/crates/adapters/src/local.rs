@@ -5,7 +5,7 @@ use std::{io::ErrorKind as IoErrorKind, process::Stdio};
 use async_trait::async_trait;
 use opensol_core::{
     ConnectionCapabilities, Error, ErrorKind, ExecRequest, ExecResult, ExitStatus, Result,
-    raw::ExecAccess,
+    raw::ConnectionAccess,
 };
 use tokio::{io::AsyncWriteExt, process::Command as TokioCommand};
 
@@ -35,7 +35,7 @@ fn io_error(error: std::io::Error) -> Error {
 }
 
 #[async_trait]
-impl ExecAccess for Local {
+impl ConnectionAccess for Local {
     fn backend(&self) -> &'static str {
         "local"
     }

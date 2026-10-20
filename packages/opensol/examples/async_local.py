@@ -16,7 +16,8 @@ async def main(config_file: str | None, pueue_directory: str | None) -> None:
     if config_file is None:
         return
     manager = aio.pueue(connection, config_file=config_file, pueue_directory=pueue_directory)
-    process, subscription = await manager.spawn(["python3", "-c", "print('managed task')"])
+    process = await manager.spawn(["python3", "-c", "print('managed task')"])
+    subscription = await process.output.subscribe()
     print("native task ID", process.ref.id)
     try:
         async for event in subscription:

@@ -70,22 +70,40 @@ impl AsyncConnection {
     }
 }
 
-#[pyclass(name = "AsyncLifecycle", frozen)]
-pub(super) struct AsyncLifecycle {
-    inner: Lifecycle,
+#[pyclass(name = "AsyncSandboxManager", frozen)]
+pub(super) struct AsyncSandboxManager {
+    inner: SandboxManager,
 }
 
 #[pymethods]
-impl AsyncLifecycle {
+impl AsyncSandboxManager {
     #[getter]
     fn backend(&self) -> &'static str {
         self.inner.backend()
     }
-
     fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         capabilities(py, self.inner.capabilities())
     }
-
+    fn get(&self, sandbox: PyRef<'_, PySandboxRef>) -> AsyncSandbox {
+        AsyncSandbox {
+            inner: self.inner.get(sandbox.inner.clone()),
+        }
+    }
+    fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        future_into_py(py, async move {
+            client
+                .list()
+                .await
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .map(|inner| PySandboxInfo { inner })
+                        .collect::<Vec<_>>()
+                })
+                .map_err(exception)
+        })
+    }
     #[pyo3(signature = (*, name=None, labels=None))]
     fn create<'py>(
         &self,
@@ -101,75 +119,54 @@ impl AsyncLifecycle {
                     labels: labels.unwrap_or_default(),
                 })
                 .await
-                .map(|inner| PyResourceRef { inner })
+                .map(|inner| AsyncSandbox { inner })
                 .map_err(exception)
         })
     }
+}
 
-    fn inspect<'py>(
-        &self,
-        py: Python<'py>,
-        resource: PyRef<'_, PyResourceRef>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+#[pyclass(name = "AsyncSandbox", frozen)]
+pub(super) struct AsyncSandbox {
+    inner: opensol_core::Sandbox,
+}
+
+#[pymethods]
+impl AsyncSandbox {
+    #[getter]
+    fn r#ref(&self) -> PySandboxRef {
+        PySandboxRef {
+            inner: self.inner.reference().clone(),
+        }
+    }
+    fn inspect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
-        let resource = resource.inner.clone();
         future_into_py(py, async move {
             client
-                .inspect(&resource)
+                .inspect()
                 .await
-                .map(|inner| PyResourceInfo { inner })
+                .map(|inner| PySandboxInfo { inner })
                 .map_err(exception)
         })
     }
-
-    fn start<'py>(
-        &self,
-        py: Python<'py>,
-        resource: PyRef<'_, PyResourceRef>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
-        let resource = resource.inner.clone();
-        future_into_py(py, async move {
-            client.start(&resource).await.map_err(exception)
-        })
+        future_into_py(py, async move { client.start().await.map_err(exception) })
     }
-
-    fn stop<'py>(
-        &self,
-        py: Python<'py>,
-        resource: PyRef<'_, PyResourceRef>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
-        let resource = resource.inner.clone();
-        future_into_py(py, async move {
-            client.stop(&resource).await.map_err(exception)
-        })
+        future_into_py(py, async move { client.stop().await.map_err(exception) })
     }
-
-    fn delete<'py>(
-        &self,
-        py: Python<'py>,
-        resource: PyRef<'_, PyResourceRef>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
-        let resource = resource.inner.clone();
-        future_into_py(py, async move {
-            client.delete(&resource).await.map_err(exception)
-        })
+        future_into_py(py, async move { client.delete().await.map_err(exception) })
     }
-
-    fn fork<'py>(
-        &self,
-        py: Python<'py>,
-        resource: PyRef<'_, PyResourceRef>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn fork<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
-        let resource = resource.inner.clone();
         future_into_py(py, async move {
             client
-                .fork(&resource)
+                .fork()
                 .await
-                .map(|inner| PyResourceRef { inner })
+                .map(|inner| AsyncSandbox { inner })
                 .map_err(exception)
         })
     }
@@ -179,7 +176,7 @@ impl AsyncLifecycle {
 /// future that has been cancelled but has not yet stopped on the Rust executor.
 #[pyclass(name = "AsyncOutputSubscription", frozen)]
 pub(super) struct AsyncOutputSubscription {
-    reference: ProcessRef,
+    backend: String,
     state: Arc<tokio::sync::Mutex<SubscriptionState>>,
     pending: Arc<Mutex<Option<Result<ProcessEvent>>>>,
     abort: AbortHandle,
@@ -190,10 +187,9 @@ impl From<OutputSubscription> for AsyncOutputSubscription {
     fn from(subscription: OutputSubscription) -> Self {
         let (abort, registration) = AbortHandle::new_pair();
         Self {
-            reference: subscription.reference,
+            backend: subscription.backend().to_owned(),
             state: Arc::new(tokio::sync::Mutex::new(SubscriptionState {
                 events: Some(Box::pin(Abortable::new(subscription.events, registration))),
-                outcome: None,
             })),
             pending: Arc::new(Mutex::new(None)),
             abort,
@@ -213,20 +209,13 @@ fn delivery_lock_error() -> PyErr {
 
 #[pymethods]
 impl AsyncOutputSubscription {
-    #[getter]
-    fn r#ref(&self) -> PyProcessRef {
-        PyProcessRef {
-            inner: self.reference.clone(),
-        }
-    }
-
     #[pyo3(signature = (*, timeout=None))]
     fn _reserve<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let timeout = crate::timeout(timeout)?;
         let state = self.state.clone();
         let pending = self.pending.clone();
         let closed = self.closed.clone();
-        let backend = self.reference.backend.clone();
+        let backend = self.backend.clone();
         future_into_py(py, async move {
             let mut state = state.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -272,27 +261,6 @@ impl AsyncOutputSubscription {
             .map_err(|_| delivery_lock_error())?
             .take();
         Ok(())
-    }
-
-    fn _outcome<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
-        let backend = self.reference.backend.clone();
-        future_into_py(py, async move {
-            state
-                .lock()
-                .await
-                .outcome
-                .clone()
-                .map(|inner| PyProcessOutcome { inner })
-                .ok_or_else(|| {
-                    exception(Error::new(
-                        ErrorKind::Transport,
-                        &backend,
-                        "wait",
-                        "subscription is closed; completion is unknown",
-                    ))
-                })
-        })
     }
 
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -376,12 +344,7 @@ impl AsyncProcessManager {
             client
                 .spawn(request)
                 .await
-                .map(|(process, subscription)| {
-                    (
-                        resources::AsyncProcess { inner: process },
-                        AsyncOutputSubscription::from(subscription),
-                    )
-                })
+                .map(|process| resources::AsyncProcess { inner: process })
                 .map_err(exception)
         })
     }
@@ -395,8 +358,8 @@ fn _async_connection(connection: PyRef<'_, PyConnection>) -> AsyncConnection {
 }
 
 #[pyfunction]
-fn _async_lifecycle(lifecycle: PyRef<'_, PyLifecycle>) -> AsyncLifecycle {
-    AsyncLifecycle {
+fn _async_sandboxes(lifecycle: PyRef<'_, PySandboxManager>) -> AsyncSandboxManager {
+    AsyncSandboxManager {
         inner: lifecycle.inner.clone(),
     }
 }
@@ -475,7 +438,7 @@ fn _aio_openshell<'py>(
         client_key,
     )?;
     future_into_py(py, async move {
-        OpenShellLifecycle::connect(config, workspace, create)
+        OpenShellSandboxManager::connect(config, workspace, create)
             .await
             .map(|inner| PyOpenShell { inner })
             .map_err(exception)
@@ -518,11 +481,12 @@ fn _aio_openshell_connection<'py>(
 
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AsyncConnection>()?;
-    module.add_class::<AsyncLifecycle>()?;
+    module.add_class::<AsyncSandboxManager>()?;
+    module.add_class::<AsyncSandbox>()?;
     module.add_class::<AsyncProcessManager>()?;
     module.add_class::<AsyncOutputSubscription>()?;
     module.add_function(wrap_pyfunction!(_async_connection, module)?)?;
-    module.add_function(wrap_pyfunction!(_async_lifecycle, module)?)?;
+    module.add_function(wrap_pyfunction!(_async_sandboxes, module)?)?;
     module.add_function(wrap_pyfunction!(_async_processes, module)?)?;
     module.add_function(wrap_pyfunction!(_aio_sandboxd, module)?)?;
     module.add_function(wrap_pyfunction!(_aio_openshell, module)?)?;

@@ -8,21 +8,21 @@
 
 ## 三层不是流水线
 
-三层表示责任边界，不是强制 `Lifecycle → Connection → ProcessManager` 的调用链：
+三层表示责任边界，不是强制 `SandboxManager → Connection → ProcessManager` 的调用链：
 
 | 公共接口 | 职责 | 返回或标识 |
 | --- | --- | --- |
-| `Lifecycle` | `create/inspect/start/stop/delete/fork` | 后端名与不透明资源 ID |
+| `SandboxManager` | `create/get/list`；单个沙盒经由 `Sandbox` 操作 | `Sandbox`、可保存的 `SandboxRef` 和状态 `SandboxInfo` |
 | `Connection` | `exec`，等待短命令完成 | 字节 stdout/stderr、退出状态 |
-| `ProcessManager` | 原生任务发现、创建与本地绑定 | `(Process, OutputSubscription)`：任务操作与原生初始订阅 |
+| `ProcessManager` | 原生任务发现、创建与本地绑定 | `Process`：任务操作与 output/terminal 视图 |
 
 例如：
 
 ```text
-DockerLifecycle ──资源引用──> DockerConnection ──注入──> Pueue
-E2bLifecycle ──资源引用──> Envd ──视图──> Connection + ProcessManager
-AgentSandboxLifecycle                  Sandboxd (Connection)
-OpenShellLifecycle ──资源引用──> OpenShellConnection
+DockerSandboxManager ──资源引用──> DockerConnection ──注入──> Pueue
+E2bSandboxManager ──资源引用──> Envd ──视图──> Connection + ProcessManager
+AgentSandboxManager                  Sandboxd (Connection)
+OpenShellSandboxManager ──资源引用──> OpenShellConnection
 Local、Ssh 或 DockerConnection ──注入──> Pueue 或 Tmux
 ```
 
@@ -32,13 +32,39 @@ Pueue 和 Tmux 包装已有的公共 `Connection`；envd 通过原生 RPC 同时
 
 | 适配器实现 | 业务使用 |
 | --- | --- |
-| `raw::LifecycleAccess` | `Lifecycle` |
-| `raw::ExecAccess` | `Connection` |
-| `raw::ProcessAccess` | `ProcessManager`、绑定的 `Process` 与 `OutputSubscription` |
+| `raw::SandboxManagerAccess` | `SandboxManager`、绑定的 `Sandbox` |
+| `raw::ConnectionAccess` | `Connection` |
+| `raw::ProcessManagerAccess` | `ProcessManager`、绑定的 `Process` 与 `OutputSubscription` |
 | `raw::OutputAccess` | 原始字节 `Output` |
 | `raw::TerminalAccess` | 原生渲染文本 `Terminal` |
 
-业务客户端是可廉价 clone 的具体类型，通过 `Lifecycle::new(adapter)` 等构造；不要求调用方管理动态 trait 对象。公共入口统一检查参数、引用与已声明能力，适配器负责原生协议、状态、权限和保留策略。第三方后端只需实现对应 raw trait 并包装，无需插件注册、全局状态、配置 DSL 或总控 `Sandbox`。这借鉴 OpenDAL 的 raw Service / 公共 Operator 边界，三类能力仍独立组合。
+业务客户端是可廉价 clone 的具体类型，通过 `SandboxManager::new(adapter)` 等构造；不要求调用方管理动态 trait 对象。公共入口统一检查参数、引用与已声明能力，适配器负责原生协议、状态、权限和保留策略。第三方后端只需实现对应 raw trait 并包装，无需插件注册、全局状态或配置 DSL。`Sandbox` 与 `Process` 分别绑定管理器和单个引用，提供单对象操作。这借鉴 OpenDAL 的 raw Service / 公共 Operator 边界，三类能力仍独立组合。
+
+## 沙盒管理与单个沙盒
+
+`SandboxManager` 提供 backend、capabilities、create、get、list。create 返回绑定的 Sandbox，get(SandboxRef) 只本地绑定，不检查存在性或权限。单个 Sandbox 提供只读 ref，以及 inspect、start、stop、delete、fork；fork 返回新的 Sandbox。Rust 使用 `sandbox.reference()`，Python 使用 `sandbox.ref`。SandboxInfo 的 sandbox 字段是 SandboxRef，另有 state、native_state。绑定、clone 和丢弃对象都不改变原生沙盒生命周期。
+
+```python
+import opensol as sdk
+
+backend = sdk.docker("my-image", command=["sleep", "infinity"])
+manager = backend.sandboxes
+sandbox = manager.create(labels={"project": "example"})
+try:
+    saved = sandbox.ref
+    rebound = manager.get(saved)
+    rebound.start()
+    connection = backend.connection(saved)
+    print(connection.exec(["true"]).success)
+    for info in manager.list():
+        print(info.sandbox.id, info.state)
+finally:
+    sandbox.delete()
+```
+
+list 返回 `list[SandboxInfo]`（Rust 为 Vec），支持情况由 SandboxManagerCapabilities.list 声明。列表范围遵循当前连接和权限，创建配置中的镜像、模板和 labels 不作为隐式过滤条件：Docker 查询当前 Engine 的全部容器（含停止状态）；agent-sandbox 查询配置 namespace 的 Sandbox CR；E2B 查询当前 API key 可见的 running/paused 沙盒；OpenShell 查询配置 workspace。E2B 和 OpenShell 自动读取全部原生分页，错误不返回截断的成功列表；列表与后续 inspect 之间的状态变化由原生后端决定。E2B 的 GET /v2/sandboxes、state、nextToken 和 X-Next-Token 遵循[上游 OpenAPI](https://github.com/e2b-dev/E2B/blob/main/spec/openapi.yml)。
+
+适配器分别实现 raw::SandboxManagerAccess、raw::ConnectionAccess、raw::ProcessManagerAccess；raw 沙盒操作接受 SandboxRef，create/fork 返回 SandboxRef，公共管理器将其绑定成 Sandbox。
 
 ## 集成与能力
 
@@ -105,7 +131,7 @@ Local 在本机继承环境，并应用请求的环境覆盖；它不是沙盒�
 
 Docker 使用调用者提供的 Engine 客户端，或 Bollard 的默认连接配置。不会自动 pull 镜像。create 返回停止的容器，start 需要显式调用；stop/start 不保留进程内存；delete 强制移除容器，但不会代替调用方清理外部卷。隔离、资源限额、挂载和网络设置来自 `DockerConfig.host_config`，SDK 不为它们作安全兜底。
 
-`DockerLifecycle.lifecycle()` 与 `.connection(resource)` 分别提供公共生命周期和执行客户端，复用原来的 Engine 连接。绑定不检查存在性、不启动容器。独立 `DockerConnection::connect_defaults` 用于连接已有容器，使用时包装为公共 `Connection`。
+`DockerSandboxManager.sandboxes()` 与 `.connection(resource)` 分别提供公共生命周期和执行客户端，复用原来的 Engine 连接。绑定不检查存在性、不启动容器。独立 `DockerConnection::connect_defaults` 用于连接已有容器，使用时包装为公共 `Connection`。
 
 Docker exec 观察原生完成后取消未被消费的 stdin，仍读完输出再返回退出码；进程仍在运行时的输入/传输错误不会被忽略。
 
@@ -135,14 +161,14 @@ state、wait 和 Completed 均以原生 pane 生命周期为准：pane Dead/EOF 
 
 restart 只允许 dead pane，保留引用并更新原生执行代次；remove 在同一原生队列内按 dead 条件销毁任务，运行中返回 Conflict。kill 使用 kill-pane，销毁任务和画面，后续查询为 NotFound，不生成退出结果。server 消失返回连接错误，SDK 不恢复进程。
 
-初始与额外订阅在建立时绑定执行代次与原生 pane PID，只交付 Completed，不生成 Output 事件。消费与完成交付前核对代次；可检测的内部/外部 respawn 返回 Conflict，原生清理返回 NotFound。已完成的 Python 订阅始终保留首次结果，包括 exit=None，不会随 OS 状态就绪而补填；Process.wait/inspect 查询当前执行，后续可取得已就绪的状态。不承诺检测两次观察间无法分辨的外部修改。轮询没有独立后台任务，关闭或取消订阅不会 kill。
+初始与额外订阅在建立时绑定执行代次与原生 pane PID，只交付 Completed，不生成 Output 事件。消费与完成交付前核对代次；可检测的内部/外部 respawn 返回 Conflict，原生清理返回 NotFound。完成事件只交付一次，之后订阅结束；已交付事件的 outcome（包括 exit=None）保持不变；Process.wait/inspect 查询当前执行，后续可取得已就绪的状态。不承诺检测两次观察间无法分辨的外部修改。轮询没有独立后台任务，关闭或取消订阅不会 kill。
 
 输入直接使用 `send-keys -H`，无 UTF-8 或 NUL 限制，不使用 paste buffer 或临时文件。为绕过 tmux 3.5 的 CLI 消息容量限制，一条经过完整身份保护的发送命令由原生 `source-file -` 从 stdin 读取，仍仅执行一次 send-keys；输入能力要求注入 Connection 支持 stdin，Local/SSH/Docker 均支持。空输入不发送按键；单次上限 8192 字节，超过上限在目标 I/O 前返回 InvalidArgument。PTY 行规仍控制目标如何接收字节，应用若需逐字节接收应自行切换 raw 模式。不会把输入解释为额外的 signal 操作，也不会重试结果不确定的输入。
 
 ```python
 # server 已由调用方启动；socket 路径属于 connection 的目标机器。
 manager = sdk.tmux(sdk.local(), socket_path="/tmp/my-tmux.sock")
-process, subscription = manager.spawn(["python3", "-c", "print('terminal')"], pty=(80, 24))
+process = manager.spawn(["python3", "-c", "print('terminal')"], pty=(80, 24))
 print(process.wait(timeout=5).exit)
 screen = process.terminal.screen()  # TerminalScreen：实际 cols / rows 和文本行。
 history = process.terminal.tail(lines=200)  # 只读取滚动历史，不含当前画面。
@@ -159,7 +185,7 @@ Tmux tail 的 before/after 均为 None，at_tail 为 true；同次观测可证�
 
 E2B 控制面使用 v2 create/connect、inspect、full-memory pause、delete 和原生 fork。create 一般返回运行中沙盒；stop 是原生内存暂停，start 是 resume，不等同 Docker stop/start。权限、模板与套餐是否允许操作仍由服务端决定。
 
-`E2bLifecycle.envd(resource)` 只读 inspect 发现 envd token/domain，复用原 HTTP pool 和超时配置构造 envd 客户端，不隐式 resume。也可以直接构造 `EnvdConfig` 连接独立 envd。API key 与 envd access token 分开，按请求设置；E2B 代理路由通过 Sandbox ID/port headers 传递。
+`E2bSandboxManager.envd(resource)` 只读 inspect 发现 envd token/domain，复用原 HTTP pool 和超时配置构造 envd 客户端，不隐式 resume。也可以直接构造 `EnvdConfig` 连接独立 envd。API key 与 envd access token 分开，按请求设置；E2B 代理路由通过 Sandbox ID/port headers 传递。
 
 envd 的 `Start` / `Connect` 是 ConnectRPC，而不是假设为 gRPC。字节输出、stdin、信号和 PTY 使用固定的上游 protobuf schema。`status` 使用原生 List；进程不在 List 中时返回 NotFound，不能推断历史退出码。原生 End 映射为带真实 ExitStatus 的 Completed outcome；缺少完成证据的意外断流返回 Transport。重连遵循 envd 的保留窗口，不是持久日志系统。
 
@@ -179,7 +205,7 @@ Suspended 删除 Pod、保留 CR 和卷，不保留内存。sandboxd 是独立�
 
 创建可以使用原生 `SandboxSpec` 或命名 workload template，二选一。exec 先只读查询 owner，转发路由 hint，然后调用原生 exec；不在不确定失败后重试。执行使用非 login shell 模式，保留 argv 和分离的字节输出。普通 exec 不等于主进程 connect：主进程的有限 replay 不作为任意进程历史接口。delete 表示服务端接受请求，不保证资源已同步消失。
 
-`OpenShellLifecycle.lifecycle()` / `.connection(resource)` 复用同一 gateway channel、TLS、凭据和 workspace；connection 绑定无需 I/O。E2B、Docker、OpenShell 的后端专属连接入口保留在后端对象上，不加入 raw 生命周期契约。
+`OpenShellSandboxManager.sandboxes()` / `.connection(resource)` 复用同一 gateway channel、TLS、凭据和 workspace；connection 绑定无需 I/O。E2B、Docker、OpenShell 的后端专属连接入口保留在后端对象上，不加入 raw 生命周期契约。
 
 ## Rust 使用
 
@@ -214,14 +240,15 @@ assert result.stdout == b"hello\n"
 
 # pueued 由调用方预先启动，SDK 只连接它。
 processes = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml")
-process, subscription = processes.spawn(["python3", "-c", "print('job')"])
+process = processes.spawn(["python3", "-c", "print('job')"])
+subscription = process.output.subscribe()
 while (event := subscription.next_event(timeout=10)) is not None:
     if event.outcome is not None:
         break
     print(event.channel, event.data)
 ```
 
-`docker()`、`e2b()`、`openshell()` 返回保留配置的后端对象，通过 `.lifecycle` 操作资源。Docker/OpenShell 的 `.connection(resource)` 本地绑定公共 Connection；E2B 的 `.envd(resource)` 只读发现连接信息，复用原 API key、endpoint 和超时。同步与 aio 使用相同形状，aio 的 E2B 发现需要 await。独立端点工厂仍可连接已有资源。
+`docker()`、`e2b()`、`openshell()` 返回保留配置的后端对象，通过 `.sandboxes` 操作资源。Docker/OpenShell 的 `.connection(resource)` 本地绑定公共 Connection；E2B 的 `.envd(resource)` 只读发现连接信息，复用原 API key、endpoint 和超时。同步与 aio 使用相同形状，aio 的 E2B 发现需要 await。独立端点工厂仍可连接已有资源。
 
 aio 的公共 I/O 方法与网络工厂都是 `async def`：调用只创建 coroutine，执行 coroutine 时才创建并 await 原生 Future，可直接交给 `asyncio.create_task()`。配置型工厂、本地绑定与属性仍同步；连接或端点发现型工厂需要 await：
 
@@ -234,7 +261,8 @@ async def main():
     print(result.stdout)
     # pueued 和配置文件由调用方提供。
     processes = aio.pueue(aio.local(), config_file="/path/to/pueue.yml")
-    process, subscription = await processes.spawn(["python3", "-c", "print('job')"])
+    process = await processes.spawn(["python3", "-c", "print('job')"])
+    subscription = await process.output.subscribe()
     try:
         async for event in subscription:
             if event.outcome is None:
@@ -245,30 +273,30 @@ async def main():
 asyncio.run(main())
 ```
 
-取消 `next_event` 或等待超时后可继续读取，已从 Rust 消费但尚未交付 Python 的一条事件或终结错误会保留。`subscription.wait(timeout=...)` 会丢弃输出，使用覆盖消费锁排队和全部事件交付的单一总 deadline；持续输出不会重新计时。`aclose` 可重复调用并唤醒阻塞读取，不终止任务。取消 create/spawn/exec 不表示远端未执行或已停止，也不触发自动重试。详见 [Python 订阅与取消](bindings/python/README.md#输出订阅与取消)；[本地异步示例](examples/async_local.py) 可直接运行。
+取消 `next_event` 或等待超时后可继续读取，已从 Rust 消费但尚未交付 Python 的一条事件或终结错误会保留。等待完成使用 `process.wait(timeout=...)`；需要输出时消费订阅并从 Completed 事件取得该次执行的结果。`aclose` 可重复调用并唤醒阻塞读取，不终止任务。取消 create/spawn/exec 不表示远端未执行或已停止，也不触发自动重试。详见 [Python 订阅与取消](bindings/python/README.md#输出订阅与取消)；[本地异步示例](examples/async_local.py) 可直接运行。
 
 ## 进程、Output 与 Terminal
 
-公共 ProcessManager 负责构造、后端信息、capabilities、probe、list、spawn、get。`spawn` 返回任务与初始订阅；已有引用通过 `manager.get(ref)` 本地绑定：
+公共 ProcessManager 负责构造、后端信息、capabilities、probe、list、spawn、get。`spawn` 返回 Process；已有引用通过 `manager.get(ref)` 本地绑定：
 
 | 对象 | 公共入口 |
 | --- | --- |
 | `Process` | 引用、inspect、wait、pause、start、restart、kill、remove、signal、send_input、close_stdin、resize；只读 output、terminal |
 | `Output` | capabilities、read、tail、subscribe；带 channel 的原始 bytes |
 | `Terminal` | capabilities、read、tail、screen；上游已渲染的文本行 |
-| `OutputSubscription` | 一次输出订阅及其引用；Rust 使用 reference、events / wait_events，Python 使用 ref、next_event / wait / close 或 aclose |
+| `OutputSubscription` | 一次输出订阅；Rust 使用 events / wait_events，Python 使用 next_event / close 或 aclose |
 
-`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均可调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。公共 `spawn` 返回 `(Process, OutputSubscription)`，两者绑定同一引用，保留 envd Start 的原始流及 Pueue/Tmux 初始执行标识，不增加 probe、状态查询或重连。Python 的 Process 和订阅均通过只读 `.ref` 返回 ProcessRef；Rust 分别使用 `reference()` 和 `reference`。
+`Process` 绑定公共 ProcessManager 和 ProcessRef，构造与丢弃都不做远端操作，也不缓存权威状态。Rust/Python 均可调用 `manager.get(ref)`；Rust 也可以使用 `Process::new(manager, ref)`。公共 `spawn` 只返回 Process，内部保留 envd Start 的原始流及 Pueue/Tmux 初始执行标识，不增加 probe、状态查询或重连。第一次 `process.output.subscribe()` 接管该初始流；Process 和 Output 的 clone 共享这一个待接管的流，后续订阅走原生重连。Python 通过只读 `process.ref` 返回 ProcessRef，Rust 使用 `process.reference()`；订阅不公开任务引用。
 
 属性、视图构造及 capabilities 只做本地绑定，不 probe、查询、重连或采集。aio 的属性同步返回视图，I/O 方法都是 coroutine。Output 的 terminal channel 仍表示可含终端控制序列的 PTY 原始字节，与 Terminal 的文本表示独立；SDK 不在两种表示之间转换。
 
-`raw::ProcessAccess` 的单任务操作继续接受 ProcessRef；spawn 直接保留原生初始订阅，二元组由公共 manager 本地组装。同步 output_access / terminal_access 钩子 clone 既有原生客户端，为视图提供独立的 `raw::OutputAccess` / `raw::TerminalAccess`。未供应 access 时也能取得视图，能力全 false，I/O 为 Unsupported。第三方可用 `Output::new(access, reference)` 或 `Terminal::new(access, reference)` 直接包装一种表示，无需实现另一种表示或 ProcessManager。
+`raw::ProcessManagerAccess` 的单任务操作继续接受 ProcessRef；spawn 返回原生初始订阅，由公共 manager 保存到 Process。适配器使用 `OutputSubscription::new(reference, events)` 构造订阅，其引用为私有字段。同步 output_access / terminal_access 钩子 clone 既有原生客户端，为视图提供独立的 `raw::OutputAccess` / `raw::TerminalAccess`。未供应 access 时也能取得视图，除尚未接管的初始订阅外，能力为 false，I/O 为 Unsupported。第三方可用 `Output::new(access, reference)` 或 `Terminal::new(access, reference)` 直接包装一种表示，无需实现另一种表示或 ProcessManager。
 
 ```python
 manager = sdk.pueue(sdk.local(), config_file="/path/to/pueue.yml",
                     pueue_directory="/path/to/pueue-data")
 print(manager.probe().client_version)
-process, subscription = manager.spawn(["python3", "-c", "print('managed')"])
+process = manager.spawn(["python3", "-c", "print('managed')"])
 page = process.output.read(max_bytes=65536)
 for chunk in page.chunks:
     print(chunk.channel, chunk.data)
@@ -281,7 +309,7 @@ print(process.inspect().state, next_page.at_tail)
 
 两种表示分别查询能力。OutputCapabilities 的 read/tail/subscribe 独立；historical_output/streaming_output 只声明订阅交付，不代表分页。Pueue 配置目录时 read/tail 为 true，订阅为历史 true、实时 false；未配置目录时仍可订阅。envd 只有订阅及实时声明为 true，遵循原生保留窗口。Tmux 只有 Output.subscribe 和 Terminal.tail/screen 为 true。subscribe=true 不承诺历史重放、实时或无丢失重连。额外订阅只调用原生 Connect/重连，不 spawn，不丢弃初始 Start 流。
 
-`process.wait()` 查询原生任务的完成状态；Python `subscription.wait()` 消费并缓存该次订阅的完成结果。Pueue 的初始与额外订阅在建立时绑定可观测的原生执行，延迟消费也不跟随任务 ID 的重启或替换；wait/follow 前后发现执行改变返回 Conflict，任务清理返回 NotFound。正常的同一 Queued 执行开始仍可消费，已经交付的完成缓存继续属于原来的执行；SDK 不归档被替换的旧日志。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
+`process.wait(timeout=...)` 查询原生任务当前执行的完成状态；订阅通过一次 Completed 事件交付其绑定执行的结果，随后结束。Pueue 的初始与额外订阅在建立时绑定可观测的原生执行，延迟消费也不跟随任务 ID 的重启或替换；wait/follow 前后发现执行改变返回 Conflict，任务清理返回 NotFound。正常的同一 Queued 执行开始仍可消费，已经交付的完成事件继续属于原来的执行；SDK 不归档被替换的旧日志。关闭或丢弃订阅不终止任务，资源仍由调用方显式清理。
 
 OutputPage 包含 chunks、before/after、at_head/at_tail；TerminalPage 对应 lines 和 TerminalCursor。before/after 是本页前后边界：after 向前、before 向后读取相邻内容且不重复；反向页内仍按原生顺序返回。无 cursor 时 forward 从保留头部、backward 从本次观测尾部开始；tail 直接取得最后一页，不依赖 read 能力。空且已知位置的页允许两个边界相同，不能证明位置时边界为 None。at_head 无法确认时为 None，at_tail 只表示本次观测尾部，与任务完成无关。
 

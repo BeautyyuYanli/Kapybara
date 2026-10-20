@@ -3,11 +3,14 @@
 //! Authentication is explicit endpoint/TLS/bearer configuration, not implicit CLI login discovery.
 //! Main-process connect/replay is intentionally not offered as arbitrary exec reconnect or history.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use opensol_core::{
     Connection, ConnectionCapabilities, CreateOptions, Error, ErrorKind, ExecRequest, ExecResult,
-    ExitStatus, Lifecycle, LifecycleCapabilities, ResourceInfo, ResourceRef, ResourceState, Result,
-    raw::{ExecAccess, LifecycleAccess},
+    ExitStatus, Result, SandboxInfo, SandboxManager, SandboxManagerCapabilities, SandboxRef,
+    SandboxState,
+    raw::{ConnectionAccess, SandboxManagerAccess},
 };
 use tonic::transport::Channel;
 
@@ -63,14 +66,14 @@ impl std::fmt::Debug for OpenShellCreate {
 
 /// Reusable workspace-scoped lifecycle client. Resource IDs are canonical names, not gateway UUIDs.
 #[derive(Clone)]
-pub struct OpenShellLifecycle {
+pub struct OpenShellSandboxManager {
     client: OpenShellClient<Channel>,
     config: GrpcConfig,
     workspace: String,
     create: OpenShellCreate,
 }
 
-impl OpenShellLifecycle {
+impl OpenShellSandboxManager {
     pub async fn connect(
         config: GrpcConfig,
         workspace: impl Into<String>,
@@ -98,12 +101,12 @@ impl OpenShellLifecycle {
         })
     }
 
-    pub fn lifecycle(&self) -> Lifecycle {
-        Lifecycle::new(self.clone())
+    pub fn sandboxes(&self) -> SandboxManager {
+        SandboxManager::new(self.clone())
     }
 
     /// Bind the same gateway/workspace/TLS context, without starting the resource.
-    pub fn connection(&self, resource: &ResourceRef) -> Result<Connection> {
+    pub fn connection(&self, resource: &SandboxRef) -> Result<Connection> {
         resource.validate("openshell", "connect")?;
         Ok(Connection::new(OpenShellConnection {
             client: self.client.clone(),
@@ -123,16 +126,80 @@ fn response_error(operation: &str) -> Error {
     )
 }
 
+fn sandbox_info(sandbox: native::Sandbox, operation: &str) -> Result<SandboxInfo> {
+    let name = sandbox
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.name.clone())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| response_error(operation))?;
+    let phase = sandbox
+        .status
+        .map(|status| status.phase)
+        .unwrap_or_default();
+    let native = native::SandboxPhase::try_from(phase).unwrap_or(native::SandboxPhase::Unknown);
+    let state = match native {
+        native::SandboxPhase::Ready => SandboxState::Running,
+        native::SandboxPhase::Stopped => SandboxState::Stopped,
+        native::SandboxPhase::Completed => SandboxState::Completed,
+        native::SandboxPhase::Error => SandboxState::Failed,
+        native::SandboxPhase::Provisioning
+        | native::SandboxPhase::Starting
+        | native::SandboxPhase::Stopping
+        | native::SandboxPhase::Deleting => SandboxState::Pending,
+        _ => SandboxState::Unknown,
+    };
+    Ok(SandboxInfo {
+        sandbox: SandboxRef::new("openshell", name),
+        state,
+        native_state: native.as_str_name().into(),
+    })
+}
+
 #[async_trait]
-impl LifecycleAccess for OpenShellLifecycle {
+impl SandboxManagerAccess for OpenShellSandboxManager {
     fn backend(&self) -> &'static str {
         "openshell"
     }
-    fn capabilities(&self) -> LifecycleCapabilities {
-        LifecycleCapabilities::BASIC
+    fn capabilities(&self) -> SandboxManagerCapabilities {
+        SandboxManagerCapabilities::BASIC
     }
 
-    async fn create(&self, options: CreateOptions) -> Result<ResourceRef> {
+    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        let mut sandboxes = Vec::new();
+        let mut page_token = String::new();
+        let mut tokens = HashSet::new();
+        loop {
+            let response = self
+                .client
+                .clone()
+                .list_sandboxes(self.config.request(
+                    native::ListSandboxesRequest {
+                        workspace_scope: self.scope(),
+                        page_size: 100,
+                        page_token,
+                        label_selector: String::new(),
+                    },
+                    "openshell",
+                )?)
+                .await
+                .map_err(|error| grpc::status(error, "openshell", "list"))?
+                .into_inner();
+            for sandbox in response.sandboxes {
+                sandboxes.push(sandbox_info(sandbox, "list")?);
+            }
+            page_token = response.next_page_token;
+            if page_token.is_empty() {
+                break;
+            }
+            if !tokens.insert(page_token.clone()) {
+                return Err(response_error("list"));
+            }
+        }
+        Ok(sandboxes)
+    }
+
+    async fn create(&self, options: CreateOptions) -> Result<SandboxRef> {
         let message = native::CreateSandboxRequest {
             workspace_scope: self.scope(),
             spec: self.create.spec.clone(),
@@ -154,10 +221,10 @@ impl LifecycleAccess for OpenShellLifecycle {
             .map(|metadata| metadata.name)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| response_error("create"))?;
-        Ok(ResourceRef::new("openshell", name))
+        Ok(SandboxRef::new("openshell", name))
     }
 
-    async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
+    async fn inspect(&self, resource: &SandboxRef) -> Result<SandboxInfo> {
         let response = self
             .client
             .clone()
@@ -172,30 +239,14 @@ impl LifecycleAccess for OpenShellLifecycle {
             .map_err(|error| grpc::status(error, "openshell", "inspect"))?
             .into_inner();
         let sandbox = response.sandbox.ok_or_else(|| response_error("inspect"))?;
-        let phase = sandbox
-            .status
-            .map(|status| status.phase)
-            .unwrap_or_default();
-        let native = native::SandboxPhase::try_from(phase).unwrap_or(native::SandboxPhase::Unknown);
-        let state = match native {
-            native::SandboxPhase::Ready => ResourceState::Running,
-            native::SandboxPhase::Stopped => ResourceState::Stopped,
-            native::SandboxPhase::Completed => ResourceState::Completed,
-            native::SandboxPhase::Error => ResourceState::Failed,
-            native::SandboxPhase::Provisioning
-            | native::SandboxPhase::Starting
-            | native::SandboxPhase::Stopping
-            | native::SandboxPhase::Deleting => ResourceState::Pending,
-            _ => ResourceState::Unknown,
-        };
-        Ok(ResourceInfo {
-            resource: resource.clone(),
-            state,
-            native_state: native.as_str_name().into(),
-        })
+        let info = sandbox_info(sandbox, "inspect")?;
+        if info.sandbox != *resource {
+            return Err(response_error("inspect"));
+        }
+        Ok(info)
     }
 
-    async fn start(&self, resource: &ResourceRef) -> Result<()> {
+    async fn start(&self, resource: &SandboxRef) -> Result<()> {
         self.client
             .clone()
             .start_sandbox(self.config.request(
@@ -211,7 +262,7 @@ impl LifecycleAccess for OpenShellLifecycle {
         Ok(())
     }
 
-    async fn stop(&self, resource: &ResourceRef) -> Result<()> {
+    async fn stop(&self, resource: &SandboxRef) -> Result<()> {
         self.client
             .clone()
             .stop_sandbox(self.config.request(
@@ -227,7 +278,7 @@ impl LifecycleAccess for OpenShellLifecycle {
         Ok(())
     }
 
-    async fn delete(&self, resource: &ResourceRef) -> Result<()> {
+    async fn delete(&self, resource: &SandboxRef) -> Result<()> {
         self.client
             .clone()
             .delete_sandbox(self.config.request(
@@ -279,7 +330,7 @@ impl OpenShellConnection {
 }
 
 #[async_trait]
-impl ExecAccess for OpenShellConnection {
+impl ConnectionAccess for OpenShellConnection {
     fn backend(&self) -> &'static str {
         "openshell"
     }

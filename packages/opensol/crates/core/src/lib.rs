@@ -6,7 +6,13 @@
 
 pub mod raw;
 
-use std::{collections::BTreeMap, fmt, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    pin::Pin,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -72,14 +78,14 @@ impl std::error::Error for Error {}
 
 pub type Result<Value> = std::result::Result<Value, Error>;
 
-/// Opaque resource identity. Its meaning is scoped to the configured provider account/namespace.
+/// Opaque sandbox identity, scoped to the configured provider account/namespace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ResourceRef {
+pub struct SandboxRef {
     pub backend: String,
     pub id: String,
 }
 
-impl ResourceRef {
+impl SandboxRef {
     pub fn new(backend: &str, id: impl Into<String>) -> Self {
         Self {
             backend: backend.into(),
@@ -92,7 +98,7 @@ impl ResourceRef {
             return Err(Error::invalid(
                 backend,
                 operation,
-                "invalid resource reference",
+                "invalid sandbox reference",
             ));
         }
         Ok(())
@@ -101,7 +107,7 @@ impl ResourceRef {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ResourceState {
+pub enum SandboxState {
     Pending,
     Running,
     Stopped,
@@ -111,9 +117,9 @@ pub enum ResourceState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ResourceInfo {
-    pub resource: ResourceRef,
-    pub state: ResourceState,
+pub struct SandboxInfo {
+    pub sandbox: SandboxRef,
+    pub state: SandboxState,
     pub native_state: String,
 }
 
@@ -125,7 +131,8 @@ pub struct CreateOptions {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct LifecycleCapabilities {
+pub struct SandboxManagerCapabilities {
+    pub list: bool,
     pub create: bool,
     pub inspect: bool,
     pub start: bool,
@@ -136,8 +143,9 @@ pub struct LifecycleCapabilities {
     pub fork: bool,
 }
 
-impl LifecycleCapabilities {
+impl SandboxManagerCapabilities {
     pub const BASIC: Self = Self {
+        list: true,
         create: true,
         inspect: true,
         start: true,
@@ -148,15 +156,15 @@ impl LifecycleCapabilities {
     };
 }
 
-/// Explicit resource operations. Start/stop retain native semantics, including memory preservation.
-/// Clones share the adapter; dropping a client never deletes its resources.
+/// Creates, discovers and locally binds native sandboxes within the adapter's configured scope.
+/// Clones share the adapter; dropping a client never deletes its sandboxes.
 #[derive(Clone)]
-pub struct Lifecycle {
-    access: Arc<dyn raw::LifecycleAccess>,
+pub struct SandboxManager {
+    access: Arc<dyn raw::SandboxManagerAccess>,
 }
 
-impl Lifecycle {
-    pub fn new(access: impl raw::LifecycleAccess + 'static) -> Self {
+impl SandboxManager {
+    pub fn new(access: impl raw::SandboxManagerAccess + 'static) -> Self {
         Self {
             access: Arc::new(access),
         }
@@ -164,10 +172,19 @@ impl Lifecycle {
     pub fn backend(&self) -> &'static str {
         self.access.backend()
     }
-    pub fn capabilities(&self) -> LifecycleCapabilities {
+    pub fn capabilities(&self) -> SandboxManagerCapabilities {
         self.access.capabilities()
     }
-    pub async fn create(&self, options: CreateOptions) -> Result<ResourceRef> {
+    /// Bind locally; existence and permissions are checked by subsequent native operations.
+    pub fn get(&self, reference: SandboxRef) -> Sandbox {
+        Sandbox::new(self.clone(), reference)
+    }
+    /// Lists native sandboxes, including stopped sandboxes still retained by the backend.
+    pub async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        self.require(self.capabilities().list, "list")?;
+        self.access.list().await
+    }
+    pub async fn create(&self, options: CreateOptions) -> Result<Sandbox> {
         if options
             .name
             .as_ref()
@@ -184,35 +201,82 @@ impl Lifecycle {
             ));
         }
         self.require(self.capabilities().create, "create")?;
-        self.access.create(options).await
+        self.access
+            .create(options)
+            .await
+            .map(|reference| self.get(reference))
     }
-    pub async fn inspect(&self, resource: &ResourceRef) -> Result<ResourceInfo> {
+    async fn inspect(&self, resource: &SandboxRef) -> Result<SandboxInfo> {
         resource.validate(self.backend(), "inspect")?;
         self.require(self.capabilities().inspect, "inspect")?;
         self.access.inspect(resource).await
     }
-    pub async fn start(&self, resource: &ResourceRef) -> Result<()> {
+    async fn start(&self, resource: &SandboxRef) -> Result<()> {
         resource.validate(self.backend(), "start")?;
         self.require(self.capabilities().start, "start")?;
         self.access.start(resource).await
     }
-    pub async fn stop(&self, resource: &ResourceRef) -> Result<()> {
+    async fn stop(&self, resource: &SandboxRef) -> Result<()> {
         resource.validate(self.backend(), "stop")?;
         self.require(self.capabilities().stop, "stop")?;
         self.access.stop(resource).await
     }
-    pub async fn delete(&self, resource: &ResourceRef) -> Result<()> {
+    async fn delete(&self, resource: &SandboxRef) -> Result<()> {
         resource.validate(self.backend(), "delete")?;
         self.require(self.capabilities().delete, "delete")?;
         self.access.delete(resource).await
     }
-    pub async fn fork(&self, resource: &ResourceRef) -> Result<ResourceRef> {
+    async fn fork(&self, resource: &SandboxRef) -> Result<Sandbox> {
         resource.validate(self.backend(), "fork")?;
         self.require(self.capabilities().fork, "fork")?;
-        self.access.fork(resource).await
+        self.access
+            .fork(resource)
+            .await
+            .map(|reference| self.get(reference))
     }
     fn require(&self, supported: bool, operation: &str) -> Result<()> {
         require(supported, self.backend(), operation)
+    }
+}
+
+/// A locally bound sandbox. State and lifetime remain native to the adapter.
+#[derive(Clone)]
+pub struct Sandbox {
+    manager: SandboxManager,
+    reference: SandboxRef,
+}
+
+impl fmt::Debug for Sandbox {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Sandbox")
+            .field("reference", &self.reference)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Sandbox {
+    pub fn new(manager: SandboxManager, reference: SandboxRef) -> Self {
+        Self { manager, reference }
+    }
+    pub fn reference(&self) -> &SandboxRef {
+        &self.reference
+    }
+    pub async fn inspect(&self) -> Result<SandboxInfo> {
+        self.manager.inspect(&self.reference).await
+    }
+    pub async fn start(&self) -> Result<()> {
+        self.manager.start(&self.reference).await
+    }
+    pub async fn stop(&self) -> Result<()> {
+        self.manager.stop(&self.reference).await
+    }
+    pub async fn delete(&self) -> Result<()> {
+        self.manager.delete(&self.reference).await
+    }
+    /// Creates a child using the backend's native fork semantics.
+    pub async fn fork(&self) -> Result<Sandbox> {
+        self.manager.fork(&self.reference).await
     }
 }
 
@@ -363,11 +427,11 @@ pub struct ConnectionCapabilities {
 /// Completed-command client bound to one execution target. Calls are never retried implicitly.
 #[derive(Clone)]
 pub struct Connection {
-    access: Arc<dyn raw::ExecAccess>,
+    access: Arc<dyn raw::ConnectionAccess>,
 }
 
 impl Connection {
-    pub fn new(access: impl raw::ExecAccess + 'static) -> Self {
+    pub fn new(access: impl raw::ConnectionAccess + 'static) -> Self {
         Self {
             access: Arc::new(access),
         }
@@ -610,6 +674,7 @@ pub struct TerminalCapabilities {
 pub struct Output {
     access: Arc<dyn raw::OutputAccess>,
     reference: ProcessRef,
+    initial_subscription: Arc<Mutex<Option<OutputSubscription>>>,
 }
 
 impl Output {
@@ -617,13 +682,20 @@ impl Output {
         Self {
             access: Arc::new(access),
             reference,
+            initial_subscription: Arc::new(Mutex::new(None)),
         }
     }
     pub fn backend(&self) -> &'static str {
         self.access.backend()
     }
     pub fn capabilities(&self) -> OutputCapabilities {
-        self.access.capabilities()
+        let mut capabilities = self.access.capabilities();
+        capabilities.subscribe |= self
+            .initial_subscription
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        capabilities
     }
     /// Reads immediately. An absent cursor selects the head (forward) or observed tail (backward).
     pub async fn read(
@@ -645,10 +717,19 @@ impl Output {
         require(self.capabilities().tail, self.backend(), "tail_output")?;
         self.access.tail(&self.reference, max_bytes).await
     }
-    /// Opens the native subscription without changing any page cursor or spawning a task.
+    /// Takes the unconsumed spawn stream once; later calls open independent native subscriptions.
+    /// Process/output clones share that single initial stream. No output is prefetched or archived.
     pub async fn subscribe(&self) -> Result<OutputSubscription> {
         self.reference
             .validate(self.backend(), "subscribe_output")?;
+        let initial = self
+            .initial_subscription
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(subscription) = initial {
+            return Ok(subscription);
+        }
         require(
             self.capabilities().subscribe,
             self.backend(),
@@ -747,12 +828,22 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProcessEvent>> + Send + 
 
 /// Owns a native output subscription, not the process lifetime. Dropping it does not delete resources.
 pub struct OutputSubscription {
-    pub reference: ProcessRef,
+    reference: ProcessRef,
     pub events: EventStream,
 }
 
+impl OutputSubscription {
+    /// Adapter constructor; the task identity is retained only for internal binding.
+    pub fn new(reference: ProcessRef, events: EventStream) -> Self {
+        Self { reference, events }
+    }
+    pub fn backend(&self) -> &str {
+        &self.reference.backend
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct ProcessCapabilities {
+pub struct ProcessManagerCapabilities {
     pub list: bool,
     pub pause: bool,
     pub start: bool,
@@ -794,11 +885,11 @@ impl Signal {
 /// Output retention and state remain native to the adapter.
 #[derive(Clone)]
 pub struct ProcessManager {
-    access: Arc<dyn raw::ProcessAccess>,
+    access: Arc<dyn raw::ProcessManagerAccess>,
 }
 
 impl ProcessManager {
-    pub fn new(access: impl raw::ProcessAccess + 'static) -> Self {
+    pub fn new(access: impl raw::ProcessManagerAccess + 'static) -> Self {
         Self {
             access: Arc::new(access),
         }
@@ -806,7 +897,7 @@ impl ProcessManager {
     pub fn backend(&self) -> &'static str {
         self.access.backend()
     }
-    pub fn capabilities(&self) -> ProcessCapabilities {
+    pub fn capabilities(&self) -> ProcessManagerCapabilities {
         self.access.capabilities()
     }
     /// Bind a reference locally. Subsequent operations check identity, existence and permissions.
@@ -820,15 +911,18 @@ impl ProcessManager {
         self.require(self.capabilities().list, "list")?;
         self.access.list().await
     }
-    /// Returns the bound task and its native initial subscription without querying or reconnecting.
-    pub async fn spawn(&self, request: SpawnRequest) -> Result<(Process, OutputSubscription)> {
+    /// Returns a bound task retaining its native initial stream for the first output subscription.
+    pub async fn spawn(&self, request: SpawnRequest) -> Result<Process> {
         request.validate(self.backend())?;
         let capabilities = self.capabilities();
         self.require(!request.stdin || capabilities.stdin, "spawn")?;
         self.require(request.pty.is_none() || capabilities.pty, "spawn")?;
         let subscription = self.access.spawn(request).await?;
-        let process = self.get(subscription.reference.clone());
-        Ok((process, subscription))
+        Ok(Process {
+            manager: self.clone(),
+            reference: subscription.reference.clone(),
+            initial_subscription: Arc::new(Mutex::new(Some(subscription))),
+        })
     }
     async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
         process.validate(self.backend(), "status")?;
@@ -917,12 +1011,17 @@ fn require(supported: bool, backend: &str, operation: &str) -> Result<()> {
 pub struct Process {
     manager: ProcessManager,
     reference: ProcessRef,
+    initial_subscription: Arc<Mutex<Option<OutputSubscription>>>,
 }
 
 impl Process {
     /// Binding is local; existence and access are checked by subsequent native operations.
     pub fn new(manager: ProcessManager, reference: ProcessRef) -> Self {
-        Self { manager, reference }
+        Self {
+            manager,
+            reference,
+            initial_subscription: Arc::new(Mutex::new(None)),
+        }
     }
     pub fn reference(&self) -> &ProcessRef {
         &self.reference
@@ -976,6 +1075,7 @@ impl Process {
                 .output_access()
                 .unwrap_or_else(|| Arc::new(UnavailableView(self.manager.backend()))),
             reference: self.reference.clone(),
+            initial_subscription: self.initial_subscription.clone(),
         }
     }
     pub fn terminal(&self) -> Terminal {

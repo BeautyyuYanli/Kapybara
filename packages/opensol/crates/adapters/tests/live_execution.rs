@@ -22,15 +22,15 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
 use opensol_adapters::{
-    docker::{DockerConfig, DockerLifecycle},
+    docker::{DockerConfig, DockerSandboxManager},
     local::Local,
     pueue::{Pueue, PueueConfig},
     ssh::{Ssh, SshConfig},
 };
 use opensol_core::{
     Command, Connection, CreateOptions, ErrorKind, ExecRequest, OutputChannel, OutputCursor,
-    Process, ProcessEvent, ProcessManager, ProcessRef, ProcessState, PtySize, ResourceState,
-    Signal, SpawnRequest, raw::ExecAccess,
+    Process, ProcessEvent, ProcessManager, ProcessRef, ProcessState, PtySize, SandboxState, Signal,
+    SpawnRequest, raw::ConnectionAccess,
 };
 use tempfile::TempDir;
 
@@ -50,7 +50,7 @@ impl LocalTarget {
 }
 
 #[async_trait]
-impl ExecAccess for LocalTarget {
+impl ConnectionAccess for LocalTarget {
     fn backend(&self) -> &'static str {
         Connection::new(Local).backend()
     }
@@ -110,7 +110,7 @@ impl PueueChangeDuringCommand {
 }
 
 #[async_trait]
-impl ExecAccess for PueueChangeDuringCommand {
+impl ConnectionAccess for PueueChangeDuringCommand {
     fn backend(&self) -> &'static str {
         "local"
     }
@@ -383,7 +383,7 @@ async fn real_ssh_tmux_uses_the_injected_connection() {
     let result = AssertUnwindSafe(async {
         let manager = ProcessManager::new(Tmux::new(ssh.clone(), TmuxConfig::new(&socket))?);
         manager.probe().await?;
-        let (process, _) = manager
+        let process = manager
             .spawn(SpawnRequest {
                 command: Command::new("printf", ["%s", "SSH tmux ; #{pane_id}"]),
                 stdin: false,
@@ -403,7 +403,7 @@ async fn real_ssh_tmux_uses_the_injected_connection() {
                 .contains("SSH tmux ; #{pane_id}")
         );
         process.remove().await?;
-        let (input, _) = manager.spawn(SpawnRequest {
+        let input = manager.spawn(SpawnRequest {
             command: Command::new("python3", ["-u", "-c",
                 "import os,tty; tty.setraw(0); print('READY',flush=True); data=b''\nwhile len(data)<4: data+=os.read(0,4-len(data))\nprint(data.hex(),flush=True)"]),
             stdin: true, pty: Some(PtySize { cols: 80, rows: 24 }),
@@ -481,8 +481,9 @@ async fn real_pueue_retains_merged_binary_logs_nonzero_exit_and_task_identity() 
         .command
         .env
         .insert("SDK_TEST".into(), "value' $()".into());
-    let (_, handle) = manager.spawn(request).await.unwrap();
-    let process = handle.reference.clone();
+    let spawned_handle = manager.spawn(request).await.unwrap();
+    let handle = spawned_handle.output().subscribe().await.unwrap();
+    let process = spawned_handle.reference().clone();
     let (output, outcome) = collect(handle.events).await;
     assert_eq!(combined_output(&output), b"\x00\xffout\nerr\n");
     assert_eq!(outcome.exit.unwrap().code, Some(7));
@@ -530,13 +531,14 @@ async fn real_pueue_delayed_subscriptions_reject_restarts_and_native_cleanup() {
     let (daemon, manager) = pueue_fixture().await;
     let script = daemon._directory.path().join("command.sh");
     std::fs::write(&script, "printf 7; exit 7").unwrap();
-    let (process, initial) = manager
+    let process = manager
         .spawn(SpawnRequest::new(Command::new(
             "sh",
             [script.to_str().unwrap()],
         )))
         .await
         .unwrap();
+    let initial = process.output().subscribe().await.unwrap();
     assert_eq!(
         process
             .wait(Some(Duration::from_secs(5)))
@@ -575,14 +577,14 @@ async fn real_pueue_delayed_subscriptions_reject_restarts_and_native_cleanup() {
     // A fresh native daemon reuses ID 0. Replacing the CLI configuration must
     // not let the old subscription accept that other task's created_at.
     let (replacement_daemon, replacement_manager) = pueue_fixture().await;
-    let (_, replacement) = replacement_manager
+    let spawned_replacement = replacement_manager
         .spawn(SpawnRequest::new(Command::new(
             "sh",
             [script.to_str().unwrap()],
         )))
         .await
         .unwrap();
-    assert_eq!(replacement.reference.id, process.reference().id);
+    assert_eq!(spawned_replacement.reference().id, process.reference().id);
     std::fs::copy(
         replacement_daemon._directory.path().join("pueue.yml"),
         daemon._directory.path().join("pueue.yml"),
@@ -616,7 +618,7 @@ async fn real_pueue_subscriptions_guard_wait_and_follow_against_native_changes()
         ("follow", true, true),
     ] {
         std::fs::write(&script, "printf 7; exit 7").unwrap();
-        let (process, initial) = manager
+        let process = manager
             .spawn(SpawnRequest::new(Command::new(
                 "sh",
                 [script.to_str().unwrap()],
@@ -627,7 +629,7 @@ async fn real_pueue_subscriptions_guard_wait_and_follow_against_native_changes()
         let racing = ProcessManager::new(
             Pueue::new(
                 Connection::new(PueueChangeDuringCommand {
-                    process,
+                    process: process.clone(),
                     command,
                     after,
                     remove,
@@ -649,7 +651,7 @@ async fn real_pueue_subscriptions_guard_wait_and_follow_against_native_changes()
             .unwrap(),
         );
         let mut subscription = racing
-            .get(initial.reference)
+            .get(process.reference().clone())
             .output()
             .subscribe()
             .await
@@ -679,7 +681,8 @@ async fn real_pueue_old_subscriptions_conflict_while_restarted_execution_is_runn
     std::fs::write(&script, "printf 7; exit 7").unwrap();
     let mut request = SpawnRequest::new(Command::new("sh", [script.to_str().unwrap()]));
     request.stdin = true;
-    let (process, initial) = manager.spawn(request).await.unwrap();
+    let process = manager.spawn(request).await.unwrap();
+    let initial = process.output().subscribe().await.unwrap();
     assert_eq!(
         process
             .wait(Some(Duration::from_secs(5)))
@@ -730,7 +733,7 @@ async fn real_pueue_post_wait_restart_conflicts_without_a_current_outcome() {
     std::fs::write(&script, "printf 7; exit 7").unwrap();
     let mut request = SpawnRequest::new(Command::new("sh", [script.to_str().unwrap()]));
     request.stdin = true;
-    let (process, initial) = manager.spawn(request).await.unwrap();
+    let process = manager.spawn(request).await.unwrap();
     assert_eq!(
         process
             .wait(Some(Duration::from_secs(5)))
@@ -766,7 +769,7 @@ async fn real_pueue_post_wait_restart_conflicts_without_a_current_outcome() {
         .unwrap(),
     );
     let mut subscription = racing
-        .get(initial.reference)
+        .get(process.reference().clone())
         .output()
         .subscribe()
         .await
@@ -823,7 +826,7 @@ fn page_bytes(page: &opensol_core::OutputPage) -> Vec<u8> {
 #[tokio::test]
 async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resumed_offsets() {
     let (daemon, manager) = pueue_fixture().await;
-    let (_, handle) = manager
+    let spawned_handle = manager
         .spawn(SpawnRequest::new(Command::new(
             "python3",
             [
@@ -834,7 +837,7 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
         .await
         .unwrap();
     manager
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
@@ -853,7 +856,7 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     // Allow fixed CLI/metadata overhead, orders of magnitude below the real 8 MiB native log.
     const METADATA_BUDGET: usize = 65_536;
     let tail = recorded
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .output()
         .tail(31)
         .await
@@ -866,7 +869,7 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     );
     let limit = 31;
     let first = recorded
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .output()
         .read(None, opensol_core::ReadDirection::Forward, limit)
         .await
@@ -879,7 +882,7 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     assert!(!first.at_tail);
     let advance = METADATA_BUDGET * 2 + 1;
     let prepared = recorded
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .output()
         .read(
             first.after.as_ref(),
@@ -895,7 +898,7 @@ async fn real_pueue_output_resources_bound_native_transfer_at_initial_and_resume
     // would exceed the entire metadata allowance on the small resumed read.
     let _ = connection.take_received();
     let second = recorded
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .output()
         .read(
             prepared.after.as_ref(),
@@ -927,7 +930,7 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
         .unwrap();
     assert!(installed.status.success());
     let program = PathBuf::from(String::from_utf8(installed.stdout).unwrap().trim());
-    let (_, handle) = manager
+    let spawned_handle = manager
         .spawn(SpawnRequest::new(Command::new(
             "printf",
             ["%s", "native log"],
@@ -935,7 +938,7 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
         .await
         .unwrap();
     manager
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
@@ -962,7 +965,7 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
     );
     assert_eq!(
         missing_tool
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .output()
             .read(None, opensol_core::ReadDirection::Forward, 32)
             .await
@@ -1035,7 +1038,7 @@ async fn real_pueue_probe_and_log_access_failures_preserve_classification_and_re
     for error in [
         denied_logs.probe().await.unwrap_err(),
         denied_logs
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .output()
             .read(None, opensol_core::ReadDirection::Forward, 32)
             .await
@@ -1110,9 +1113,10 @@ async fn real_pueue_resource_reads_running_binary_pages_and_detects_log_loss() {
             .unwrap()
             .starts_with("4.")
     );
-    let (_, handle) = manager.spawn(SpawnRequest::new(Command::new("python3", ["-c", "import sys; sys.stdin.readline(); sys.stdout.buffer.write(b'\\x00\\xffA'*3000); sys.stdout.buffer.flush(); sys.stdin.readline(); sys.stdout.buffer.write(b'\\x80tail'); sys.exit(7)"]))).await.unwrap();
-    await_state(&manager, &handle.reference, ProcessState::Running).await;
-    let process = Process::new(manager.clone(), handle.reference.clone());
+    let spawned_handle = manager.spawn(SpawnRequest::new(Command::new("python3", ["-c", "import sys; sys.stdin.readline(); sys.stdout.buffer.write(b'\\x00\\xffA'*3000); sys.stdout.buffer.flush(); sys.stdin.readline(); sys.stdout.buffer.write(b'\\x80tail'); sys.exit(7)"]))).await.unwrap();
+    let handle = spawned_handle.output().subscribe().await.unwrap();
+    await_state(&manager, spawned_handle.reference(), ProcessState::Running).await;
+    let process = Process::new(manager.clone(), spawned_handle.reference().clone());
     assert!(process.output().capabilities().read);
     drop(handle);
     assert!(
@@ -1305,14 +1309,15 @@ async fn real_pueue_resource_reads_running_binary_pages_and_detects_log_loss() {
 #[tokio::test]
 async fn real_pueue_controls_use_native_task_states_and_restart_replaces_execution() {
     let (daemon, manager) = pueue_fixture().await;
-    let (process, handle) = manager
+    let process = manager
         .spawn(SpawnRequest::new(Command::shell("printf ready; sleep 30")))
         .await
         .unwrap();
-    await_state(&manager, &handle.reference, ProcessState::Running).await;
+    let handle = process.output().subscribe().await.unwrap();
+    await_state(&manager, process.reference(), ProcessState::Running).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while manager
-            .get(handle.reference.clone())
+            .get(process.reference().clone())
             .output()
             .tail(1)
             .await
@@ -1470,12 +1475,17 @@ async fn real_pueue_native_spawn_failure_has_a_result_name_without_a_fabricated_
     let cwd = TempDir::with_prefix("opensol-private-native-error-").unwrap();
     let mut command = Command::new("true", Vec::<String>::new());
     command.cwd = Some(cwd.path().to_string_lossy().into_owned());
-    let (_, handle) = manager.spawn(SpawnRequest::new(command)).await.unwrap();
+    let spawned_handle = manager.spawn(SpawnRequest::new(command)).await.unwrap();
+    let handle = spawned_handle.output().subscribe().await.unwrap();
     drop(cwd); // Native Pueue can no longer spawn in the original, valid-at-add cwd.
-    manager.get(handle.reference.clone()).start().await.unwrap();
-    await_state(&manager, &handle.reference, ProcessState::Exited).await;
+    manager
+        .get(spawned_handle.reference().clone())
+        .start()
+        .await
+        .unwrap();
+    await_state(&manager, spawned_handle.reference(), ProcessState::Exited).await;
     let info = manager
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .inspect()
         .await
         .unwrap();
@@ -1483,7 +1493,7 @@ async fn real_pueue_native_spawn_failure_has_a_result_name_without_a_fabricated_
     assert_eq!(outcome.native_result.as_deref(), Some("FailedToSpawn"));
     assert!(outcome.exit.is_none());
     let waited = manager
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
@@ -1493,7 +1503,7 @@ async fn real_pueue_native_spawn_failure_has_a_result_name_without_a_fabricated_
             ._directory
             .path()
             .join("task_logs")
-            .join(format!("{}.log", handle.reference.id)),
+            .join(format!("{}.log", spawned_handle.reference().id)),
     )
     .unwrap();
     let (output, completed) = collect(handle.events).await;
@@ -1523,7 +1533,7 @@ async fn real_ssh_pueue_log_resources_use_the_injected_execution_target() {
     .map(ProcessManager::new)
     .unwrap();
     manager.probe().await.unwrap();
-    let (_, handle) = manager
+    let spawned_handle = manager
         .spawn(SpawnRequest::new(Command::new(
             "python3",
             [
@@ -1534,14 +1544,14 @@ async fn real_ssh_pueue_log_resources_use_the_injected_execution_target() {
         .await
         .unwrap();
     manager
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
     assert_eq!(
         page_bytes(
             &manager
-                .get(handle.reference.clone())
+                .get(spawned_handle.reference().clone())
                 .output()
                 .read(None, opensol_core::ReadDirection::Forward, 3)
                 .await
@@ -1575,7 +1585,8 @@ async fn real_pueue_task_environment_does_not_change_the_client_environment() {
         ("SDK_TEST".into(), value.into()),
         ("SDK-TEST".into(), value.into()),
     ]);
-    let (_, handle) = manager.spawn(SpawnRequest::new(command)).await.unwrap();
+    let spawned_handle = manager.spawn(SpawnRequest::new(command)).await.unwrap();
+    let handle = spawned_handle.output().subscribe().await.unwrap();
     let (output, outcome) = collect(handle.events).await;
     assert_eq!(combined_output(&output), value.as_bytes());
     assert!(outcome.exit.unwrap().success());
@@ -1586,10 +1597,11 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     let (_daemon, manager) = pueue_fixture().await;
     let mut request = SpawnRequest::new(Command::shell("read -r value; printf '%s' \"$value\""));
     request.stdin = true;
-    let (_, handle) = manager.spawn(request).await.unwrap();
+    let spawned_handle = manager.spawn(request).await.unwrap();
+    let handle = spawned_handle.output().subscribe().await.unwrap();
     for _attempt in 0..100 {
         if manager
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .inspect()
             .await
             .unwrap()
@@ -1600,7 +1612,7 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let restored = ProcessRef::new("pueue", &handle.reference.id, None);
+    let restored = ProcessRef::new("pueue", &spawned_handle.reference().id, None);
     manager
         .get(restored.clone())
         .send_input(b"hello ' $()\n".to_vec())
@@ -1609,13 +1621,13 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     let (output, outcome) = collect(handle.events).await;
     assert!(outcome.exit.unwrap().success());
     assert_eq!(combined_output(&output), b"hello ' $()");
-    let (_, handle) = manager
+    let spawned_handle = manager
         .spawn(SpawnRequest::new(Command::shell("sleep 30")))
         .await
         .unwrap();
     assert_eq!(
         manager
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .wait(Some(Duration::from_millis(50)))
             .await
             .unwrap_err()
@@ -1624,7 +1636,7 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     );
     for _attempt in 0..150 {
         if manager
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .inspect()
             .await
             .unwrap()
@@ -1637,7 +1649,7 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     }
     assert_eq!(
         manager
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .inspect()
             .await
             .unwrap()
@@ -1645,12 +1657,12 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
         opensol_core::ProcessState::Running
     );
     manager
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .signal(Signal::Kill)
         .await
         .unwrap();
     let outcome = manager
-        .get(handle.reference.clone())
+        .get(spawned_handle.reference().clone())
         .wait(Some(Duration::from_secs(5)))
         .await
         .unwrap();
@@ -1658,7 +1670,7 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     assert!(outcome.exit.is_none());
     assert_eq!(
         manager
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .inspect()
             .await
             .unwrap()
@@ -1667,7 +1679,7 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     );
     let (output, completed) = collect(
         manager
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .output()
             .subscribe()
             .await
@@ -1679,7 +1691,7 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
     assert_eq!(completed, outcome);
     assert_eq!(
         manager
-            .get(handle.reference.clone())
+            .get(spawned_handle.reference().clone())
             .send_input(vec![0xff])
             .await
             .unwrap_err()
@@ -1692,18 +1704,20 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
 async fn real_docker_lifecycle_exec_and_in_container_pueue() {
     let image = std::env::var("OPENSOL_TEST_IMAGE")
         .expect("run scripts/check.sh in the test container with Docker socket mounted");
-    let backend = DockerLifecycle::connect_defaults(DockerConfig {
+    let backend = DockerSandboxManager::connect_defaults(DockerConfig {
         image,
         command: vec!["sleep".into(), "infinity".into()],
         ..Default::default()
     })
     .unwrap();
-    let lifecycle = backend.lifecycle();
+    let lifecycle = backend.sandboxes();
     let resource = lifecycle.create(CreateOptions::default()).await.unwrap();
     let result = AssertUnwindSafe(async {
-        assert_eq!(lifecycle.inspect(&resource).await?.state, ResourceState::Stopped);
-        lifecycle.start(&resource).await?;
-        let connection = backend.connection(&resource)?;
+        assert_eq!(resource.inspect().await?.state, SandboxState::Stopped);
+        assert!(lifecycle.list().await?.iter().any(|info| info.sandbox == *resource.reference() && info.state == SandboxState::Stopped));
+        resource.start().await?;
+        assert!(lifecycle.list().await?.iter().any(|info| info.sandbox == *resource.reference() && info.state == SandboxState::Running));
+        let connection = backend.connection(resource.reference())?;
         let result = connection.exec(ExecRequest { command: Command::new("python3", ["-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()); sys.stderr.buffer.write(b'\\xff'); sys.exit(7)"]), stdin: b"\x00\xffinput".to_vec(), timeout: Some(Duration::from_secs(5)) }).await?;
         assert_eq!(result.stdout, b"\x00\xffinput"); assert_eq!(result.stderr, b"\xff"); assert_eq!(result.exit.code, Some(7));
         for (command, stdout, code) in [
@@ -1733,19 +1747,20 @@ async fn real_docker_lifecycle_exec_and_in_container_pueue() {
         }
         let manager = Pueue::new(connection, PueueConfig { config_file: Some(config_path), pueue_directory: Some(directory.into()), ..Default::default() }).map(ProcessManager::new)?;
         manager.probe().await?;
-        let (_, handle) = manager.spawn(SpawnRequest::new(Command::new("printf", ["%s", "Docker + Pueue '$()"]))).await?;
+        let spawned_handle = manager.spawn(SpawnRequest::new(Command::new("printf", ["%s", "Docker + Pueue '$()"]))).await?;
+        let handle = spawned_handle.output().subscribe().await?;
         let (output, outcome) = collect(handle.events).await;
         assert_eq!(combined_output(&output), b"Docker + Pueue '$()"); assert!(outcome.exit.unwrap().success());
-        assert_eq!(page_bytes(&manager.get(handle.reference.clone()).output().read(None, opensol_core::ReadDirection::Forward, 8).await?), b"Docker +");
-        assert_eq!(lifecycle.fork(&resource).await.unwrap_err().kind, ErrorKind::Unsupported);
-        lifecycle.stop(&resource).await?; assert_eq!(lifecycle.inspect(&resource).await?.state, ResourceState::Stopped);
-        lifecycle.start(&resource).await?; assert_eq!(lifecycle.inspect(&resource).await?.state, ResourceState::Running);
+        assert_eq!(page_bytes(&manager.get(spawned_handle.reference().clone()).output().read(None, opensol_core::ReadDirection::Forward, 8).await?), b"Docker +");
+        assert_eq!(resource.fork().await.unwrap_err().kind, ErrorKind::Unsupported);
+        resource.stop().await?; assert_eq!(resource.inspect().await?.state, SandboxState::Stopped);
+        resource.start().await?; assert_eq!(resource.inspect().await?.state, SandboxState::Running);
         Ok::<(), Box<dyn std::error::Error>>(())
     }).catch_unwind().await;
-    lifecycle.delete(&resource).await.unwrap();
+    resource.delete().await.unwrap();
     result.unwrap().unwrap();
     assert_eq!(
-        lifecycle.inspect(&resource).await.unwrap_err().kind,
+        resource.inspect().await.unwrap_err().kind,
         ErrorKind::NotFound
     );
 }
