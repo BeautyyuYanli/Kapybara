@@ -33,7 +33,9 @@ async def test_http_layer_validation_defaults_and_immutable_configuration(
             },
             {"layer_states": {"shell": {"jobs": {"injected": 1}}}},
         ):
-            response = await client.post("/api/sessions", json=base | invalid)
+            response = await client.post(
+                "/api/sessions", json=base | invalid | {"activity_id": str(uuid4())}
+            )
             assert response.status_code == 422
         assert not (await service.list_sessions()).items
         response = await client.post(

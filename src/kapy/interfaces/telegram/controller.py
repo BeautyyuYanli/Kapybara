@@ -1,8 +1,9 @@
 """Session-only Telegram input adapter with durable, at-least-once business calls.
 
 The inbox consumer is serial. Fixed targets/templates, preallocated session IDs and
-create/run/close Activity UUIDs survive retries. Recovery confirms the same durable
-operation without replaying scope enter. Core commits and private SQLite progress
+create/run/close Activity UUIDs survive retries. Recovery queries the attempted
+UUID without resubmission. Missing native records finish with an unconfirmed
+reply so one old message cannot block all later inbox work. Core and private SQLite progress
 deliberately remain separate transactions. Explicit close targets never rebind the route.
 Polling and recovery never hold a transaction during a network or runner call.
 The model catalog is read only: /model changes the bound session's model pair and
@@ -18,17 +19,17 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
-from temporalio.service import RPCError
+from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
+    ActivityIdentityConflict,
     CreateSession,
-    OperationConflict,
-    OperationFailed,
-    SessionBusy,
+    SessionExecutionError,
     SessionService,
     UpdateSession,
 )
+from kapy.control.sessions.temporal import CLOSE, CREATE
 from kapy.lifecycle import LifecycleError
 
 from .client import TelegramClient, TelegramFailure, retry_delay
@@ -178,7 +179,9 @@ class TelegramController:
                 session_id = None
         if command == "model":
             return await self.resolve_model(text, session_id)
-        if command in {"status", "close"} and session_id is None:
+        if command == "status":
+            return {"command": "status", "session_id": str(session_id) if session_id else None}
+        if command == "close" and session_id is None:
             return {"command": "reply", "reply": "No current session. Use /new or send text."}
         create = command == "new" or session_id is None
         template = await self.session_template() if create else None
@@ -195,6 +198,86 @@ class TelegramController:
             if create and template is not None
             else None,
         }
+
+    async def status(self, item: InboxRow, session_id: UUID | None) -> str:
+        lines = []
+        references: list[tuple[UUID, UUID, str | None]] = []
+        if session_id is not None:
+            session = await self.sessions.get_session(session_id)
+            lines.extend([f"Session: {session_id}", f"Status: {session.status}"])
+            if session.current_activity_id is not None:
+                references.append(
+                    (session_id, session.current_activity_id, session.current_activity_run_id)
+                )
+        previous = await self.repository.latest_request(item)
+        action = dict(previous.resolved_action or {}) if previous else {}
+        latest = None
+        if action:
+            target = action.get("session_id") or action.get("creating_session_id")
+            for kind in ("close", "run", "create"):
+                if target and action.get(kind + "_activity_id"):
+                    reference = (
+                        UUID(target),
+                        UUID(action[kind + "_activity_id"]),
+                        action.get(kind + "_run_id"),
+                    )
+                    if reference not in references:
+                        references.append(reference)
+                    latest = (UUID(target), UUID(action[kind + "_activity_id"]), kind)
+                    break
+        for target, activity_id, run_id in references:
+            try:
+                execution = await self.sessions.get_activity(target, activity_id, run_id=run_id)
+            except LookupError:
+                lines.append(
+                    f"Session: {target}\nActivity: {activity_id}\nOutcome cannot be confirmed."
+                )
+            else:
+                if (
+                    previous is not None
+                    and latest is not None
+                    and latest[:2] == (target, activity_id)
+                ):
+                    key = latest[2] + "_run_id"
+                    if action.get(key) != execution.run_id:
+                        action[key] = execution.run_id
+                        await self.repository.save_action(
+                            previous,
+                            action,
+                            handled=previous.handled,
+                            next_attempt_at=previous.next_attempt_at,
+                        )
+                lines.append(
+                    f"Session: {target}\nActivity: {execution.activity_id}\n"
+                    f"Run: {execution.run_id}\n"
+                    f"Temporal: {execution.status}"
+                    + (f" / {execution.run_state}" if execution.run_state else "")
+                    + (f"\nFailure: {execution.error}" if execution.error else "")
+                )
+        return "\n".join(lines) or "No current session or saved request. Use /new or send text."
+
+    async def remember_reference(
+        self,
+        item: InboxRow,
+        action: dict[str, Any],
+        kind: str,
+        session_id: UUID,
+    ) -> None:
+        """Keep an observed native reference without undoing a confirmed business result."""
+        try:
+            execution = await self.sessions.get_activity(
+                session_id,
+                UUID(action[kind + "_activity_id"]),
+                run_id=action.get(kind + "_run_id"),
+            )
+        except LookupError, RPCError, ActivityIdentityConflict:
+            # The result was already received. Retain its UUID when a follow-up
+            # reference lookup is unavailable; later /status may resolve it.
+            return
+        if execution.activity_type != {"create": CREATE, "close": CLOSE}[kind]:
+            return
+        action[kind + "_run_id"] = execution.run_id
+        await self.repository.save_action(item, action)
 
     async def handle(self, item: InboxRow) -> None:
         resolved = item.resolved_action
@@ -223,6 +306,13 @@ class TelegramController:
             )
             action["completed"] = True
             await self.repository.save_action(item, action)
+        if command == "status" and not action.get("completed"):
+            action["reply"] = await self.status(
+                item,
+                UUID(action["session_id"]) if action["session_id"] else None,
+            )
+            action["completed"] = True
+            await self.repository.save_action(item, action)
         if command not in {"ignore", "reply"} and not action.get("completed"):
             if action["session_id"] is None:
                 # Save the identity before the cross-database call. A core COMMIT
@@ -234,12 +324,27 @@ class TelegramController:
                 if not action.get("create_activity_id"):
                     action["create_activity_id"] = str(uuid4())
                     await self.repository.save_action(item, action)
-                session = await self.sessions.create_session(
-                    CreateSession.model_validate(action["template"]).model_copy(
-                        update={"id": candidate}
-                    ),
-                    activity_id=UUID(action["create_activity_id"]),
-                )
+                    session = await self.sessions.create_session(
+                        CreateSession.model_validate(action["template"]).model_copy(
+                            update={"id": candidate}
+                        ),
+                        activity_id=UUID(action["create_activity_id"]),
+                    )
+                    await self.remember_reference(item, action, "create", candidate)
+                else:
+                    execution = await self.sessions.get_activity(
+                        candidate,
+                        UUID(action["create_activity_id"]),
+                        run_id=action.get("create_run_id"),
+                    )
+                    action["create_run_id"] = execution.run_id
+                    await self.repository.save_action(item, action)
+                    session = await self.sessions.wait_session_activity(
+                        candidate,
+                        execution.activity_id,
+                        run_id=execution.run_id,
+                        activity_type=CREATE,
+                    )
                 await self.repository.bind(item, action, session.id)
                 action = dict(item.resolved_action or {})
             session_id = UUID(action["session_id"])
@@ -249,44 +354,61 @@ class TelegramController:
                         if not action.get("run_activity_id"):
                             action["run_activity_id"] = str(uuid4())
                             await self.repository.save_action(item, action)
-                        operation = await self.sessions.start_runner(
-                            session_id,
-                            user_prompt=action["text"],
-                            activity_id=UUID(action["run_activity_id"]),
-                        )
-                        if operation.phase == "failed":
-                            raise OperationFailed(operation)
-                    except SessionBusy:
-                        action["reply"] = "Session is busy; this text was not submitted."
-                    except OperationConflict:
+                            handle = await self.sessions.start_runner(
+                                session_id,
+                                user_prompt=action["text"],
+                                activity_id=UUID(action["run_activity_id"]),
+                            )
+                            action["run_run_id"] = handle.run_id
+                        else:
+                            execution = await self.sessions.get_activity(
+                                session_id,
+                                UUID(action["run_activity_id"]),
+                                run_id=action.get("run_run_id"),
+                            )
+                            if execution.activity_type != "kapy.run_agent":
+                                raise ActivityIdentityConflict(
+                                    session_id, execution.activity_id, execution.run_id
+                                )
+                            action["run_run_id"] = execution.run_id
+                    except ActivityIdentityConflict:
                         action["reply"] = (
                             "Previous execution is unsuccessful or unconfirmed. "
                             "Use /new to continue."
                         )
                     else:
                         action["submitted"] = True
+                        action["reply"] = (
+                            f"Submitted.\nSession: {session_id}\n"
+                            f"Activity: {action['run_activity_id']}\n"
+                            f"Run: {action['run_run_id']}\nUse /status to check execution."
+                        )
                     await self.repository.save_action(item, action)
                 if command == "new" and "reply" not in action:
                     action["reply"] = "New session created."
             elif command == "close":
-                try:
-                    if not action.get("close_activity_id"):
-                        action["close_activity_id"] = str(uuid4())
-                        await self.repository.save_action(item, action)
+                if not action.get("close_activity_id"):
+                    action["close_activity_id"] = str(uuid4())
+                    await self.repository.save_action(item, action)
                     await self.sessions.close_session(
                         session_id, activity_id=UUID(action["close_activity_id"])
                     )
-                except SessionBusy:
-                    action["reply"] = "Session is busy; close has not started. Retry explicitly."
+                    await self.remember_reference(item, action, "close", session_id)
                 else:
-                    action["reply"] = "Session closed."
-            elif command == "status":
-                session = await self.sessions.get_session(session_id)
-                running = await self.sessions.is_runner_running(session_id)
-                action["reply"] = (
-                    f"Session: {session_id}\nStatus: {session.status}\n"
-                    f"Activity: {'running' if running else 'idle'}"
-                )
+                    execution = await self.sessions.get_activity(
+                        session_id,
+                        UUID(action["close_activity_id"]),
+                        run_id=action.get("close_run_id"),
+                    )
+                    action["close_run_id"] = execution.run_id
+                    await self.repository.save_action(item, action)
+                    await self.sessions.wait_session_activity(
+                        session_id,
+                        execution.activity_id,
+                        run_id=execution.run_id,
+                        activity_type=CLOSE,
+                    )
+                action["reply"] = "Session closed."
             action["completed"] = True
             await self.repository.save_action(item, action)
         if reply := action.get("reply"):
@@ -308,24 +430,42 @@ class TelegramController:
                 handled=error.code in {400, 403},
                 next_attempt_at=time.time() + retry_delay(error),
             )
-        except RPCError:
+        except RPCError as error:
             # Dispatch may have succeeded. Keep the resolved IDs and frozen intent
             # so the inbox confirms the same operation after a transient outage.
-            await self.repository.save_action(
-                item, item.resolved_action or {}, next_attempt_at=time.time() + 1
-            )
-        except OperationFailed as error:
+            if error.status == RPCStatusCode.NOT_FOUND:
+                await self.unconfirmed(item)
+            else:
+                await self.repository.save_action(
+                    item, item.resolved_action or {}, next_attempt_at=time.time() + 1
+                )
+        except SessionExecutionError as error:
+            action = dict(item.resolved_action or {})
+            if error.run_id:
+                for kind in ("create", "run", "close"):
+                    if action.get(kind + "_activity_id") == str(error.activity_id):
+                        action[kind + "_run_id"] = error.run_id
+            if error.category == "OutcomeUnavailable":
+                await self.repository.save_action(item, action)
+                await self.unconfirmed(item)
+                return True
+            if error.category == "UnableToConfirm":
+                await self.repository.save_action(item, action, next_attempt_at=time.time() + 1)
+                return True
             await self.repository.save_action(
                 item,
-                {
+                action
+                | {
                     "command": "reply",
                     "reply": (
-                        f"Session: {error.operation.session_id}\n"
-                        f"Operation failed. Use /close {error.operation.session_id} "
+                        f"Session: {error.session_id}\nActivity: {error.activity_id}\n"
+                        f"Execution failed ({error.category}). Use /close {error.session_id} "
                         "to clean up this session or /new to continue."
                     ),
                 },
             )
+        except ActivityIdentityConflict:
+            await self.unconfirmed(item)
         except LifecycleError:
             await self.repository.save_action(
                 item,
@@ -336,14 +476,42 @@ class TelegramController:
             )
         except (LookupError, ValueError) as error:
             # Definite business validation failures are safe to report by category only.
-            await self.repository.save_action(
-                item,
-                {
-                    "command": "reply",
-                    "reply": f"Session operation failed ({type(error).__name__}).",
-                },
-            )
+            if isinstance(error, LookupError) and any(
+                (item.resolved_action or {}).get(kind + "_activity_id")
+                for kind in ("create", "run", "close")
+            ):
+                await self.unconfirmed(item)
+            else:
+                await self.repository.save_action(
+                    item,
+                    (item.resolved_action or {})
+                    | {
+                        "command": "reply",
+                        "reply": f"Session operation failed ({type(error).__name__}).",
+                    },
+                )
         return True
+
+    async def unconfirmed(self, item: InboxRow) -> None:
+        action = dict(item.resolved_action or {})
+        target = action.get("session_id") or action.get("creating_session_id")
+        identities = "\n".join(
+            f"{kind.title()} Activity: {action[kind + '_activity_id']}"
+            for kind in ("create", "run", "close")
+            if action.get(kind + "_activity_id")
+        )
+        await self.repository.save_action(
+            item,
+            action
+            | {
+                "command": "reply",
+                "completed": True,
+                "reply": (
+                    f"Session: {target}\n{identities}\nOutcome cannot be confirmed. "
+                    "Use /new or /close <session UUID>."
+                ),
+            },
+        )
 
     async def process(self) -> None:
         while True:

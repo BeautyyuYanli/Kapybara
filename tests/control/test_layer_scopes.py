@@ -1,29 +1,25 @@
 """Real scope Activities keep durable ownership across hooks and compensation."""
 
 import asyncio
-from datetime import timedelta
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import pytest
 from pydantic import BaseModel, model_validator
 from pydantic_ai.capabilities import Capability
+from temporalio import activity
 from temporalio.client import ActivityFailureError
 
 from kapy.control.sessions import (
     CreateSession,
-    OperationConflict,
-    OperationFailed,
-    OperationPhase,
     SessionBusy,
+    SessionExecutionError,
     UpdateSession,
 )
-from kapy.control.sessions import service as sessions_service
 from kapy.control.sessions.models import SessionRow
-from kapy.control.sessions.operations import SessionOperationRow
-from kapy.control.types import utc_now
 from kapy.layers.registry import get_layers
-from kapy.lifecycle import LifecycleError, LifecycleStatus
-from kapy.runner import scopes
+from kapy.lifecycle import LifecycleStatus
+from kapy.runner import activities, scopes
 from pydantic_ai_layer_protocol import Layer, LayerRegistry, RetryableScopeError
 from pydantic_ai_layer_protocol.examples import echo
 
@@ -33,7 +29,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 def install_layer(
     monkeypatch, layer_id, *, config=echo.Config, state=echo.State, enter=None, exit_hook=None
 ):
-    definitions = dict(sessions_service.layer_registry.definitions)
+    definitions = dict(activities.layer_registry.definitions)
     definitions[layer_id] = Layer(
         config_type=config,
         state_type=state,
@@ -46,7 +42,7 @@ def install_layer(
         for name, definition in definitions.items()
     }
     registry = LayerRegistry(factories, get_layers=get_layers)
-    monkeypatch.setattr(sessions_service, "layer_registry", registry)
+    monkeypatch.setattr(activities, "layer_registry", registry)
     monkeypatch.setattr(scopes, "layer_registry", registry)
 
 
@@ -86,8 +82,10 @@ async def test_enter_initializes_required_states_and_same_key_returns_original_r
         "default": {"calls": 0},
     }
     assert await service.create_session(data, activity_id=key) == session
-    with pytest.raises(OperationConflict):
+    assert (
         await service.create_session(data.model_copy(update={"title": "changed"}), activity_id=key)
+        == session
+    )
     close_key = uuid4()
     closed = await service.close_session(session.id, activity_id=close_key)
     assert closed.status == LifecycleStatus.CLOSED
@@ -121,7 +119,7 @@ async def test_validation_precedes_any_enter(database, session_runtime, monkeypa
         }
     )
     service = session_runtime.service(database.sessions)
-    with pytest.raises(ValueError):
+    with pytest.raises(SessionExecutionError):
         await service.create_session(data, activity_id=uuid4())
     assert not calls and not (await service.list_sessions()).items
 
@@ -148,7 +146,7 @@ async def test_existing_scope_retry_contract_is_bounded_without_activity_retry(
         assert session.status == LifecycleStatus.READY
         assert await stored(database, session_id) == {"scoped": {"calls": 7}}
     else:
-        with pytest.raises(OperationFailed):
+        with pytest.raises(SessionExecutionError):
             await service.create_session(data, activity_id=key)
         assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
     assert calls == [(session_id, "fixed")] * 3
@@ -175,9 +173,10 @@ async def test_creating_owns_session_and_local_wait_cancellation_does_not_cancel
     try:
         await asyncio.wait_for(entering.wait(), 5)
         assert (await service.get_session(session_id)).status == LifecycleStatus.CREATING
-        with pytest.raises(SessionBusy):
+        with pytest.raises(SessionExecutionError) as busy:
             await service.close_session(session_id, activity_id=uuid4())
-        with pytest.raises(LifecycleError):
+        assert busy.value.category == "SessionBusy"
+        with pytest.raises(SessionBusy):
             await service.update_session(session_id, UpdateSession(title="busy"))
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -221,7 +220,7 @@ async def test_real_creation_activity_cancellation_compensates_partial_and_uncal
     await handle.cancel()
     with pytest.raises(ActivityFailureError):
         await handle.result()
-    with pytest.raises(OperationFailed):
+    with pytest.raises(SessionExecutionError):
         await task
     assert exits == [("second", None), ("first", None)]
     assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
@@ -253,12 +252,12 @@ async def test_creation_compensation_retains_owner_and_failed_close_saves_progre
     try:
         await asyncio.wait_for(compensating.wait(), 5)
         assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSING
-        assert (await service.get_operation(session_id, key)).phase == OperationPhase.RUNNING
-        with pytest.raises(SessionBusy):
+        assert (await service.get_activity(session_id, key)).status == "RUNNING"
+        with pytest.raises(SessionExecutionError):
             await service.close_session(session_id, activity_id=uuid4())
     finally:
         release.set()
-    with pytest.raises(OperationFailed):
+    with pytest.raises(SessionExecutionError):
         await task
     assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSING
     failing = False
@@ -267,11 +266,26 @@ async def test_creation_compensation_retains_owner_and_failed_close_saves_progre
     ).status == LifecycleStatus.CLOSED
 
 
-async def test_deadline_fences_old_creator_before_publish_and_allows_explicit_cleanup(
+async def test_terminal_creator_takeover_prevents_late_publish_and_compensation(
     database, session_runtime, monkeypatch
 ):
-    entering, release = asyncio.Event(), asyncio.Event()
+    entering, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
     exits = []
+    key, session_id = uuid4(), uuid4()
+    invocation = activities.RunnerActivity._invocation
+
+    @asynccontextmanager
+    async def observe_local_completion(runner, target):
+        try:
+            async with invocation(runner, target) as owner:
+                yield owner
+        finally:
+            # Native TERMINATED precedes this local cleanup. Observe the entire
+            # invocation, including its final conditional ownership release.
+            if activity.info().activity_id == str(key):
+                finished.set()
+
+    monkeypatch.setattr(activities.RunnerActivity, "_invocation", observe_local_completion)
 
     async def enter(session_id, config):
         entering.set()
@@ -283,7 +297,6 @@ async def test_deadline_fences_old_creator_before_publish_and_allows_explicit_cl
 
     install_layer(monkeypatch, "scoped", enter=enter, exit_hook=exit_hook)
     service = session_runtime.service(database.sessions)
-    key, session_id = uuid4(), uuid4()
     task = asyncio.create_task(
         service.create_session(
             selection(scoped={}).model_copy(update={"id": session_id}), activity_id=key
@@ -291,23 +304,24 @@ async def test_deadline_fences_old_creator_before_publish_and_allows_explicit_cl
     )
     try:
         await asyncio.wait_for(entering.wait(), 5)
-        async with database.sessions.begin() as db:
-            operation = await db.get(SessionOperationRow, key)
-            operation.deadline = utc_now() - timedelta(seconds=1)
-        assert (await service.get_operation(session_id, key)).phase == OperationPhase.FAILED
+        await session_runtime.client.get_activity_handle(str(key)).terminate(reason="test takeover")
+        assert (await service.get_activity(session_id, key)).status == "TERMINATED"
         assert (
             await service.close_session(session_id, activity_id=uuid4())
         ).status == LifecycleStatus.CLOSED
         release.set()
-        with pytest.raises(OperationFailed):
+        with pytest.raises(SessionExecutionError):
             await task
-        # Wait for the late native result; its stale owner cannot write or compensate.
-        with pytest.raises(ActivityFailureError):
-            await session_runtime.client.get_activity_handle(str(key)).result()
-        assert exits == [None] and await stored(database, session_id) == {}
+        await asyncio.wait_for(finished.wait(), 5)
+        row = await service.get_session(session_id)
+        assert row.status == LifecycleStatus.CLOSED
+        assert row.current_activity_id is None and row.current_activity_run_id is None
+        assert await stored(database, session_id) == {} and exits == [None]
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+        if entering.is_set():
+            await asyncio.wait_for(finished.wait(), 5)
 
 
 async def test_lost_creation_commit_acknowledgment_keeps_success_without_compensation(
@@ -316,7 +330,7 @@ async def test_lost_creation_commit_acknowledgment_keeps_success_without_compens
     from sqlalchemy import event
     from sqlalchemy.orm import Session
 
-    from kapy.control.sessions.operations import OperationRepository
+    from kapy.control.sessions.repository import SessionRepository
 
     exits = []
 
@@ -327,29 +341,32 @@ async def test_lost_creation_commit_acknowledgment_keeps_success_without_compens
         exits.append(session_id)
 
     install_layer(monkeypatch, "scoped", enter=enter, exit_hook=exit_hook)
-    original = OperationRepository.complete
+    original = SessionRepository.complete
 
     async def mark(repo, *args, **kwargs):
         result = await original(repo, *args, **kwargs)
-        repo.db.info["lost_ack"] = True
+        repo._db.info["lost_ack"] = True
         return result
 
     def lost_ack(db):
         if db.info.pop("lost_ack", False):
             raise RuntimeError("commit response lost after durable commit")
 
-    monkeypatch.setattr(OperationRepository, "complete", mark)
+    monkeypatch.setattr(SessionRepository, "complete", mark)
     event.listen(Session, "after_commit", lost_ack)
     service = session_runtime.service(database.sessions)
     key = uuid4()
     data = selection(scoped={})
     try:
-        session = await service.create_session(data, activity_id=key)
+        with pytest.raises(SessionExecutionError):
+            await service.create_session(data, activity_id=key)
+        session = await service.get_session(key)
         assert session.status == LifecycleStatus.READY
         assert await stored(database, session.id) == {"scoped": {"calls": 4}}
-        assert await service.create_session(data, activity_id=key) == session
+        with pytest.raises(SessionExecutionError):
+            await service.create_session(data, activity_id=key)
         assert not exits
-        assert (await service.get_operation(session.id, key)).phase == OperationPhase.SUCCEEDED
+        assert (await service.get_activity(session.id, key)).status == "FAILED"
     finally:
         event.remove(Session, "after_commit", lost_ack)
 
@@ -408,3 +425,35 @@ async def test_enter_receives_the_same_validated_config_as_persisted(
     assert data.layers == {"scoped": {"items": ["input"]}}
     assert await service.create_session(data, activity_id=key) == session
     assert received == [["input", "validated"]]
+
+
+async def test_deleted_create_record_does_not_reenter_existing_session(
+    database,
+    session_runtime,
+    monkeypatch,
+):
+    from temporalio.api.workflowservice.v1 import DeleteActivityExecutionRequest
+
+    calls = []
+
+    async def enter(session_id, config):
+        calls.append(session_id)
+        return echo.State()
+
+    install_layer(monkeypatch, "scoped", enter=enter)
+    service = session_runtime.service(database.sessions)
+    key = uuid4()
+    data = selection(scoped={})
+    session = await service.create_session(data, activity_id=key)
+    record = await service.get_activity(session.id, key)
+    await session_runtime.client.workflow_service.delete_activity_execution(
+        DeleteActivityExecutionRequest(
+            namespace=session_runtime.client.namespace,
+            activity_id=str(key),
+            run_id=record.run_id,
+        )
+    )
+    with pytest.raises(SessionExecutionError) as conflict:
+        await service.create_session(data, activity_id=key)
+    assert conflict.value.category == "SessionAlreadyExists"
+    assert calls == [session.id]

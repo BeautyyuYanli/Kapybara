@@ -89,6 +89,33 @@ class TelegramRepository:
                 .first()
             )
 
+    async def latest_request(self, item: InboxRow) -> InboxRow | None:
+        """Read the last persisted execution reference for this chat/topic.
+
+        No scheduling state or outcome is cached here; /status queries Temporal.
+        """
+        async with self.sessions.begin() as db:
+            rows = (
+                await db.execute(
+                    select(InboxRow)
+                    .where(
+                        col(InboxRow.bot_id) == item.bot_id,
+                        col(InboxRow.chat_id) == item.chat_id,
+                        col(InboxRow.thread_id) == item.thread_id,
+                        col(InboxRow.update_id) < item.update_id,
+                        col(InboxRow.resolved_action).is_not(None),
+                    )
+                    .order_by(col(InboxRow.update_id).desc())
+                )
+            ).scalars()
+            for row in rows:
+                action = row.resolved_action
+                if action and any(
+                    action.get(kind + "_activity_id") for kind in ("create", "run", "close")
+                ):
+                    return row
+        return None
+
     async def save_action(
         self,
         item: InboxRow,

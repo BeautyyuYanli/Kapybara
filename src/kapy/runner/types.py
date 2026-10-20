@@ -1,8 +1,7 @@
-"""Serializable frozen input, loaded from the operation ledger by the Worker.
+"""Worker-local execution snapshot, never serialized into Temporal or a ledger.
 
-The complete configuration, including the API key, is stored in private database input.
-`repr=False` prevents accidental repr disclosure; it does not encrypt payloads.
-Settings are final values, not overrides of a Worker-local model catalogue.
+The admission transaction copies current provider credentials and business data.
+`repr=False` prevents accidental disclosure of those process-local credentials.
 """
 
 from dataclasses import dataclass, field
@@ -67,6 +66,7 @@ class RunnerDeps:
 
     session_id: UUID
     activity_id: UUID
+    activity_run_id: str
     session_factory: async_sessionmaker[AsyncSession]
     output_service: AgentOutputService
     layers: dict[str, LayerData] = field(default_factory=dict)

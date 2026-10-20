@@ -18,7 +18,6 @@ from kapy.application.settings import CommonSettings
 from kapy.control.database import ControlTable
 from kapy.control.models import models as model_tables  # noqa: F401
 from kapy.control.sessions import models as session_tables  # noqa: F401
-from kapy.control.sessions import operations as operation_tables  # noqa: F401
 
 from .migration import execute, migration_config
 
@@ -56,6 +55,7 @@ async def migrate(
             "shell-scope-state",
             "durable-only",
             "session-operations",
+            "temporal-session-ownership",
         }
     ):
         raise ValueError("plan must name a supported revision generation plan")
@@ -83,6 +83,7 @@ async def migrate(
                         "shell-scope-state": revision_plans.shell_scope_state,
                         "durable-only": revision_plans.durable_only,
                         "session-operations": revision_plans.session_operations,
+                        "temporal-session-ownership": revision_plans.temporal_session_ownership,
                     }[plan]
                 execute(config, operation, message=message)
 
@@ -101,6 +102,7 @@ def main(argv: list[str]) -> int:
             "shell-scope-state",
             "durable-only",
             "session-operations",
+            "temporal-session-ownership",
         ],
     )
     args = parser.parse_args(argv)

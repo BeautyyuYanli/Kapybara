@@ -16,7 +16,7 @@ from temporalio.worker import Worker
 
 from kapy.application.resources import connect_temporal
 from kapy.control.models.models import ModelRow, ProviderRow
-from kapy.control.sessions import CreateSession, OperationFailed, SessionService
+from kapy.control.sessions import CreateSession, SessionExecutionError, SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.layers.shell import runtime
 from kapy.lifecycle import LifecycleStatus
@@ -48,7 +48,7 @@ def run(script, timeout=0.2):
 async def worker_service(database):
     client = await connect_temporal(database.settings)
     queue = f"layers-{uuid4()}"
-    runner = RunnerActivity(database.sessions, database.outputs)
+    runner = RunnerActivity(database.sessions, database.outputs, client)
     async with Worker(
         client,
         task_queue=queue,
@@ -61,10 +61,7 @@ async def worker_service(database):
 
 
 async def start_runner(service, client, session_id, **kwargs):
-    operation = await service.start_runner(session_id, **kwargs)
-    return client.get_activity_handle(
-        str(operation.activity_id), run_id=operation.run_id, result_type=str
-    )
+    return await service.start_runner(session_id, **kwargs)
 
 
 async def create_shell_session(database, service, shell_server):
@@ -157,7 +154,7 @@ async def test_two_sequential_tools_resume_and_partial_close(
             deleted.append(job_id)
 
         monkeypatch.setattr(runtime, "delete_job", interrupted_close)
-        with pytest.raises(OperationFailed):
+        with pytest.raises(SessionExecutionError):
             await service.close_session(session.id, activity_id=uuid4())
         assert (await service.get_session(session.id)).status == LifecycleStatus.CLOSING
         remaining = (await state(runner_database, session.id))["jobs"]

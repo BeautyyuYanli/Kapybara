@@ -9,8 +9,6 @@ from enum import StrEnum
 class LifecycleStatus(StrEnum):
     CREATING = "creating"
     READY = "ready"
-    STARTING = "starting"
-    RUNNING = "running"
     CLOSING = "closing"
     CLOSED = "closed"
 

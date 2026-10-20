@@ -1,7 +1,7 @@
 """Session HTTP composition and WebSocket transport; services own history/admission.
 
-Create/close dispatch Worker scope Activities and wait for database business results.
-Runner submission returns its durable operation without waiting for Agent completion.
+Create/close wait for native Activity results. Runner submission returns a native
+execution reference; 202 acceptance does not imply Worker admission.
 Borrowed services outlive requests and subscriptions.
 """
 
@@ -17,8 +17,9 @@ from starlette.websockets import WebSocketState
 from kapy.agent_history import HistoryMessage
 from kapy.agent_output import OutputEvent
 from kapy.control.sessions import (
+    ActivityReference,
     CreateSession,
-    SessionOperation,
+    SessionActivity,
     SessionRecord,
     SessionService,
     UpdateSession,
@@ -64,20 +65,22 @@ def create_session_router(sessions: SessionService) -> APIRouter:
         return await sessions.close_session(session_id, activity_id=data.activity_id)
 
     @router.post("/sessions/{session_id}/runner", status_code=202, operation_id="start_runner")
-    async def start_runner(session_id: UUID, data: StartRunner) -> SessionOperation:
-        return await sessions.start_runner(
+    async def start_runner(session_id: UUID, data: StartRunner) -> ActivityReference:
+        handle = await sessions.start_runner(
             session_id, activity_id=data.activity_id, user_prompt=data.user_prompt
         )
+        assert handle.run_id is not None
+        return ActivityReference(activity_id=UUID(handle.id), run_id=handle.run_id)
 
     @router.get(
-        "/sessions/{session_id}/operations/{activity_id}", operation_id="get_session_operation"
+        "/sessions/{session_id}/activities/{activity_id}", operation_id="get_session_activity"
     )
-    async def get_session_operation(session_id: UUID, activity_id: UUID) -> SessionOperation:
-        return await sessions.get_operation(session_id, activity_id)
-
-    @router.get("/sessions/{session_id}/runner", operation_id="is_runner_running")
-    async def is_runner_running(session_id: UUID) -> bool:
-        return await sessions.is_runner_running(session_id)
+    async def get_session_activity(
+        session_id: UUID,
+        activity_id: UUID,
+        run_id: str | None = None,
+    ) -> SessionActivity:
+        return await sessions.get_activity(session_id, activity_id, run_id=run_id)
 
     @router.get("/sessions/{session_id}/history", operation_id="read_history")
     async def read_history(session_id: UUID, page: HistoryPage) -> Page[HistoryMessage]:

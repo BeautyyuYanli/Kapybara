@@ -20,7 +20,7 @@ from pydantic_ai.models import ModelRequestContext
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_output import MessageCommitted
-from kapy.control.sessions.operations import OperationRepository
+from kapy.control.sessions.repository import SessionRepository
 from kapy.lifecycle import LifecycleStatus
 
 from .types import RunnerDeps
@@ -90,8 +90,8 @@ class Recorder:
         existing history follower; no transaction spans publisher I/O.
         """
         async with deps.session_factory() as db, db.begin():
-            session, _ = await OperationRepository(db).guard(
-                deps.activity_id, (LifecycleStatus.RUNNING,)
+            session = await SessionRepository(db).guard(
+                deps.session_id, deps.activity_id, deps.activity_run_id, (LifecycleStatus.READY,)
             )
             if session.id != deps.session_id:
                 raise ValueError("Recording identity does not match session")

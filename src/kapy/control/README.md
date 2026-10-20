@@ -30,50 +30,51 @@ async def run(settings: CommonSettings, provider_id, model_name: str):
 
 ## Session state machine
 
-SessionService borrows the database, output service and Temporal client. Each
-create/run/close call supplies a UUID `activity_id`; the ID is both the permanent
-operation key and native Activity ID. `start_runner` returns `SessionOperation`,
-not a native handle. `get_operation(session_id, activity_id)` returns its phase,
-optional native run_id and saved result/safe error, without private request/input.
-Create and close wait for their immutable SessionRecord result; caller cancellation
-does not cancel Worker execution. Failed operations raise OperationFailed.
+SessionService borrows database, output and Temporal clients. Each request supplies
+an Activity UUID; Temporal owns its retained input, status and outcome. New requests
+need new UUIDs; retries keep the original request. Same-key changed prompt/config
+uses the first accepted input. Only session/type identity is checked, directly
+against Temporal. Deduplication and old-result retrieval end with native retention.
 
-| From | To | Owner action |
-| --- | --- | --- |
-| absent | creating | Insert session and pending create operation together |
-| creating | ready | Commit all initial States and succeeded result |
-| creating | closing | Original running owner compensates failed initialization |
-| ready | starting | Claim new run and freeze configuration/messages/State |
-| starting | running | Worker claims pending before I/O |
-| running | ready | Commit messages, all States and succeeded output |
-| creating/starting/running | closing | Confirm failure or seal fixed deadline |
-| ready | closing | Claim close before exits |
-| closing | closing | New close can claim only after previous operation is terminal |
-| closing | closed | Finish all cleanup; successful close or failed-create compensation |
-| closed | closed | Read retained state; new close records the already-closed result |
+`start_runner` returns `ActivityHandle[str]`. Create and close await native
+`handle.result()` and return SessionRecord, or raise a safe SessionExecutionError
+with session/Activity/run identities. Canceling a local wait does not cancel remote
+execution. `get_activity(session_id, activity_id, run_id=...)` reads native status,
+run_state and available outcome; it works before create inserts a business row and
+never mutates business data. An unknown record cannot confirm the old outcome.
 
-Creating, starting, running and closing with a pending/running operation reject a
-different operation with SessionBusy. Same-key intent is checked first, so its
-saved result survives later session changes. A key bound to different session,
-kind or normalized intent raises OperationConflict. READY edits use conditional
-UPDATE; the run's claim returns that same row to freeze input. No transaction spans
-remote calls and no explicit SELECT FOR UPDATE or session lease remains.
+Sessions use only creating/ready/closing/closed. READY means scopes are initialized,
+not that an execution is absent. A paired current_activity_id/current_activity_run_id
+identifies the current writer; both clear on normal completion or failed cleanup.
+The database stores no queued phase, execution outcome, input, error or deadline.
 
-The Worker validates the actual native Activity identity, claims pending → running
-and loads frozen input. All history/final-state/cleanup/result writes conditionally
-check the current ID, allowed status, phase and deadline in the same transaction.
-Database-internal UPDATE exclusion lasts only through that short transaction.
-Terminal phase/result cannot change. Success commits with READY/CLOSED before
-Temporal acknowledgment and remains success after a lost acknowledgment.
+| Action | Business mutation in the executing Worker |
+| --- | --- |
+| create | Insert creating, validated fixed Config and native writer; publish all initial States with ready and release |
+| run | Claim unowned ready; atomically read current model/provider, settings, snapshot and States |
+| run success | Commit snapshot/all States with ready and release, after model/tool clients exit |
+| run failure | Preserve preceding snapshot and history; set closing and release after resource exit |
+| close | Claim unowned ready/closing, save each exit's progress, then close and release |
 
-USE_EXISTING does not validate input and retained-ID rejection expires; therefore
-PostgreSQL stores intent, frozen input, a fixed one-hour deadline and terminal
-result permanently. RPC uncertainty leaves the owner active and same-key
-confirmation uses the original input. Queries/admission reconcile the exact native
-run_id and confirmed terminal status; expired active operations seal failed/closing.
-NOT_FOUND and RPC failures never mean READY. One Temporal attempt executes the full
-run; there is no Agent retry, enter replay, lease takeover or background sweeper.
-`is_runner_running` reads database starting/running, without a Temporal RPC.
+Submission does not reserve a session or guarantee order. Several queued Activities
+can be accepted; Worker competition chooses the writer, and a loser fails finally
+without calling models/tools/hooks. Edits require ready and both identity fields
+empty, competing with Worker admission on that same row. Every history/snapshot/
+cleanup write checks session ID, full execution identity and permitted lifecycle
+in one short transaction. No transaction spans RPC, hook, model or publication I/O.
+
+Only explicit close can recover an abandoned writer. It reads the old identity,
+queries that exact native execution outside its transaction, and replaces it by
+CAS only for a confirmed terminal status or NOT_FOUND. RUNNING/PAUSED, unknown
+nonterminal states and temporary RPC failure preserve the old writer. A changed
+identity prevents takeover; an old execution cannot write after replacement.
+Queries, configuration edits and run admission never reconcile abandoned ownership.
+
+Every Activity has one Temporal attempt, a one-hour schedule/start-to-close budget
+and heartbeat cancellation. There is no database deadline, local timeout sealing,
+background recovery or automatic Agent replay. A business commit can coexist with
+a native failure/timeout; current session/history show business facts without
+pretending to reconstruct an old Activity result.
 
 ## Configuration
 
@@ -113,9 +114,10 @@ Lists use creation-time/identity order, offset >= 0 and limit 1..200, returning
 Worker create and close Activities share static definitions with the Agent.
 Creation validates configuration and default States before reservation, commits
 creating with empty State, then enters scopes outside transactions. All initial
-States publish with ready and succeeded together. Failed initialization retains its
-running owner during reverse compensation, exits every configured layer with None
-including partial/uncalled enters, and records failed after compensation completes.
+States, READY and ownership release commit atomically as business state; Temporal
+records its terminal outcome independently. Failed initialization retains its
+writer during reverse compensation and exits every configured layer with None,
+including partial/uncalled enters. Temporal records the creation failure.
 Complete compensation sets closed; otherwise closing permits a new explicit close.
 An uncertain success commit is checked before compensation; unavailable database
 leaves the outcome unconfirmed rather than issuing cleanup without ownership.

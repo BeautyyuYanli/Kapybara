@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
@@ -31,7 +32,13 @@ from kapy.lifecycle import LifecycleStatus
 
 class SessionRow(ControlTable, table=True):
     __tablename__ = "sessions"  # pyrefly: ignore[bad-override]
-    __table_args__ = (Index("ix_sessions_provider_model", "provider_id", "model_name"),)
+    __table_args__ = (
+        Index("ix_sessions_provider_model", "provider_id", "model_name"),
+        CheckConstraint(
+            "(current_activity_id IS NULL) = (current_activity_run_id IS NULL)",
+            name="ck_sessions_current_activity_pair",
+        ),
+    )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     status: LifecycleStatus = Field(
@@ -60,6 +67,7 @@ class SessionRow(ControlTable, table=True):
     )
     runner_state: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     current_activity_id: UUID | None = Field(default=None)
+    current_activity_run_id: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     created_at: datetime = Field(
         default_factory=utc_now, sa_column=Column(DateTime(timezone=True), nullable=False)
     )

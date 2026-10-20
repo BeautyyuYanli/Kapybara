@@ -197,10 +197,7 @@ async def serve(app):
 async def test_http_waits_for_durable_start_confirmation(
     database, seed_session, monkeypatch, session_runtime
 ):
-    from datetime import timedelta
-
-    from kapy.control.sessions import OperationKind, OperationPhase, SessionOperation
-    from kapy.control.types import utc_now
+    from types import SimpleNamespace
 
     sessions = session_runtime.service(database.sessions)
     session_id = uuid4()
@@ -210,16 +207,9 @@ async def test_http_waits_for_durable_start_confirmation(
     async def start(session_id, **kwargs):
         started.set()
         await release.wait()
-        return SessionOperation(
-            session_id=session_id,
-            activity_id=kwargs["activity_id"],
-            kind=OperationKind.RUN,
-            phase=OperationPhase.PENDING,
+        return SimpleNamespace(
+            id=str(kwargs["activity_id"]),
             run_id="accepted-run",
-            result=None,
-            error=None,
-            created_at=utc_now(),
-            deadline=utc_now() + timedelta(hours=1),
         )
 
     monkeypatch.setattr(sessions, "start_runner", start)

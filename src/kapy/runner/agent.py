@@ -22,7 +22,13 @@ from .types import RunnerDeps
 async def before_request(
     ctx: RunContext[RunnerDeps], request: ModelRequestContext
 ) -> ModelRequestContext:
-    await check_owner(ctx.deps.session_factory, ctx.deps.activity_id, (LifecycleStatus.RUNNING,))
+    await check_owner(
+        ctx.deps.session_factory,
+        ctx.deps.session_id,
+        ctx.deps.activity_id,
+        ctx.deps.activity_run_id,
+        (LifecycleStatus.READY,),
+    )
     return await recorder.predict_response_seq(ctx, request)
 
 
@@ -33,7 +39,13 @@ async def before_tool(
     tool_def: ToolDefinition,
     args: ValidatedToolArgs,
 ) -> ValidatedToolArgs:
-    await check_owner(ctx.deps.session_factory, ctx.deps.activity_id, (LifecycleStatus.RUNNING,))
+    await check_owner(
+        ctx.deps.session_factory,
+        ctx.deps.session_id,
+        ctx.deps.activity_id,
+        ctx.deps.activity_run_id,
+        (LifecycleStatus.READY,),
+    )
     return args
 
 

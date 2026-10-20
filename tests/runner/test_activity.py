@@ -63,30 +63,45 @@ from kapy.runner.worker import serve
 
 
 async def start(client, queue, data, *, database, **kwargs):
+    """Prepare business data; the native request contains only session and prompt."""
+    from kapy.control.models.models import ModelRow, ProviderRow
     from kapy.control.sessions.models import SessionRow
-    from kapy.control.sessions.operations import SessionOperationRow
-    from kapy.control.sessions.types import OperationKind, OperationPhase
-    from kapy.control.types import utc_now
+    from kapy.control.sessions.types import RunAgentActivity
     from kapy.lifecycle import LifecycleStatus
 
     key = uuid4()
     async with database.sessions.begin() as db:
         session = await db.get(SessionRow, data.session_id)
-        session.status, session.current_activity_id = LifecycleStatus.STARTING, key
-        db.add(
-            SessionOperationRow(
-                activity_id=key,
-                session_id=data.session_id,
-                kind=OperationKind.RUN,
-                phase=OperationPhase.PENDING,
-                request={},
-                input=data.model_dump(mode="json"),
-                deadline=utc_now() + timedelta(seconds=35),
+        session.status = LifecycleStatus.READY
+        session.current_activity_id = session.current_activity_run_id = None
+        session.model_name = data.config.model_name
+        session.layers = {name: entry["config"] for name, entry in data.layers.items()}
+        session.layer_states = {name: entry["state"] for name, entry in data.layers.items()}
+        if data.runner_state is not None:
+            session.runner_state = data.runner_state
+        await db.merge(
+            ProviderRow(
+                id=session.provider_id,
+                name="local-test",
+                provider_class=data.config.provider_class,
+                model_class=data.config.model_class,
+                api_key=data.config.api_key,
+                base_url=data.config.base_url,
+                provider_kwargs=data.config.provider_kwargs,
+            )
+        )
+        await db.merge(
+            ModelRow(
+                provider_id=session.provider_id,
+                model_name=data.config.model_name,
+                name="test",
+                settings=data.config.model_settings,
+                context_window=data.config.context_window,
             )
         )
     return await client.start_activity(
         RunnerActivity.run,
-        key,
+        RunAgentActivity(session_id=data.session_id, user_prompt=data.user_prompt),
         id=str(key),
         task_queue=queue,
         start_to_close_timeout=timedelta(seconds=30),
@@ -482,8 +497,8 @@ async def test_activity_restores_state_and_records_after_run_tail_once(
     )
     monkeypatch.setattr(import_module("kapy.runner.activities"), "agent", tail_agent)
     monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     queue = f"runner-restore-{uuid4()}"
     async with Worker(
         client,
@@ -591,8 +606,8 @@ async def test_invalid_state_fails_activity_before_model_call(
     from kapy.agent_history.repository import HistoryRepository
 
     base_url, requests = endpoint
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
     client = await connect_temporal(runner_database.settings)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     queue = f"runner-invalid-state-{uuid4()}"
     async with Worker(
         client,
@@ -613,10 +628,13 @@ async def test_invalid_state_fails_activity_before_model_call(
                 database=runner_database,
             )
     assert isinstance(error.value.cause, ApplicationError)
-    assert error.value.cause.type == "UserError"
+    assert error.value.cause.type == "InvalidParameters"
     assert requests == []
     async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == state
+        assert (
+            await SessionRepository(db).get_session(runner_database.session_id)
+        ).current_activity_id is None
         assert await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
 
 
@@ -678,7 +696,7 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
     )
     path = tmp_path / "telegram.sqlite3"
     await migrate(path, "upgrade")
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, temporal)
     async with (
         open_storage(path) as storage,
         Worker(
@@ -744,9 +762,7 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
             second = await sessions.start_runner(
                 session_id, user_prompt="second prompt", activity_id=uuid4()
             )
-            second_handle = temporal.get_activity_handle(
-                str(second.activity_id), run_id=second.run_id
-            )
+            second_handle = temporal.get_activity_handle(second.id, run_id=second.run_id)
             assert await asyncio.wait_for(second_handle.result(), 30) == "done"
             assert len(requests) == 2
             assert requests[0]["headers"]["authorization"] == "Bearer local-test"
@@ -760,17 +776,12 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
             async with runner_database.sessions.begin() as db:
                 state = await SessionRepository(db).read_runner_state(session_id)
             assert state is not None
-            assert not await sessions.is_runner_running(session_id)
+            assert (await sessions.get_session(session_id)).current_activity_id is None
             async with asyncio.timeout(5):
                 while (  # noqa: ASYNC110
                     (await repository.get_delivery(delivery_key(row))).after_seq < 3
                 ):
                     await asyncio.sleep(0.01)
-            assert [
-                call.args[2]
-                for call in telegram.send.call_args_list
-                if "draft_id" not in call.kwargs
-            ] == ["done", "done"]
             assert telegram.send.call_args.args[2] == "done"
             assert "draft_id" not in telegram.send.call_args.kwargs
             saved = await repository.get_delivery(delivery_key(row))
@@ -815,7 +826,7 @@ async def test_activity_protocol_resources_and_history(
     monkeypatch.setattr(runner_database.outputs, "_publish", observe_publish)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-protocol-{uuid4()}"
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     async with Worker(
         client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
     ):
@@ -873,7 +884,7 @@ async def test_model_failure_executes_once_closes_resources_and_keeps_previous_s
     async with runner_database.sessions.begin() as db:
         from kapy.control.sessions.models import SessionRow
 
-        (await db.get(SessionRow, runner_database.session_id)).runner_state = "previous"
+        (await db.get(SessionRow, runner_database.session_id)).runner_state = "[]"
 
     @asynccontextmanager
     async def fail_request(self, *args, **kwargs):
@@ -885,7 +896,7 @@ async def test_model_failure_executes_once_closes_resources_and_keeps_previous_s
     monkeypatch.setattr(OpenAIChatModel, "request_stream", fail_request)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-failure-{uuid4()}"
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     async with Worker(
         client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
     ):
@@ -906,9 +917,7 @@ async def test_model_failure_executes_once_closes_resources_and_keeps_previous_s
     assert len(models) == 1 and models[0].provider._own_http_client.is_closed
     assert requests == []
     async with runner_database.sessions.begin() as db:
-        assert (
-            await SessionRepository(db).read_runner_state(runner_database.session_id) == "previous"
-        )
+        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == "[]"
         assert await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
 
 
@@ -934,7 +943,7 @@ async def test_cancellation_waits_for_model_cleanup_and_preserves_snapshot(
     monkeypatch.setattr(OpenAIChatModel, "request_stream", blocked_request)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-cancel-{uuid4()}"
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     async with Worker(
         client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
     ):
@@ -978,12 +987,10 @@ async def test_final_save_failure_does_not_retry_agent_or_undo_history(
         saves.append(kwargs)
         raise RuntimeError("database save unavailable")
 
-    from kapy.control.sessions.operations import OperationRepository
-
-    monkeypatch.setattr(OperationRepository, "complete", fail_save)
+    monkeypatch.setattr(SessionRepository, "complete", fail_save)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-save-failure-{uuid4()}"
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     async with Worker(
         client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
     ):
@@ -1000,7 +1007,7 @@ async def test_final_save_failure_does_not_retry_agent_or_undo_history(
         )
         with pytest.raises(ActivityFailureError):
             await asyncio.wait_for(handle.result(), 35)
-    assert len(requests) == len(saves) == 1
+    assert len(requests) == 1 and len(saves) == 2
     async with runner_database.sessions.begin() as db:
         assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
         assert [
@@ -1044,90 +1051,118 @@ async def test_application_client_and_worker_entry(endpoint, runner_database):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.parametrize("save_fails", [True, False], ids=["failed-save", "completed"])
-async def test_deleted_temporal_record_does_not_release_business_key(
-    endpoint, runner_database, monkeypatch, save_fails
+async def test_queued_run_loads_latest_business_snapshot_and_keeps_credentials_local(
+    endpoint,
+    runner_database,
+    monkeypatch,
 ):
-    from pydantic import SecretStr
-    from temporalio.api.workflowservice.v1 import DeleteActivityExecutionRequest
-
-    from kapy.control.models import CreateModel, CreateProvider, ModelService
-    from kapy.control.sessions import CreateSession, OperationPhase, SessionBusy, SessionService
-    from kapy.control.sessions.operations import OperationRepository
+    from kapy.control.models.models import ModelRow, ProviderRow
+    from kapy.control.sessions.models import SessionRow
 
     base_url, requests = endpoint
-    catalog = ModelService(runner_database.sessions)
-    provider = await catalog.create_provider(
-        CreateProvider(
-            name="retention-test",
-            provider_class="pydantic_ai.providers.openai:OpenAIProvider",
-            model_class="pydantic_ai.models.openai:OpenAIChatModel",
-            api_key=SecretStr("local-key"),
-            base_url=base_url,
-        )
-    )
-    await catalog.create_model(
-        CreateModel(provider_id=provider.id, model_name="gpt-4o-mini", context_window=12345)
-    )
     client = await connect_temporal(runner_database.settings)
-    queue = f"ledger-{uuid4()}"
+    queue = f"latest-input-{uuid4()}"
+    handle = await start(
+        client,
+        queue,
+        RunnerInput(
+            session_id=runner_database.session_id,
+            runner_state=None,
+            user_prompt="queued",
+            config=make_config(base_url),
+        ),
+        database=runner_database,
+    )
+    description = await handle.describe(include_input=True)
+    assert await description.input() == [
+        {"session_id": str(runner_database.session_id), "user_prompt": "queued"}
+    ]
+    async with runner_database.sessions.begin() as db:
+        row = await db.get(SessionRow, runner_database.session_id)
+        (await db.get(ProviderRow, row.provider_id)).api_key = "latest-key"
+        (await db.get(ModelRow, (row.provider_id, row.model_name))).settings = {"temperature": 0.75}
+        row.runner_state = ModelMessagesTypeAdapter.dump_json(
+            [
+                ModelRequest([UserPromptPart("latest snapshot")]),
+            ]
+        ).decode()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = OpenAIChatModel.request_stream
+
+    @asynccontextmanager
+    async def blocked(self, *args, **kwargs):
+        entered.set()
+        await release.wait()
+        async with original(self, *args, **kwargs) as stream:
+            yield stream
+
+    monkeypatch.setattr(OpenAIChatModel, "request_stream", blocked)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            async with runner_database.sessions.begin() as db:
+                row = await db.get(SessionRow, runner_database.session_id)
+                (await db.get(ProviderRow, row.provider_id)).api_key = "after-admission-key"
+            release.set()
+            assert await asyncio.wait_for(handle.result(), 30) == "done"
+        finally:
+            release.set()
+    assert requests[0]["headers"]["authorization"] == "Bearer latest-key"
+    assert requests[0]["body"]["temperature"] == 0.75
+    assert [message["content"] for message in requests[0]["body"]["messages"]] == [
+        "latest snapshot",
+        "queued",
+    ]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_deleted_native_result_is_unconfirmed_and_uuid_can_be_reused(
+    endpoint, runner_database
+):
+    from uuid import UUID
+
+    from temporalio.api.workflowservice.v1 import DeleteActivityExecutionRequest
+
+    from kapy.control.sessions import SessionService
+
+    base_url, requests = endpoint
+    client = await connect_temporal(runner_database.settings)
+    queue = f"retention-{uuid4()}"
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     service = SessionService(
         runner_database.sessions, temporal_client=client, temporal_task_queue=queue
     )
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
-    async with Worker(
-        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
-    ):
-        session = await service.create_session(
-            CreateSession(provider_id=provider.id, model_name="gpt-4o-mini"), activity_id=uuid4()
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
+        first = await start(
+            client,
+            queue,
+            RunnerInput(
+                session_id=runner_database.session_id,
+                runner_state=None,
+                user_prompt="first",
+                config=make_config(base_url),
+            ),
+            database=runner_database,
         )
-        original = OperationRepository.complete
-        if save_fails:
-
-            async def fail_save(self, *args, **kwargs):
-                raise RuntimeError("save failed")
-
-            monkeypatch.setattr(OperationRepository, "complete", fail_save)
-        key = uuid4()
-        operation = await service.start_runner(session.id, activity_id=key, user_prompt="prompt A")
-        assert operation.run_id is not None
-        handle = client.get_activity_handle(str(key), run_id=operation.run_id, result_type=str)
-        if save_fails:
-            with pytest.raises(ActivityFailureError):
-                await handle.result()
-        else:
-            assert await handle.result() == "done"
-        terminal = await service.get_operation(session.id, key)
-        assert terminal.phase == (OperationPhase.FAILED if save_fails else OperationPhase.SUCCEEDED)
+        assert await first.result() == "done"
+        key = UUID(first.id)
+        retained = await service.start_runner(
+            runner_database.session_id, activity_id=key, user_prompt="ignored"
+        )
+        assert retained.run_id == first.run_id and await retained.result() == "done"
         await client.workflow_service.delete_activity_execution(
             DeleteActivityExecutionRequest(
                 namespace=client.namespace,
-                activity_id=str(key),
-                run_id=operation.run_id,
+                activity_id=first.id,
+                run_id=first.run_id,
             )
         )
-        monkeypatch.setattr(OperationRepository, "complete", original)
-        assert (
-            await service.start_runner(session.id, activity_id=key, user_prompt="prompt A")
-            == terminal
+        with pytest.raises(LookupError):
+            await service.get_activity(runner_database.session_id, key, run_id=first.run_id)
+        second = await service.start_runner(
+            runner_database.session_id, activity_id=key, user_prompt="new"
         )
-        assert len(requests) == 1
-        if save_fails:
-            with pytest.raises(SessionBusy):
-                await service.start_runner(session.id, activity_id=uuid4(), user_prompt="prompt B")
-        else:
-            continued = await service.start_runner(
-                session.id, activity_id=uuid4(), user_prompt="prompt B"
-            )
-            assert (
-                await client.get_activity_handle(
-                    str(continued.activity_id), run_id=continued.run_id, result_type=str
-                ).result()
-                == "done"
-            )
-            assert [message["content"] for message in requests[-1]["body"]["messages"]] == [
-                "prompt A",
-                "done",
-                "prompt B",
-            ]
-        assert (await service.close_session(session.id, activity_id=uuid4())).status == "closed"
+        assert second.run_id != first.run_id and await second.result() == "done"
+        assert len(requests) == 2

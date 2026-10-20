@@ -24,25 +24,27 @@ async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> Non
 ```
 
 The scope ID is the host session UUID, stable across runs and process restarts.
-SessionService validates Config and no-enter default States, then atomically
-reserves creating with fixed Config and a pending create operation. Its UUID
-activity_id is the Temporal ID and permanent database key. A Worker Activity claims
-pending before enter hooks; hooks never hold a database transaction. Without enter,
+The create Worker validates Config and no-enter default States, then atomically
+inserts creating with fixed Config and its actual Activity UUID/native run_id.
+The default session ID is the Activity UUID. Only the executing Worker reserves
+business state; hooks never hold a database transaction. Without enter,
 State is initialized from `{}`; returned State can require fields without defaults.
 Config and State remain JSON, while SDK component/client lifetimes stay separate.
 
-Complete State, ready and the saved creation result commit together. Failed creation
-moves to closing while retaining its running operation through compensation, exits
+Complete State, ready and ownership release commit together. Failed creation
+moves to closing while retaining its writer through compensation, exits
 all configured layers in reverse with None, including partial/uncalled enters, then
-records failed/closed or failed/closing. None does not mean no remote resources.
+finishes closed or closing and releases ownership. Temporal records failure.
+None does not mean no remote resources.
 An uncertain ready commit is checked before compensation; a committed success
 cannot be overwritten or cleaned up by that failed acknowledgment.
 
-Close claims ready or closing whose previous operation is terminal, using a new ID.
+Close claims unowned ready/closing, or CAS-replaces an old exact execution after
+Temporal confirms terminal/NOT_FOUND, using a new UUID and native run_id.
 Exit hooks run in reverse and save validated mutable State after each attempt,
 including errors/cancellation. Ordinary failures still attempt remaining exits;
 all cleanup must succeed for closed. Failure saves progress and closing. Same-key
-terminal close returns its prior result; a new explicit close may repeat successful
+terminal close returns its retained Temporal result; a new explicit close may repeat successful
 exits, so exits must always be idempotent and accept None for abandoned initialization.
 
 Only outer `RetryableScopeError` allows three hook attempts separated by 0.5 seconds.
@@ -52,8 +54,8 @@ before the next exit attempt. Storage/validation failure does not retry a hook.
 This is the existing business-hook contract; Temporal itself uses one attempt and
 never restores the Agent or automatically replays enter.
 
-Every new scope/model/tool call checks current_activity_id, operation phase and
-fixed deadline. Progress/result writes conditionally check them in one short
+Every new scope/model/tool call checks the session's current UUID/native run_id.
+Progress writes conditionally check full writer identity and lifecycle in one short
 transaction, without SELECT FOR UPDATE or a lease. A stale owner cannot issue
 further calls or write back; already-issued remote I/O cannot be revoked. Layers
 must reclaim late allocations or provide terminal scope closure by ID/Config.
@@ -172,9 +174,9 @@ wrapper around a native client:
 from kapy.layers.mcps import Config, make_toolset
 from pydantic_ai import Agent
 
-config = Config.model_validate({
-    "servers": {"public": {"transport": "http", "url": "http://localhost:9000/mcp"}}
-})
+config = Config.model_validate(
+    {"servers": {"public": {"transport": "http", "url": "http://localhost:9000/mcp"}}}
+)
 agent = Agent("openai:gpt-4.1", toolsets=[make_toolset(config)])
 # await agent.run("Use public's tools") starts and closes its Gateway.
 ```
@@ -185,7 +187,7 @@ names, such as `await toolset.mcp.direct_call_tool("public.search", {...})` insi
 after discovery. The registered layer and standalone builder use the same wrapper.
 
 Kapy's Config JSON export deliberately retains plaintext upstream credentials so
-PostgreSQL session configuration and frozen operation input can restore them; repr hides
+PostgreSQL session configuration and create's original Temporal request retain them; repr hides
 secret values. These credentials are part of the stored configuration and public
 session DTO, like the supplied inline data. Processes, connections and JWE keys
 never enter State. The independent `InlineGatewayConfig` keeps its ordinary JSON

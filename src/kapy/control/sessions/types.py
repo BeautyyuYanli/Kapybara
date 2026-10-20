@@ -4,7 +4,6 @@ Execution State stays internal. Layer names/configuration are fixed on creation.
 """
 
 from datetime import datetime
-from enum import StrEnum
 from typing import Self
 from uuid import UUID
 
@@ -17,8 +16,8 @@ from kapy.lifecycle import LifecycleStatus
 class CreateSession(DTO):
     """Fixed execution configuration; optional id lets callers resolve lost responses.
 
-    SessionService requires a separate activity_id. Same-key identical intent
-    returns its original result; a different key cannot reuse a reserved session ID.
+    The Activity UUID is the default session ID. Temporal retains deduplication
+    and results only for its retention period; the session primary key is permanent.
     """
 
     id: UUID | None = None
@@ -50,6 +49,8 @@ class SessionRecord(DTO):
     provider_id: UUID
     model_name: str
     model_settings: JsonObject
+    current_activity_id: UUID | None = None
+    current_activity_run_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -62,47 +63,61 @@ class SessionAlreadyExists(RuntimeError):
         super().__init__(f"Session {session_id} already exists or is being created")
 
 
-class OperationKind(StrEnum):
-    CREATE = "create"
-    RUN = "run"
-    CLOSE = "close"
+class SessionActivityRequest(DTO):
+    session_id: UUID
 
 
-class OperationPhase(StrEnum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
+class CreateSessionActivity(SessionActivityRequest):
+    request: CreateSession
 
 
-class SessionOperation(DTO):
-    """Durable public outcome. Private frozen inputs never leave the repository."""
+class RunAgentActivity(SessionActivityRequest):
+    user_prompt: str
+
+
+class ActivityReference(DTO):
+    """A reference to one native execution, fixed after submission or lookup."""
+
+    activity_id: UUID
+    run_id: str
+
+
+class SessionActivity(ActivityReference):
+    """Temporal facts; input is used only to validate ownership, never returned."""
 
     session_id: UUID
-    activity_id: UUID
-    kind: OperationKind
-    phase: OperationPhase
-    run_id: str | None
-    result: str | SessionRecord | None
-    error: str | None
-    created_at: datetime
-    deadline: datetime
+    activity_type: str
+    status: str
+    run_state: str | None
+    result: str | SessionRecord | None = None
+    error: str | None = None
 
 
 class SessionBusy(RuntimeError):
     """A different operation currently owns the session."""
 
 
-class OperationConflict(RuntimeError):
-    """An Activity ID was reused for different intent."""
+class ActivityIdentityConflict(RuntimeError):
+    """A retained Activity belongs to a different session or Activity type."""
+
+    def __init__(self, session_id: UUID, activity_id: UUID, run_id: str | None) -> None:
+        self.session_id = session_id
+        self.activity_id = activity_id
+        self.run_id = run_id
+        super().__init__("Activity identity conflict")
 
 
-class OperationFailed(RuntimeError):
-    """The immutable safe error from a failed operation."""
+class SessionExecutionError(RuntimeError):
+    """Safe native failure or uncertain RPC outcome, with recovery identities."""
 
-    def __init__(self, operation: SessionOperation) -> None:
-        self.operation = operation
-        super().__init__(operation.error or "Session operation failed")
+    def __init__(
+        self, session_id: UUID, activity_id: UUID, run_id: str | None, category: str
+    ) -> None:
+        self.session_id = session_id
+        self.activity_id = activity_id
+        self.run_id = run_id
+        self.category = category
+        super().__init__(category)
 
 
 class OwnershipLost(RuntimeError):

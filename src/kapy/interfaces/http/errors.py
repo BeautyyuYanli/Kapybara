@@ -15,10 +15,9 @@ from kapy.control.models.types import (
     ModelDiscoveryError,
 )
 from kapy.control.sessions import (
-    OperationConflict,
-    OperationFailed,
-    SessionAlreadyExists,
+    ActivityIdentityConflict,
     SessionBusy,
+    SessionExecutionError,
 )
 from kapy.lifecycle import LifecycleError
 
@@ -34,21 +33,23 @@ class ControlRoute(APIRoute):
                 return await handler(request)
             except HTTPException:
                 raise
-            except SessionAlreadyExists as error:
+            except SessionExecutionError as error:
                 return JSONResponse(
-                    status_code=409,
+                    status_code={
+                        "SessionBusy": 409,
+                        "LifecycleError": 409,
+                        "SessionAlreadyExists": 409,
+                        "OwnershipLost": 409,
+                        "NotFound": 404,
+                        "OutcomeUnavailable": 404,
+                        "InvalidParameters": 422,
+                        "UnableToConfirm": 503,
+                    }.get(error.category, 500),
                     content={
-                        "detail": "Session identity conflict",
+                        "detail": error.category,
                         "session_id": str(error.session_id),
-                    },
-                )
-            except OperationFailed as error:
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "detail": error.operation.error,
-                        "session_id": str(error.operation.session_id),
-                        "activity_id": str(error.operation.activity_id),
+                        "activity_id": str(error.activity_id),
+                        "run_id": error.run_id,
                     },
                 )
             except (RequestValidationError, ValidationError) as error:
@@ -58,10 +59,15 @@ class ControlRoute(APIRoute):
                 return JSONResponse(status_code=422, content={"detail": detail})
             except SessionBusy:
                 return JSONResponse(status_code=409, content={"detail": "Session busy"})
-            except OperationConflict:
+            except ActivityIdentityConflict as error:
                 return JSONResponse(
                     status_code=409,
-                    content={"detail": "Activity identity conflict"},
+                    content={
+                        "detail": "Activity identity conflict",
+                        "session_id": str(error.session_id),
+                        "activity_id": str(error.activity_id),
+                        "run_id": error.run_id,
+                    },
                 )
             except RPCError:
                 return JSONResponse(

@@ -193,12 +193,17 @@ async def test_sdk_settings_validation_and_update_semantics(database, session_ru
     saved = await sessions.get_session(session.id)
     assert saved.model_settings == {"google_top_k": 1}
     from temporalio.client import Client
+    from temporalio.contrib.pydantic import pydantic_data_converter
 
-    temporal = await Client.connect(os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"))
+    temporal = await Client.connect(
+        os.environ.get("KAPY_TEMPORAL_ADDRESS", "localhost:7233"),
+        data_converter=pydantic_data_converter,
+    )
     executing = SessionService(database.sessions, temporal_client=temporal, temporal_task_queue="q")
-    with pytest.raises(ValueError):
-        await executing.start_runner(session.id, user_prompt="go", activity_id=uuid4())
-    assert not await executing.is_runner_running(session.id)
+    # Submission succeeds without validation/admission on this unpolled queue.
+    handle = await executing.start_runner(session.id, user_prompt="go", activity_id=uuid4())
+    assert (await executing.get_session(session.id)).current_activity_id is None
+    await handle.terminate(reason="test cleanup")
     changed = await catalog.update_provider(
         provider.id, UpdateProvider(api_key=SecretStr("new-secret"), base_url=None)
     )

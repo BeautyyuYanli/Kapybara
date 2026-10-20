@@ -497,9 +497,9 @@ async def test_failed_creation_cleanup_targets_its_uuid_and_preserves_binding(
 
     from pydantic_ai.capabilities import Capability
 
-    from kapy.control.sessions import service as session_module
     from kapy.layers.registry import get_layers
     from kapy.lifecycle import LifecycleStatus
+    from kapy.runner import activities as session_module
     from kapy.runner import scopes
     from pydantic_ai_layer_protocol import Layer, LayerRegistry
     from pydantic_ai_layer_protocol.examples import echo

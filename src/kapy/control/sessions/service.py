@@ -1,62 +1,43 @@
-"""Durable session operations, configuration and immutable output replay.
+"""Session configuration, native Temporal execution and immutable output replay.
 
-Database ownership is claimed before Temporal submission. Every external call is
-outside its short transaction. Same-key requests reuse frozen input and permanent
-outcomes; uncertain dispatch never releases the session. Workers own all scopes,
-model/tool resources and execution. Each live call owns its subscription/read task.
+Submission never reserves business state. Workers compete for the current writer
+when they execute; Temporal retains inputs, scheduling, failures and results.
+Queries do not mutate sessions. Each live call owns its subscription/read task.
 """
 
 import asyncio
 import math
 from collections.abc import AsyncGenerator
 from datetime import timedelta
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from pydantic_ai.exceptions import UserError
-from sqlalchemy import or_, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlmodel import col, select
-from temporalio.client import ActivityExecutionStatus, Client
+from temporalio.client import ActivityFailureError, ActivityHandle, Client
 from temporalio.common import ActivityIDConflictPolicy, ActivityIDReusePolicy, RetryPolicy
 from temporalio.exceptions import ActivityAlreadyStartedError
-from temporalio.service import RPCError
+from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent, TextDelta
-from kapy.control.models.repository import ModelRepository
-from kapy.control.models.runtime import resolve_classes, validate_settings
-from kapy.control.types import utc_now
-from kapy.layers.registry import layer_registry
-from kapy.lifecycle import LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
-from kapy.runner.types import ExecutionConfig, RunnerInput
-from pydantic_ai_layer_protocol import dump_object
 
-from .models import SessionRow
-from .operations import ACTIVE, TERMINAL, OperationRepository, SessionOperationRow, public_operation
 from .repository import SessionRepository
+from .temporal import CLOSE, CREATE, RUN, failure_category
 from .types import (
+    ActivityIdentityConflict,
     CreateSession,
-    OperationConflict,
-    OperationFailed,
-    OperationKind,
-    OperationPhase,
-    OwnershipLost,
-    SessionAlreadyExists,
-    SessionBusy,
-    SessionOperation,
+    CreateSessionActivity,
+    RunAgentActivity,
+    SessionActivity,
+    SessionActivityRequest,
+    SessionExecutionError,
     SessionRecord,
     UpdateSession,
 )
 
 _TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
-_OPERATION_TIMEOUT = timedelta(hours=1)
-_ACTIVITY_NAMES = {
-    OperationKind.CREATE: "kapy.create_session",
-    OperationKind.RUN: "kapy.run_agent",
-    OperationKind.CLOSE: "kapy.close_session",
-}
+_ACTIVITY_TIMEOUT = timedelta(hours=1)
+_INPUT_TYPES = {CREATE: CreateSessionActivity, RUN: RunAgentActivity, CLOSE: SessionActivityRequest}
 
 
 class SessionService:
@@ -80,83 +61,127 @@ class SessionService:
         self._live_poll_interval = live_poll_interval
 
     def _client(self) -> Client:
-        if self._temporal_client is None or not self._temporal_task_queue:
-            raise RuntimeError("Session mutations require a Temporal client and task queue")
+        if self._temporal_client is None:
+            raise RuntimeError("Activity calls require a Temporal client")
         return self._temporal_client
 
-    async def _existing(
+    async def _describe(
         self,
+        session_id: UUID,
         activity_id: UUID,
-        kind: OperationKind,
-        request: dict,
-        session_id: UUID | None = None,
-    ) -> SessionOperation | None:
-        async with self._session_factory() as db, db.begin():
-            row = await db.get(SessionOperationRow, activity_id)
-            if row is None:
-                return None
-            if (
-                row.kind != kind
-                or row.request != request
-                or (session_id is not None and row.session_id != session_id)
-            ):
-                raise OperationConflict("Activity ID belongs to different intent")
-            result = public_operation(row)
-        return await self._reconcile(result)
+        run_id: str | None,
+        *,
+        expected_type: str | None = None,
+        include_outcome: bool = True,
+    ):
+        description = (
+            await self._client()
+            .get_activity_handle(
+                str(activity_id),
+                run_id=run_id,
+            )
+            .describe(
+                include_input=True,
+                include_outcome=include_outcome,
+                rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
+            )
+        )
+        input_type = _INPUT_TYPES.get(description.activity_type)
+        if input_type is None or (
+            expected_type is not None and description.activity_type != expected_type
+        ):
+            raise ActivityIdentityConflict(session_id, activity_id, description.activity_run_id)
+        inputs = await description.input([input_type])
+        if (
+            not inputs
+            or len(inputs) != 1
+            or inputs[0].session_id != session_id
+            or not description.activity_run_id
+        ):
+            raise ActivityIdentityConflict(session_id, activity_id, description.activity_run_id)
+        return description
+
+    async def _start[T](
+        self, name: str, request: SessionActivityRequest, activity_id: UUID, result_type: type[T]
+    ) -> ActivityHandle[T]:
+        client = self._client()
+        if not self._temporal_task_queue:
+            raise RuntimeError("Activity submission requires a task queue")
+        try:
+            handle = await client.start_activity(
+                name,
+                request,
+                result_type=result_type,
+                id=str(activity_id),
+                task_queue=self._temporal_task_queue,
+                id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
+                id_reuse_policy=ActivityIDReusePolicy.REJECT_DUPLICATE,
+                schedule_to_close_timeout=_ACTIVITY_TIMEOUT,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                heartbeat_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+                rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
+            )
+        except ActivityAlreadyStartedError as error:
+            # Retained terminal rejection supplies the precise execution to reuse.
+            handle = client.get_activity_handle(
+                str(activity_id),
+                run_id=error.run_id,
+                result_type=result_type,
+            )
+        try:
+            description = await self._describe(
+                request.session_id,
+                activity_id,
+                handle.run_id,
+                expected_type=name,
+                include_outcome=False,
+            )
+        except RPCError:
+            raise SessionExecutionError(
+                request.session_id,
+                activity_id,
+                handle.run_id,
+                "UnableToConfirm",
+            ) from None
+        return client.get_activity_handle(
+            str(activity_id),
+            run_id=description.activity_run_id,
+            result_type=result_type,
+        )
+
+    async def _wait_session(
+        self, session_id: UUID, activity_id: UUID, handle: ActivityHandle[SessionRecord]
+    ) -> SessionRecord:
+        try:
+            return await handle.result(rpc_timeout=_TEMPORAL_RPC_TIMEOUT)
+        except ActivityFailureError as error:
+            raise SessionExecutionError(
+                session_id, activity_id, handle.run_id, failure_category(error.cause)
+            ) from None
+        except RPCError as error:
+            raise SessionExecutionError(
+                session_id,
+                activity_id,
+                handle.run_id,
+                "OutcomeUnavailable"
+                if error.status == RPCStatusCode.NOT_FOUND
+                else "UnableToConfirm",
+            ) from None
 
     async def create_session(self, data: CreateSession, *, activity_id: UUID) -> SessionRecord:
-        """Create once; cancellation of this await leaves the remote operation intact."""
-        self._client()
-        request = data.model_dump(mode="json")
-        existing = await self._existing(activity_id, OperationKind.CREATE, request)
-        if existing is None:
-            try:
-                configs = layer_registry.prepare_configs(request["layers"])
-                for name in configs:
-                    definition = layer_registry.definitions[name]
-                    if definition.enter_scope is None:
-                        definition.state_type.model_validate({})
-            except UserError as error:
-                raise ValueError(str(error)) from error
-            layers = {name: dump_object(config) for name, config in configs.items()}
-            session_id = data.id or uuid4()
-            now = utc_now()
-            operation = SessionOperationRow(
-                activity_id=activity_id,
-                session_id=session_id,
-                kind=OperationKind.CREATE,
-                request=request,
-                # Worker validates the same fixed request, rather than running
-                # deterministic normalizers again on already-normalized Config.
-                input={"layers": request["layers"]},
-                created_at=now,
-                deadline=now + _OPERATION_TIMEOUT,
+        """Wait for native create; canceling this await leaves the Activity running."""
+        session_id = data.id or activity_id
+        try:
+            handle = await self._start(
+                CREATE,
+                CreateSessionActivity(session_id=session_id, request=data),
+                activity_id,
+                SessionRecord,
             )
-            async with self._session_factory() as db, db.begin():
-                row, fresh = await OperationRepository(db).insert(operation)
-                if fresh:
-                    inserted = (
-                        await db.execute(
-                            insert(SessionRow)
-                            .values(
-                                **data.model_dump(exclude={"id", "layers"}),
-                                id=session_id,
-                                layers=layers,
-                                layer_states={},
-                                status=LifecycleStatus.CREATING,
-                                current_activity_id=activity_id,
-                                created_at=now,
-                                updated_at=now,
-                            )
-                            .on_conflict_do_nothing()
-                            .returning(col(SessionRow.id))
-                        )
-                    ).scalar_one_or_none()
-                    if inserted is None:
-                        raise SessionAlreadyExists(session_id)
-                existing = public_operation(row)
-        operation = await self._dispatch(existing)
-        return await self._wait_session(operation)
+        except RPCError:
+            raise SessionExecutionError(session_id, activity_id, None, "UnableToConfirm") from None
+        return await self._wait_session(session_id, activity_id, handle)
 
     async def start_runner(
         self,
@@ -164,236 +189,83 @@ class SessionService:
         *,
         activity_id: UUID,
         user_prompt: str,
-    ) -> SessionOperation:
-        """Freeze input and claim STARTING; same-key confirmation never re-resolves config."""
-        self._client()
+    ) -> ActivityHandle[str]:
+        """Return an accepted native execution; Worker admission can still fail."""
         if not isinstance(user_prompt, str):
             raise ValueError("user_prompt must be a string")
-        request = {"user_prompt": user_prompt}
-        existing = await self._existing(activity_id, OperationKind.RUN, request, session_id)
-        if existing is None:
-            await self._reconcile_current(session_id)
-            now = utc_now()
-            async with self._session_factory() as db, db.begin():
-                row, fresh = await OperationRepository(db).insert(
-                    SessionOperationRow(
-                        activity_id=activity_id,
-                        session_id=session_id,
-                        kind=OperationKind.RUN,
-                        request=request,
-                        created_at=now,
-                        deadline=now + _OPERATION_TIMEOUT,
-                    )
-                )
-                if fresh:
-                    session = await self._claim_session(db, session_id, activity_id, close=False)
-                    catalog = ModelRepository(db)
-                    model = await catalog.get_model(session.provider_id, session.model_name)
-                    provider = await catalog.get_provider_config(session.provider_id)
-                    _, model_class = resolve_classes(provider)
-                    settings = validate_settings(
-                        model_class, model.settings | session.model_settings
-                    )
-                    data = RunnerInput(
-                        session_id=session_id,
-                        runner_state=session.runner_state,
-                        layers=layer_registry.load(session.layers, session.layer_states),
-                        user_prompt=user_prompt,
-                        config=ExecutionConfig(
-                            provider_class=provider.provider_class,
-                            model_class=provider.model_class,
-                            model_name=model.model_name,
-                            api_key=provider.api_key.get_secret_value(),
-                            base_url=provider.base_url,
-                            provider_kwargs=provider.provider_kwargs,
-                            model_settings=settings,
-                            context_window=model.context_window,
-                        ),
-                    )
-                    row.input = data.model_dump(mode="json")
-                    await db.flush()
-                existing = public_operation(row)
-        return await self._dispatch(existing)
+        return await self._start(
+            RUN,
+            RunAgentActivity(session_id=session_id, user_prompt=user_prompt),
+            activity_id,
+            str,
+        )
 
     async def close_session(self, session_id: UUID, *, activity_id: UUID) -> SessionRecord:
-        """Claim cleanup only when no live owner exists; repeat failed cleanup with a new ID."""
-        self._client()
-        request: dict = {}
-        existing = await self._existing(activity_id, OperationKind.CLOSE, request, session_id)
-        if existing is None:
-            await self._reconcile_current(session_id)
-            now = utc_now()
-            async with self._session_factory() as db, db.begin():
-                row, fresh = await OperationRepository(db).insert(
-                    SessionOperationRow(
-                        activity_id=activity_id,
-                        session_id=session_id,
-                        kind=OperationKind.CLOSE,
-                        request=request,
-                        created_at=now,
-                        deadline=now + _OPERATION_TIMEOUT,
-                    )
-                )
-                if fresh:
-                    session = await db.get(SessionRow, session_id)
-                    if session is None:
-                        raise LookupError(f"Session {session_id} does not exist")
-                    if session.status == LifecycleStatus.CLOSED:
-                        row.phase = OperationPhase.SUCCEEDED
-                        row.result = SessionRecord.model_validate(session).model_dump(mode="json")
-                    else:
-                        session = await self._claim_session(db, session_id, activity_id, close=True)
-                        row.input = {"layers": session.layers, "layer_states": session.layer_states}
-                    await db.flush()
-                existing = public_operation(row)
-        operation = await self._dispatch(existing)
-        return await self._wait_session(operation)
+        try:
+            handle = await self._start(
+                CLOSE,
+                SessionActivityRequest(session_id=session_id),
+                activity_id,
+                SessionRecord,
+            )
+        except RPCError:
+            raise SessionExecutionError(session_id, activity_id, None, "UnableToConfirm") from None
+        return await self._wait_session(session_id, activity_id, handle)
 
-    async def _claim_session(
+    async def get_activity(
         self,
-        db: AsyncSession,
         session_id: UUID,
         activity_id: UUID,
         *,
-        close: bool,
-    ) -> SessionRow:
-        statement = update(SessionRow).where(col(SessionRow.id) == session_id)
-        if close:
-            terminal = select(SessionOperationRow.activity_id).where(
-                col(SessionOperationRow.phase).in_(TERMINAL)
-            )
-            statement = statement.where(
-                or_(
-                    col(SessionRow.status) == LifecycleStatus.READY,
-                    (col(SessionRow.status) == LifecycleStatus.CLOSING)
-                    & or_(
-                        col(SessionRow.current_activity_id).is_(None),
-                        col(SessionRow.current_activity_id).in_(terminal),
-                    ),
-                )
-            )
-        else:
-            statement = statement.where(col(SessionRow.status) == LifecycleStatus.READY)
-        row = (
-            await db.execute(
-                statement.values(
-                    status=LifecycleStatus.CLOSING if close else LifecycleStatus.STARTING,
-                    current_activity_id=activity_id,
-                    updated_at=utc_now(),
-                )
-                .returning(SessionRow)
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            if await db.get(SessionRow, session_id) is None:
-                raise LookupError(f"Session {session_id} does not exist")
-            raise SessionBusy(f"Session {session_id} cannot be claimed")
-        return row
-
-    async def _dispatch(self, operation: SessionOperation) -> SessionOperation:
-        if operation.phase in TERMINAL:
-            return operation
-        if operation.phase == OperationPhase.RUNNING:
-            return await self._reconcile(operation)
-        client = self._client()
-        assert self._temporal_task_queue is not None
-        remaining = operation.deadline - utc_now()
-        if remaining <= timedelta():
-            return await self._reconcile(operation)
+        run_id: str | None = None,
+    ) -> SessionActivity:
+        """Read Temporal directly, even before create has inserted a session row."""
         try:
-            handle = await client.start_activity(
-                _ACTIVITY_NAMES[operation.kind],
-                operation.activity_id,
-                result_type=str if operation.kind == OperationKind.RUN else SessionRecord,
-                id=str(operation.activity_id),
-                task_queue=self._temporal_task_queue,
-                id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
-                id_reuse_policy=ActivityIDReusePolicy.REJECT_DUPLICATE,
-                schedule_to_close_timeout=remaining,
-                start_to_close_timeout=remaining,
-                heartbeat_timeout=timedelta(seconds=10),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-                rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
-            )
-        except ActivityAlreadyStartedError:
-            return await self._reconcile(operation)
-        if handle.run_id is not None:
-            async with self._session_factory() as db, db.begin():
-                await OperationRepository(db).bind_run_id(operation.activity_id, handle.run_id)
-        return await self.get_operation(operation.session_id, operation.activity_id)
+            description = await self._describe(session_id, activity_id, run_id)
+        except RPCError as error:
+            if error.status == RPCStatusCode.NOT_FOUND:
+                raise LookupError("Activity not found; its outcome cannot be confirmed") from None
+            raise
+        result = await description.result(
+            str if description.activity_type == RUN else SessionRecord
+        )
+        failure = await description.outcome_failure()
+        assert description.activity_run_id is not None
+        return SessionActivity(
+            session_id=session_id,
+            activity_id=activity_id,
+            run_id=description.activity_run_id,
+            activity_type=description.activity_type,
+            status=description.status.name,
+            run_state=description.run_state.name if description.run_state is not None else None,
+            result=result,
+            error=failure_category(failure) if failure is not None else None,
+        )
 
-    async def _reconcile_current(self, session_id: UUID) -> None:
-        async with self._session_factory() as db, db.begin():
-            session = await db.get(SessionRow, session_id)
-            if session is None:
-                raise LookupError(f"Session {session_id} does not exist")
-            row = (
-                None
-                if session.current_activity_id is None
-                else await db.get(SessionOperationRow, session.current_activity_id)
-            )
-            operation = None if row is None else public_operation(row)
-        if operation is not None:
-            await self._reconcile(operation)
-
-    async def _reconcile(self, operation: SessionOperation) -> SessionOperation:
-        if operation.phase in TERMINAL:
-            return operation
-        failed = operation.deadline <= utc_now()
-        if not failed and self._temporal_client is not None:
-            try:
-                description = await self._temporal_client.get_activity_handle(
-                    str(operation.activity_id),
-                    run_id=operation.run_id,
-                ).describe(rpc_timeout=_TEMPORAL_RPC_TIMEOUT)
-            except RPCError:
-                # Unknown execution is not permission to release or re-execute.
-                pass
-            else:
-                if description.activity_run_id is not None:
-                    async with self._session_factory() as db, db.begin():
-                        await OperationRepository(db).bind_run_id(
-                            operation.activity_id, description.activity_run_id
-                        )
-                failed = description.status not in (
-                    ActivityExecutionStatus.RUNNING,
-                    ActivityExecutionStatus.PAUSED,
-                )
-        if failed:
-            try:
-                async with self._session_factory() as db, db.begin():
-                    await OperationRepository(db).fail(
-                        operation.activity_id,
-                        "Session operation ended without a committed result",
-                        expired=True,
-                    )
-            except OwnershipLost:
-                pass
-        async with self._session_factory() as db, db.begin():
-            return public_operation(await OperationRepository(db).get(operation.activity_id))
-
-    async def get_operation(self, session_id: UUID, activity_id: UUID) -> SessionOperation:
-        async with self._session_factory() as db, db.begin():
-            row = await OperationRepository(db).get(activity_id)
-            if row.session_id != session_id:
-                raise LookupError("Session operation does not exist")
-            operation = public_operation(row)
-        return await self._reconcile(operation)
-
-    async def _wait_session(self, operation: SessionOperation) -> SessionRecord:
-        while operation.phase in ACTIVE:
-            await asyncio.sleep(0.05)
-            operation = await self.get_operation(operation.session_id, operation.activity_id)
-        if operation.phase == OperationPhase.FAILED:
-            raise OperationFailed(operation)
-        assert isinstance(operation.result, SessionRecord)
-        return operation.result
-
-    async def is_runner_running(self, session_id: UUID) -> bool:
-        async with self._session_factory() as db, db.begin():
-            record = await SessionRepository(db).get_session(session_id)
-            return record.status in (LifecycleStatus.STARTING, LifecycleStatus.RUNNING)
+    async def wait_session_activity(
+        self,
+        session_id: UUID,
+        activity_id: UUID,
+        *,
+        run_id: str | None = None,
+        activity_type: str,
+    ) -> SessionRecord:
+        """Recover an attempted create/close by lookup only; never resubmit it."""
+        if activity_type not in (CREATE, CLOSE):
+            raise ValueError("Only create and close return a session")
+        description = await self._describe(
+            session_id,
+            activity_id,
+            run_id,
+            expected_type=activity_type,
+            include_outcome=False,
+        )
+        handle = self._client().get_activity_handle(
+            str(activity_id),
+            run_id=description.activity_run_id,
+            result_type=SessionRecord,
+        )
+        return await self._wait_session(session_id, activity_id, handle)
 
     async def get_session(self, session_id: UUID) -> SessionRecord:
         async with self._session_factory() as db, db.begin():

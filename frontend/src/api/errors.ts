@@ -1,7 +1,27 @@
+export type ExecutionReference = {
+  session_id: string;
+  activity_id: string;
+  run_id: string;
+};
+
+// Error bodies are not generated response DTOs. Retain only the safe identity
+// needed to recover a request, never arbitrary upstream response fields.
+export function readExecutionReference(value: unknown): ExecutionReference | undefined {
+  if (!value || typeof value !== "object") return;
+  if (!("session_id" in value) || !("activity_id" in value) || !("run_id" in value)) return;
+  const { session_id, activity_id, run_id } = value;
+  if (
+    typeof session_id !== "string" || typeof activity_id !== "string" ||
+    typeof run_id !== "string" || !run_id
+  ) return;
+  return { session_id, activity_id, run_id };
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
     public detail: unknown,
+    public reference?: ExecutionReference,
   ) {
     super("API request failed");
   }

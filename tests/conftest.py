@@ -25,7 +25,6 @@ from kapy.agent_history.models import history_metadata
 from kapy.agent_output import AgentOutputService
 from kapy.control.database import ControlTable
 from kapy.control.sessions import models as session_models  # noqa: F401
-from kapy.control.sessions.operations import SessionOperationRow
 
 DATABASE_URL = os.environ.get(
     "KAPY_DATABASE_URL", "postgresql://kapy:kapy-local@127.0.0.1:55432/kapy"
@@ -124,24 +123,8 @@ def seed_session(database):
                 existing = SessionRow(id=session_id, provider_id=provider.id, model_name="test")
                 db.add(existing)
             if running:
-                from datetime import timedelta
-
-                from kapy.control.sessions.types import OperationKind, OperationPhase
-                from kapy.control.types import utc_now
-                from kapy.lifecycle import LifecycleStatus
-
-                existing.status = LifecycleStatus.RUNNING
                 existing.current_activity_id = session_id
-                db.add(
-                    SessionOperationRow(
-                        activity_id=session_id,
-                        session_id=session_id,
-                        kind=OperationKind.RUN,
-                        phase=OperationPhase.RUNNING,
-                        request={},
-                        deadline=utc_now() + timedelta(hours=1),
-                    )
-                )
+                existing.current_activity_run_id = "test-run"
 
     return seed
 
@@ -202,7 +185,7 @@ async def session_runtime(database, valkey_client):
     )
     queue = f"session-test-{uuid4()}"
     outputs = AgentOutputService(valkey_client, channel_prefix=f"session-test-{uuid4()}")
-    runner = RunnerActivity(database.sessions, outputs)
+    runner = RunnerActivity(database.sessions, outputs, client)
     async with Worker(
         client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
     ):

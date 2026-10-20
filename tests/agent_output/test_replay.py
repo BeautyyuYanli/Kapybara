@@ -84,6 +84,7 @@ async def test_live_replays_completed_activity_batches(database, valkey_client, 
                     session_factory=database.sessions,
                     output_service=outputs,
                     activity_id=session_id,
+                    activity_run_id="test-run",
                 ),
                 [
                     HistoryMessage(session_id, seq, ModelRequest([UserPromptPart(prompt)])),
@@ -366,6 +367,7 @@ async def test_unstarted_session_can_follow_new_execution(
                     session_factory=database.sessions,
                     output_service=outputs,
                     activity_id=session_id,
+                    activity_run_id="test-run",
                 ),
                 [
                     HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("go")])),

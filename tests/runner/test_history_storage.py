@@ -3,7 +3,6 @@
 import asyncio
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
-from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -24,10 +23,8 @@ from kapy.agent_history.repository import HistoryRepository
 from kapy.agent_output import MessageCommitted
 from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
-from kapy.control.sessions.operations import OperationRepository, SessionOperationRow
 from kapy.control.sessions.repository import SessionRepository
-from kapy.control.sessions.types import OperationKind, OperationPhase, OwnershipLost
-from kapy.control.types import utc_now
+from kapy.control.sessions.types import OwnershipLost
 from kapy.lifecycle import LifecycleStatus
 from kapy.runner import Recorder, RunnerDeps
 
@@ -68,6 +65,7 @@ async def test_stored_message_is_immutable_and_broadcast_preserves_complete_inpu
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
                 activity_id=session_id,
+                activity_run_id="test-run",
             ),
             [entry],
         )
@@ -85,6 +83,7 @@ async def test_stored_message_is_immutable_and_broadcast_preserves_complete_inpu
                     session_factory=runner_database.sessions,
                     output_service=runner_database.outputs,
                     activity_id=session_id,
+                    activity_run_id="test-run",
                 ),
                 [replace(entry, message=ModelRequest([UserPromptPart("changed")]))],
             )
@@ -137,6 +136,7 @@ async def test_invalid_batch_does_not_write_or_broadcast(runner_database, monkey
             session_factory=runner_database.sessions,
             output_service=runner_database.outputs,
             activity_id=session_id,
+            activity_run_id="test-run",
         ),
         [valid, other],
     )
@@ -162,6 +162,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
                 activity_id=session_id,
+                activity_run_id="test-run",
             ),
             initial,
         )
@@ -204,6 +205,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
                 activity_id=session_id,
+                activity_run_id="test-run",
             ),
             batch,
         )
@@ -222,6 +224,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
                 activity_id=session_id,
+                activity_run_id="test-run",
             ),
             [
                 history(session_id, 12, "changed retry"),
@@ -236,6 +239,7 @@ async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_databas
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
                 activity_id=session_id,
+                activity_run_id="test-run",
             ),
             [],
         )
@@ -290,6 +294,7 @@ async def test_record_missing_session_does_not_publish(runner_database, monkeypa
                     session_factory=runner_database.sessions,
                     output_service=runner_database.outputs,
                     activity_id=session_id,
+                    activity_run_id="test-run",
                 ),
                 [history(session_id, 0)],
             )
@@ -307,18 +312,9 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
                 id=other_id,
                 provider_id=uuid4(),
                 model_name="test",
-                status=LifecycleStatus.RUNNING,
+                status=LifecycleStatus.READY,
                 current_activity_id=other_id,
-            )
-        )
-        db.add(
-            SessionOperationRow(
-                activity_id=other_id,
-                session_id=other_id,
-                kind=OperationKind.RUN,
-                phase=OperationPhase.RUNNING,
-                request={},
-                deadline=utc_now() + timedelta(hours=1),
+                current_activity_run_id="test-run",
             )
         )
     attempted_lock = asyncio.Event()
@@ -331,7 +327,9 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
     task = None
     try:
         async with runner_database.sessions.begin() as db:
-            await OperationRepository(db).guard(session_id, (LifecycleStatus.RUNNING,))
+            await SessionRepository(db).guard(
+                session_id, session_id, "test-run", (LifecycleStatus.READY,)
+            )
             await HistoryRepository(db).append_history(session_id, [history(session_id, 2)])
             event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
             task = asyncio.create_task(
@@ -342,6 +340,7 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
                             session_factory=runner_database.sessions,
                             output_service=runner_database.outputs,
                             activity_id=session_id,
+                            activity_run_id="test-run",
                         ),
                         [history(session_id, 1)],
                     )
@@ -357,6 +356,7 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
                             session_factory=runner_database.sessions,
                             output_service=runner_database.outputs,
                             activity_id=other_id,
+                            activity_run_id="test-run",
                         ),
                         [history(other_id, 1)],
                     )
@@ -390,6 +390,7 @@ async def test_commit_before_broadcast_failure_recovers_without_retry_publicatio
                 session_factory=runner_database.sessions,
                 output_service=runner_database.outputs,
                 activity_id=session_id,
+                activity_run_id="test-run",
             ),
             [first],
         )
@@ -401,6 +402,7 @@ async def test_commit_before_broadcast_failure_recovers_without_retry_publicatio
             session_factory=runner_database.sessions,
             output_service=runner_database.outputs,
             activity_id=session_id,
+            activity_run_id="test-run",
         ),
         [final],
     )

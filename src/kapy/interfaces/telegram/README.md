@@ -88,24 +88,27 @@ update whose progress is already saved. Confirmation-send retries do not reapply
 completed configuration. A crash before progress is saved can repeat the same
 session update, following the inbox's existing at-least-once contract.
 
-Polling persists every batch and offset together before the next poll. Inbox
-processing saves resolved targets/templates, a fixed session ID and create/run/close
-Activity UUIDs before calling the core. Those IDs and inputs survive crashes between
-core commit and SQLite acknowledgment. Creation is confirmed with the same operation
-key before binding the route. Same-key running requests use the first frozen input;
-terminal requests return the saved result without replaying scopes or Agent work.
-Completed progress is saved before confirmation messages, so message delivery retries
-do not repeat business execution. No additional private operation table is needed.
+Polling persists every batch and offset atomically. The existing inbox saves fixed
+targets/templates, preallocated session IDs, create/run/close Activity UUIDs and
+received run_id references before progressing. No execution state/result ledger is
+added. Completed progress precedes confirmation delivery, so send retries do not
+repeat business calls. Core and private SQLite commits remain separate.
 
-Text and `/new <text>` submit a run operation without waiting for model completion.
-Database starting/running reports an exclusive execution. Busy receives an explicit
-reply and is not queued. A Temporal RPC error preserves the resolved action and keys;
-the next inbox attempt confirms the same operation. The fixed deadline does not
-extend. Failed operation replies contain `/close <failed session UUID>` and /new
-guidance, hiding upstream details. Failed creation keeps the previous binding, so
-the UUID targets its unbound resources safely. A new command generates new operation keys.
-Caller/process cancellation does not stop Worker Activity execution. There are no
-queue, steer or cancellation-flag commands; obsolete persisted commands return an
+Text and `/new <text>` return a submitted acknowledgment with execution identity;
+acceptance does not guarantee Worker admission. `/status` queries Temporal using
+the most recent inbox request and any current writer, showing native status,
+run_state and safe failure category. An unbound failed/queued creation can still
+be queried. No current writer does not imply that no tasks are queued. There is no
+background execution monitor or failure-push service.
+
+After restart an attempted UUID is queried, never automatically resubmitted or
+replaced. A found create/close is awaited through its fixed native run ID. Temporary
+RPC failures retry lookup; NOT_FOUND produces a safe reply with session/Activity
+identities and completes the inbox item, allowing later /new and /close commands.
+A crash between persisting the UUID and sending it can thus remain unconfirmed.
+No exact-once guarantee extends beyond Temporal retention. Failed creation retains
+the previous route; explicit `/close <UUID>` can clean its unbound resources.
+Caller cancellation does not cancel Worker execution. Obsolete commands return an
 unknown-command reply without allocating resources.
 
 Each delivery consumes SessionService.live batches in order with its persisted
@@ -154,12 +157,13 @@ preview state. Cancellation unwinds the current read or send and closes the live
 Bot API, SQLite, Valkey and core PostgreSQL resources. Existing legacy Telegram state is not imported.
 
 `/close` sends its saved target and Activity key. `/close <UUID>` also works without
-a current binding and preserves any existing binding. The Worker claims cleanup only when no active
-owner exists, runs exits in reverse outside transactions and saves validated progress
+a current binding and preserves any existing binding. The Worker claims unowned cleanup,
+or explicitly takes over a terminal/missing native writer by CAS, runs exits in reverse and saves progress
 after each attempt. Failure retains closing; a later explicit /close uses a new key
 and can repeat idempotent exits. Only outer RetryableScopeError gets three local
 attempts; Temporal itself has one attempt. Failed creation compensates all configured
 layers with None, including partial/uncalled enters, before recording its terminal
-result. /status reads database lifecycle and starting/running, independently of the
-Temporal record's retention. Configuration/title updates require ready. See the
+native failure. /status reads lifecycle plus Temporal references from the inbox and
+current writer. Forgotten execution results remain unconfirmed. Configuration/title
+updates require ready and no current writer. See the
 [control state machine](../../control/README.md#session-state-machine).

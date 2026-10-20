@@ -25,7 +25,9 @@ async def serve(settings: CommonSettings) -> None:
         output_service = AgentOutputService(
             resources.valkey, channel_prefix=settings.valkey_namespace + ":agent-output"
         )
-        runner = RunnerActivity(resources.core_session_factory, output_service)
+        runner = RunnerActivity(
+            resources.core_session_factory, output_service, resources.temporal_client
+        )
         async with Worker(
             resources.temporal_client,
             task_queue=settings.temporal_task_queue,

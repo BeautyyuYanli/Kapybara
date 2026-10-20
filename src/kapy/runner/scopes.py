@@ -2,9 +2,8 @@
 
 Creation publishes all initial States together. Failed creation cleans every
 configured layer with None, including partial/uncalled enters, while retaining
-its current operation. Exit attempts save validated progress even on failure.
-Creation loads the original frozen Config request; deterministic, I/O-free
-validation produces the same once-normalized Config stored at reservation.
+its current writer. Exit attempts save validated progress even on failure.
+Creation uses the Config validated before insertion, without normalizing it twice.
 External cleanup must be idempotent; ownership cannot revoke issued remote I/O.
 """
 
@@ -16,9 +15,10 @@ from uuid import UUID
 import anyio
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from temporalio import activity
 
-from kapy.control.sessions.operations import OperationRepository
-from kapy.control.sessions.types import OperationPhase, OwnershipLost, SessionRecord
+from kapy.control.sessions.repository import SessionRepository
+from kapy.control.sessions.types import OwnershipLost, SessionRecord
 from kapy.layers.registry import layer_registry
 from kapy.layers.scopes import retry_scope
 from kapy.lifecycle import LifecycleStatus
@@ -30,20 +30,29 @@ _logger = logging.getLogger(__name__)
 
 async def check_owner(
     factory: async_sessionmaker[AsyncSession],
+    session_id: UUID,
     activity_id: UUID,
+    run_id: str,
     statuses: tuple[LifecycleStatus, ...],
+    *,
+    allow_cancelled: bool = False,
 ) -> None:
+    if not allow_cancelled and activity.in_activity() and activity.is_cancelled():
+        raise asyncio.CancelledError
     async with factory() as db, db.begin():
-        await OperationRepository(db).guard(activity_id, statuses)
+        await SessionRepository(db).guard(session_id, activity_id, run_id, statuses)
 
 
 async def _exit_scope(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
+    run_id: str,
     session_id: UUID,
     name: str,
     config: BaseModel,
     saved_state: JsonObject | None,
+    *,
+    compensation: bool,
 ) -> None:
     """Revalidate and save State before another local exit attempt."""
     definition = layer_registry.definitions[name]
@@ -55,7 +64,14 @@ async def _exit_scope(
     )
 
     async def attempt(exit_hook=exit_hook, config=config):
-        await check_owner(factory, activity_id, (LifecycleStatus.CLOSING,))
+        await check_owner(
+            factory,
+            session_id,
+            activity_id,
+            run_id,
+            (LifecycleStatus.CLOSING,),
+            allow_cancelled=compensation,
+        )
         await exit_hook(session_id, config.model_copy(deep=True), state)
 
     async def save_progress(name=name, state_type=definition.state_type):
@@ -66,8 +82,8 @@ async def _exit_scope(
         saved = dump_object(state)
         with anyio.CancelScope(shield=True):
             async with factory() as db, db.begin():
-                session, _ = await OperationRepository(db).guard(
-                    activity_id, (LifecycleStatus.CLOSING,)
+                session = await SessionRepository(db).guard(
+                    session_id, activity_id, run_id, (LifecycleStatus.CLOSING,)
                 )
                 session.layer_states = session.layer_states | {name: saved}
                 await db.flush()
@@ -78,6 +94,7 @@ async def _exit_scope(
 async def _exit_scopes(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
+    run_id: str,
     session_id: UUID,
     configs: dict[str, BaseModel],
     states: dict[str, JsonObject],
@@ -87,7 +104,16 @@ async def _exit_scopes(
     complete = True
     for name, config in reversed(configs.items()):
         try:
-            await _exit_scope(factory, activity_id, session_id, name, config, states.get(name))
+            await _exit_scope(
+                factory,
+                activity_id,
+                run_id,
+                session_id,
+                name,
+                config,
+                states.get(name),
+                compensation=compensation,
+            )
         except OwnershipLost:
             raise
         except asyncio.CancelledError:
@@ -106,10 +132,10 @@ async def _exit_scopes(
 async def create_scopes(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
+    run_id: str,
     session_id: UUID,
-    frozen: dict,
+    configs: dict[str, BaseModel],
 ) -> SessionRecord:
-    configs = layer_registry.prepare_configs(frozen["layers"])
     states: dict[str, JsonObject] = {}
     try:
         for name, config in configs.items():
@@ -120,42 +146,47 @@ async def create_scopes(
                 continue
 
             async def attempt(enter=enter, config=config):
-                await check_owner(factory, activity_id, (LifecycleStatus.CREATING,))
+                await check_owner(
+                    factory, session_id, activity_id, run_id, (LifecycleStatus.CREATING,)
+                )
                 return await enter(session_id, config.model_copy(deep=True))
 
             returned = await retry_scope(attempt)
             if not isinstance(returned, definition.state_type):
                 raise TypeError(f"Layer {name!r} enter_scope must return its State")
             states[name] = dump_object(definition.state_type.model_validate(dump_object(returned)))
+        await check_owner(factory, session_id, activity_id, run_id, (LifecycleStatus.CREATING,))
         async with factory() as db, db.begin():
-            row = await OperationRepository(db).complete(
-                activity_id, LifecycleStatus.READY, None, layer_states=states
+            result = await SessionRepository(db).complete(
+                session_id,
+                activity_id,
+                run_id,
+                (LifecycleStatus.CREATING,),
+                LifecycleStatus.READY,
+                layer_states=states,
             )
-            result = SessionRecord.model_validate(row)
         return result
     except BaseException:
         # A final commit acknowledgment can be lost. Never compensate until the
-        # transaction ended and the durable outcome has been checked.
-        with anyio.CancelScope(shield=True):
+        # transaction ended and a conditional write confirms uncommitted creation.
+        # A committed READY or a replacement writer prevents business compensation.
+        with anyio.move_on_after(15, shield=True):
             async with factory() as db, db.begin():
-                operation = await OperationRepository(db).get(activity_id)
-                if operation.phase == OperationPhase.SUCCEEDED:
-                    return SessionRecord.model_validate(operation.result)
-                session, _ = await OperationRepository(db).guard(
-                    activity_id, (LifecycleStatus.CREATING,)
+                session = await SessionRepository(db).guard(
+                    session_id, activity_id, run_id, (LifecycleStatus.CREATING,)
                 )
                 session.status = LifecycleStatus.CLOSING
                 await db.flush()
             complete = await _exit_scopes(
-                factory, activity_id, session_id, configs, {}, compensation=True
+                factory, activity_id, run_id, session_id, configs, {}, compensation=True
             )
             async with factory() as db, db.begin():
-                await OperationRepository(db).complete(
+                await SessionRepository(db).complete(
+                    session_id,
                     activity_id,
+                    run_id,
+                    (LifecycleStatus.CLOSING,),
                     LifecycleStatus.CLOSED if complete else LifecycleStatus.CLOSING,
-                    None,
-                    failed=True,
-                    error="Session creation failed",
                 )
         raise
 
@@ -163,6 +194,7 @@ async def create_scopes(
 async def close_scopes(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
+    run_id: str,
     session_id: UUID,
     frozen: dict,
 ) -> SessionRecord:
@@ -171,11 +203,17 @@ async def close_scopes(
     if states and states.keys() != configs.keys():
         raise ValueError("Saved layer states must match configured layers")
     complete = await _exit_scopes(
-        factory, activity_id, session_id, configs, states, compensation=False
+        factory, activity_id, run_id, session_id, configs, states, compensation=False
     )
     if not complete:
         raise RuntimeError("Session cleanup failed")
+    await check_owner(factory, session_id, activity_id, run_id, (LifecycleStatus.CLOSING,))
     async with factory() as db, db.begin():
-        row = await OperationRepository(db).complete(activity_id, LifecycleStatus.CLOSED, None)
-        result = SessionRecord.model_validate(row)
+        result = await SessionRepository(db).complete(
+            session_id,
+            activity_id,
+            run_id,
+            (LifecycleStatus.CLOSING,),
+            LifecycleStatus.CLOSED,
+        )
     return result

@@ -53,10 +53,12 @@ fixed native `layers` configuration, history and durable submission. Layer Confi
 is accepted by creation and returned by session DTOs; State remains internal.
 The session form edits title, model identity and model settings. Creating a session
 initializes scopes through a Worker Activity. The form saves its Activity UUID and
-intent in tab sessionStorage before submission; an identical retry reuses the key,
-including after reload. New input uses a new key. UUIDs use Web Crypto random bytes
+intent in tab sessionStorage before submission. The UUID is also the default session
+ID. After a lost response/reload it queries that resource and the same Temporal
+execution, retaining the reference when neither outcome can be confirmed. A new
+attempt requires explicitly abandoning the original reference. UUIDs use Web Crypto random bytes
 on both HTTP LAN and secure origins. Existing sessions permit title/configuration
-edits only while ready. No provisional
+edits only while ready with both current Activity identity fields empty. No provisional
 schema or handwritten API DTOs are
 retained. Only TypeScript, SDK and Fetch plugins are enabled.
 

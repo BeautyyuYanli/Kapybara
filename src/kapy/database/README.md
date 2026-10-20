@@ -22,7 +22,7 @@ stamped or converted; recreate those development databases. Stopping processes
 never drops data. The process manager's SQLite is outside these histories.
 
 Current core metadata consists of ControlTable and history_metadata.
-Current tables are providers, models, sessions, agent_history and session_operations.
+Current tables are providers, models, sessions and agent_history.
 `OWNED_TABLES` also retains removed/renamed table names so autogeneration can discover
 removal. Reflection excludes unrelated tables and schemas. Core versions live in
 `database/migrations/` with `core_schema_version`; Telegram versions live in
@@ -33,26 +33,27 @@ rendering for structural changes.
 ## Durable snapshots, layers and history
 
 Sessions retain opaque runner_state TEXT, initially NULL, fixed Config and mutable
-layer State JSON. current_activity_id identifies the operation allowed to write.
-The permanent session_operations ledger stores normalized intent, frozen input,
-phase, native run_id, fixed deadline and immutable result/safe error. Private input
-includes provider credentials and is never returned by public DTOs. Temporal input
-is only the UUID. Run final save commits snapshot, all States, ready and succeeded
-output together; cleanup saves individual State progress in owned short transactions.
-No snapshot version or session lease protocol remains.
+layer State JSON. Paired current_activity_id/current_activity_run_id grant only
+current business write ownership. Normal completion clears both. A database CHECK
+requires both empty or both present. Temporal owns all execution status, input,
+results and timeouts; provider credentials and run snapshots never enter run
+Activity parameters. Run final save commits snapshot/all States and ownership
+release together; cleanup saves State progress in owned short transactions.
 
-The session-operations revision moves existing nonclosed sessions to closing,
-preserving snapshots, history and State for reads/explicit cleanup. It does not
-fabricate completion evidence or call remote hooks. It adds the operation ledger
-and current ID, removes session_leases and runner_state_version, and rejects
-downgrade because earlier ownership cannot be reconstructed. Generate it against
-a disposable preceding schema with `kapy db revision --message '...' --plan
-session-operations`; revisions are generated, not edited manually.
+The temporal-session-ownership revision drops session_operations without copying
+its private inputs/results into other storage. It maps legacy creating/starting/
+running/closing to closing, preserves ready/closed, clears all old ownership and
+retains Config, State, snapshot and history. The conversion is irreversible.
+Generate against a disposable preceding schema using:
 
-This ownership migration requires old interfaces/Workers stopped and old Activities
-drained or ended. The SQL changes ownership records; it cannot stop execution.
-New code must use the new schema and UUID-only Activity inputs together: preceding
-RunnerInput payloads and lease/version-based Workers are incompatible with it.
+```sh
+kapy db revision --message 'Use Temporal execution records for sessions' --plan temporal-session-ownership
+```
+
+Stop old interfaces/Workers and drain or end their Activities before upgrade. SQL
+cannot stop their execution. New code/schema and minimal native Activity requests
+must be deployed together; UUID-only legacy inputs are incompatible. Revisions are
+generated from explicit plans and contain fixed SQL, never runtime plan imports.
 
 Shell layer State requires `scope_id` alongside `jobs`; its enter hook initializes
 the UUID from the session identity. The data-only revision fills a missing field

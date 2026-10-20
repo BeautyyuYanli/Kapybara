@@ -2,7 +2,7 @@
 
 `HistoryMessage(session_id, seq, message)` is one complete SDK message at a stored
 session position. `HistoryRepository` borrows a transaction; it never commits,
-claims operation ownership, or manages session lifetime. The physical table remains
+claims session ownership, or manages session lifetime. The physical table remains
 `agent_history`, keyed by `(session_id, seq)` without physical foreign keys.
 
 `append_history(id, messages)` requires the caller to serialize writers with its
@@ -26,11 +26,11 @@ Missing session history returns empty values. Cursor validation and pagination a
 independent of durable snapshot encoding.
 
 [`kapy.runner.recording.Recorder.persist_messages`](../runner/recording.py) borrows
-Worker resources from run deps, confirms current ID/phase/deadline using conditional
+Worker resources from run deps, confirms session ID/native UUID/run_id using conditional
 writes in a short transaction, then
 publishes accepted messages through [agent_output](../agent_output/README.md) after
 commit. Recording and final runner-state saving remain separate transactions: a
 failure before the final save commits can leave recorded history while the
 previous successful snapshot remains. SessionService's
-[Temporal admission](../control/README.md) prevents starting a new run after such
+[Worker admission](../control/README.md) prevents executing a new run after such
 failure. `live()` combines these immutable messages with best-effort previews.

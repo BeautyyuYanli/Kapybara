@@ -3,7 +3,6 @@
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import timedelta
 from uuid import UUID, uuid4
 
 import psycopg
@@ -16,9 +15,6 @@ from kapy.agent_output import AgentOutputService
 from kapy.application.resources import open_core_database
 from kapy.application.settings import CommonSettings
 from kapy.control.sessions.models import SessionRow
-from kapy.control.sessions.operations import SessionOperationRow
-from kapy.control.sessions.types import OperationKind, OperationPhase
-from kapy.control.types import utc_now
 from kapy.database.schema import migrate
 from kapy.lifecycle import LifecycleStatus
 from kapy.runner import RunnerDeps
@@ -36,6 +32,7 @@ class RunnerDatabase:
         return RunnerDeps(
             session_id=session_id or self.session_id,
             activity_id=session_id or self.session_id,
+            activity_run_id="test-run",
             session_factory=self.sessions,
             output_service=self.outputs,
         )
@@ -61,18 +58,9 @@ async def runner_database() -> AsyncIterator[RunnerDatabase]:
                         id=session_id,
                         provider_id=uuid4(),
                         model_name="test",
-                        status=LifecycleStatus.RUNNING,
+                        status=LifecycleStatus.READY,
                         current_activity_id=session_id,
-                    )
-                )
-                db.add(
-                    SessionOperationRow(
-                        activity_id=session_id,
-                        session_id=session_id,
-                        kind=OperationKind.RUN,
-                        phase=OperationPhase.RUNNING,
-                        request={},
-                        deadline=utc_now() + timedelta(hours=1),
+                        current_activity_run_id="test-run",
                     )
                 )
             async with Valkey.from_url(settings.valkey_url.get_secret_value()) as client:

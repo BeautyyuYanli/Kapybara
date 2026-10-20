@@ -6,8 +6,8 @@ import time
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, Mock
-from uuid import uuid4
+from unittest.mock import ANY, AsyncMock
+from uuid import UUID, uuid4
 
 import httpx2
 import pytest
@@ -30,10 +30,8 @@ from kapy.agent_output import MessageCommitted, TextDelta
 from kapy.control.models import ModelService
 from kapy.control.sessions import (
     CreateSession,
-    OperationFailed,
-    OperationKind,
-    OperationPhase,
-    SessionOperation,
+    SessionActivity,
+    SessionExecutionError,
     SessionService,
     UpdateSession,
 )
@@ -87,10 +85,24 @@ def update(update_id, text="hello", *, chat=123, thread=0, **message):
 def controller(repository, tmp_path):
     sessions = AsyncMock(spec=SessionService)
     existing = {}
+    executions = {}
 
     async def create(data, *, activity_id):
-        record = SimpleNamespace(id=data.id, status=LifecycleStatus.READY)
+        record = SimpleNamespace(
+            id=data.id,
+            status=LifecycleStatus.READY,
+            current_activity_id=None,
+            current_activity_run_id=None,
+        )
         existing[record.id] = record
+        executions[activity_id] = SessionActivity(
+            session_id=data.id,
+            activity_id=activity_id,
+            run_id=str(uuid4()),
+            activity_type="kapy.create_session",
+            status="COMPLETED",
+            run_state=None,
+        )
         sessions.create_session.return_value = record
         return record
 
@@ -101,7 +113,29 @@ def controller(repository, tmp_path):
 
     sessions.create_session.side_effect = create
     sessions.get_session.side_effect = get
-    sessions.is_runner_running.return_value = False
+
+    async def start(session_id, *, activity_id, user_prompt):
+        executions[activity_id] = SessionActivity(
+            session_id=session_id,
+            activity_id=activity_id,
+            run_id=str(uuid4()),
+            activity_type="kapy.run_agent",
+            status="RUNNING",
+            run_state="SCHEDULED",
+        )
+        return SimpleNamespace(id=str(activity_id), run_id=executions[activity_id].run_id)
+
+    async def execution(session_id, activity_id, *, run_id=None):
+        if activity_id not in executions:
+            raise LookupError("Native record not found")
+        return executions[activity_id]
+
+    async def wait(session_id, activity_id, **kwargs):
+        return existing[session_id]
+
+    sessions.start_runner.side_effect = start
+    sessions.get_activity.side_effect = execution
+    sessions.wait_session_activity.side_effect = wait
     client = telegram_client()
     result = TelegramController(
         client=client,
@@ -124,6 +158,80 @@ async def test_removed_commands_do_not_create_or_submit_execution(repository, tm
     sessions.create_session.assert_not_awaited()
     sessions.start_runner.assert_not_awaited()
     assert client.send.await_args.args[-1] == "Unknown command. Use /help."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["create", "run", "close"])
+@pytest.mark.parametrize("missing", ["lookup", "rpc"])
+async def test_missing_attempted_execution_finishes_inbox_without_resubmitting(
+    repository,
+    tmp_path,
+    kind,
+    missing,
+):
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from kapy.interfaces.telegram.models import InboxRow
+
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "/new")])
+    await app.process_once()
+    await repository.ingest(
+        42, [update(2, "/new" if kind == "create" else "/close" if kind == "close" else "text")]
+    )
+    item = await repository.next_inbox(42)
+    action = await app.resolve(item)
+    key = str(uuid4())
+    action[kind + "_activity_id"] = key
+    if kind == "create":
+        action["creating_session_id"] = str(uuid4())
+    await repository.save_action(item, action)
+    sessions.get_activity.side_effect = (
+        LookupError("expired")
+        if missing == "lookup"
+        else RPCError("private failure", RPCStatusCode.NOT_FOUND, b"")
+    )
+    await app.process_once()
+    await app.process_once()
+    assert await repository.next_inbox(42) is None
+    assert key in client.send.await_args.args[-1]
+    assert "cannot be confirmed" in client.send.await_args.args[-1]
+    assert "private failure" not in client.send.await_args.args[-1]
+    sessions.start_runner.assert_not_awaited()
+    sessions.close_session.assert_not_awaited()
+    assert sessions.create_session.await_count == 1
+    async with repository.sessions.begin() as db:
+        saved = await db.get(InboxRow, (42, 2))
+        assert saved.handled and saved.resolved_action[kind + "_activity_id"] == key
+    await repository.ingest(42, [update(3, "/new")])
+    await app.process_once()
+    assert sessions.create_session.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_status_queries_recent_queued_request_without_current_writer(repository, tmp_path):
+    from kapy.interfaces.telegram.models import InboxRow
+
+    app, sessions, client = controller(repository, tmp_path)
+    await repository.ingest(42, [update(1, "queued"), update(2, "/status")])
+    await app.process_once()
+    async with repository.sessions.begin() as db:
+        row = await db.get(InboxRow, (42, 1))
+        action = dict(row.resolved_action)
+        action.pop("run_run_id")
+        row.resolved_action = action
+    sessions.get_activity.reset_mock()
+    await app.process_once()
+    reply = client.send.await_args.args[-1]
+    assert "RUNNING / SCHEDULED" in reply and "idle" not in reply
+    sessions.get_activity.assert_awaited_once()
+    async with repository.sessions.begin() as db:
+        row = await db.get(InboxRow, (42, 1))
+        pinned = row.resolved_action["run_run_id"]
+        assert row.handled and pinned
+    await repository.ingest(42, [update(3, "/status")])
+    await app.process_once()
+    assert sessions.get_activity.await_args.kwargs["run_id"] == pinned
 
 
 @pytest.mark.asyncio
@@ -488,9 +596,10 @@ async def test_inbox_dedup_topics_and_session_business_only(repository, tmp_path
     )
     assert await repository.route(42, 123, 0) == sessions.create_session.return_value.id
     assert await repository.route(42, 123, 1) is None
-    assert [call.args[2] for call in client.send.call_args_list] == [
+    assert client.send.call_args_list[0].args[2].startswith("Submitted.")
+    assert [call.args[2] for call in client.send.call_args_list[1:]] == [
         "Unknown command. Use /help.",
-        "No current session. Use /new or send text.",
+        "No current session or saved request. Use /new or send text.",
     ]
 
 
@@ -547,10 +656,10 @@ async def test_bind_failure_after_creation_recovers_saved_identity(
     restarted.sessions = sessions
     await restarted.process_once()
     assert await repository.route(42, 123, 0) == created_id
-    assert sessions.create_session.await_count == 2
-    assert sessions.create_session.await_args_list[0] == sessions.create_session.await_args_list[1]
+    assert sessions.create_session.await_count == 1
+    sessions.wait_session_activity.assert_awaited_once()
     sessions.start_runner.assert_awaited_once_with(created_id, user_prompt="first", activity_id=ANY)
-    assert client.send.await_args.args[-1] == "New session created."
+    assert client.send.await_args.args[-1].startswith("Submitted.")
     assert await repository.next_inbox(42) is None
 
 
@@ -1013,10 +1122,9 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
 ):
     app, sessions, _ = controller(repository, tmp_path)
     content = "retain this input"
-    sessions.start_runner.side_effect = [
-        OperationalError("start_runner", {}, Exception("temporary connection failure")),
-        Mock(spec=SessionOperation, phase=OperationPhase.RUNNING),
-    ]
+    sessions.start_runner.side_effect = OperationalError(
+        "start_runner", {}, Exception("temporary connection failure")
+    )
     await repository.ingest(42, [update(1, "/new " + content, thread=17)])
     with pytest.raises(OperationalError):
         await app.process_once()
@@ -1025,8 +1133,9 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
 
     async with open_storage(tmp_path / "telegram.sqlite3") as engine:
         restored = TelegramRepository(async_sessionmaker(engine, expire_on_commit=False))
+        restarted_client = telegram_client()
         restarted = TelegramController(
-            client=telegram_client(),
+            client=restarted_client,
             sessions=sessions,
             models=app.models,
             repository=restored,
@@ -1035,14 +1144,13 @@ async def test_recreated_controller_retries_submission_to_durably_bound_session(
             username="kapy_bot",
         )
         await restarted.process_once()
+        await restarted.process_once()
         assert await restored.route(42, 123, 17) == target
         assert await restored.next_inbox(42) is None
     sessions.create_session.assert_awaited_once()
-    # Both attempts confirm one durable operation identity.
-    assert [call.args for call in sessions.start_runner.await_args_list] == [
-        (target,),
-        (target,),
-    ]
+    # An attempted UUID is queried once; NOT_FOUND is reported without resubmission.
+    assert [call.args for call in sessions.start_runner.await_args_list] == [(target,)]
+    assert "cannot be confirmed" in restarted_client.send.await_args.args[-1]
     assert all(
         call.kwargs["user_prompt"] == content for call in sessions.start_runner.await_args_list
     )
@@ -1104,16 +1212,23 @@ async def test_open_group_stream_skips_drafts_while_private_stream_previews(repo
 
 
 @pytest.mark.asyncio
-async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp_path):
-    from kapy.control.sessions import SessionBusy
-
+async def test_failed_close_reports_native_identity_and_finishes_inbox(repository, tmp_path):
     app, sessions, client = controller(repository, tmp_path)
     await repository.ingest(42, [update(1, "/new")])
     assert await app.process_once()
-    sessions.close_session.side_effect = SessionBusy("occupied")
+
+    async def fail(session_id, *, activity_id):
+        raise SessionExecutionError(session_id, activity_id, "close-run", "SessionBusy")
+
+    sessions.close_session.side_effect = fail
     await repository.ingest(42, [update(2, "/close")])
     assert await app.process_once()
-    assert "close has not started" in client.send.await_args.args[-1]
+    item = await repository.next_inbox(42)
+    assert item.resolved_action["close_run_id"] == "close-run"
+    key = item.resolved_action["close_activity_id"]
+    assert await app.process_once()
+    reply = client.send.await_args.args[-1]
+    assert "SessionBusy" in reply and key in reply
     assert await repository.next_inbox(42) is None
     assert not await app.process_once()
     sessions.close_session.assert_awaited_once()
@@ -1126,26 +1241,10 @@ async def test_busy_close_finishes_inbox_without_automatic_retry(repository, tmp
 
 @pytest.mark.asyncio
 async def test_failed_creation_reports_saved_identity_and_explicit_cleanup(repository, tmp_path):
-    from datetime import timedelta
-
-    from kapy.control.types import utc_now
-
     app, sessions, client = controller(repository, tmp_path)
 
     async def fail(data, *, activity_id):
-        raise OperationFailed(
-            SessionOperation(
-                session_id=data.id,
-                activity_id=activity_id,
-                kind=OperationKind.CREATE,
-                phase=OperationPhase.FAILED,
-                run_id="test-run",
-                result=None,
-                error="Session creation failed",
-                created_at=utc_now(),
-                deadline=utc_now() + timedelta(hours=1),
-            )
-        )
+        raise SessionExecutionError(data.id, activity_id, "test-run", "ExecutionFailed")
 
     sessions.create_session.side_effect = fail
     await repository.ingest(42, [update(1, "/new")])
@@ -1206,33 +1305,31 @@ async def test_complete_reply_advances_cursor_and_restart_deduplicates(
 
 
 @pytest.mark.asyncio
-async def test_busy_is_not_queued_and_ambiguous_start_confirms_same_key(repository, tmp_path):
+async def test_ambiguous_start_queries_same_key_without_resubmission(repository, tmp_path):
     from temporalio.service import RPCError, RPCStatusCode
 
-    from kapy.control.sessions import SessionBusy
-
     app, sessions, client = controller(repository, tmp_path)
-    await repository.ingest(42, [update(1), update(2, "next")])
-    sessions.start_runner.side_effect = [
-        SessionBusy("busy"),
-        RPCError("secret", RPCStatusCode.DEADLINE_EXCEEDED, b""),
-    ]
-    await app.process_once()
+    await repository.ingest(42, [update(1)])
+    sessions.start_runner.side_effect = RPCError("secret", RPCStatusCode.DEADLINE_EXCEEDED, b"")
     await app.process_once()
     item = await repository.next_inbox(42)
     assert item is not None and item.resolved_action["run_activity_id"]
     saved_key = item.resolved_action["run_activity_id"]
-    sessions.start_runner.side_effect = None
-    sessions.start_runner.return_value = Mock(spec=SessionOperation, phase=OperationPhase.RUNNING)
+    session_id = await repository.route(42, 123, 0)
+    sessions.get_activity.side_effect = None
+    sessions.get_activity.return_value = SessionActivity(
+        session_id=session_id,
+        activity_id=saved_key,
+        run_id="test-run",
+        activity_type="kapy.run_agent",
+        status="RUNNING",
+        run_state="SCHEDULED",
+    )
     await repository.save_action(item, item.resolved_action, next_attempt_at=0)
     await app.process_once()
-    assert sessions.start_runner.await_count == 3
-    assert str(sessions.start_runner.await_args_list[-1].kwargs["activity_id"]) == saved_key
-    assert (
-        sessions.start_runner.await_args_list[-1].kwargs
-        == sessions.start_runner.await_args_list[-2].kwargs
-    )
-    assert "busy" in client.send.call_args_list[0].args[2]
+    sessions.start_runner.assert_awaited_once()
+    sessions.get_activity.assert_awaited_with(session_id, UUID(saved_key), run_id=None)
+    assert saved_key in client.send.await_args.args[-1]
     assert "secret" not in str(client.send.call_args_list)
     assert await repository.next_inbox(42) is None
 

@@ -51,38 +51,37 @@ Session routes are:
 | GET /sessions/{id} | get_session | SessionRecord |
 | PATCH /sessions/{id} | update_session | SessionRecord |
 | POST /sessions/{id}/close | close_session | SessionRecord |
-| POST /sessions/{id}/runner | start_runner | 202 SessionOperation |
-| GET /sessions/{id}/runner | is_runner_running | bool for starting/running |
-| GET /sessions/{id}/operations/{activity_id} | get_session_operation | SessionOperation |
+| POST /sessions/{id}/runner | start_runner | 202 ActivityReference |
+| GET /sessions/{id}/activities/{activity_id} | get_session_activity | SessionActivity |
 | GET /sessions/{id}/history | read_history | Page[HistoryMessage] |
 | WS /sessions/{id}/live?after_seq=N | live_ws | one nonempty OutputEvent[] per text frame |
 
-Create, run and close requests require `activity_id: UUID`. Its string is the
-native Activity ID and permanent database idempotency key. Repeated identical
-intent returns the same operation/result; a different session/kind/request at that
-ID returns 409. Use a new key for a new operation. Creation accepts optional session
-`id`; when omitted, the operation saves its generated ID before submission.
+Create/run/close require an Activity UUID. Its string is the native Activity ID.
+Temporal provides deduplication and result retrieval only while records are retained.
+Use a new UUID for new work and preserve the original request on retries. Same-key
+changed prompt/config uses the first accepted input; another session/type receives
+409. Create accepts an explicit session ID, defaulting to its Activity UUID.
 
-Creation submits a scope Activity and waits for the saved SessionRecord; it does
-not run the Agent. Close accepts `{activity_id}` and waits for its saved cleanup
-result. Run accepts `{activity_id, user_prompt}` and returns 202 SessionOperation
-without waiting for model completion. The response includes session_id, kind,
-phase, optional native run_id, saved result/safe error and fixed deadline; frozen
-input and credentials remain private. Query the operation route to observe it.
+Create and close await native results. Safe failure/uncertain responses carry the
+session/Activity identity and known run_id for recovery. Run returns 202 with only
+`{activity_id, run_id}`: acceptance does not imply business admission or ordering.
+Query `/activities/{activity_id}?run_id=...` for Temporal status, available run_state,
+execution identity and terminal result/safe failure category. Input and exception
+text are never returned. Without run_id the lookup fixes and returns the observed
+native run ID. Create is queryable even before its business row exists.
 
-The database records starting before dispatch and running when the Worker claims
-it. Another key receives 409 while creation/execution/cleanup has an active owner.
-A failed run becomes closing and requires explicit cleanup or a new session.
-Close does not cancel an active run. READY alone permits title/model updates.
-Each Activity has one Temporal attempt and no Agent resumption. USE_EXISTING
-reuses running executions; REJECT_DUPLICATE rejects retained closed records, while
-the permanent database outcome prevents resurrection after Temporal retention.
+A Worker acquires an unowned ready session only when executing, then loads current
+business data/model/provider. Competing runs can therefore fail after 202. READY
+with both current identity fields empty permits edits. One Temporal attempt owns
+all model/tool resources. A failed run becomes closing; cleanup uses explicit close.
+Only close queries and CAS-replaces a terminal/missing old execution. A live/unknown
+old execution or RPC failure preserves its occupancy. Reads never reconcile state.
 
-A lost RPC response may mean submission succeeded. 503 hides upstream payloads;
-confirm the same activity_id rather than choose a new one. Caller cancellation
-does not cancel Worker execution. Same-key terminal results remain unchanged after
-later session operations. Unknown status/NOT_FOUND retains ownership within the
-fixed deadline; query/repeated admission seals expired operations failed/closing.
+Caller disconnect/cancel does not cancel the Activity. For a lost response, query
+the original reference and business resource before deciding on a new request.
+NOT_FOUND means no old result can be confirmed; it does not recreate a result from
+current business state. A committed business change may coexist with Temporal
+failure/timeout, and retained success is not stored permanently by Kapy.
 
 List providers/models/sessions with offset=0 and limit=100. Page contains only
 items and has_more; limit is 1..200. Fetch history without before_seq for the latest
@@ -118,13 +117,13 @@ Mount the SPA beside the API with `app.include_router(create_frontend_router(dis
 The host supplies the explicit Vite build directory and shares its existing resource
 lifespan. Missing index.html fails setup. See the root frontend/README.md.
 
-SessionRecord exposes creating/ready/starting/running/closing/closed. Reads,
+SessionRecord exposes creating/ready/closing/closed and current execution identity. Reads,
 history and live remain available throughout; layer Config stays public and fixed,
 while State and message snapshots stay internal. Scope Activities run hooks outside
-transactions and publish results/progress through current-operation predicates.
+transactions and publish business progress through full writer-identity predicates.
 Creation compensation exits every configured layer with None in reverse order;
 cleanup progress persists after each attempt. Only an outer RetryableScopeError
 allows the existing three local hook attempts. Failed scope Activities return a
-safe failed operation; explicit cleanup retry uses a new ID. See
+safe native failure; explicit cleanup retry uses a new ID. See
 [control state machine](../../control/README.md#session-state-machine) and
 [layers](../../layers/README.md).

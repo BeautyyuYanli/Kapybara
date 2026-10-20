@@ -13,7 +13,6 @@ from kapy.application.resources import connect_temporal
 from kapy.control.models.models import ModelRow, ProviderRow
 from kapy.control.sessions import CreateSession, SessionService
 from kapy.control.sessions.models import SessionRow
-from kapy.control.sessions.types import OperationPhase
 from kapy.runner import RunnerActivity
 
 
@@ -50,7 +49,7 @@ async def test_registered_mcps_layer_owns_gateway_per_run_and_reuses_saved_opera
         )
     client = await connect_temporal(runner_database.settings)
     queue = f"mcps-{uuid4()}"
-    runner = RunnerActivity(runner_database.sessions, runner_database.outputs)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
     async with Worker(
         client,
         task_queue=queue,
@@ -76,7 +75,7 @@ async def test_registered_mcps_layer_owns_gateway_per_run_and_reuses_saved_opera
                 session.id, activity_id=key, user_prompt="use MCP"
             )
             handle = client.get_activity_handle(
-                str(operation.activity_id), run_id=operation.run_id, result_type=str
+                operation.id, run_id=operation.run_id, result_type=str
             )
             assert await handle.result() == "worker:durable:durable-secret"
             async with runner_database.sessions.begin() as db:
@@ -98,7 +97,7 @@ async def test_registered_mcps_layer_owns_gateway_per_run_and_reuses_saved_opera
             confirmed = await service.start_runner(
                 session.id, activity_id=key, user_prompt="use MCP"
             )
-            assert confirmed.phase == OperationPhase.SUCCEEDED
-            assert confirmed.result == "worker:durable:durable-secret"
+            assert confirmed.run_id == operation.run_id
+            assert await confirmed.result() == "worker:durable:durable-secret"
             assert marker.read_text() == before
         await service.close_session(session.id, activity_id=uuid4())

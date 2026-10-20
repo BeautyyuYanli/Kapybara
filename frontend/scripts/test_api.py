@@ -56,7 +56,7 @@ async def lifespan(app):
             os.environ.get("KAPY_VALKEY_URL", "redis://127.0.0.1:56379/0")
         ) as valkey:
             outputs = AgentOutputService(valkey, channel_prefix=f"spa-test-{uuid4()}")
-            runner = RunnerActivity(factory, outputs)
+            runner = RunnerActivity(factory, outputs, client)
             sessions = SessionService(
                 factory, output_service=outputs, temporal_client=client, temporal_task_queue=queue
             )

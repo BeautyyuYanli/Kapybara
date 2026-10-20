@@ -248,3 +248,58 @@ def session_operations(context, revision, directives) -> None:
     context.config.attributes["irreversible_reason"] = (
         "Session operation ownership migration is irreversible"
     )
+
+
+def temporal_session_ownership(context, revision, directives) -> None:
+    """Discard the old ledger offline; preserve all business data and history.
+
+    Alembic does not infer CHECK additions, so emit the paired-identity constraint
+    explicitly. Old ownership cannot identify a native run and is cleared rather
+    than copied into business JSON or another ledger.
+    """
+    script = directives[0]
+    detected: set[tuple[type, str, str | None]] = set()
+    for operation in script.upgrade_ops.ops:
+        if isinstance(operation, ops.ModifyTableOps):
+            for change in operation.ops:
+                if (
+                    isinstance(change, ops.DropIndexOp)
+                    and operation.table_name == "session_operations"
+                ):
+                    continue
+                detected.add(
+                    (type(change), operation.table_name, getattr(change, "column_name", None))
+                )
+                if isinstance(change, ops.AddColumnOp):
+                    detected.discard((type(change), operation.table_name, None))
+                    detected.add((type(change), operation.table_name, change.column.name))
+        else:
+            detected.add((type(operation), getattr(operation, "table_name", ""), None))
+    detected.discard((ops.AlterColumnOp, "sessions", "status"))
+    if detected != {
+        (ops.DropTableOp, "session_operations", None),
+        (ops.AddColumnOp, "sessions", "current_activity_run_id"),
+    }:
+        raise ValueError("temporal-session-ownership requires only the session ledger removal")
+    for operation in script.upgrade_ops.ops:
+        if isinstance(operation, ops.ModifyTableOps) and operation.table_name == "sessions":
+            operation.ops.extend(
+                [
+                    ops.ExecuteSQLOp(
+                        "UPDATE sessions SET status = CASE WHEN status IN "
+                        "('creating', 'starting', 'running', 'closing') "
+                        "THEN 'closing' ELSE status END, "
+                        "current_activity_id = NULL, current_activity_run_id = NULL, "
+                        "updated_at = clock_timestamp()"
+                    ),
+                    ops.CreateCheckConstraintOp(
+                        "ck_sessions_current_activity_pair",
+                        "sessions",
+                        "(current_activity_id IS NULL) = (current_activity_run_id IS NULL)",
+                    ),
+                ]
+            )
+    script.downgrade_ops = ops.DowngradeOps([])
+    context.config.attributes["irreversible_reason"] = (
+        "Temporal execution ownership migration and operation ledger deletion are irreversible"
+    )

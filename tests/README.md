@@ -52,10 +52,10 @@ resource cleanup. Native ownership, tool flags and deferred capability/Toolset
 instructions are checked through ordinary Agent runs. No external model API is called.
 
 Shared PostgreSQL/Valkey fixtures live in `tests/conftest.py`. `tests/control`
-covers catalog, permanent operation identity, conditional ownership, deadline
-fencing and layer lifecycle.
+covers catalog, retained Temporal execution identity, conditional writer ownership,
+explicit close takeover and layer lifecycle.
 `tests/agent_output` covers transport and history replay, and `tests/database`
-checks historical revisions and the current operation migration. History fixtures
+checks historical revisions and the ledger-removal/paired-identity migration. History fixtures
 write through HistoryRepository in isolated short transactions; no legacy runner is
 used to seed current tests.
 
@@ -66,6 +66,6 @@ cancellation, and model-compatible aliases for dotted and long MCP tool names.
 `tests/runner/test_mcps.py` uses real PostgreSQL and standalone Temporal Activities
 with a deterministic SDK model. It verifies one Gateway for multiple calls, fresh
 processes for subsequent runs, saved configuration/empty State, process cleanup
-and same-key operation confirmation without MCP I/O. These tests need no JWE or
+and retained native result retrieval without MCP I/O. These tests need no JWE or
 external model credentials. The independent Gateway's HTTP/JWE and inline suites
 live in `packages/mcp_gateway/tests` and run separately from the root suite.

@@ -5,14 +5,13 @@ from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 
 from .service import SessionService
 from .types import (
+    ActivityIdentityConflict,
+    ActivityReference,
     CreateSession,
-    OperationConflict,
-    OperationFailed,
-    OperationKind,
-    OperationPhase,
+    SessionActivity,
     SessionAlreadyExists,
     SessionBusy,
-    SessionOperation,
+    SessionExecutionError,
     SessionRecord,
     UpdateSession,
 )
@@ -27,10 +26,9 @@ __all__ = [
     "TextDelta",
     "SessionService",
     "SessionAlreadyExists",
-    "OperationConflict",
-    "OperationFailed",
-    "OperationKind",
-    "OperationPhase",
+    "ActivityIdentityConflict",
+    "ActivityReference",
     "SessionBusy",
-    "SessionOperation",
+    "SessionActivity",
+    "SessionExecutionError",
 ]

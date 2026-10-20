@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { effectScope, nextTick, ref } from "vue";
 import { useResource } from "@/composables/useResource";
-import { ApiError, describeError } from "@/api/errors";
+import { ApiError, describeError, readExecutionReference } from "@/api/errors";
 import { parseObject, optionalInteger } from "@/forms";
 
 describe("read lifetime", () => {
@@ -67,4 +67,10 @@ it("maps field validation and keeps unknown errors generic", () => {
   expect(describeError(new ApiError(500, "<script>secret</script>")).message).not.toContain(
     "secret",
   );
+});
+it("retains only a complete safe execution reference from error bodies", () => {
+  const reference = { session_id: "session", activity_id: "activity", run_id: "native-run" };
+  expect(readExecutionReference({ ...reference, api_key: "private", detail: "failure" })).toEqual(reference);
+  for (const body of [null, {}, { ...reference, run_id: "" }, { ...reference, activity_id: 42 }])
+    expect(readExecutionReference(body)).toBeUndefined();
 });

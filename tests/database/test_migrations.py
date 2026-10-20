@@ -199,6 +199,93 @@ async def test_durable_only_closes_legacy_sessions_and_retains_history_snapshots
 
 
 @pytest.mark.asyncio
+async def test_temporal_ownership_upgrade_drops_ledger_preserves_business_and_pairs_ids(database):
+    schema = "temporal_ownership_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    statuses = ("creating", "ready", "starting", "running", "closing", "closed")
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def config(connection):
+                    connection.dialect.default_schema_name = schema
+                    return migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "33472a5802a2"))
+                for status in statuses:
+                    identity, activity_id = uuid4(), uuid4()
+                    await db.execute(
+                        text("""INSERT INTO sessions
+                        (id, status, title, provider_id, model_name, model_settings,
+                         layers, layer_states, runner_state, current_activity_id,
+                         created_at, updated_at)
+                        VALUES (:id, :status, :title, :provider, 'test', '{"temperature": 0.5}',
+                            '{"scope":{"config":"retained"}}', '{"scope":{"progress": 7}}',
+                            'opaque snapshot', :activity, now(), now())"""),
+                        {
+                            "id": identity,
+                            "status": status,
+                            "title": status,
+                            "provider": uuid4(),
+                            "activity": activity_id,
+                        },
+                    )
+                    await db.execute(
+                        text("""INSERT INTO session_operations
+                        (activity_id, session_id, kind, phase, request, input, created_at, deadline)
+                        VALUES (:activity, :id, 'run', 'running', '{}',
+                            '{"api_key":"private-copy"}', now(), now())"""),
+                        {"id": identity, "activity": activity_id},
+                    )
+                    await db.execute(
+                        text("""INSERT INTO agent_history
+                        (session_id,seq,kind,message,message_metadata,created_at)
+                        VALUES (:id,3,'request','{"parts":[]}','{}',now())"""),
+                        {"id": identity},
+                    )
+                before = (
+                    await db.execute(text("SELECT * FROM agent_history ORDER BY session_id"))
+                ).all()
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                rows = (await db.execute(text("SELECT * FROM sessions"))).all()
+                assert {row.title: row.status for row in rows} == {
+                    status: status if status in {"ready", "closed"} else "closing"
+                    for status in statuses
+                }
+                for row in rows:
+                    assert row.layers == {"scope": {"config": "retained"}}
+                    assert row.layer_states == {"scope": {"progress": 7}}
+                    assert row.runner_state == "opaque snapshot"
+                    assert row.model_settings == {"temperature": 0.5}
+                    assert row.current_activity_id is row.current_activity_run_id is None
+                assert "session_operations" not in await db.run_sync(
+                    lambda conn: inspect(conn).get_table_names()
+                )
+                assert (
+                    await db.execute(text("SELECT * FROM agent_history ORDER BY session_id"))
+                ).all() == before
+                checks = await db.run_sync(
+                    lambda conn: inspect(conn).get_check_constraints("sessions")
+                )
+                assert any(check["name"] == "ck_sessions_current_activity_pair" for check in checks)
+                await db.run_sync(lambda conn: command.check(config(conn)))
+                with pytest.raises(NotImplementedError, match="irreversible"):
+                    await db.run_sync(lambda conn: command.downgrade(config(conn), "33472a5802a2"))
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
+            await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
 async def test_core_migrations_own_only_core_tables(database):
     schema = "tmpv2_migrations_" + uuid4().hex
     settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
@@ -772,9 +859,9 @@ async def test_operation_migration_fences_legacy_sessions_and_preserves_stored_d
                 assert (
                     await db.execute(text("SELECT * FROM agent_history ORDER BY session_id"))
                 ).all() == before
-                assert (
-                    await db.execute(text("SELECT count(*) FROM session_operations"))
-                ).scalar_one() == 0
+                assert "session_operations" not in await db.run_sync(
+                    lambda conn: inspect(conn).get_table_names()
+                )
                 assert "session_leases" not in await db.run_sync(
                     lambda conn: inspect(conn).get_table_names()
                 )
