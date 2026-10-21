@@ -21,12 +21,13 @@ use opensol_core::{
     Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExecResult, ExitStatus,
     OutputChannel, OutputSubscription, ProcessEvent, ProcessInfo, ProcessManager, ProcessOutcome,
     ProcessRef, PtySize, Result, SandboxInfo, SandboxManager, SandboxRef, Signal, SpawnRequest,
+    SubscriptionDelivery,
 };
 use pyo3::{
     create_exception,
     exceptions::PyException,
     prelude::*,
-    types::{PyBytes, PyDict},
+    types::{PyBytes, PyDict, PyList},
 };
 use tokio::runtime::Runtime;
 
@@ -136,40 +137,47 @@ fn capabilities<'py>(
             "capability conversion failed",
         ))
     })?;
-    let result = PyDict::new(py);
-    if let Some(fields) = value.as_object() {
-        for (key, value) in fields {
-            match value {
-                serde_json::Value::Bool(value) => result.set_item(key, value)?,
-                serde_json::Value::Array(values) if key == "supported_signals" => {
-                    let numbers: Vec<i32> = values
-                        .iter()
-                        .map(|value| match value.as_str() {
-                            Some("Interrupt") => Ok(2),
-                            Some("Terminate") => Ok(15),
-                            Some("Kill") => Ok(9),
-                            _ => Err(exception(Error::new(
-                                ErrorKind::Backend,
-                                "python",
-                                "capabilities",
-                                "unknown portable signal",
-                            ))),
-                        })
-                        .collect::<PyResult<_>>()?;
-                    result.set_item(key, numbers)?;
-                }
-                _ => {
-                    return Err(exception(Error::new(
-                        ErrorKind::Backend,
-                        "python",
-                        "capabilities",
-                        "unsupported capability value",
-                    )));
-                }
+    json_value(py, &value)?
+        .cast_into::<PyDict>()
+        .map_err(Into::into)
+}
+
+/// Allocate an independent Python tree with the same shape as Rust serde JSON.
+fn json_value<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<Bound<'py, PyAny>> {
+    use serde_json::Value;
+    Ok(match value {
+        Value::Null => py.None().into_bound(py),
+        Value::Bool(value) => value.into_pyobject(py)?.to_owned().into_any(),
+        Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                value.into_pyobject(py)?.into_any()
+            } else if let Some(value) = value.as_u64() {
+                value.into_pyobject(py)?.into_any()
+            } else {
+                value
+                    .as_f64()
+                    .expect("JSON number")
+                    .into_pyobject(py)?
+                    .into_any()
             }
         }
-    }
-    Ok(result)
+        Value::String(value) => value.into_pyobject(py)?.into_any(),
+        Value::Array(values) => PyList::new(
+            py,
+            values
+                .iter()
+                .map(|value| json_value(py, value))
+                .collect::<PyResult<Vec<_>>>()?,
+        )?
+        .into_any(),
+        Value::Object(fields) => {
+            let result = PyDict::new(py);
+            for (key, value) in fields {
+                result.set_item(key, json_value(py, value)?)?;
+            }
+            result.into_any()
+        }
+    })
 }
 
 #[pyclass(name = "SandboxRef", frozen)]
@@ -500,6 +508,9 @@ struct PySandbox {
 
 #[pymethods]
 impl PySandbox {
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities(py, self.inner.capabilities())
+    }
     #[getter]
     fn r#ref(&self) -> PySandboxRef {
         PySandboxRef {
@@ -588,6 +599,7 @@ struct SubscriptionState {
 #[pyclass(name = "OutputSubscription", frozen)]
 struct PyOutputSubscription {
     backend: String,
+    delivery: SubscriptionDelivery,
     state: Arc<tokio::sync::Mutex<SubscriptionState>>,
     abort: AbortHandle,
     closed: Arc<AtomicBool>,
@@ -598,6 +610,7 @@ impl From<OutputSubscription> for PyOutputSubscription {
         let (abort, registration) = AbortHandle::new_pair();
         Self {
             backend: subscription.backend().to_owned(),
+            delivery: subscription.capabilities().clone(),
             state: Arc::new(tokio::sync::Mutex::new(SubscriptionState {
                 events: Some(Box::pin(Abortable::new(subscription.events, registration))),
             })),
@@ -658,6 +671,9 @@ fn subscription_timeout(backend: &str, operation: &str) -> Error {
 
 #[pymethods]
 impl PyOutputSubscription {
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities(py, &self.delivery)
+    }
     #[pyo3(signature = (*, timeout=None))]
     fn next_event(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<PyProcessEvent>> {
         let timeout = crate::timeout(timeout)?;

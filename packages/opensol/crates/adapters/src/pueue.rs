@@ -13,10 +13,12 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
-    Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    OutputCapabilities, OutputChannel, OutputCursor, OutputPage, OutputSubscription, ProcessEvent,
-    ProcessInfo, ProcessManagerCapabilities, ProcessOutcome, ProcessRef, ProcessState,
-    ReadDirection, Result, Signal, SpawnRequest,
+    Command, CompletionKind, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus,
+    InputConstraints, InputContent, KillEffect, ManagerInfo, OutputCapabilities, OutputChannel,
+    OutputCursor, OutputPage, OutputSubscription, ProcessCapabilities, ProcessEvent, ProcessInfo,
+    ProcessInputCapabilities, ProcessManagerCapabilities, ProcessOutcome, ProcessRef, ProcessState,
+    ReadDirection, Result, Signal, SpawnMode, SpawnRequest, SubscriptionDelivery,
+    SubscriptionSources,
     raw::{OutputAccess, ProcessManagerAccess, SpawnedProcess},
 };
 use serde_json::Value;
@@ -89,7 +91,28 @@ impl Pueue {
                 "invalid native data directory",
             ));
         }
+        let capabilities = connection.capabilities();
+        if !capabilities.timeout || !capabilities.separate_stderr {
+            return Err(Error::unsupported("pueue", "configure_connection"));
+        }
         Ok(Self { connection, config })
+    }
+
+    fn output_capabilities(&self) -> OutputCapabilities {
+        let readable = self.config.pueue_directory.is_some();
+        OutputCapabilities {
+            read: readable,
+            tail: readable,
+            read_channels: if readable {
+                vec![OutputChannel::Combined]
+            } else {
+                vec![]
+            },
+            subscribe: SubscriptionSources {
+                initial: None,
+                reconnect: Some(subscription_delivery()),
+            },
+        }
     }
 
     fn command(&self, args: Vec<String>) -> Command {
@@ -357,6 +380,15 @@ fn protocol_error(operation: &str) -> Error {
     )
 }
 
+fn subscription_delivery() -> SubscriptionDelivery {
+    SubscriptionDelivery {
+        channels: vec![OutputChannel::Combined],
+        historical_output: true,
+        streaming_output: false,
+        completion: CompletionKind::NativeTask,
+    }
+}
+
 #[async_trait]
 impl ProcessManagerAccess for Pueue {
     fn backend(&self) -> &'static str {
@@ -365,17 +397,38 @@ impl ProcessManagerAccess for Pueue {
 
     fn capabilities(&self) -> ProcessManagerCapabilities {
         ProcessManagerCapabilities {
+            probe: true,
             list: true,
-            pause: true,
-            start: true,
-            restart: true,
-            kill: true,
-            remove: true,
-            stdin: true,
-            binary_stdin: false,
-            supported_signals: &[Signal::Interrupt, Signal::Terminate, Signal::Kill],
-            detached: true,
-            reconnect: true,
+            spawn_modes: vec![
+                SpawnMode {
+                    pty: false,
+                    stdin: false,
+                },
+                SpawnMode {
+                    pty: false,
+                    stdin: true,
+                },
+            ],
+            process: ProcessCapabilities {
+                pause: true,
+                start: true,
+                restart: true,
+                kill: Some(KillEffect::RequestTermination),
+                remove: true,
+                input: Some(ProcessInputCapabilities {
+                    constraints: InputConstraints {
+                        content: InputContent::Utf8WithoutNul,
+                        max_bytes: None,
+                    },
+                    close: false,
+                }),
+                supported_signals: vec![Signal::Interrupt, Signal::Kill, Signal::Terminate],
+                detached: true,
+                reconnect: true,
+                completion: CompletionKind::NativeTask,
+                ..Default::default()
+            },
+            output: self.output_capabilities(),
             ..Default::default()
         }
     }
@@ -576,14 +629,8 @@ impl OutputAccess for Pueue {
     fn backend(&self) -> &'static str {
         "pueue"
     }
-    fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities {
-            read: self.config.pueue_directory.is_some(),
-            tail: self.config.pueue_directory.is_some(),
-            subscribe: true,
-            historical_output: true,
-            streaming_output: false,
-        }
+    fn capabilities(&self, _process: &ProcessRef) -> OutputCapabilities {
+        self.output_capabilities()
     }
     async fn read(
         &self,
@@ -602,6 +649,7 @@ impl OutputAccess for Pueue {
     async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         Ok(OutputSubscription::new(
             process.clone(),
+            subscription_delivery(),
             self.output(process).await?,
         ))
     }

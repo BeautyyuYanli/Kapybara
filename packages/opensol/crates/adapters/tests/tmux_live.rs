@@ -144,6 +144,159 @@ impl ConnectionAccess for CountingConnection {
     }
 }
 
+/// Restrict public stdin while retaining the real Local execution path. Script size is observed
+/// at the dependency boundary, so capacity assertions do not duplicate tmux's private encoder.
+#[derive(Clone)]
+struct InputConnection {
+    stdin: Option<opensol_core::InputConstraints>,
+    calls: Arc<AtomicUsize>,
+    script_bytes: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ConnectionAccess for InputConnection {
+    fn backend(&self) -> &'static str {
+        "local"
+    }
+    fn capabilities(&self) -> ConnectionCapabilities {
+        ConnectionCapabilities {
+            stdin: self.stdin,
+            ..Connection::new(Local).capabilities()
+        }
+    }
+    async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if !request.stdin.is_empty() {
+            self.script_bytes
+                .store(request.stdin.len(), Ordering::SeqCst);
+        }
+        Connection::new(Local).exec(request).await
+    }
+}
+
+#[tokio::test]
+async fn input_capabilities_fit_the_actual_script_and_accept_text_only_dependencies() {
+    use opensol_core::{InputConstraints, InputContent, SpawnMode};
+    let server = Server::new();
+    let connection = InputConnection {
+        stdin: Some(InputConstraints {
+            content: InputContent::Utf8WithoutNul,
+            max_bytes: None,
+        }),
+        calls: Arc::new(AtomicUsize::new(0)),
+        script_bytes: Arc::new(AtomicUsize::new(0)),
+    };
+    let manager = ProcessManager::new(
+        Tmux::new(
+            Connection::new(connection.clone()),
+            TmuxConfig::new(&server.socket),
+        )
+        .unwrap(),
+    );
+    let process = manager.spawn(terminal(Command::new("python3", ["-u", "-c",
+        "import os,tty; tty.setraw(0); print('READY',flush=True)\nwhile True: print(os.read(0,8192).hex(),flush=True)"
+    ]))).await.unwrap();
+    screen(&process, b"READY").await;
+    process.send_input(vec![0xff]).await.unwrap();
+    screen(&process, b"ff").await;
+    let one_byte_script = connection.script_bytes.load(Ordering::SeqCst);
+    assert!(one_byte_script > 1);
+    for (budget, expected) in [
+        (one_byte_script - 1, None),
+        (one_byte_script, Some(1)),
+        (one_byte_script + 2, Some(1)),
+        (one_byte_script + 3, Some(2)),
+        (one_byte_script + 3 * 8191, Some(8192)),
+    ] {
+        let limited = InputConnection {
+            stdin: Some(InputConstraints {
+                content: InputContent::Utf8WithoutNul,
+                max_bytes: std::num::NonZeroUsize::new(budget),
+            }),
+            ..connection.clone()
+        };
+        let bound_manager = ProcessManager::new(
+            Tmux::new(Connection::new(limited), TmuxConfig::new(&server.socket)).unwrap(),
+        );
+        let before = connection.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            bound_manager
+                .capabilities()
+                .process
+                .input
+                .unwrap()
+                .constraints
+                .max_bytes
+                .unwrap()
+                .get(),
+            8192
+        );
+        let bound = bound_manager.get(process.reference().clone());
+        assert_eq!(
+            bound
+                .capabilities()
+                .input
+                .map(|input| input.constraints.max_bytes.unwrap().get()),
+            expected
+        );
+        let error = bound
+            .send_input(vec![0; expected.unwrap_or(0) + 1])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            if expected.is_some() {
+                ErrorKind::InvalidArgument
+            } else {
+                ErrorKind::Unsupported
+            }
+        );
+        assert_eq!(
+            connection.calls.load(Ordering::SeqCst),
+            before,
+            "queries and rejected payloads are local"
+        );
+        if expected == Some(2) {
+            bound.send_input(vec![0, 0xff]).await.unwrap();
+            assert_eq!(
+                connection.script_bytes.load(Ordering::SeqCst),
+                one_byte_script + 3
+            );
+            screen(&process, b"00ff").await;
+        }
+    }
+    let without_stdin = ProcessManager::new(
+        Tmux::new(
+            Connection::new(InputConnection {
+                stdin: None,
+                ..connection.clone()
+            }),
+            TmuxConfig::new(&server.socket),
+        )
+        .unwrap(),
+    );
+    let before = connection.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        without_stdin.capabilities().spawn_modes,
+        [SpawnMode {
+            pty: true,
+            stdin: false
+        }]
+    );
+    assert!(
+        without_stdin
+            .get(process.reference().clone())
+            .capabilities()
+            .input
+            .is_none()
+    );
+    assert!(
+        matches!(without_stdin.spawn(terminal(Command::shell("true"))).await, Err(error) if error.kind == ErrorKind::Unsupported)
+    );
+    assert_eq!(connection.calls.load(Ordering::SeqCst), before);
+    process.kill().await.unwrap();
+}
+
 #[tokio::test]
 async fn history_tail_bounds_native_transfer_before_returning_the_last_lines() {
     let server = Server::new();
@@ -475,7 +628,7 @@ async fn first_subscriptions_observe_the_current_execution_after_bound_or_extern
             .spawn(terminal(Command::new("sh", [script.to_str().unwrap()])))
             .await
             .unwrap();
-        assert_eq!(process.capabilities(), manager.capabilities());
+        assert_eq!(process.capabilities(), manager.capabilities().process);
         let output = process.output();
         let cloned = process.clone();
         let rebound = manager.get(process.reference().clone());

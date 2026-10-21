@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use opensol_core::{
-    Api, Backend, BackendAccess, Connection, Error, OpenOptions, ProcessManager, Result,
-    SandboxManager, SandboxRef,
+    Api, Backend, BackendAccess, BackendCapabilities, Connection, ConnectionDependency, Error,
+    OpenOptions, ProcessManager, Result, SandboxManager, SandboxRef, TargetRequirement,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -37,6 +37,60 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
+    /// Shared route description for configuration discovery and runtime binding validation.
+    pub fn capabilities(&self) -> BackendCapabilities {
+        use ConnectionDependency as Dependency;
+        use TargetRequirement as Target;
+        let (sandboxes, connection, processes, connection_dependency) = match self {
+            #[cfg(feature = "local")]
+            Self::Local(_) => (None, Some(Target::Forbidden), None, Dependency::Forbidden),
+            #[cfg(feature = "ssh")]
+            Self::Ssh(_) => (None, Some(Target::Forbidden), None, Dependency::Forbidden),
+            #[cfg(feature = "docker")]
+            Self::Docker(_) => (
+                Some(Target::Forbidden),
+                Some(Target::Required),
+                None,
+                Dependency::Forbidden,
+            ),
+            #[cfg(feature = "e2b")]
+            Self::E2b(_) => (
+                Some(Target::Forbidden),
+                Some(Target::Required),
+                Some(Target::Required),
+                Dependency::Forbidden,
+            ),
+            #[cfg(feature = "envd")]
+            Self::Envd(_) => (
+                None,
+                Some(Target::Forbidden),
+                Some(Target::Forbidden),
+                Dependency::Forbidden,
+            ),
+            #[cfg(feature = "agent-sandbox")]
+            Self::AgentSandbox(_) => (Some(Target::Forbidden), None, None, Dependency::Forbidden),
+            #[cfg(feature = "openshell")]
+            Self::OpenShell(_) => (
+                Some(Target::Forbidden),
+                Some(Target::Required),
+                None,
+                Dependency::Forbidden,
+            ),
+            #[cfg(feature = "sandboxd")]
+            Self::Sandboxd(_) => (None, Some(Target::Forbidden), None, Dependency::Forbidden),
+            #[cfg(feature = "pueue")]
+            Self::Pueue(_) => (None, None, Some(Target::Forbidden), Dependency::Required),
+            #[cfg(feature = "tmux")]
+            Self::Tmux(_) => (None, None, Some(Target::Forbidden), Dependency::Required),
+        };
+        BackendCapabilities {
+            sandboxes,
+            connection,
+            processes,
+            connection_dependency,
+        }
+    }
+
     pub fn backend(&self) -> &'static str {
         match self {
             #[cfg(feature = "local")]
@@ -63,37 +117,36 @@ impl BackendConfig {
     }
 }
 
-fn binding(kind: &str, api: Api, target: Option<&SandboxRef>) -> Result<()> {
-    let supported = match api {
-        Api::Sandboxes => matches!(kind, "docker" | "e2b" | "agent-sandbox" | "openshell"),
-        Api::Connection => matches!(
-            kind,
-            "local" | "ssh" | "docker" | "e2b" | "envd" | "openshell" | "sandboxd"
-        ),
-        Api::Processes => matches!(kind, "e2b" | "envd" | "pueue" | "tmux"),
-    };
-    if !supported {
-        return Err(Error::unsupported(kind, "open"));
+fn binding(
+    kind: &str,
+    capabilities: BackendCapabilities,
+    api: Api,
+    target: Option<&SandboxRef>,
+) -> Result<()> {
+    let requirement = match api {
+        Api::Sandboxes => capabilities.sandboxes,
+        Api::Connection => capabilities.connection,
+        Api::Processes => capabilities.processes,
     }
-    let needs_target = api != Api::Sandboxes && matches!(kind, "docker" | "e2b" | "openshell");
-    match (needs_target, target) {
-        (true, Some(reference)) => reference.validate(kind, "open"),
-        (true, None) => Err(Error::invalid(
+    .ok_or_else(|| Error::unsupported(kind, "open"))?;
+    match (requirement, target) {
+        (TargetRequirement::Required, Some(reference)) => reference.validate(kind, "open"),
+        (TargetRequirement::Required, None) => Err(Error::invalid(
             kind,
             "open",
             "SandboxRef target is required",
         )),
-        (false, Some(_)) => Err(Error::invalid(
+        (TargetRequirement::Forbidden, Some(_)) => Err(Error::invalid(
             kind,
             "open",
             "this API does not accept a sandbox target",
         )),
-        (false, None) => Ok(()),
+        (TargetRequirement::Forbidden, None) => Ok(()),
     }
 }
 
-fn dependency(kind: &str, present: bool) -> Result<()> {
-    if matches!(kind, "pueue" | "tmux") != present {
+fn dependency(kind: &str, capabilities: BackendCapabilities, present: bool) -> Result<()> {
+    if (capabilities.connection_dependency == ConnectionDependency::Required) != present {
         return Err(Error::invalid(
             kind,
             "open",
@@ -136,13 +189,25 @@ struct Context {
 
 #[async_trait]
 impl opensol_core::BackendConfig for BackendConfig {
+    fn capabilities(&self) -> BackendCapabilities {
+        self.capabilities()
+    }
     fn validate_open(&self, api: Api, options: &OpenOptions) -> Result<()> {
-        binding(self.backend(), api, options.target.as_ref())?;
-        dependency(self.backend(), options.connection.is_some())
+        binding(
+            self.backend(),
+            self.capabilities(),
+            api,
+            options.target.as_ref(),
+        )?;
+        dependency(
+            self.backend(),
+            self.capabilities(),
+            options.connection.is_some(),
+        )
     }
 
     async fn open(&self, connection: Option<Connection>) -> Result<Backend> {
-        dependency(self.backend(), connection.is_some())?;
+        dependency(self.backend(), self.capabilities(), connection.is_some())?;
         let native = match self {
             #[cfg(feature = "local")]
             Self::Local(_) => Native::Local,
@@ -212,8 +277,11 @@ impl BackendAccess for Context {
     fn backend(&self) -> &'static str {
         self.config.backend()
     }
+    fn capabilities(&self) -> BackendCapabilities {
+        self.config.capabilities()
+    }
     fn validate_open(&self, api: Api, target: Option<&SandboxRef>) -> Result<()> {
-        binding(self.backend(), api, target)
+        binding(self.backend(), self.capabilities(), api, target)
     }
     fn sandboxes(&self) -> Result<SandboxManager> {
         match &self.native {
@@ -275,6 +343,9 @@ macro_rules! config_source {
         #[cfg(feature = $feature)]
         #[async_trait]
         impl opensol_core::BackendConfig for $config {
+            fn capabilities(&self) -> BackendCapabilities {
+                BackendConfig::$variant(self.clone()).capabilities()
+            }
             fn validate_open(&self, api: Api, options: &OpenOptions) -> Result<()> {
                 opensol_core::BackendConfig::validate_open(
                     &BackendConfig::$variant(self.clone()),

@@ -4,9 +4,19 @@ Native async methods return scheduled awaitables. The Async* wrappers create and
 await them inside async def, so public calls remain lazy and accept create_task.
 """
 
-import builtins
 from collections.abc import Awaitable, Sequence
-from typing import Literal, TypedDict
+from typing import Literal
+from .capabilities import (
+    BackendCapabilities as BackendCapabilities,
+    SandboxManagerCapabilities as SandboxManagerCapabilities,
+    SandboxCapabilities as SandboxCapabilities,
+    ConnectionCapabilities as ConnectionCapabilities,
+    ProcessManagerCapabilities as ProcessManagerCapabilities,
+    ProcessCapabilities as ProcessCapabilities,
+    OutputCapabilities as OutputCapabilities,
+    TerminalCapabilities as TerminalCapabilities,
+    SubscriptionDelivery as SubscriptionDelivery,
+)
 
 class SdkError(Exception):
     backend: str
@@ -21,50 +31,6 @@ class PermissionError(SdkError): ...
 class TimeoutError(SdkError): ...
 class TransportError(SdkError): ...
 class BackendError(SdkError): ...
-
-class SandboxManagerCapabilities(TypedDict):
-    list: bool
-    create: bool
-    inspect: bool
-    start: bool
-    stop: bool
-    stop_preserves_memory: bool
-    delete: bool
-    fork: bool
-
-class ConnectionCapabilities(TypedDict):
-    stdin: bool
-    timeout: bool
-    separate_stderr: bool
-
-class ProcessManagerCapabilities(TypedDict):
-    list: bool
-    pause: bool
-    start: bool
-    restart: bool
-    kill: bool
-    remove: bool
-    stdin: bool
-    close_stdin: bool
-    binary_stdin: bool
-    pty: bool
-    resize: bool
-    supported_signals: builtins.list[Literal[2, 9, 15]]
-    detached: bool
-    reconnect: bool
-    daemon_restart_recovery: bool
-
-class OutputCapabilities(TypedDict):
-    read: bool
-    tail: bool
-    subscribe: bool
-    historical_output: bool
-    streaming_output: bool
-
-class TerminalCapabilities(TypedDict):
-    read: bool
-    tail: bool
-    screen: bool
 
 class SandboxRef:
     def __init__(self, backend: str, id: str) -> None: ...
@@ -206,7 +172,7 @@ class Terminal:
     def screen(self) -> TerminalScreen: ...
 
 class Process:
-    def capabilities(self) -> ProcessManagerCapabilities: ...
+    def capabilities(self) -> ProcessCapabilities: ...
     @property
     def ref(self) -> ProcessRef: ...
     def inspect(self) -> ProcessInfo: ...
@@ -258,6 +224,7 @@ class SandboxManager:
     def create(self, spec: str) -> Sandbox: ...
 
 class Sandbox:
+    def capabilities(self) -> SandboxCapabilities: ...
     @property
     def ref(self) -> SandboxRef: ...
     def inspect(self) -> SandboxInfo: ...
@@ -275,6 +242,7 @@ class ProcessEvent:
     def outcome(self) -> ProcessOutcome | None: ...
 
 class OutputSubscription:
+    def capabilities(self) -> SubscriptionDelivery: ...
     def next_event(self, *, timeout: float | None = None) -> ProcessEvent | None: ...
     def close(self) -> None: ...
 
@@ -296,6 +264,7 @@ class ProcessManager:
     ) -> Process: ...
 
 class Backend:
+    def capabilities(self) -> BackendCapabilities: ...
     @property
     def backend(self) -> str: ...
 
@@ -325,6 +294,7 @@ class AsyncSandboxManager:
     def create(self, spec: str) -> Awaitable[AsyncSandbox]: ...
 
 class AsyncSandbox:
+    def capabilities(self) -> SandboxCapabilities: ...
     @property
     def ref(self) -> SandboxRef: ...
     def inspect(self) -> Awaitable[SandboxInfo]: ...
@@ -334,6 +304,7 @@ class AsyncSandbox:
     def fork(self) -> Awaitable[AsyncSandbox]: ...
 
 class AsyncOutputSubscription:
+    def capabilities(self) -> SubscriptionDelivery: ...
     def _reserve(self, *, timeout: float | None = None) -> Awaitable[ProcessEvent | None]: ...
     def _commit(self) -> None: ...
     def aclose(self) -> Awaitable[None]: ...
@@ -353,7 +324,7 @@ class AsyncProcessManager:
     ) -> Awaitable[AsyncProcess]: ...
 
 class AsyncProcess:
-    def capabilities(self) -> ProcessManagerCapabilities: ...
+    def capabilities(self) -> ProcessCapabilities: ...
     @property
     def ref(self) -> ProcessRef: ...
     def inspect(self) -> Awaitable[ProcessInfo]: ...
@@ -385,6 +356,7 @@ class AsyncTerminal:
     def tail(self, *, lines: int = 200) -> Awaitable[TerminalPage]: ...
     def screen(self) -> Awaitable[TerminalScreen]: ...
 
+def _config_capabilities(value: str) -> BackendCapabilities: ...
 def _new_backend(value: str, connection: Connection | None = None) -> Backend: ...
 def _new_sandboxes(value: str | Backend) -> AsyncSandboxManager: ...
 def _new_connection(value: str | Backend, target: SandboxRef | None = None) -> AsyncConnection: ...

@@ -189,8 +189,8 @@ class PueueTests(unittest.TestCase):
         self.assertEqual(combined_output(replay), b"\x00\xffouterr")
         self.assertEqual(replay_outcome.exit.code, 7)
         capabilities = process.output.capabilities()
-        self.assertTrue(capabilities["historical_output"])
-        self.assertFalse(capabilities["streaming_output"])
+        self.assertTrue(capabilities["subscribe"]["reconnect"]["historical_output"])
+        self.assertFalse(capabilities["subscribe"]["reconnect"]["streaming_output"])
 
     def test_stdin_polling_timeouts_and_unsupported_capabilities(self):
         process = self.manager.spawn(
@@ -499,13 +499,10 @@ class EnvdBindingTests(unittest.TestCase):
         unknown = manager.get(listed)
         self.assertEqual(unknown.inspect().state, "running")
         before = len(self.records)
-        self.assertEqual(
-            {key: unknown.capabilities()[key] for key in ("stdin", "binary_stdin", "close_stdin", "pty", "resize")},
-            dict(stdin=False, binary_stdin=False, close_stdin=False, pty=False, resize=False),
-        )
-        self.assertTrue(manager.capabilities()["close_stdin"])
-        self.assertTrue(process.capabilities()["pty"])
-        self.assertFalse(process.capabilities()["close_stdin"])
+        self.assertIsNone(unknown.capabilities()["input"])
+        self.assertFalse(unknown.capabilities()["resize"])
+        self.assertTrue(manager.capabilities()["process"]["input"]["close"])
+        self.assertFalse(process.capabilities()["input"]["close"])
         self.assertEqual(manager.get(process.ref).capabilities(), process.capabilities())
         for operation in (lambda: unknown.resize(80, 24),
                           lambda: unknown.send_input(b"input"), unknown.close_stdin):

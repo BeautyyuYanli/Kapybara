@@ -9,9 +9,9 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     ConnectionCapabilities, Error, ExecRequest, ExecResult, ManagerInfo, OutputCapabilities,
-    OutputCursor, OutputPage, OutputSubscription, ProcessInfo, ProcessManagerCapabilities,
-    ProcessOutcome, ProcessRef, PtySize, ReadDirection, Result, SandboxInfo,
-    SandboxManagerCapabilities, SandboxRef, SandboxSpec, Signal, SpawnRequest,
+    OutputCursor, OutputPage, OutputSubscription, ProcessCapabilities, ProcessInfo,
+    ProcessManagerCapabilities, ProcessOutcome, ProcessRef, PtySize, ReadDirection, Result,
+    SandboxInfo, SandboxManagerCapabilities, SandboxRef, SandboxSpec, Signal, SpawnRequest,
     TerminalCapabilities, TerminalCursor, TerminalPage, TerminalScreen,
 };
 
@@ -46,7 +46,8 @@ pub trait ConnectionAccess: Send + Sync {
 #[async_trait]
 pub trait OutputAccess: Send + Sync {
     fn backend(&self) -> &'static str;
-    fn capabilities(&self) -> OutputCapabilities;
+    /// Local, reference-aware narrowing. Initial streams are supplied exclusively by spawn.
+    fn capabilities(&self, process: &ProcessRef) -> OutputCapabilities;
     async fn read(
         &self,
         _process: &ProcessRef,
@@ -68,7 +69,7 @@ pub trait OutputAccess: Send + Sync {
 #[async_trait]
 pub trait TerminalAccess: Send + Sync {
     fn backend(&self) -> &'static str;
-    fn capabilities(&self) -> TerminalCapabilities;
+    fn capabilities(&self, process: &ProcessRef) -> TerminalCapabilities;
     async fn read(
         &self,
         _process: &ProcessRef,
@@ -102,15 +103,8 @@ pub trait ProcessManagerAccess: Send + Sync {
     fn capabilities(&self) -> ProcessManagerCapabilities;
     /// Local narrowing only. Never probe state, permissions, existence or stdin availability.
     /// Overrides must preserve the manager's upper bound and disable operations lacking mode data.
-    fn process_capabilities(&self, process: &ProcessRef) -> ProcessManagerCapabilities {
-        let mut capabilities = self.capabilities();
-        if process.pty == Some(true) && !capabilities.pty {
-            capabilities.stdin = false;
-            capabilities.binary_stdin = false;
-            capabilities.close_stdin = false;
-            capabilities.resize = false;
-        }
-        capabilities
+    fn process_capabilities(&self, _process: &ProcessRef) -> ProcessCapabilities {
+        self.capabilities().process
     }
     /// Local binding only: clone the native client/configuration without probing or reconnecting.
     fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {

@@ -7,7 +7,10 @@ use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::{Connection, CreateOptions, Error, ProcessManager, Result, SandboxManager, SandboxRef};
+use crate::{
+    BackendCapabilities, Connection, CreateOptions, Error, ProcessManager, Result, SandboxManager,
+    SandboxRef,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Api {
@@ -79,6 +82,10 @@ impl Backend {
     pub fn backend(&self) -> &'static str {
         self.access.backend()
     }
+    /// Construction and binding rules only; never constructs a business client or probes targets.
+    pub fn capabilities(&self) -> BackendCapabilities {
+        self.access.capabilities()
+    }
 
     pub(crate) fn sandboxes(&self) -> Result<SandboxManager> {
         let mut client = self.access.sandboxes()?;
@@ -102,6 +109,7 @@ impl Backend {
 /// Adapter configuration extension. Implementations validate options before opening transports.
 #[async_trait]
 pub trait BackendConfig: Send + Sync {
+    fn capabilities(&self) -> BackendCapabilities;
     fn validate_open(&self, api: Api, options: &OpenOptions) -> Result<()>;
     async fn open(&self, connection: Option<Connection>) -> Result<Backend>;
 }
@@ -110,6 +118,7 @@ pub trait BackendConfig: Send + Sync {
 #[async_trait]
 pub trait BackendAccess: Send + Sync {
     fn backend(&self) -> &'static str;
+    fn capabilities(&self) -> BackendCapabilities;
     fn validate_open(&self, api: Api, target: Option<&SandboxRef>) -> Result<()>;
     fn sandboxes(&self) -> Result<SandboxManager> {
         Err(Error::unsupported(self.backend(), "open_sandboxes"))

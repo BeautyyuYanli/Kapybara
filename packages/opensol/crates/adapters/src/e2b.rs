@@ -252,8 +252,13 @@ impl SandboxManagerAccess for E2bSandboxManager {
     }
     fn capabilities(&self) -> SandboxManagerCapabilities {
         SandboxManagerCapabilities {
-            fork: true,
-            stop_preserves_memory: true,
+            sandbox: opensol_core::SandboxCapabilities {
+                fork: true,
+                stop: Some(opensol_core::StopCapabilities {
+                    preserves_memory: true,
+                }),
+                ..SandboxManagerCapabilities::BASIC.sandbox
+            },
             ..SandboxManagerCapabilities::BASIC
         }
     }

@@ -134,6 +134,9 @@ class AsyncSandbox:
     def ref(self) -> SandboxRef:
         return self._native.ref
 
+    def capabilities(self) -> _native.SandboxCapabilities:
+        return self._native.capabilities()
+
     async def inspect(self) -> SandboxInfo:
         return await self._native.inspect()
 
@@ -161,6 +164,10 @@ class AsyncOutputSubscription(AsyncIterator[ProcessEvent]):
     def __init__(self, native: _native.AsyncOutputSubscription) -> None:
         self._native = native
         self._reader = asyncio.Lock()
+
+    def capabilities(self) -> _native.SubscriptionDelivery:
+        """Return the actual native source contract, unchanged by reads or closure."""
+        return self._native.capabilities()
 
     async def next_event(self, *, timeout: float | None = None) -> ProcessEvent | None:
         """Read one event; timeout/cancellation leaves the subscription usable.
@@ -251,8 +258,8 @@ class AsyncProcess:
     def ref(self) -> ProcessRef:
         return self._native.ref
 
-    def capabilities(self) -> _native.ProcessManagerCapabilities:
-        """Local mode-aware support, without probing existence, permissions or state."""
+    def capabilities(self) -> _native.ProcessCapabilities:
+        """Local mode-aware control, without probing existence, permissions or state."""
         return self._native.capabilities()
 
     async def inspect(self) -> ProcessInfo:

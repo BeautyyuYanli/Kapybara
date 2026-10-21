@@ -23,7 +23,17 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 - `Connection`：`exec(argv, cwd=..., env=..., stdin=b"", timeout=...)`、显式 `.shell(script)`。返回 `ExecResult`，不返回后台任务 ID。
 - `ProcessManager`：除构造、backend 和 capabilities 外，只提供 `probe/list/get/spawn`。`get(ProcessRef(backend, id, pty=None))` 本地绑定轻量 Process 资源，单任务操作经由该资源执行；存在性与权限由后续 I/O 检查。
 
-每层都提供 `.backend` 和 `.capabilities()`，查询不做 I/O。`manager.capabilities()` 是配置下的能力上限；`process.capabilities()` 同步返回同一字典形状，按引用的已知模式裁剪。list 等管理器字段仍表达上限；查询不探测存在性、权限、运行状态或 stdin 是否仍可用，支持也不保证调用成功。公共任务操作使用同一份裁剪结果，在派发 I/O 前拒绝不支持的操作。能力字典除布尔项外，`ProcessManagerCapabilities.supported_signals` 是信号编号列表；`SandboxManagerCapabilities.stop_preserves_memory` 表达 stop 是否保留进程内存，E2B 为 true，Docker、Kubernetes 与 OpenShell 为 false。
+每层都提供 `.backend` 和 `.capabilities()`；配置、Backend、单对象、视图和订阅的能力方法始终同步，不需要事件循环或目标 I/O。结果是独立的普通 dict/list，与 Rust serde 一致：None、bool、整数、snake_case 枚举、列表和嵌套对象。所有能力 TypedDict 与 Literal 均从 opensol 顶层导出。查询不证明目标存在、权限、原生版本、状态、开放输入或日志仍保留。
+
+`config.capabilities()` 与 `backend.capabilities()` 返回 BackendCapabilities：sandboxes/connection/processes 为 None（无入口）、`"forbidden"`（不接受 target）或 `"required"`（需要本后端作用域的 SandboxRef）；connection_dependency 描述配置构造时是否必须注入 Connection，已有 Backend 不接受替换。配置查询不构造客户端、不读文件、不握手，内置构造验证共用该描述。各后端绑定见下表。
+
+沙盒管理器返回 `{"list": bool, "create": bool, "sandbox": SandboxCapabilities}`；单个 Sandbox 只返回 sandbox 投影，包含 inspect/start/stop/delete/fork。stop 为 None 时不支持，否则 `stop["preserves_memory"]` 仅在 E2B 为 true；其他生命周期后端为 false。
+
+进程管理器返回 probe/list、spawn_modes 和 process/output/terminal 三种配置上限。spawn_modes 是合法的 `{"pty": bool, "stdin": bool}` 组合列表，按该顺序排序去重：Pueue 为无 PTY 的两种输入选择，envd 为四种，Tmux 必须 PTY 且 stdin=true 需要底层支持控制脚本。第三层的 spawn/inspect/wait 是必需操作，不另设支持位。`process.capabilities()` 只返回 ProcessCapabilities：可选控制、input、supported_signals（编号 2/9/15）、detached/reconnect/daemon_restart_recovery、completion。不包含管理器或视图字段；output/terminal 自行查询。公共 guard 先校验参数和引用，再按同一裁剪能力检查操作、组合与输入约束。
+
+input 为 None 时不支持 send_input/close_stdin；存在时形如 `{"constraints": {"content": "bytes", "max_bytes": 8192}, "close": False}`。content 为 bytes 或 utf8_without_nul；max_bytes 为单次公开输入的 SDK 正整数上限，None 表示未声明额外固定上限，不是无限容量，也不覆盖 OS、协议或服务端限制。内容域不支持报 UnsupportedError，超限报 InvalidArgumentError，不自动分块或重试不确定输入。kill 为 None、request_termination（Pueue/envd）或 remove_task（Tmux）；completion 为 os_exit（envd）或 native_task（Pueue/Tmux）。NativeTask 完成不证明 OS 已退出，实际成功看 ProcessOutcome；reconnect/detached 不代表 daemon 重启恢复。
+
+Connection 的 exec 是必需方法，能力描述 stdin（可选 InputConstraints）、timeout、separate_stderr 与 cancellation。sandboxd 的 stdin=None，其他内置连接为 bytes、无固定上限；空输入均合法，没有 close_stdin 位。所有内置连接支持 timeout 与分离 stderr。Local cancellation=request_target_termination，取消时请求清理目标；其余为 no_target_termination_guarantee，均不保证撤销副作用。Pueue/Tmux 构造时要求注入连接支持 timeout 与 separate_stderr，否则本地返回 UnsupportedError。Pueue 文本输入走 argv，即使连接没有 stdin 仍支持。
 
 ## 统一构造与数据对象
 
@@ -171,7 +181,7 @@ Pending/Unknown 不当作就绪，Failed/Completed 立即报告。循环次数�
 
 进程任务由实际的 pueued/envd/tmux 创建、持有和回收。OpenSOL 不托管 daemon，不增加执行队列或后台日志服务。`probe()` 做真实管理请求，返回 ManagerInfo；Pueue 可报告 CLI 版本，Tmux 可报告 client/server version，无法确认的版本为 None。`list()` 只返回原生当前保留的 ProcessInfo，不回传任务环境；Pueue 的 group 用于创建默认值和 list 过滤，不是权限边界。ProcessRef.pty 是可保存的 `bool | None` 模式提示，由适配器决定操作是否需要模式；envd List 返回 None，spawn 返回 True/False，Pueue 返回 False，Tmux 返回 True。envd 未知模式仍可 inspect、signal、kill、wait 和订阅，但 send_input、close_stdin、resize 返回 UnsupportedError，不发送猜测的 RPC；应保存 spawn 引用，或在已知模式时显式传 pty 参数。Pueue send 只需 task ID，重建的 `ProcessRef("pueue", id)` 仍可发送输入。
 
-envd 的 `process.capabilities()` 在 pty=None 时禁用 stdin/binary_stdin/close_stdin/pty/resize；False 时允许后端的 stdin/close_stdin，禁用 pty/resize；True 时允许 PTY 输入和 resize，禁用 close_stdin。spawn 引用的已知模式及其本地恢复保留这些能力。Pueue 未知模式不裁剪 stdin，仍校验 UTF-8/NUL；Tmux 输入与 PTY 能力需要完整引用及 pty=True，stdin 还受注入 Connection 的能力上限约束。
+envd 在 pty=None 时 input=None、resize=false；非 PTY 时 input 为 bytes、close=true、resize=false；PTY 时 close=false、resize=true，均无额外固定字节上限。未知模式仍支持 inspect/wait/kill/信号及输出重连。Pueue 的 input 为 utf8_without_nul、max_bytes=None、close=false，不因未知模式禁用；Tmux 的输入和 resize 需要完整归属引用及 pty=True。模式提示不是权威状态。
 
 同步资源方法是阻塞调用；异步资源的相同 I/O 方法可 await，DTO 与异常相同。`get(ref)` 本地绑定任务，Process 的只读 `.ref` 返回 ProcessRef，不做 I/O；订阅不公开任务引用：
 
@@ -208,7 +218,9 @@ kill 的共同保证是原生控制请求成功，不统一保证 OS 已退出�
 
 Output 大小须为 1–1,048,576 的整数，限制 chunks 合计字节数；Terminal 行数须为 1–10,000 的整数，方向只接受 forward/backward。参数在目标 I/O 前校验，查询在目标侧有界读取，立即返回当前数据，不下载全量再切片。视图构造、属性和 capabilities 只本地绑定，不探测或采集。同步方法阻塞并释放 GIL，异步接口的属性同步返回视图，其 I/O 方法需要 await。
 
-能力按表示分别查询：OutputCapabilities 有 read/tail/subscribe 和只描述订阅的 historical_output/streaming_output；TerminalCapabilities 有 read/tail/screen。Pueue 配置目录时支持 Output.read/tail；不论是否配置目录，订阅均是历史 true、实时 false。envd 只有 Output.subscribe 和 streaming_output 为 true。Tmux 支持 Output.subscribe，但只交付 Completed，历史/实时均 false；Terminal.tail/screen 为 true，read 为 false。subscribe=true 本身不承诺实时、历史或无丢失重连。
+OutputCapabilities 有 read/tail、分页的 read_channels，以及 subscribe.initial/reconnect 两种可选来源。每个 SubscriptionDelivery 包含 channels、historical_output、streaming_output、completion；来源存在但 channels=[] 表示只交付 Completed，两个来源均 None 才不能订阅。Pueue 配置目录后分页 channel 为 combined；reconnect 始终 combined、历史 true、实时 false、native_task。envd 无分页，Start 的 channels 按实际 spawn 为 stdout/stderr 或 terminal，Connect 始终声明 stdout/stderr/terminal 并集，不由可修改的 pty 提示推断分离保证；两者历史不保证、实时 true、os_exit。原生事件违反来源 channel 契约返回 BackendError。Tmux 无分页，reconnect 为 channels=[]、历史/实时 false、native_task；Terminal.tail/screen 为 true，read=false。
+
+管理器 output.initial 描述新任务的潜在初始流；绑定 Output.initial 仅在对象族共享槽保留未移交的 Start 流时存在，通过 get 不产生。Process/Output clones 共享原子接管；接管后相关视图 initial=None、reconnect 不变，查询不预留。`subscription.capabilities()` 返回本次实际采用来源的固定描述，关闭、取消读取和完成均不改变。各查询分别本地执行，不建立跨入口快照；控制能力查询不读初始槽。历史仅保证原生仍保留的该执行输出，实时不表示完整日志、持久保留或无丢失重连。
 
 Pueue 需显式传 pueue_directory，指向注入 Connection 目标上的 daemon 数据目录，且与 config/profile 对应；要求 Linux 和 GNU stat/dd。Local、SSH、Docker 都经过同一 Connection，在目标侧同一打开的日志描述符上观察大小并计算正向、反向或尾部范围，不把远端路径当成本机路径。probe 和调用时检查依赖/权限，Output 的 read/tail 能力只表示配置，不缓存探测结果。未配置目录及 envd 的 Output.read/tail 返回 Unsupported。CLI 只能提供非结构化失败时保留脱敏 Backend；Connection 已确定的结构化错误种类不被改写。
 
@@ -240,7 +252,7 @@ async def terminal_job(connection, socket_path):
 
 查询不读取 copy-mode 浏览画面。主屏与备用屏按原生活动 grid 选择，备用屏无历史时 tail 为空；退出备用屏后恢复主屏，不跨屏归档。清屏/清历史遵循原生配置，scroll-on-clear 可把清屏内容推入历史。Tmux 没有稳定历史游标：tail 的 before/after 为 None、at_tail 为 true，at_head 根据同次观测的全部保留历史判断；read 返回 UnsupportedError。SDK 不生成字节事件、pipe-pane 日志或后台采集，也不改变全局配置。
 
-send_input 接受任意 bytes，经原生 `send-keys -H` 发送，不经过 paste buffer 或文件；PTY 行规仍由目标控制。为支持 8192 字节上限，一条受身份保护的原生命令经 `source-file -` 从 Connection stdin 传入；输入能力要求 Connection 支持 stdin（Local/SSH/Docker 均支持）。空 bytes 不产生按键；超限在目标 I/O 前返回 InvalidArgumentError，由调用方显式拆分，不自动重试不确定发送。创建会关闭本 pane 的原生退出横幅，避免首行被滚入历史；管理客户端的 `-u` 保留 UTF-8 文本。
+send_input 接受任意 bytes，经原生 `send-keys -H` 发送，不经过 paste buffer 或文件；PTY 行规仍由目标控制。受身份保护的原生命令经 `source-file -` 从 Connection stdin 传入，脚本是无 NUL 的 UTF-8，因此底层 bytes 或 utf8_without_nul 都可承载；无 stdin 则禁用输入及 spawn 的 stdin=true。管理器声明潜在 8192 字节上限；底层有固定字节上限 B 时，以实际编码器对该引用编码一个任务字节的脚本长度 L1 计算，B<L1 则禁用输入，否则单任务 max_bytes=`min(8192, 1+(B-L1)//3)`。发送复用该编码器与检查，不隐藏较小的已知容量。空 bytes 不产生按键；超限在目标 I/O 前返回 InvalidArgumentError，由调用方显式拆分，不重试不确定发送。创建会关闭本 pane 的退出横幅，管理客户端 `-u` 保留 UTF-8 文本。
 
 Tmux 的 state、wait 和 Completed 均以原生 pane 生命周期为准，pane Dead/EOF 即可使 `ProcessInfo.state="completed"` 并返回完成。pane Dead/EOF、OS 进程退出和数值退出状态就绪可以分离；wait 返回后 OS 进程仍可能继续工作，`exit=None` 不能推断 OS 进程成功或已退出。可用的退出码和可确认的便携信号编号保留在 outcome.exit；其他信号保留 `SIG...` 名称，无可用 OS 状态时保留 Dead。
 
@@ -345,7 +357,7 @@ coroutine 开始执行后，取消 exec、create、spawn 等操作仅取消客�
 
 `process.wait(timeout=...)` 超时不代表进程已终止。明确停止请用 `process.kill()` 或支持的 signal；删除环境请显式 `sandbox.delete()`。包装对象没有自动销毁远端环境的上下文管理器。
 
-Pueue 订阅完成后才返回合并日志，并要求 CLI 与 daemon 在同一执行环境、`client.read_local_logs: true`；独立资源查询可读取运行中的原生日志。它不支持 PTY 或关闭 stdin；输入限 UTF-8 且无 NUL，在 Connection I/O 前按 UnsupportedError 拒绝不符合的载荷。`binary_stdin=true` 保证任意 bytes，false 表示具体限制由适配器判断。envd 原样传递 bytes，可以实时输出和 PTY，但不承诺完整历史或 daemon 重启恢复。详见[能力矩阵](../../README.md#第三层的独立能力)。
+Pueue 订阅完成后才返回合并日志，并要求 CLI 与 daemon 在同一执行环境、`client.read_local_logs: true`；独立资源查询可读取运行中的原生日志。它不支持 PTY 或关闭 stdin；输入限 UTF-8 且无 NUL，在 Connection I/O 前按 UnsupportedError 拒绝不符合的载荷。envd 原样传递 bytes，可以实时输出和 PTY，但不承诺完整历史或 daemon 重启恢复。详见[能力矩阵](../../README.md#第三层的独立能力)。
 
 ## 错误与验证
 

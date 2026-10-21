@@ -130,6 +130,9 @@ pub(super) struct AsyncSandbox {
 
 #[pymethods]
 impl AsyncSandbox {
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities(py, self.inner.capabilities())
+    }
     #[getter]
     fn r#ref(&self) -> PySandboxRef {
         PySandboxRef {
@@ -175,6 +178,7 @@ impl AsyncSandbox {
 #[pyclass(name = "AsyncOutputSubscription", frozen)]
 pub(super) struct AsyncOutputSubscription {
     backend: String,
+    delivery: SubscriptionDelivery,
     state: Arc<tokio::sync::Mutex<SubscriptionState>>,
     pending: Arc<Mutex<Option<Result<ProcessEvent>>>>,
     abort: AbortHandle,
@@ -186,6 +190,7 @@ impl From<OutputSubscription> for AsyncOutputSubscription {
         let (abort, registration) = AbortHandle::new_pair();
         Self {
             backend: subscription.backend().to_owned(),
+            delivery: subscription.capabilities().clone(),
             state: Arc::new(tokio::sync::Mutex::new(SubscriptionState {
                 events: Some(Box::pin(Abortable::new(subscription.events, registration))),
             })),
@@ -207,6 +212,9 @@ fn delivery_lock_error() -> PyErr {
 
 #[pymethods]
 impl AsyncOutputSubscription {
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities(py, &self.delivery)
+    }
     #[pyo3(signature = (*, timeout=None))]
     fn _reserve<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let timeout = crate::timeout(timeout)?;

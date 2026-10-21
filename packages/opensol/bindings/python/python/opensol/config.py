@@ -13,7 +13,8 @@ import types
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
-from ._native import InvalidArgumentError
+from ._native import InvalidArgumentError, _config_capabilities
+from .capabilities import BackendCapabilities
 
 
 def _invalid(message: str) -> InvalidArgumentError:
@@ -117,6 +118,10 @@ class _Data:
 class BackendConfig(_Data):
     """Access data only. Use a concrete provider configuration below."""
     _section: ClassVar[str] = "config"
+
+    def capabilities(self) -> BackendCapabilities:
+        """Describe entrances and bindings without constructing clients or probing targets."""
+        return _config_capabilities(_source(self))
 
 
 @dataclass(frozen=True)
@@ -267,6 +272,9 @@ class _RuntimeBackend:
     @property
     def backend(self) -> str:
         return self._native.backend
+
+    def capabilities(self) -> BackendCapabilities:
+        return self._native.capabilities()
 
 
 class _RuntimeConnection:

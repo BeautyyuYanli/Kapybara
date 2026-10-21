@@ -42,8 +42,22 @@ from .config import (
     E2bConfig, E2bSandboxSpec, EnvdConfig, AgentSandboxConfig, AgentSandboxSpec,
     PueueConfig, TmuxConfig, SandboxdConfig, OpenShellConfig, OpenShellSandboxSpec,
 )
+from .capabilities import (
+    BackendCapabilities, TargetRequirement, ConnectionDependency,
+    SandboxManagerCapabilities, SandboxCapabilities, StopCapabilities,
+    InputContent, InputConstraints, ExecCancellation, ConnectionCapabilities,
+    SpawnMode, ProcessManagerCapabilities, ProcessCapabilities, ProcessInputCapabilities,
+    KillEffect, CompletionKind, Signal, OutputChannel, SubscriptionDelivery,
+    SubscriptionSources, OutputCapabilities, TerminalCapabilities,
+)
 
 __all__ = [
+    "BackendCapabilities", "TargetRequirement", "ConnectionDependency",
+    "SandboxManagerCapabilities", "SandboxCapabilities", "StopCapabilities",
+    "InputContent", "InputConstraints", "ExecCancellation", "ConnectionCapabilities",
+    "SpawnMode", "ProcessManagerCapabilities", "ProcessCapabilities", "ProcessInputCapabilities",
+    "KillEffect", "CompletionKind", "Signal", "OutputChannel", "SubscriptionDelivery",
+    "SubscriptionSources", "OutputCapabilities", "TerminalCapabilities",
     "AsyncBackend", "AsyncConnection", "AsyncProcessManager", "AsyncSandboxManager",
     "AsyncSandbox", "AsyncProcess", "AsyncOutput", "AsyncTerminal", "AsyncOutputSubscription",
     "BackendError",

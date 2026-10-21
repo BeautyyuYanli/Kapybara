@@ -14,10 +14,12 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{Buf, BytesMut};
 use futures::{Stream, StreamExt};
 use opensol_core::{
-    Connection, ConnectionCapabilities, Error, ErrorKind, EventStream, ExecRequest, ExecResult,
-    ExitStatus, ManagerInfo, OutputCapabilities, OutputChannel, OutputSubscription, ProcessEvent,
-    ProcessInfo, ProcessManager, ProcessManagerCapabilities, ProcessOutcome, ProcessRef,
-    ProcessState, PtySize, Result, Signal, SpawnRequest,
+    CompletionKind, Connection, ConnectionCapabilities, Error, ErrorKind, EventStream, ExecRequest,
+    ExecResult, ExitStatus, InputConstraints, KillEffect, ManagerInfo, OutputCapabilities,
+    OutputChannel, OutputSubscription, ProcessCapabilities, ProcessEvent, ProcessInfo,
+    ProcessInputCapabilities, ProcessManager, ProcessManagerCapabilities, ProcessOutcome,
+    ProcessRef, ProcessState, PtySize, Result, Signal, SpawnMode, SpawnRequest,
+    SubscriptionDelivery, SubscriptionSources,
     raw::{ConnectionAccess, OutputAccess, ProcessManagerAccess, SpawnedProcess},
     wait_events,
 };
@@ -371,6 +373,11 @@ impl Envd {
             Some(protocol::process_event::Event::Start(event)) if event.pid > 0 => event.pid,
             _ => return Err(protocol_error(method)),
         };
+        let delivery = if start {
+            start_delivery(pty == Some(true))
+        } else {
+            reconnect_delivery()
+        };
         let events = Box::pin(async_stream::try_stream! {
             let mut exited = false;
             while let Some(data) = raw.next().await {
@@ -382,6 +389,7 @@ impl Envd {
                             Some(protocol::process_event::data_event::Output::Pty(data)) => (OutputChannel::Terminal, data),
                             None => Err(protocol_error(method))?,
                         };
+                        if !delivery.channels.contains(&channel) { Err(protocol_error(method))?; }
                         yield ProcessEvent::Output { channel, data };
                     }
                     Some(protocol::process_event::Event::End(event)) => {
@@ -429,6 +437,41 @@ impl Envd {
     }
 }
 
+fn delivery(channels: Vec<OutputChannel>) -> SubscriptionDelivery {
+    SubscriptionDelivery {
+        channels,
+        historical_output: false,
+        streaming_output: true,
+        completion: CompletionKind::OsExit,
+    }
+}
+
+fn start_delivery(pty: bool) -> SubscriptionDelivery {
+    delivery(if pty {
+        vec![OutputChannel::Terminal]
+    } else {
+        vec![OutputChannel::Stdout, OutputChannel::Stderr]
+    })
+}
+
+fn reconnect_delivery() -> SubscriptionDelivery {
+    delivery(vec![
+        OutputChannel::Stdout,
+        OutputChannel::Stderr,
+        OutputChannel::Terminal,
+    ])
+}
+
+fn output_capabilities(initial: bool) -> OutputCapabilities {
+    OutputCapabilities {
+        subscribe: SubscriptionSources {
+            initial: initial.then(reconnect_delivery),
+            reconnect: Some(reconnect_delivery()),
+        },
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl ProcessManagerAccess for Envd {
     fn backend(&self) -> &'static str {
@@ -436,27 +479,51 @@ impl ProcessManagerAccess for Envd {
     }
     fn capabilities(&self) -> ProcessManagerCapabilities {
         ProcessManagerCapabilities {
+            probe: true,
             list: true,
-            kill: true,
-            stdin: true,
-            close_stdin: true,
-            binary_stdin: true,
-            pty: true,
-            resize: true,
-            supported_signals: &[Signal::Terminate, Signal::Kill],
-            detached: true,
-            reconnect: true,
+            spawn_modes: vec![
+                SpawnMode {
+                    pty: false,
+                    stdin: false,
+                },
+                SpawnMode {
+                    pty: false,
+                    stdin: true,
+                },
+                SpawnMode {
+                    pty: true,
+                    stdin: false,
+                },
+                SpawnMode {
+                    pty: true,
+                    stdin: true,
+                },
+            ],
+            process: ProcessCapabilities {
+                kill: Some(KillEffect::RequestTermination),
+                input: Some(ProcessInputCapabilities {
+                    constraints: InputConstraints::BYTES,
+                    close: true,
+                }),
+                resize: true,
+                supported_signals: vec![Signal::Kill, Signal::Terminate],
+                detached: true,
+                reconnect: true,
+                completion: CompletionKind::OsExit,
+                ..Default::default()
+            },
+            output: output_capabilities(true),
             ..Default::default()
         }
     }
 
-    fn process_capabilities(&self, process: &ProcessRef) -> ProcessManagerCapabilities {
-        let mut capabilities = ProcessManagerAccess::capabilities(self);
+    fn process_capabilities(&self, process: &ProcessRef) -> ProcessCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(self).process;
         // The protocol cannot infer stdin versus PTY routing from the PID returned by List.
-        capabilities.stdin &= process.pty.is_some();
-        capabilities.binary_stdin &= process.pty.is_some();
-        capabilities.close_stdin &= process.pty == Some(false);
-        capabilities.pty &= process.pty == Some(true);
+        capabilities.input = process.pty.map(|pty| ProcessInputCapabilities {
+            constraints: InputConstraints::BYTES,
+            close: !pty,
+        });
         capabilities.resize &= process.pty == Some(true);
         capabilities
     }
@@ -504,10 +571,11 @@ impl ProcessManagerAccess for Envd {
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedProcess> {
+        let delivery = start_delivery(request.pty.is_some());
         let (reference, events) = self.start_process(request).await?;
         Ok(SpawnedProcess {
             reference: reference.clone(),
-            initial_subscription: Some(OutputSubscription::new(reference, events)),
+            initial_subscription: Some(OutputSubscription::new(reference, delivery, events)),
         })
     }
 
@@ -617,12 +685,9 @@ impl OutputAccess for Envd {
     fn backend(&self) -> &'static str {
         "envd"
     }
-    fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities {
-            subscribe: true,
-            streaming_output: true,
-            ..Default::default()
-        }
+    fn capabilities(&self, _process: &ProcessRef) -> OutputCapabilities {
+        // Connect may report any native channel, independently of the caller's PTY hint.
+        output_capabilities(false)
     }
     async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         let selector = self.selector(process, "reconnect")?;
@@ -642,7 +707,11 @@ impl OutputAccess for Envd {
         if reference.id != process.id {
             return Err(protocol_error("Connect"));
         }
-        Ok(OutputSubscription::new(reference, events))
+        Ok(OutputSubscription::new(
+            reference,
+            reconnect_delivery(),
+            events,
+        ))
     }
 }
 
@@ -653,9 +722,10 @@ impl ConnectionAccess for Envd {
     }
     fn capabilities(&self) -> ConnectionCapabilities {
         ConnectionCapabilities {
-            stdin: true,
+            stdin: Some(InputConstraints::BYTES),
             timeout: true,
             separate_stderr: true,
+            cancellation: opensol_core::ExecCancellation::NoTargetTerminationGuarantee,
         }
     }
 

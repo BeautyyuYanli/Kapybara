@@ -38,8 +38,8 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(test_sdk.combined_output(chunks), b"9")
         self.assertEqual(outcome.exit.code, 9)
         self.assertEqual(process.inspect().state, "completed")
-        self.assertEqual(process.capabilities(), self.manager.capabilities())
-        self.assertTrue(self.manager.get(sdk.ProcessRef("pueue", process.ref.id)).capabilities()["stdin"])
+        self.assertEqual(process.capabilities(), self.manager.capabilities()["process"])
+        self.assertIsNotNone(self.manager.get(sdk.ProcessRef("pueue", process.ref.id)).capabilities()["input"])
         process.remove()
 
     def test_bound_resource_pages_restart_controls_and_retention(self):
@@ -54,8 +54,10 @@ class ResourceTests(unittest.TestCase):
         self.assertIsInstance(process, sdk.Process)
         self.assertIsInstance(process.output, sdk.Output)
         self.assertIsInstance(process.terminal, sdk.Terminal)
-        self.assertEqual(process.output.capabilities(), dict(read=True, tail=True, subscribe=True,
-                                                           historical_output=True, streaming_output=False))
+        self.assertEqual(process.output.capabilities(), dict(read=True, tail=True, read_channels=["combined"],
+                         subscribe=dict(initial=None, reconnect=dict(channels=["combined"], historical_output=True,
+                                        streaming_output=False, completion="native_task"))))
+        self.assertEqual(handle.capabilities(), process.output.capabilities()["subscribe"]["reconnect"])
         self.assertEqual(process.terminal.capabilities(), dict(read=False, tail=False, screen=False))
         self.assertIsInstance(handle, sdk.OutputSubscription)
         self.assertFalse(hasattr(handle, "ref"))
@@ -158,7 +160,7 @@ class ResourceTests(unittest.TestCase):
                                              connection=sdk.Connection(sdk.LocalConfig()))
         missing = unavailable.get(sdk.ProcessRef("pueue", "123"))
         self.assertEqual(missing.ref.id, "123", "binding must not contact a daemon")
-        self.assertTrue(missing.output.capabilities()["subscribe"])
+        self.assertIsNotNone(missing.output.capabilities()["subscribe"]["reconnect"])
         self.assertFalse(missing.terminal.capabilities()["screen"])
         manager = sdk.ProcessManager(sdk.PueueConfig(config_file=str(self.config)),
                                          connection=sdk.Connection(sdk.LocalConfig()))
@@ -219,7 +221,7 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(test_sdk.combined_output(chunks), b"9")
         self.assertEqual(outcome.exit.code, 9)
         self.assertEqual((await process.inspect()).state, "completed")
-        self.assertEqual(process.capabilities(), self.manager.capabilities())
+        self.assertEqual(process.capabilities(), self.manager.capabilities()["process"])
         await subscription.aclose()
         await process.remove()
 

@@ -19,6 +19,8 @@ use opensol_core::{
 struct Backend {
     calls: Arc<Mutex<Vec<&'static str>>>,
     reconnect: bool,
+    input_constraints: Option<InputConstraints>,
+    probe: bool,
 }
 
 struct ExtensionContext {
@@ -29,6 +31,14 @@ struct ExtensionContext {
 impl BackendAccess for ExtensionContext {
     fn backend(&self) -> &'static str {
         "extension"
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            sandboxes: Some(TargetRequirement::Forbidden),
+            connection: Some(TargetRequirement::Forbidden),
+            processes: Some(TargetRequirement::Forbidden),
+            connection_dependency: ConnectionDependency::Forbidden,
+        }
     }
     fn validate_open(&self, _api: Api, target: Option<&SandboxRef>) -> Result<()> {
         if target.is_some() {
@@ -208,9 +218,10 @@ impl ConnectionAccess for Backend {
     }
     fn capabilities(&self) -> ConnectionCapabilities {
         ConnectionCapabilities {
-            stdin: false,
+            stdin: self.input_constraints,
             timeout: false,
             separate_stderr: true,
+            cancellation: ExecCancellation::NoTargetTerminationGuarantee,
         }
     }
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
@@ -308,7 +319,10 @@ impl SandboxManagerAccess for Backend {
     fn capabilities(&self) -> SandboxManagerCapabilities {
         SandboxManagerCapabilities {
             create: true,
-            inspect: true,
+            sandbox: SandboxCapabilities {
+                inspect: true,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -410,13 +424,46 @@ impl ProcessManagerAccess for Backend {
     }
     fn capabilities(&self) -> ProcessManagerCapabilities {
         ProcessManagerCapabilities {
-            stdin: true,
-            close_stdin: true,
-            resize: true,
-            supported_signals: &[Signal::Kill],
-            reconnect: self.reconnect,
+            probe: self.probe,
+            spawn_modes: vec![
+                SpawnMode {
+                    pty: false,
+                    stdin: false,
+                },
+                SpawnMode {
+                    pty: false,
+                    stdin: true,
+                },
+            ],
+            process: ProcessCapabilities {
+                input: Some(ProcessInputCapabilities {
+                    constraints: self.input_constraints.unwrap_or(InputConstraints::BYTES),
+                    close: true,
+                }),
+                resize: true,
+                supported_signals: vec![Signal::Kill],
+                reconnect: self.reconnect,
+                ..Default::default()
+            },
+            output: OutputCapabilities {
+                read: true,
+                tail: true,
+                read_channels: vec![OutputChannel::Combined],
+                subscribe: SubscriptionSources {
+                    initial: Some(initial_delivery()),
+                    reconnect: self.reconnect.then(reconnect_delivery),
+                },
+            },
             ..Default::default()
         }
+    }
+    fn process_capabilities(&self, process: &ProcessRef) -> ProcessCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(self).process;
+        if process.pty == Some(true) {
+            capabilities.input = None;
+            capabilities.resize = false;
+        }
+        capabilities
     }
     fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
         self.reconnect
@@ -429,6 +476,7 @@ impl ProcessManagerAccess for Backend {
             reference: reference.clone(),
             initial_subscription: Some(OutputSubscription::new(
                 reference,
+                initial_delivery(),
                 Box::pin(stream::iter([
                     Ok(ProcessEvent::Output {
                         channel: OutputChannel::Combined,
@@ -444,6 +492,9 @@ impl ProcessManagerAccess for Backend {
     }
     async fn list(&self) -> Result<Vec<ProcessInfo>> {
         self.entered("list")
+    }
+    async fn probe(&self) -> Result<ManagerInfo> {
+        self.entered("probe")
     }
     async fn status(&self, _process: &ProcessRef) -> Result<ProcessInfo> {
         self.entered("status")
@@ -489,12 +540,15 @@ impl OutputAccess for Backend {
     fn backend(&self) -> &'static str {
         "extension"
     }
-    fn capabilities(&self) -> OutputCapabilities {
+    fn capabilities(&self, _process: &ProcessRef) -> OutputCapabilities {
         OutputCapabilities {
             read: true,
             tail: true,
-            subscribe: self.reconnect,
-            ..Default::default()
+            read_channels: vec![OutputChannel::Combined],
+            subscribe: SubscriptionSources {
+                initial: None,
+                reconnect: self.reconnect.then(reconnect_delivery),
+            },
         }
     }
     async fn read(
@@ -513,6 +567,7 @@ impl OutputAccess for Backend {
         self.calls.lock().unwrap().push("reconnect");
         Ok(OutputSubscription::new(
             process.clone(),
+            reconnect_delivery(),
             Box::pin(stream::iter([Ok(ProcessEvent::Completed(
                 ProcessOutcome {
                     exit: None,
@@ -532,8 +587,8 @@ fn terminal_input_requires_pty_support_without_changing_reference_identity() {
         let bound = manager.get(terminal.clone());
         assert_eq!(bound.reference(), &terminal);
         let capabilities = bound.capabilities();
-        assert!(!capabilities.stdin && !capabilities.close_stdin && !capabilities.resize);
-        assert!(manager.capabilities().stdin && manager.capabilities().close_stdin);
+        assert!(capabilities.input.is_none() && !capabilities.resize);
+        assert!(manager.capabilities().process.input.unwrap().close);
         assert_eq!(
             bound.send_input(b"text".to_vec()).await.unwrap_err().kind,
             ErrorKind::Unsupported
@@ -573,11 +628,20 @@ fn terminal_input_requires_pty_support_without_changing_reference_identity() {
 }
 
 #[test]
-fn native_input_restrictions_are_not_inferred_from_mode_or_binary_guarantees() {
+fn byte_input_needs_no_mode_hint_unless_the_adapter_requires_one() {
     block_on(async {
         let adapter = Backend::default();
         let manager = ProcessManager::new(adapter.clone());
-        assert!(!manager.capabilities().binary_stdin);
+        assert_eq!(
+            manager
+                .capabilities()
+                .process
+                .input
+                .unwrap()
+                .constraints
+                .content,
+            InputContent::Bytes
+        );
         let process = manager.get(ProcessRef::new("extension", "task", None));
         // This adapter needs no mode hint and may accept payloads that Pueue cannot express.
         for data in [b"text".to_vec(), vec![0xff], vec![0]] {
@@ -638,6 +702,7 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
                 .unwrap_err(),
             process.signal(Signal::Interrupt).await.unwrap_err(),
             manager.list().await.unwrap_err(),
+            manager.probe().await.unwrap_err(),
         ] {
             assert_eq!(error.kind, ErrorKind::Unsupported);
         }
@@ -700,9 +765,13 @@ fn bound_operations_validate_before_dispatch_and_keep_the_initial_subscription()
         assert_eq!(*adapter.calls.lock().unwrap(), ["spawn"]);
         drop(manager);
         let output = bound.output();
-        assert!(output.capabilities().subscribe);
+        assert_eq!(
+            output.capabilities().subscribe.initial,
+            Some(initial_delivery())
+        );
         let mut subscription = bound.clone().output().subscribe().await.unwrap();
-        assert!(!output.capabilities().subscribe);
+        assert_eq!(subscription.capabilities(), &initial_delivery());
+        assert!(output.capabilities().subscribe.initial.is_none());
         assert!(
             matches!(output.subscribe().await, Err(error) if error.kind == ErrorKind::Unsupported)
         );
@@ -776,6 +845,328 @@ fn spawned_process_views_share_the_initial_stream_before_native_reconnect() {
     });
 }
 
+/// An upper bound may include restart while an individual execution is immutable.
+struct MixedExecutionManager {
+    immutable: bool,
+}
+
+#[async_trait]
+impl ProcessManagerAccess for MixedExecutionManager {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn capabilities(&self) -> ProcessManagerCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(&Backend::default());
+        capabilities.process.restart = true;
+        capabilities
+    }
+    fn process_capabilities(&self, _process: &ProcessRef) -> ProcessCapabilities {
+        let mut capabilities = self.capabilities().process;
+        capabilities.restart = !self.immutable;
+        capabilities
+    }
+    async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedProcess> {
+        ProcessManagerAccess::spawn(&Backend::default(), request).await
+    }
+    async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
+        ProcessManagerAccess::status(&Backend::default(), process).await
+    }
+    async fn wait(
+        &self,
+        process: &ProcessRef,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutcome> {
+        ProcessManagerAccess::wait(&Backend::default(), process, timeout).await
+    }
+}
+
+#[test]
+fn initial_stream_requires_an_immutable_execution_within_the_declared_upper_bound() {
+    block_on(async {
+        for immutable in [true, false] {
+            let manager = ProcessManager::new(MixedExecutionManager { immutable });
+            assert!(manager.capabilities().process.restart);
+            let result = manager
+                .spawn(SpawnRequest::new(Command::shell("true")))
+                .await;
+            if immutable {
+                let process = result.unwrap();
+                assert!(!process.capabilities().restart);
+                assert_eq!(
+                    process.output().capabilities().subscribe.initial,
+                    Some(initial_delivery())
+                );
+                let subscription = process.output().subscribe().await.unwrap();
+                assert_eq!(subscription.capabilities(), &initial_delivery());
+            } else {
+                assert!(matches!(result, Err(error) if error.kind == ErrorKind::Backend));
+            }
+        }
+    });
+}
+
+/// Supplies an actual native description independently of the advertised source. Deliberate
+/// mismatches exercise the public adapter-contract errors, without inspecting private guards.
+#[derive(Clone)]
+struct SourceDescriptions {
+    initial: bool,
+    declared: Option<SubscriptionDelivery>,
+    actual: SubscriptionDelivery,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl SourceDescriptions {
+    fn new(
+        initial: bool,
+        declared: Option<SubscriptionDelivery>,
+        actual: SubscriptionDelivery,
+    ) -> Self {
+        Self {
+            initial,
+            declared,
+            actual,
+            calls: Arc::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl ProcessManagerAccess for SourceDescriptions {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn capabilities(&self) -> ProcessManagerCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(&Backend::default());
+        capabilities.process.reconnect = !self.initial && self.declared.is_some();
+        capabilities.output = OutputCapabilities {
+            subscribe: SubscriptionSources {
+                initial: if self.initial {
+                    self.declared.clone()
+                } else {
+                    None
+                },
+                reconnect: if self.initial {
+                    None
+                } else {
+                    self.declared.clone()
+                },
+            },
+            ..Default::default()
+        };
+        capabilities
+    }
+    fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
+        Some(Arc::new(self.clone()))
+    }
+    async fn spawn(&self, _request: SpawnRequest) -> Result<SpawnedProcess> {
+        self.calls.lock().unwrap().push("spawn");
+        let reference = ProcessRef::new("extension", "task", Some(false));
+        Ok(SpawnedProcess {
+            initial_subscription: self
+                .initial
+                .then(|| described_subscription(&reference, self.actual.clone())),
+            reference,
+        })
+    }
+    async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
+        ProcessManagerAccess::status(&Backend::default(), process).await
+    }
+    async fn wait(
+        &self,
+        process: &ProcessRef,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutcome> {
+        ProcessManagerAccess::wait(&Backend::default(), process, timeout).await
+    }
+}
+
+#[async_trait]
+impl OutputAccess for SourceDescriptions {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn capabilities(&self, _process: &ProcessRef) -> OutputCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(self).output;
+        capabilities.subscribe.initial = None;
+        capabilities
+    }
+    async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
+        self.calls.lock().unwrap().push("subscribe_output");
+        Ok(described_subscription(process, self.actual.clone()))
+    }
+}
+
+fn described_subscription(
+    reference: &ProcessRef,
+    delivery: SubscriptionDelivery,
+) -> OutputSubscription {
+    let mut events = Vec::new();
+    if let Some(&channel) = delivery.channels.first() {
+        events.push(Ok(ProcessEvent::Output {
+            channel,
+            data: vec![0xff],
+        }));
+    }
+    events.push(Ok(ProcessEvent::Completed(ProcessOutcome {
+        exit: Some(ExitStatus::code(7)),
+        native_result: None,
+    })));
+    OutputSubscription::new(reference.clone(), delivery, Box::pin(stream::iter(events)))
+}
+
+#[test]
+fn spawn_rejects_an_undeclared_initial_subscription() {
+    block_on(async {
+        let adapter = SourceDescriptions::new(true, None, initial_delivery());
+        let manager = ProcessManager::new(adapter.clone());
+        let error = manager
+            .spawn(SpawnRequest::new(Command::shell("true")))
+            .await
+            .err()
+            .expect("undeclared initial stream must fail");
+        assert_eq!(error.kind, ErrorKind::Backend);
+        assert_eq!(error.operation, "spawn");
+        assert_eq!(*adapter.calls.lock().unwrap(), ["spawn"]);
+    });
+}
+
+#[test]
+fn subscriptions_reject_delivery_outside_the_declared_source() {
+    block_on(async {
+        let declared = SubscriptionDelivery {
+            channels: vec![OutputChannel::Stdout, OutputChannel::Stderr],
+            historical_output: false,
+            streaming_output: false,
+            completion: CompletionKind::NativeTask,
+        };
+        let incompatible = [
+            (
+                "channel",
+                SubscriptionDelivery {
+                    channels: vec![OutputChannel::Terminal],
+                    ..declared.clone()
+                },
+            ),
+            (
+                "history",
+                SubscriptionDelivery {
+                    historical_output: true,
+                    ..declared.clone()
+                },
+            ),
+            (
+                "streaming",
+                SubscriptionDelivery {
+                    streaming_output: true,
+                    ..declared.clone()
+                },
+            ),
+            (
+                "completion",
+                SubscriptionDelivery {
+                    completion: CompletionKind::OsExit,
+                    ..declared.clone()
+                },
+            ),
+        ];
+        for initial in [true, false] {
+            for (name, actual) in &incompatible {
+                let adapter =
+                    SourceDescriptions::new(initial, Some(declared.clone()), actual.clone());
+                let manager = ProcessManager::new(adapter.clone());
+                let spawned = manager
+                    .spawn(SpawnRequest::new(Command::shell("true")))
+                    .await;
+                let error = if initial {
+                    spawned
+                        .err()
+                        .expect("incompatible initial stream must fail")
+                } else {
+                    spawned
+                        .unwrap()
+                        .output()
+                        .subscribe()
+                        .await
+                        .err()
+                        .expect("incompatible reconnect must fail")
+                };
+                assert_eq!(error.kind, ErrorKind::Backend, "{name}, initial={initial}");
+                assert_eq!(
+                    error.operation,
+                    if initial { "spawn" } else { "subscribe_output" }
+                );
+                assert_eq!(
+                    *adapter.calls.lock().unwrap(),
+                    if initial {
+                        vec!["spawn"]
+                    } else {
+                        vec!["spawn", "subscribe_output"]
+                    }
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn subscriptions_accept_the_declared_delivery_and_legal_subsets() {
+    block_on(async {
+        let declared = SubscriptionDelivery {
+            channels: vec![OutputChannel::Stdout, OutputChannel::Stderr],
+            historical_output: true,
+            streaming_output: true,
+            completion: CompletionKind::NativeTask,
+        };
+        let deliveries = [
+            declared.clone(),
+            SubscriptionDelivery {
+                channels: vec![OutputChannel::Stdout],
+                historical_output: false,
+                streaming_output: false,
+                completion: CompletionKind::NativeTask,
+            },
+            reconnect_delivery(),
+        ];
+        for initial in [true, false] {
+            for actual in &deliveries {
+                let adapter =
+                    SourceDescriptions::new(initial, Some(declared.clone()), actual.clone());
+                let process = ProcessManager::new(adapter.clone())
+                    .spawn(SpawnRequest::new(Command::shell("true")))
+                    .await
+                    .unwrap();
+                let mut subscription = process.output().subscribe().await.unwrap();
+                assert_eq!(subscription.capabilities(), actual);
+                if let Some(&channel) = actual.channels.first() {
+                    assert_eq!(
+                        subscription.events.next().await.unwrap().unwrap(),
+                        ProcessEvent::Output {
+                            channel,
+                            data: vec![0xff]
+                        }
+                    );
+                }
+                assert_eq!(
+                    subscription.events.next().await.unwrap().unwrap(),
+                    ProcessEvent::Completed(ProcessOutcome {
+                        exit: Some(ExitStatus::code(7)),
+                        native_result: None
+                    })
+                );
+                assert_eq!(subscription.capabilities(), actual);
+                assert_eq!(
+                    *adapter.calls.lock().unwrap(),
+                    if initial {
+                        vec!["spawn"]
+                    } else {
+                        vec!["spawn", "subscribe_output"]
+                    }
+                );
+            }
+        }
+    });
+}
+
 #[test]
 fn additional_subscriptions_use_native_reconnect_and_preserve_identity() {
     block_on(async {
@@ -801,6 +1192,57 @@ fn additional_subscriptions_use_native_reconnect_and_preserve_identity() {
     });
 }
 
+#[test]
+fn input_domains_and_limits_guard_both_exec_and_process_calls() {
+    block_on(async {
+        for content in [InputContent::Bytes, InputContent::Utf8WithoutNul] {
+            let adapter = Backend {
+                input_constraints: Some(InputConstraints {
+                    content,
+                    max_bytes: std::num::NonZeroUsize::new(3),
+                }),
+                probe: true,
+                ..Default::default()
+            };
+            let manager = ProcessManager::new(adapter.clone());
+            let process = manager.get(ProcessRef::new("extension", "task", Some(false)));
+            let connection = Connection::new(adapter.clone());
+            for data in [vec![0xff], vec![0], b"abc".to_vec(), b"abcd".to_vec()] {
+                let invalid_content =
+                    content == InputContent::Utf8WithoutNul && data != b"abc" && data != b"abcd";
+                let expected = if data.len() > 3 {
+                    ErrorKind::InvalidArgument
+                } else if invalid_content {
+                    ErrorKind::Unsupported
+                } else {
+                    ErrorKind::Transport
+                };
+                let before = adapter.calls.lock().unwrap().len();
+                assert_eq!(
+                    process.send_input(data.clone()).await.unwrap_err().kind,
+                    expected
+                );
+                let mut request = ExecRequest::new(Command::new("transport", ["secret"]));
+                request.stdin = data;
+                assert_eq!(connection.exec(request).await.unwrap_err().kind, expected);
+                assert_eq!(
+                    adapter.calls.lock().unwrap().len() - before,
+                    if expected == ErrorKind::Transport {
+                        2
+                    } else {
+                        0
+                    }
+                );
+            }
+            assert_eq!(
+                manager.probe().await.unwrap_err().kind,
+                ErrorKind::Transport
+            );
+            assert_eq!(adapter.calls.lock().unwrap().last(), Some(&"probe"));
+        }
+    });
+}
+
 /// A third party can expose native terminal text without implementing task control or bytes.
 #[derive(Clone, Default)]
 struct TerminalOnly(Arc<Mutex<Vec<&'static str>>>);
@@ -809,7 +1251,7 @@ impl TerminalAccess for TerminalOnly {
     fn backend(&self) -> &'static str {
         "terminal-only"
     }
-    fn capabilities(&self) -> TerminalCapabilities {
+    fn capabilities(&self, _process: &ProcessRef) -> TerminalCapabilities {
         TerminalCapabilities {
             tail: true,
             screen: true,
@@ -826,6 +1268,296 @@ impl TerminalAccess for TerminalOnly {
             at_tail: true,
         })
     }
+}
+
+fn initial_delivery() -> SubscriptionDelivery {
+    SubscriptionDelivery {
+        channels: vec![OutputChannel::Combined],
+        historical_output: false,
+        streaming_output: false,
+        completion: CompletionKind::NativeTask,
+    }
+}
+
+fn reconnect_delivery() -> SubscriptionDelivery {
+    SubscriptionDelivery {
+        channels: vec![],
+        historical_output: false,
+        streaming_output: false,
+        completion: CompletionKind::NativeTask,
+    }
+}
+
+/// Native view methods accept both identities; only the local capability hook restricts one.
+/// Recording the reference at I/O distinguishes public guard checks from adapter rejection.
+#[derive(Clone, Default)]
+struct ReferenceViews(Arc<Mutex<Vec<(&'static str, ProcessRef)>>>);
+
+impl ReferenceViews {
+    fn record(&self, operation: &'static str, process: &ProcessRef) {
+        self.0.lock().unwrap().push((operation, process.clone()));
+    }
+    fn output_page() -> OutputPage {
+        OutputPage {
+            chunks: vec![OutputChunk {
+                channel: OutputChannel::Combined,
+                data: vec![0xff],
+            }],
+            before: None,
+            after: None,
+            at_head: Some(true),
+            at_tail: true,
+        }
+    }
+    fn terminal_page() -> TerminalPage {
+        TerminalPage {
+            lines: vec!["view".into()],
+            before: None,
+            after: None,
+            at_head: Some(true),
+            at_tail: true,
+        }
+    }
+}
+
+#[async_trait]
+impl ProcessManagerAccess for ReferenceViews {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn capabilities(&self) -> ProcessManagerCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(&Backend {
+            reconnect: true,
+            ..Default::default()
+        });
+        capabilities.terminal = TerminalCapabilities {
+            read: true,
+            tail: true,
+            screen: true,
+        };
+        capabilities
+    }
+    fn output_access(&self) -> Option<Arc<dyn OutputAccess>> {
+        Some(Arc::new(self.clone()))
+    }
+    fn terminal_access(&self) -> Option<Arc<dyn TerminalAccess>> {
+        Some(Arc::new(self.clone()))
+    }
+    async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedProcess> {
+        ProcessManagerAccess::spawn(&Backend::default(), request).await
+    }
+    async fn status(&self, process: &ProcessRef) -> Result<ProcessInfo> {
+        ProcessManagerAccess::status(&Backend::default(), process).await
+    }
+    async fn wait(
+        &self,
+        process: &ProcessRef,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutcome> {
+        ProcessManagerAccess::wait(&Backend::default(), process, timeout).await
+    }
+}
+
+#[async_trait]
+impl OutputAccess for ReferenceViews {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn capabilities(&self, process: &ProcessRef) -> OutputCapabilities {
+        if process.id != "available" {
+            return OutputCapabilities::default();
+        }
+        let mut capabilities = ProcessManagerAccess::capabilities(self).output;
+        capabilities.subscribe.initial = None;
+        capabilities
+    }
+    async fn read(
+        &self,
+        process: &ProcessRef,
+        _cursor: Option<&OutputCursor>,
+        _direction: ReadDirection,
+        _max_bytes: usize,
+    ) -> Result<OutputPage> {
+        self.record("read_output", process);
+        Ok(Self::output_page())
+    }
+    async fn tail(&self, process: &ProcessRef, _max_bytes: usize) -> Result<OutputPage> {
+        self.record("tail_output", process);
+        Ok(Self::output_page())
+    }
+    async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
+        self.record("subscribe_output", process);
+        Ok(described_subscription(process, reconnect_delivery()))
+    }
+}
+
+#[async_trait]
+impl TerminalAccess for ReferenceViews {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn capabilities(&self, process: &ProcessRef) -> TerminalCapabilities {
+        if process.id == "available" {
+            ProcessManagerAccess::capabilities(self).terminal
+        } else {
+            TerminalCapabilities::default()
+        }
+    }
+    async fn read(
+        &self,
+        process: &ProcessRef,
+        _cursor: Option<&TerminalCursor>,
+        _direction: ReadDirection,
+        _lines: usize,
+    ) -> Result<TerminalPage> {
+        self.record("read_terminal", process);
+        Ok(Self::terminal_page())
+    }
+    async fn tail(&self, process: &ProcessRef, _lines: usize) -> Result<TerminalPage> {
+        self.record("tail_terminal", process);
+        Ok(Self::terminal_page())
+    }
+    async fn screen(&self, process: &ProcessRef) -> Result<TerminalScreen> {
+        self.record("terminal_screen", process);
+        Ok(TerminalScreen {
+            cols: 4,
+            rows: 1,
+            lines: vec!["view".into()],
+        })
+    }
+}
+
+#[test]
+fn bound_and_independent_views_use_reference_capabilities_before_native_io() {
+    block_on(async {
+        for independent in [false, true] {
+            let adapter = ReferenceViews::default();
+            let manager = ProcessManager::new(adapter.clone());
+            for (id, supported) in [("available", true), ("unavailable", false)] {
+                let reference = ProcessRef::new("extension", id, None);
+                let before = adapter.0.lock().unwrap().len();
+                let (output, terminal) = if independent {
+                    (
+                        Output::new(adapter.clone(), reference.clone()),
+                        Terminal::new(adapter.clone(), reference.clone()),
+                    )
+                } else {
+                    let process = manager.get(reference.clone());
+                    (process.output(), process.terminal())
+                };
+                assert_eq!(
+                    output.capabilities(),
+                    OutputCapabilities {
+                        read: supported,
+                        tail: supported,
+                        read_channels: if supported {
+                            vec![OutputChannel::Combined]
+                        } else {
+                            vec![]
+                        },
+                        subscribe: SubscriptionSources {
+                            initial: None,
+                            reconnect: supported.then(reconnect_delivery)
+                        },
+                    }
+                );
+                assert_eq!(
+                    terminal.capabilities(),
+                    TerminalCapabilities {
+                        read: supported,
+                        tail: supported,
+                        screen: supported
+                    }
+                );
+                assert_eq!(
+                    adapter.0.lock().unwrap().len(),
+                    before,
+                    "binding and capability queries must stay local"
+                );
+                if supported {
+                    assert_eq!(
+                        output
+                            .read(None, ReadDirection::Forward, 64)
+                            .await
+                            .unwrap()
+                            .chunks[0]
+                            .data,
+                        [0xff]
+                    );
+                    assert_eq!(
+                        output.tail(64).await.unwrap().chunks[0].channel,
+                        OutputChannel::Combined
+                    );
+                    let subscription = output.subscribe().await.unwrap();
+                    assert_eq!(
+                        wait_events(subscription.events, "extension")
+                            .await
+                            .unwrap()
+                            .exit
+                            .unwrap()
+                            .code,
+                        Some(7)
+                    );
+                    assert_eq!(
+                        terminal
+                            .read(None, ReadDirection::Forward, 1)
+                            .await
+                            .unwrap()
+                            .lines,
+                        ["view"]
+                    );
+                    assert_eq!(terminal.tail(1).await.unwrap().lines, ["view"]);
+                    let screen = terminal.screen().await.unwrap();
+                    assert_eq!(
+                        (screen.cols, screen.rows, screen.lines),
+                        (4, 1, vec!["view".into()])
+                    );
+                    let expected: Vec<_> = [
+                        "read_output",
+                        "tail_output",
+                        "subscribe_output",
+                        "read_terminal",
+                        "tail_terminal",
+                        "terminal_screen",
+                    ]
+                    .into_iter()
+                    .map(|operation| (operation, reference.clone()))
+                    .collect();
+                    assert_eq!(&adapter.0.lock().unwrap()[before..], expected.as_slice());
+                } else {
+                    for error in [
+                        output
+                            .read(None, ReadDirection::Forward, 64)
+                            .await
+                            .unwrap_err(),
+                        output.tail(64).await.unwrap_err(),
+                        output
+                            .subscribe()
+                            .await
+                            .err()
+                            .expect("disabled subscribe must fail"),
+                        terminal
+                            .read(None, ReadDirection::Forward, 1)
+                            .await
+                            .unwrap_err(),
+                        terminal.tail(1).await.unwrap_err(),
+                        terminal.screen().await.unwrap_err(),
+                    ] {
+                        assert_eq!(
+                            error.kind,
+                            ErrorKind::Unsupported,
+                            "{id}, independent={independent}"
+                        );
+                    }
+                    assert_eq!(
+                        adapter.0.lock().unwrap().len(),
+                        before,
+                        "disabled operations must not enter raw I/O"
+                    );
+                }
+            }
+        }
+    });
 }
 
 #[test]

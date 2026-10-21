@@ -66,9 +66,10 @@ impl ConnectionAccess for Ssh {
     }
     fn capabilities(&self) -> ConnectionCapabilities {
         ConnectionCapabilities {
-            stdin: true,
+            stdin: Some(opensol_core::InputConstraints::BYTES),
             timeout: true,
             separate_stderr: true,
+            cancellation: opensol_core::ExecCancellation::NoTargetTerminationGuarantee,
         }
     }
 

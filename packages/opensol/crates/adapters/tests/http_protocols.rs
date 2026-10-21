@@ -137,7 +137,7 @@ fn output_response(program: &str, pty: bool, completion: Option<Arc<Notify>>) ->
     if program == "bad-first" {
         bytes.clear();
     }
-    let data = if pty {
+    let data = if pty != (program == "wrong-channel") {
         protocol::process_event::data_event::Output::Pty(vec![0xff, 0, b'T'])
     } else {
         protocol::process_event::data_event::Output::Stdout(vec![0xff, 0, b'O'])
@@ -554,7 +554,7 @@ async fn unified_e2b_binding_is_local_and_first_io_does_not_resume_paused_target
         .await
         .unwrap();
     assert!(fixture.records.lock().unwrap().is_empty());
-    assert!(connection.capabilities().stdin);
+    assert!(connection.capabilities().stdin.is_some());
     processes.list().await.unwrap();
     let records = fixture.records.lock().unwrap();
     assert_eq!(records.len(), 2);
@@ -760,10 +760,39 @@ async fn envd_clones_hand_off_start_once_without_prefetch_or_replacing_it_with_c
         .unwrap();
     let first = process.output();
     let second = process.clone().output();
+    let control = process.capabilities();
+    assert_eq!(
+        first.capabilities().subscribe.initial.unwrap().channels,
+        [OutputChannel::Stdout, OutputChannel::Stderr]
+    );
+    assert!(
+        manager
+            .get(process.reference().clone())
+            .output()
+            .capabilities()
+            .subscribe
+            .initial
+            .is_none()
+    );
     assert_eq!(fixture.records.lock().unwrap().len(), 1);
     let (a, b) = futures::join!(first.subscribe(), second.subscribe());
     let mut a = a.unwrap();
     let mut b = b.unwrap();
+    assert_eq!(
+        a.capabilities().channels,
+        [OutputChannel::Stdout, OutputChannel::Stderr]
+    );
+    assert_eq!(
+        b.capabilities().channels,
+        [
+            OutputChannel::Stdout,
+            OutputChannel::Stderr,
+            OutputChannel::Terminal
+        ]
+    );
+    assert!(first.capabilities().subscribe.initial.is_none());
+    assert!(second.capabilities().subscribe.initial.is_none());
+    assert_eq!(process.capabilities(), control);
     assert!(matches!(
         a.events.next().await.unwrap().unwrap(),
         ProcessEvent::Output { .. }
@@ -809,6 +838,28 @@ async fn envd_clones_hand_off_start_once_without_prefetch_or_replacing_it_with_c
 }
 
 #[tokio::test]
+async fn envd_start_rejects_channels_outside_the_actual_spawn_mode() {
+    let fixture = Fixture::start().await;
+    for pty in [None, Some(PtySize { cols: 80, rows: 24 })] {
+        let process = fixture
+            .envd()
+            .processes()
+            .spawn(SpawnRequest {
+                command: Command::new("wrong-channel", Vec::<String>::new()),
+                stdin: false,
+                pty,
+            })
+            .await
+            .unwrap();
+        let mut subscription = process.output().subscribe().await.unwrap();
+        assert_eq!(
+            subscription.events.next().await.unwrap().unwrap_err().kind,
+            ErrorKind::Backend
+        );
+    }
+}
+
+#[tokio::test]
 async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     let fixture = Fixture::start().await;
     let envd = fixture.envd().processes();
@@ -823,27 +874,21 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
     assert_eq!(listed.pty, None);
     let unknown = envd.get(listed);
     let before = fixture.records.lock().unwrap().len();
-    assert!(envd.capabilities().stdin && envd.capabilities().close_stdin);
+    assert!(envd.capabilities().process.input.unwrap().close);
     let unknown_caps = unknown.capabilities();
-    assert!(!unknown_caps.stdin && !unknown_caps.close_stdin && !unknown_caps.binary_stdin);
-    assert!(!unknown_caps.pty && !unknown_caps.resize);
-    assert!(unknown_caps.kill && unknown_caps.list && unknown_caps.reconnect);
+    assert!(unknown_caps.input.is_none() && !unknown_caps.resize);
+    assert!(unknown_caps.kill.is_some() && unknown_caps.reconnect);
     let terminal_caps = spawned_handle.capabilities();
-    assert!(
-        terminal_caps.stdin
-            && terminal_caps.binary_stdin
-            && terminal_caps.pty
-            && terminal_caps.resize
-    );
-    assert!(!terminal_caps.close_stdin);
+    assert!(terminal_caps.resize);
+    assert!(!terminal_caps.input.unwrap().close);
     assert_eq!(
         envd.get(spawned_handle.reference().clone()).capabilities(),
         terminal_caps
     );
     let plain = envd.get(ProcessRef::new("envd", "42", Some(false)));
     let plain_caps = plain.capabilities();
-    assert!(plain_caps.stdin && plain_caps.close_stdin && plain_caps.binary_stdin);
-    assert!(!plain_caps.pty && !plain_caps.resize);
+    assert!(plain_caps.input.unwrap().close);
+    assert!(!plain_caps.resize);
     for error in [
         unknown.send_input(vec![1]).await.unwrap_err(),
         unknown.close_stdin().await.unwrap_err(),
@@ -897,8 +942,16 @@ async fn envd_pty_control_reconnect_and_capabilities_are_independent() {
             .kind,
         ErrorKind::Unsupported
     );
-    assert!(!unknown.output().capabilities().historical_output);
-    assert!(envd.capabilities().reconnect);
+    assert!(
+        !unknown
+            .output()
+            .capabilities()
+            .subscribe
+            .reconnect
+            .unwrap()
+            .historical_output
+    );
+    assert!(envd.capabilities().process.reconnect);
     let process = ProcessRef::new("envd", "42", Some(false));
     assert_eq!(
         envd.get(process.clone()).inspect().await.unwrap().state,

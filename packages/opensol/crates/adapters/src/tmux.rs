@@ -18,13 +18,15 @@
 //! A failed cd ends that native execution with status 125. Relative cwd is anchored once using
 //! `pwd -P` on the injected Connection target; no SDK-side task configuration is retained.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use opensol_core::{
-    Command, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus, ManagerInfo,
-    OutputCapabilities, OutputSubscription, ProcessEvent, ProcessInfo, ProcessManagerCapabilities,
-    ProcessOutcome, ProcessRef, ProcessState, PtySize, Result, SpawnRequest, TerminalCapabilities,
+    Command, CompletionKind, Connection, Error, ErrorKind, EventStream, ExecRequest, ExitStatus,
+    InputConstraints, InputContent, KillEffect, ManagerInfo, OutputCapabilities,
+    OutputSubscription, ProcessCapabilities, ProcessEvent, ProcessInfo, ProcessInputCapabilities,
+    ProcessManagerCapabilities, ProcessOutcome, ProcessRef, ProcessState, PtySize, Result,
+    SpawnMode, SpawnRequest, SubscriptionDelivery, SubscriptionSources, TerminalCapabilities,
     TerminalPage, TerminalScreen,
     raw::{OutputAccess, ProcessManagerAccess, SpawnedProcess, TerminalAccess},
 };
@@ -117,7 +119,52 @@ impl Tmux {
                 "invalid program, session prefix or request timeout",
             ));
         }
+        let capabilities = connection.capabilities();
+        if !capabilities.timeout || !capabilities.separate_stderr {
+            return Err(Error::unsupported("tmux", "configure_connection"));
+        }
         Ok(Self { connection, config })
+    }
+
+    /// One guarded command, encoded identically for capacity discovery and actual sending.
+    fn input_script(identity: &Identity, data: &[u8]) -> Vec<u8> {
+        let keys = data
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = Self::guard_command(
+            identity,
+            format!("send-keys -H -t {} {keys}", identity.pane),
+        );
+        (command
+            .iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ")
+            + "\n")
+            .into_bytes()
+    }
+
+    fn input_capabilities(&self, identity: Option<&Identity>) -> Option<ProcessInputCapabilities> {
+        let underlying = self.connection.capabilities().stdin?;
+        let mut max_bytes = MAX_INPUT_BYTES;
+        if let (Some(identity), Some(limit)) = (identity, underlying.max_bytes) {
+            // The script is NUL-free UTF-8 for either underlying content domain. Each extra
+            // task byte adds exactly one space and two hex digits, with no search or probing.
+            let one = Self::input_script(identity, &[0]).len();
+            if limit.get() < one {
+                return None;
+            }
+            max_bytes = max_bytes.min(1 + (limit.get() - one) / 3);
+        }
+        Some(ProcessInputCapabilities {
+            constraints: InputConstraints {
+                content: InputContent::Bytes,
+                max_bytes: NonZeroUsize::new(max_bytes),
+            },
+            close: false,
+        })
     }
 
     async fn run(&self, args: Vec<String>, operation: &str) -> Result<Vec<u8>> {
@@ -513,28 +560,46 @@ impl ProcessManagerAccess for Tmux {
         "tmux"
     }
     fn capabilities(&self) -> ProcessManagerCapabilities {
-        let stdin = self.connection.capabilities().stdin;
-        ProcessManagerCapabilities {
-            list: true,
-            restart: true,
-            kill: true,
-            remove: true,
-            stdin,
-            binary_stdin: stdin,
+        let input = self.input_capabilities(None);
+        let mut spawn_modes = vec![SpawnMode {
             pty: true,
-            resize: true,
-            detached: true,
-            reconnect: true,
-            ..Default::default()
+            stdin: false,
+        }];
+        if input.is_some() {
+            spawn_modes.push(SpawnMode {
+                pty: true,
+                stdin: true,
+            });
+        }
+        ProcessManagerCapabilities {
+            probe: true,
+            list: true,
+            spawn_modes,
+            process: ProcessCapabilities {
+                restart: true,
+                kill: Some(KillEffect::RemoveTask),
+                remove: true,
+                input,
+                resize: true,
+                detached: true,
+                reconnect: true,
+                completion: CompletionKind::NativeTask,
+                ..Default::default()
+            },
+            output: output_capabilities(),
+            terminal: terminal_capabilities(),
         }
     }
 
-    fn process_capabilities(&self, process: &ProcessRef) -> ProcessManagerCapabilities {
-        let mut capabilities = ProcessManagerAccess::capabilities(self);
-        let terminal = process.pty == Some(true) && self.identity(process, "capabilities").is_ok();
-        capabilities.stdin &= terminal;
-        capabilities.binary_stdin &= terminal;
-        capabilities.pty &= terminal;
+    fn process_capabilities(&self, process: &ProcessRef) -> ProcessCapabilities {
+        let mut capabilities = ProcessManagerAccess::capabilities(self).process;
+        let identity = self.identity(process, "capabilities").ok();
+        let terminal = process.pty == Some(true) && identity.is_some();
+        capabilities.input = if terminal {
+            self.input_capabilities(identity.as_ref())
+        } else {
+            None
+        };
         capabilities.resize &= terminal;
         capabilities
     }
@@ -777,41 +842,20 @@ impl ProcessManagerAccess for Tmux {
         Ok(())
     }
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
-        if data.len() > MAX_INPUT_BYTES {
-            return Err(Error::invalid(
-                "tmux",
-                "send_input",
-                "input exceeds 8192 bytes; split it explicitly",
-            ));
-        }
         let identity = self.identity(process, "send_input")?;
+        let input = self
+            .input_capabilities(Some(&identity))
+            .ok_or_else(|| Error::unsupported("tmux", "send_input"))?;
+        input.constraints.validate(&data, "tmux", "send_input")?;
         if data.is_empty() {
             self.pane(&identity, "send_input").await?;
         } else {
-            let keys = data
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let command = Self::guard_command(
-                &identity,
-                format!("send-keys -H -t {} {keys}", identity.pane),
-            );
             // The 3.5 native IPC argv frame cannot hold 8192 hex arguments. source-file's
             // stdin transport streams this one guarded native command without files/buffers
             // or retrying an uncertain send. Single quotes keep formats and IDs literal.
-            let source = command
-                .iter()
-                .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
-                .collect::<Vec<_>>()
-                .join(" ")
-                + "\n";
+            let source = Self::input_script(&identity, &data);
             let bytes = self
-                .execute(
-                    vec!["source-file".into(), "-".into()],
-                    source.into_bytes(),
-                    "send_input",
-                )
+                .execute(vec!["source-file".into(), "-".into()], source, "send_input")
                 .await?;
             Self::control_result(bytes, "send_input")?;
         }
@@ -837,17 +881,15 @@ impl OutputAccess for Tmux {
     fn backend(&self) -> &'static str {
         "tmux"
     }
-    fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities {
-            subscribe: true,
-            ..Default::default()
-        }
+    fn capabilities(&self, _process: &ProcessRef) -> OutputCapabilities {
+        output_capabilities()
     }
     async fn subscribe(&self, process: &ProcessRef) -> Result<OutputSubscription> {
         let identity = self.identity(process, "output")?;
         let pane = self.pane(&identity, "output").await?;
         Ok(OutputSubscription::new(
             process.clone(),
+            subscription_delivery(),
             self.subscription(identity, pane.execution),
         ))
     }
@@ -858,12 +900,8 @@ impl TerminalAccess for Tmux {
     fn backend(&self) -> &'static str {
         "tmux"
     }
-    fn capabilities(&self) -> TerminalCapabilities {
-        TerminalCapabilities {
-            tail: true,
-            screen: true,
-            ..Default::default()
-        }
+    fn capabilities(&self, _process: &ProcessRef) -> TerminalCapabilities {
+        terminal_capabilities()
     }
     async fn tail(&self, process: &ProcessRef, lines: usize) -> Result<TerminalPage> {
         let (text, _, history) = self.capture(process, Some(lines)).await?;
@@ -882,6 +920,33 @@ impl TerminalAccess for Tmux {
             rows: size.rows,
             lines,
         })
+    }
+}
+
+fn subscription_delivery() -> SubscriptionDelivery {
+    SubscriptionDelivery {
+        channels: vec![],
+        historical_output: false,
+        streaming_output: false,
+        completion: CompletionKind::NativeTask,
+    }
+}
+
+fn output_capabilities() -> OutputCapabilities {
+    OutputCapabilities {
+        subscribe: SubscriptionSources {
+            initial: None,
+            reconnect: Some(subscription_delivery()),
+        },
+        ..Default::default()
+    }
+}
+
+fn terminal_capabilities() -> TerminalCapabilities {
+    TerminalCapabilities {
+        read: false,
+        tail: true,
+        screen: true,
     }
 }
 

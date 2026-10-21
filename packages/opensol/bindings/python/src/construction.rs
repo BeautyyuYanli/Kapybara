@@ -112,6 +112,9 @@ struct PyBackend {
 
 #[pymethods]
 impl PyBackend {
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities(py, self.inner.capabilities())
+    }
     #[getter]
     fn backend(&self) -> &'static str {
         self.inner.backend()
@@ -140,6 +143,11 @@ impl BackendSource for Source {
             Self::Open(backend) => backend.resolve(api, options).await,
         }
     }
+}
+
+#[pyfunction]
+fn _config_capabilities<'py>(py: Python<'py>, value: &str) -> PyResult<Bound<'py, PyDict>> {
+    capabilities(py, config(value)?.capabilities())
 }
 
 #[pyfunction]
@@ -200,6 +208,7 @@ fn _new_processes(
 
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyBackend>()?;
+    module.add_function(wrap_pyfunction!(_config_capabilities, module)?)?;
     module.add_function(wrap_pyfunction!(_new_backend, module)?)?;
     module.add_function(wrap_pyfunction!(_new_sandboxes, module)?)?;
     module.add_function(wrap_pyfunction!(_new_connection, module)?)?;

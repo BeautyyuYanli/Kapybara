@@ -14,8 +14,25 @@ use opensol_core::{
     ProcessRef, Result, raw::ConnectionAccess,
 };
 
-#[derive(Clone, Default)]
-struct UnavailableConnection(Arc<AtomicUsize>);
+#[derive(Clone)]
+struct UnavailableConnection {
+    calls: Arc<AtomicUsize>,
+    capabilities: ConnectionCapabilities,
+}
+
+impl Default for UnavailableConnection {
+    fn default() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            capabilities: ConnectionCapabilities {
+                stdin: None,
+                timeout: true,
+                separate_stderr: true,
+                cancellation: opensol_core::ExecCancellation::NoTargetTerminationGuarantee,
+            },
+        }
+    }
+}
 
 #[async_trait]
 impl ConnectionAccess for UnavailableConnection {
@@ -23,14 +40,10 @@ impl ConnectionAccess for UnavailableConnection {
         "unavailable"
     }
     fn capabilities(&self) -> ConnectionCapabilities {
-        ConnectionCapabilities {
-            stdin: true,
-            timeout: true,
-            separate_stderr: true,
-        }
+        self.capabilities
     }
     async fn exec(&self, _request: ExecRequest) -> Result<ExecResult> {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Err(Error::new(
             ErrorKind::Transport,
             self.backend(),
@@ -48,8 +61,12 @@ async fn invalid_text_and_nul_are_unsupported_before_connection_io() {
     );
     for pty in [None, Some(false)] {
         let process = manager.get(ProcessRef::new("pueue", "1", pty));
-        assert!(process.capabilities().stdin);
-        assert!(!process.capabilities().pty && !process.capabilities().binary_stdin);
+        let input = process.capabilities().input.unwrap();
+        assert_eq!(
+            input.constraints.content,
+            opensol_core::InputContent::Utf8WithoutNul
+        );
+        assert!(!input.close);
         for data in [vec![0xff], b"text\0input".to_vec(), vec![0, 0xff]] {
             let error = process.send_input(data).await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::Unsupported);
@@ -59,12 +76,29 @@ async fn invalid_text_and_nul_are_unsupported_before_connection_io() {
             );
         }
     }
-    assert_eq!(connection.0.load(Ordering::SeqCst), 0);
+    assert_eq!(connection.calls.load(Ordering::SeqCst), 0);
     let error = manager
         .get(ProcessRef::new("pueue", "1", None))
         .send_input(b"valid text".to_vec())
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Transport);
-    assert_eq!(connection.0.load(Ordering::SeqCst), 1);
+    assert_eq!(connection.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn required_connection_contracts_are_checked_without_io() {
+    for (timeout, separate_stderr) in [(false, true), (true, false)] {
+        let mut connection = UnavailableConnection::default();
+        connection.capabilities.timeout = timeout;
+        connection.capabilities.separate_stderr = separate_stderr;
+        assert!(
+            matches!(Pueue::new(Connection::new(connection.clone()), PueueConfig::default()), Err(error) if error.kind == ErrorKind::Unsupported)
+        );
+        #[cfg(feature = "tmux")]
+        assert!(
+            matches!(opensol_adapters::tmux::Tmux::new(Connection::new(connection.clone()), opensol_adapters::tmux::TmuxConfig::new("/tmp/unopened")), Err(error) if error.kind == ErrorKind::Unsupported)
+        );
+        assert_eq!(connection.calls.load(Ordering::SeqCst), 0);
+    }
 }

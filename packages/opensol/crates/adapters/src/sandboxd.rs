@@ -67,9 +67,10 @@ impl ConnectionAccess for Sandboxd {
     }
     fn capabilities(&self) -> ConnectionCapabilities {
         ConnectionCapabilities {
-            stdin: false,
+            stdin: None,
             timeout: true,
             separate_stderr: true,
+            cancellation: opensol_core::ExecCancellation::NoTargetTerminationGuarantee,
         }
     }
 

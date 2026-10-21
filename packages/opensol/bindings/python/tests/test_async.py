@@ -176,7 +176,7 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_reads_timeouts_and_input_keep_task_and_subscription(self):
         manager = self.manager
-        self.assertEqual(set(manager.capabilities()["supported_signals"]), {2, 9, 15})
+        self.assertEqual(manager.capabilities()["process"]["supported_signals"], [2, 9, 15])
         process = await manager.spawn(
             ["/bin/sh", "-c", "read -r value; printf '%s' \"$value\"; exit 7"], stdin=True,
         )
@@ -292,7 +292,7 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         output, terminal = process.output, process.terminal
         self.assertIsInstance(output, sdk.AsyncOutput)
         self.assertIsInstance(terminal, sdk.AsyncTerminal)
-        self.assertTrue(output.capabilities()["streaming_output"])
+        self.assertTrue(output.capabilities()["subscribe"]["initial"]["streaming_output"])
         self.assertFalse(terminal.capabilities()["read"])
         for coroutine in (output.subscribe(), output.read(), output.tail(), terminal.read(),
                           terminal.tail(), terminal.screen()):
@@ -302,15 +302,29 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.assertEqual([method for method, _ in self.records], ["Start"])
+        sources = output.capabilities()["subscribe"]
+        self.assertEqual(sources["initial"]["channels"], ["stdout", "stderr"])
+        self.assertEqual(sources["reconnect"]["channels"], ["stdout", "stderr", "terminal"])
+        self.assertIsNone(self.processes.get(process.ref).output.capabilities()["subscribe"]["initial"])
+        control = process.capabilities()
         initial = await process.output.subscribe()
+        self.assertEqual(initial.capabilities(), sources["initial"])
+        self.assertIsNone(output.capabilities()["subscribe"]["initial"])
+        self.assertEqual(output.capabilities()["subscribe"]["reconnect"], sources["reconnect"])
+        self.assertEqual(process.capabilities(), control)
         self.assertFalse(hasattr(initial, "ref"))
         await process.close_stdin()
         self.assertEqual(((await collect(initial))[1]).exit.code, 7)
+        await initial.aclose()
+        self.assertEqual(initial.capabilities(), sources["initial"])
 
     async def test_initial_stream_and_additional_subscription_use_start_and_connect(self):
         manager = self.processes
         process = await manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
+        sources = process.output.capabilities()["subscribe"]
+        self.assertEqual(sources["initial"]["channels"], ["terminal"])
         initial = await process.output.subscribe()
+        self.assertEqual(initial.capabilities(), sources["initial"])
 
         self.assertEqual((await initial.next_event(timeout=2)).data, b"\x00\xffterminal")
         self.assertEqual([method for method, _ in self.records], ["Start"])
@@ -318,6 +332,10 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         offline = (sdk.AsyncProcessManager(sdk.EnvdConfig("http://127.0.0.1:1"))).get(restored)
         self.assertIsInstance(offline, sdk.AsyncProcess)
         replay = await manager.get(restored).output.subscribe()
+        self.assertEqual(replay.capabilities(), sources["reconnect"])
+        copy = replay.capabilities()
+        copy["channels"].clear()
+        self.assertEqual(replay.capabilities()["channels"], ["stdout", "stderr", "terminal"])
         self.assertFalse(hasattr(replay, "ref"))
         self.assertEqual((await replay.next_event(timeout=2)).data, b"\x00\xffterminal")
         await process.send_input(b"\x00\xffreconnected\x04")
@@ -331,6 +349,8 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([message.process.pid for message in connected], [int(restored.id)])
         await initial.aclose()
         await replay.aclose()
+        self.assertEqual(initial.capabilities(), sources["initial"])
+        self.assertEqual(replay.capabilities(), sources["reconnect"])
 
     async def test_unexpected_end_is_transport_error_and_never_success(self):
         process = await self.processes.spawn(["disconnect"])
@@ -346,15 +366,13 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_binary_stdin_exec_and_pty_capabilities(self):
         manager = self.processes
-        self.assertEqual(set(manager.capabilities()["supported_signals"]), {9, 15})
+        self.assertEqual(manager.capabilities()["process"]["supported_signals"], [9, 15])
         data = b"\x00\xff\x80input"
         result = await self.connection.exec(["stdin-program"], stdin=data, timeout=3)
         self.assertEqual((result.stdout, result.exit_code), (data, 7))
         plain_process = await manager.spawn(["stdin-program"], stdin=True)
         self.assertEqual(manager.get(plain_process.ref).capabilities(), plain_process.capabilities())
-        self.assertTrue(plain_process.capabilities()["stdin"])
-        self.assertTrue(plain_process.capabilities()["close_stdin"])
-        self.assertFalse(plain_process.capabilities()["pty"])
+        self.assertEqual(plain_process.capabilities()["input"], dict(constraints=dict(content="bytes", max_bytes=None), close=True))
         self.assertFalse(plain_process.capabilities()["resize"])
         plain = await plain_process.output.subscribe()
         await plain_process.send_input(data)
@@ -371,11 +389,11 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(listed.pty)
         before = len(self.records)
         unknown = manager.get(listed)
-        for capability in ("stdin", "binary_stdin", "close_stdin", "pty", "resize"):
-            self.assertFalse(unknown.capabilities()[capability])
-        self.assertTrue(process.capabilities()["stdin"])
+        self.assertIsNone(unknown.capabilities()["input"])
+        self.assertFalse(unknown.capabilities()["resize"])
+        self.assertIsNotNone(process.capabilities()["input"])
         self.assertTrue(process.capabilities()["resize"])
-        self.assertFalse(process.capabilities()["close_stdin"])
+        self.assertFalse(process.capabilities()["input"]["close"])
         for operation in (lambda: unknown.resize(80, 24),
                           lambda: unknown.send_input(b"input"), unknown.close_stdin):
             with self.assertRaises(sdk.UnsupportedError):
@@ -415,7 +433,7 @@ class AsyncDockerTests(unittest.IsolatedAsyncioTestCase):
     async def test_lifecycle_explicit_delete_and_shared_dto(self):
         backend = sdk.AsyncBackend(sdk.DockerConfig())
         lifecycle = sdk.AsyncSandboxManager(backend)
-        self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
+        self.assertFalse(lifecycle.capabilities()["sandbox"]["stop"]["preserves_memory"])
         resource = await lifecycle.create(sdk.DockerSandboxSpec(os.environ["OPENSOL_TEST_IMAGE"],
                                               command=["sleep", "infinity"], labels={"project": "async-python"}))
         self.assertIsInstance(resource, sdk.AsyncSandbox)
@@ -490,7 +508,7 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
         try:
             backend = sdk.AsyncBackend(sdk.E2bConfig("secret", api_endpoint=endpoint, envd_endpoint=endpoint))
             lifecycle = sdk.AsyncSandboxManager(backend)
-            self.assertTrue(lifecycle.capabilities()["stop_preserves_memory"])
+            self.assertTrue(lifecycle.capabilities()["sandbox"]["stop"]["preserves_memory"])
             creation = lifecycle.create(sdk.E2bSandboxSpec())
             self.addCleanup(creation.close)
             await asyncio.sleep(.03)
@@ -543,7 +561,7 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
             synchronous = sdk.Backend(sdk.OpenShellConfig(endpoint))
             self.assertIsInstance(sdk.SandboxManager(synchronous), sdk.SandboxManager)
             self.assertIsInstance(sdk.Connection(synchronous, target=sdk.SandboxRef("openshell", "sandbox")), sdk.Connection)
-            self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
+            self.assertFalse(lifecycle.capabilities()["sandbox"]["stop"]["preserves_memory"])
             with self.assertRaises(sdk.UnsupportedError):
                 await lifecycle.get(sdk.SandboxRef("openshell", "sandbox")).fork()
             with self.assertRaises(sdk.UnsupportedError):

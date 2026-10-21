@@ -5,6 +5,8 @@
 //! A transport failure or cancelled call does not imply that a remote side effect was undone.
 
 mod backend;
+mod capabilities;
+pub use capabilities::*;
 pub mod raw;
 pub use backend::{
     Api, Backend, BackendAccess, BackendConfig, BackendSource, OpenOptions, SandboxSpec,
@@ -138,32 +140,6 @@ pub struct CreateOptions {
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct SandboxManagerCapabilities {
-    pub list: bool,
-    pub create: bool,
-    pub inspect: bool,
-    pub start: bool,
-    pub stop: bool,
-    /// A successful native stop preserves process memory for a later start.
-    pub stop_preserves_memory: bool,
-    pub delete: bool,
-    pub fork: bool,
-}
-
-impl SandboxManagerCapabilities {
-    pub const BASIC: Self = Self {
-        list: true,
-        create: true,
-        inspect: true,
-        start: true,
-        stop: true,
-        stop_preserves_memory: false,
-        delete: true,
-        fork: false,
-    };
-}
-
 /// Creates, discovers and locally binds native sandboxes within the adapter's configured scope.
 /// Clones share the adapter; dropping a client never deletes its sandboxes.
 #[derive(Clone)]
@@ -227,27 +203,27 @@ impl SandboxManager {
     }
     async fn inspect(&self, resource: &SandboxRef) -> Result<SandboxInfo> {
         resource.validate(self.backend(), "inspect")?;
-        self.require(self.capabilities().inspect, "inspect")?;
+        self.require(self.capabilities().sandbox.inspect, "inspect")?;
         self.access.inspect(resource).await
     }
     async fn start(&self, resource: &SandboxRef) -> Result<()> {
         resource.validate(self.backend(), "start")?;
-        self.require(self.capabilities().start, "start")?;
+        self.require(self.capabilities().sandbox.start, "start")?;
         self.access.start(resource).await
     }
     async fn stop(&self, resource: &SandboxRef) -> Result<()> {
         resource.validate(self.backend(), "stop")?;
-        self.require(self.capabilities().stop, "stop")?;
+        self.require(self.capabilities().sandbox.stop.is_some(), "stop")?;
         self.access.stop(resource).await
     }
     async fn delete(&self, resource: &SandboxRef) -> Result<()> {
         resource.validate(self.backend(), "delete")?;
-        self.require(self.capabilities().delete, "delete")?;
+        self.require(self.capabilities().sandbox.delete, "delete")?;
         self.access.delete(resource).await
     }
     async fn fork(&self, resource: &SandboxRef) -> Result<Sandbox> {
         resource.validate(self.backend(), "fork")?;
-        self.require(self.capabilities().fork, "fork")?;
+        self.require(self.capabilities().sandbox.fork, "fork")?;
         self.access
             .fork(resource)
             .await
@@ -282,6 +258,9 @@ impl Sandbox {
     }
     pub fn reference(&self) -> &SandboxRef {
         &self.reference
+    }
+    pub fn capabilities(&self) -> SandboxCapabilities {
+        self.manager.capabilities().sandbox
     }
     pub async fn inspect(&self) -> Result<SandboxInfo> {
         self.manager.inspect(&self.reference).await
@@ -441,13 +420,6 @@ pub struct ExecResult {
     pub exit: ExitStatus,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ConnectionCapabilities {
-    pub stdin: bool,
-    pub timeout: bool,
-    pub separate_stderr: bool,
-}
-
 /// Completed-command client bound to one execution target. Calls are never retried implicitly.
 #[derive(Clone)]
 pub struct Connection {
@@ -483,11 +455,12 @@ impl Connection {
     pub async fn exec(&self, request: ExecRequest) -> Result<ExecResult> {
         request.validate(self.backend())?;
         let capabilities = self.capabilities();
-        require(
-            request.stdin.is_empty() || capabilities.stdin,
-            self.backend(),
-            "exec",
-        )?;
+        if !request.stdin.is_empty() {
+            let constraints = capabilities
+                .stdin
+                .ok_or_else(|| Error::unsupported(self.backend(), "exec"))?;
+            constraints.validate(&request.stdin, self.backend(), "exec")?;
+        }
         require(
             request.timeout.is_none() || capabilities.timeout,
             self.backend(),
@@ -603,7 +576,7 @@ pub struct ProcessInfo {
     pub native_state: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputChannel {
     Stdout,
@@ -693,23 +666,6 @@ pub fn validate_terminal_lines(lines: usize, backend: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct OutputCapabilities {
-    pub read: bool,
-    pub tail: bool,
-    pub subscribe: bool,
-    /// Subscription delivery only; independent of paginated native logs.
-    pub historical_output: bool,
-    pub streaming_output: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct TerminalCapabilities {
-    pub read: bool,
-    pub tail: bool,
-    pub screen: bool,
-}
-
 /// Locally bound raw byte view. It neither collects output nor owns a task's lifetime.
 #[derive(Clone)]
 pub struct Output {
@@ -732,12 +688,15 @@ impl Output {
         self.access.backend()
     }
     pub fn capabilities(&self) -> OutputCapabilities {
-        let mut capabilities = self.access.capabilities();
-        capabilities.subscribe |= self
+        let mut capabilities = self.access.capabilities(&self.reference).normalized();
+        // Only the shared slot can declare an available initial stream; raw view descriptions
+        // describe reconnect. Taking the stream changes all related views atomically.
+        capabilities.subscribe.initial = self
             .initial_subscription
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_some();
+            .as_ref()
+            .map(|subscription| subscription.capabilities().clone());
         capabilities
     }
     /// Reads immediately. An absent cursor selects the head (forward) or observed tail (backward).
@@ -774,15 +733,21 @@ impl Output {
         if let Some(subscription) = initial {
             return Ok(subscription.retain(self.owner.clone()));
         }
-        require(
-            self.capabilities().subscribe,
-            self.backend(),
-            "subscribe_output",
-        )?;
-        self.access
-            .subscribe(&self.reference)
-            .await
-            .map(|subscription| subscription.retain(self.owner.clone()))
+        let delivery = self
+            .capabilities()
+            .subscribe
+            .reconnect
+            .ok_or_else(|| Error::unsupported(self.backend(), "subscribe_output"))?;
+        let subscription = self.access.subscribe(&self.reference).await?;
+        if !delivery.permits(subscription.capabilities()) {
+            return Err(Error::new(
+                ErrorKind::Backend,
+                self.backend(),
+                "subscribe_output",
+                "subscription contradicts its declared source",
+            ));
+        }
+        Ok(subscription.retain(self.owner.clone()))
     }
 }
 
@@ -806,7 +771,7 @@ impl Terminal {
         self.access.backend()
     }
     pub fn capabilities(&self) -> TerminalCapabilities {
-        self.access.capabilities()
+        self.access.capabilities(&self.reference)
     }
     pub async fn read(
         &self,
@@ -843,7 +808,7 @@ impl raw::OutputAccess for UnavailableView {
     fn backend(&self) -> &'static str {
         self.0
     }
-    fn capabilities(&self) -> OutputCapabilities {
+    fn capabilities(&self, _process: &ProcessRef) -> OutputCapabilities {
         OutputCapabilities::default()
     }
 }
@@ -851,7 +816,7 @@ impl raw::TerminalAccess for UnavailableView {
     fn backend(&self) -> &'static str {
         self.0
     }
-    fn capabilities(&self) -> TerminalCapabilities {
+    fn capabilities(&self, _process: &ProcessRef) -> TerminalCapabilities {
         TerminalCapabilities::default()
     }
 }
@@ -878,13 +843,22 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProcessEvent>> + Send + 
 /// Owns a native output subscription, not the process lifetime. Dropping it does not delete resources.
 pub struct OutputSubscription {
     reference: ProcessRef,
+    delivery: SubscriptionDelivery,
     pub events: EventStream,
 }
 
 impl OutputSubscription {
     /// Adapter constructor; the task identity is retained only for internal binding.
-    pub fn new(reference: ProcessRef, events: EventStream) -> Self {
-        Self { reference, events }
+    pub fn new(reference: ProcessRef, delivery: SubscriptionDelivery, events: EventStream) -> Self {
+        Self {
+            reference,
+            delivery: delivery.normalized(),
+            events,
+        }
+    }
+    /// The actual source contract, fixed even after completion or subscription closure.
+    pub fn capabilities(&self) -> &SubscriptionDelivery {
+        &self.delivery
     }
     pub fn backend(&self) -> &str {
         &self.reference.backend
@@ -901,33 +875,19 @@ impl OutputSubscription {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct ProcessManagerCapabilities {
-    pub list: bool,
-    pub pause: bool,
-    pub start: bool,
-    pub restart: bool,
-    pub kill: bool,
-    pub remove: bool,
-    pub stdin: bool,
-    pub close_stdin: bool,
-    /// True guarantees arbitrary bytes; false leaves native payload restrictions to the adapter.
-    pub binary_stdin: bool,
-    pub pty: bool,
-    pub resize: bool,
-    /// Exact portable signals accepted by this instance's native protocol.
-    pub supported_signals: &'static [Signal],
-    pub detached: bool,
-    pub reconnect: bool,
-    pub daemon_restart_recovery: bool,
-}
-
 /// Portable signals. Public clients check the adapter's declared supported set before dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(into = "i32")]
 pub enum Signal {
     Interrupt,
     Terminate,
     Kill,
+}
+
+impl From<Signal> for i32 {
+    fn from(signal: Signal) -> Self {
+        signal.number()
+    }
 }
 
 impl Signal {
@@ -976,13 +936,14 @@ impl ProcessManager {
     }
     /// Configured backend upper bound, not a guarantee for every discovered ProcessRef.
     pub fn capabilities(&self) -> ProcessManagerCapabilities {
-        self.access.capabilities()
+        self.access.capabilities().normalized()
     }
     /// Bind a reference locally. Subsequent operations check identity, existence and permissions.
     pub fn get(&self, reference: ProcessRef) -> Process {
         Process::new(self.clone(), reference)
     }
     pub async fn probe(&self) -> Result<ManagerInfo> {
+        self.require(self.capabilities().probe, "probe")?;
         self.access.probe().await
     }
     pub async fn list(&self) -> Result<Vec<ProcessInfo>> {
@@ -993,9 +954,31 @@ impl ProcessManager {
     pub async fn spawn(&self, request: SpawnRequest) -> Result<Process> {
         request.validate(self.backend())?;
         let capabilities = self.capabilities();
-        self.require(!request.stdin || capabilities.stdin, "spawn")?;
-        self.require(request.pty.is_none() || capabilities.pty, "spawn")?;
+        self.require(
+            capabilities.spawn_modes.contains(&SpawnMode {
+                pty: request.pty.is_some(),
+                stdin: request.stdin,
+            }),
+            "spawn",
+        )?;
         let spawned = self.access.spawn(request).await?;
+        if let Some(subscription) = &spawned.initial_subscription {
+            let allowed = !self.access.process_capabilities(&spawned.reference).restart
+                && capabilities
+                    .output
+                    .subscribe
+                    .initial
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.permits(subscription.capabilities()));
+            if !allowed {
+                return Err(Error::new(
+                    ErrorKind::Backend,
+                    self.backend(),
+                    "spawn",
+                    "initial subscription contradicts manager capabilities",
+                ));
+            }
+        }
         Ok(Process {
             manager: self.clone(),
             reference: spawned.reference,
@@ -1032,7 +1015,10 @@ impl ProcessManager {
     }
     async fn kill(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "kill")?;
-        self.require(self.access.process_capabilities(process).kill, "kill")?;
+        self.require(
+            self.access.process_capabilities(process).kill.is_some(),
+            "kill",
+        )?;
         self.access.kill(process).await
     }
     async fn remove(&self, process: &ProcessRef) -> Result<()> {
@@ -1043,13 +1029,21 @@ impl ProcessManager {
     async fn send_input(&self, process: &ProcessRef, data: Vec<u8>) -> Result<()> {
         process.validate(self.backend(), "send_input")?;
         let capabilities = self.access.process_capabilities(process);
-        self.require(capabilities.stdin, "send_input")?;
+        let input = capabilities
+            .input
+            .ok_or_else(|| Error::unsupported(self.backend(), "send_input"))?;
+        input
+            .constraints
+            .validate(&data, self.backend(), "send_input")?;
         self.access.send_input(process, data).await
     }
     async fn close_stdin(&self, process: &ProcessRef) -> Result<()> {
         process.validate(self.backend(), "close_stdin")?;
         let capabilities = self.access.process_capabilities(process);
-        self.require(capabilities.close_stdin, "close_stdin")?;
+        self.require(
+            capabilities.input.is_some_and(|input| input.close),
+            "close_stdin",
+        )?;
         self.access.close_stdin(process).await
     }
     async fn signal(&self, process: &ProcessRef, signal: Signal) -> Result<()> {
@@ -1106,8 +1100,11 @@ impl Process {
     }
     /// Local mode-aware subset of the manager's capabilities, without probing native state.
     /// Support does not promise existence, permission, a running task or an open stdin channel.
-    pub fn capabilities(&self) -> ProcessManagerCapabilities {
-        self.manager.access.process_capabilities(&self.reference)
+    pub fn capabilities(&self) -> ProcessCapabilities {
+        self.manager
+            .access
+            .process_capabilities(&self.reference)
+            .normalized()
     }
     pub async fn inspect(&self) -> Result<ProcessInfo> {
         self.manager.status(&self.reference).await

@@ -9,6 +9,62 @@ import opensol as sdk
 
 
 class DataTests(unittest.TestCase):
+    def test_backend_capabilities_describe_bindings_without_opening_clients(self):
+        cases = [
+            (sdk.LocalConfig(), (None, "forbidden", None, "forbidden")),
+            (sdk.SshConfig("unreachable", identity_file="/missing/key"), (None, "forbidden", None, "forbidden")),
+            (sdk.DockerConfig(), ("forbidden", "required", None, "forbidden")),
+            (sdk.E2bConfig("unused"), ("forbidden", "required", "required", "forbidden")),
+            (sdk.AgentSandboxConfig(kubeconfig="/missing/config"), ("forbidden", None, None, "forbidden")),
+            (sdk.OpenShellConfig("https://unreachable", ca_certificate="not-a-certificate"), ("forbidden", "required", None, "forbidden")),
+            (sdk.EnvdConfig("http://127.0.0.1:1"), (None, "forbidden", "forbidden", "forbidden")),
+            (sdk.SandboxdConfig("http://127.0.0.1:1"), (None, "forbidden", None, "forbidden")),
+            (sdk.PueueConfig(config_file="/missing/config"), (None, None, "forbidden", "required")),
+            (sdk.TmuxConfig("/missing/socket"), (None, None, "forbidden", "required")),
+        ]
+        for config, expected in cases:
+            with self.subTest(backend=config.backend):
+                caps: sdk.BackendCapabilities = config.capabilities()
+                self.assertEqual(caps, dict(zip(("sandboxes", "connection", "processes", "connection_dependency"), expected)))
+                caps["processes"] = None
+                self.assertEqual(config.capabilities()["processes"], expected[2])
+
+    def test_nested_capabilities_are_local_independent_and_shared_by_sync_async_views(self):
+        config = sdk.E2bConfig("unused", api_endpoint="http://127.0.0.1:1")
+        backend = sdk.AsyncBackend(config)
+        self.assertEqual(backend.capabilities(), config.capabilities())
+        self.assertEqual(backend.to_backend().capabilities(), config.capabilities())
+        manager = sdk.AsyncProcessManager(backend, target=sdk.SandboxRef("e2b", "saved"))
+        upper: sdk.ProcessManagerCapabilities = manager.capabilities()
+        self.assertEqual(upper["spawn_modes"], [dict(pty=False, stdin=False), dict(pty=False, stdin=True),
+                                               dict(pty=True, stdin=False), dict(pty=True, stdin=True)])
+        self.assertEqual(upper["process"]["supported_signals"], [9, 15])
+        self.assertEqual(upper["process"]["kill"], "request_termination")
+        self.assertEqual(upper["process"]["completion"], "os_exit")
+        upper["process"]["supported_signals"].clear()
+        upper["spawn_modes"].clear()
+        upper["output"]["subscribe"]["reconnect"]["channels"].clear()
+        self.assertEqual(manager.capabilities(), manager.to_process_manager().capabilities())
+        self.assertEqual(manager.capabilities()["process"]["supported_signals"], [9, 15])
+        process = manager.get(sdk.ProcessRef("envd", "42"))
+        control: sdk.ProcessCapabilities = process.capabilities()
+        self.assertIsNone(control["input"])
+        self.assertNotIn("list", control)
+        self.assertNotIn("output", control)
+        self.assertIsNone(process.output.capabilities()["subscribe"]["initial"])
+        self.assertEqual(process.output.capabilities()["subscribe"]["reconnect"]["channels"], ["stdout", "stderr", "terminal"])
+        lifecycle = sdk.AsyncSandboxManager(backend)
+        sandbox = lifecycle.get(sdk.SandboxRef("e2b", "saved"))
+        self.assertEqual(sandbox.capabilities(), lifecycle.capabilities()["sandbox"])
+        self.assertEqual(sandbox.capabilities()["stop"], dict(preserves_memory=True))
+        self.assertEqual(sandbox.capabilities(), lifecycle.to_sandbox_manager().get(sandbox.ref).capabilities())
+        local = sdk.Connection(sdk.LocalConfig()).capabilities()
+        self.assertEqual(local["stdin"], dict(content="bytes", max_bytes=None))
+        self.assertEqual(local["cancellation"], "request_target_termination")
+        ssh = sdk.Connection(sdk.SshConfig("unreachable")).capabilities()
+        self.assertEqual(ssh["cancellation"], "no_target_termination_guarantee")
+        self.assertIsNone(sdk.Connection(sdk.SandboxdConfig("http://127.0.0.1:1")).capabilities()["stdin"])
+
     def test_configuration_and_spec_serialization_are_independent_of_runtime_handles(self):
         configs = [sdk.LocalConfig(), sdk.SshConfig("unreachable"), sdk.DockerConfig(),
                    sdk.E2bConfig("api-secret"), sdk.EnvdConfig("http://127.0.0.1:1", access_token="envd-secret"),

@@ -30,19 +30,25 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         missing_socket = str(Path(self.directory.name) / "never-started.sock")
         missing = sdk.ProcessManager(sdk.TmuxConfig(socket_path=missing_socket), connection=sdk.Connection(sdk.LocalConfig()))
         capabilities = missing.capabilities()
-        for name in ("list", "restart", "kill", "remove", "stdin",
-                     "binary_stdin", "pty", "resize", "detached", "reconnect"):
-            self.assertTrue(capabilities[name], name)
-        for name in ("daemon_restart_recovery", "pause", "start", "close_stdin"):
-            self.assertFalse(capabilities[name], name)
-        self.assertEqual(capabilities["supported_signals"], [])
+        self.assertTrue(capabilities["probe"] and capabilities["list"])
+        self.assertEqual(capabilities["spawn_modes"], [dict(pty=True, stdin=False), dict(pty=True, stdin=True)])
+        control = capabilities["process"]
+        for name in ("restart", "remove", "resize", "detached", "reconnect"):
+            self.assertTrue(control[name], name)
+        for name in ("daemon_restart_recovery", "pause", "start"):
+            self.assertFalse(control[name], name)
+        self.assertEqual(control["kill"], "remove_task")
+        self.assertEqual(control["completion"], "native_task")
+        self.assertEqual(control["input"], dict(constraints=dict(content="bytes", max_bytes=8192), close=False))
+        self.assertEqual(control["supported_signals"], [])
         bound = missing.get(sdk.ProcessRef("tmux", "opaque-unchecked"))
-        for capability in ("stdin", "binary_stdin", "pty", "resize"):
-            self.assertFalse(bound.capabilities()[capability])
+        self.assertIsNone(bound.capabilities()["input"])
+        self.assertFalse(bound.capabilities()["resize"])
         with self.assertRaises(sdk.UnsupportedError):
             bound.send_input(b"input")
-        self.assertEqual(bound.output.capabilities(), dict(read=False, tail=False, subscribe=True,
-                                                         historical_output=False, streaming_output=False))
+        self.assertEqual(bound.output.capabilities(), dict(read=False, tail=False, read_channels=[],
+                         subscribe=dict(initial=None, reconnect=dict(channels=[], historical_output=False,
+                                        streaming_output=False, completion="native_task"))))
         self.assertEqual(bound.terminal.capabilities(), dict(read=False, tail=True, screen=True))
         self.assertEqual(bound.ref.id, "opaque-unchecked")
         with self.assertRaises(sdk.UnsupportedError):
@@ -76,10 +82,11 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         handle = process.output.subscribe()
 
         self.assertIs(process.ref.pty, True)
-        self.assertEqual(process.capabilities(), self.manager.capabilities())
+        self.assertEqual(process.capabilities(), self.manager.capabilities()["process"])
         unknown_mode = self.manager.get(sdk.ProcessRef("tmux", process.ref.id))
-        self.assertFalse(unknown_mode.capabilities()["stdin"])
+        self.assertIsNone(unknown_mode.capabilities()["input"])
         self.assertFalse(unknown_mode.capabilities()["resize"])
+        self.assertEqual(handle.capabilities(), process.output.capabilities()["subscribe"]["reconnect"])
         for _ in range(100):
             if "READY" in "\n".join(process.terminal.screen().lines):
                 break
