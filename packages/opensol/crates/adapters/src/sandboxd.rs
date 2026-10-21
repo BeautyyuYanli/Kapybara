@@ -40,6 +40,16 @@ pub struct Sandboxd {
 }
 
 impl Sandboxd {
+    /// Bind within a Tokio runtime without network I/O; Execute performs the handshake.
+    pub fn new(config: GrpcConfig) -> Result<Self> {
+        Ok(Self {
+            client: protocol::process_service_client::ProcessServiceClient::new(
+                config.bind("sandboxd")?,
+            ),
+            config,
+        })
+    }
+
     pub async fn connect(config: GrpcConfig) -> Result<Self> {
         Ok(Self {
             client: protocol::process_service_client::ProcessServiceClient::new(

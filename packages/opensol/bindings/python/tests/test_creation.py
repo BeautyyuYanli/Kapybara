@@ -1,13 +1,11 @@
 """Unified construction on the installed wheel, with local resources and fixed protocol data."""
 
-import asyncio
 import gc
 import inspect
 import os
 import unittest
 
 import opensol as sdk
-from opensol import aio
 
 
 class DataTests(unittest.TestCase):
@@ -29,7 +27,6 @@ class DataTests(unittest.TestCase):
                 self.assertEqual(base.from_json(value.to_json()), value)
                 self.assertEqual(type(value).from_dict(value.to_dict()), value)
                 self.assertFalse(inspect.isawaitable(value))
-                self.assertIs(getattr(aio, type(value).__name__), type(value))
         for value in configs:
             self.assertNotIn("-secret", repr(value))
         original = sdk.DockerSandboxSpec("image", labels={"project": "original"})
@@ -57,7 +54,7 @@ class DataTests(unittest.TestCase):
                 operation()
 
     def test_old_provider_factories_and_containers_are_absent(self):
-        for module in (sdk, aio):
+        for module in (sdk,):
             for name in ("local", "ssh", "docker", "docker_connection", "envd", "e2b",
                          "agent_sandbox", "pueue", "tmux", "sandboxd", "openshell",
                          "openshell_connection", "Docker", "E2b", "Envd", "OpenShell"):
@@ -65,38 +62,61 @@ class DataTests(unittest.TestCase):
 
 
 class ConstructionTests(unittest.TestCase):
+    def test_async_clients_and_conversions_need_neither_network_nor_running_loop(self):
+        backend = sdk.AsyncBackend(sdk.E2bConfig("key", api_endpoint="http://127.0.0.1:1"))
+        connection = sdk.AsyncConnection(backend, target=sdk.SandboxRef("e2b", "saved"))
+        processes = sdk.AsyncProcessManager(backend, target=sdk.SandboxRef("e2b", "saved"))
+        sandboxes = sdk.AsyncSandboxManager(backend)
+        for view, to_sync, to_async in (
+            (backend, "to_backend", "to_async_backend"),
+            (connection, "to_connection", "to_async_connection"),
+            (processes, "to_process_manager", "to_async_process_manager"),
+            (sandboxes, "to_sandbox_manager", "to_async_sandbox_manager"),
+        ):
+            blocking = getattr(view, to_sync)()
+            restored = getattr(blocking, to_async)()
+            self.assertEqual(restored.backend, view.backend)
+            self.assertFalse(inspect.isawaitable(view))
+        self.assertTrue(connection.capabilities()["stdin"])
+        self.assertIsInstance(processes.get(sdk.ProcessRef("envd", "42", False)), sdk.AsyncProcess)
+        self.assertIsInstance(sandboxes.get(sdk.SandboxRef("e2b", "saved")), sdk.AsyncSandbox)
+        for config, target in ((sdk.SandboxdConfig("http://127.0.0.1:1"), None),
+                               (sdk.OpenShellConfig("http://127.0.0.1:1"), sdk.SandboxRef("openshell", "saved"))):
+            client = sdk.AsyncConnection(config, target=target)
+            self.assertEqual(client.to_connection().backend, client.backend)
+
     def test_binding_errors_are_reported_before_native_connections(self):
         for config in (sdk.OpenShellConfig("http://127.0.0.1:1"),
                        sdk.E2bConfig("key", api_endpoint="http://127.0.0.1:1"), sdk.DockerConfig()):
             for target in (None, sdk.SandboxRef("other", "id"), sdk.SandboxRef(config.backend, "")):
                 with self.subTest(config=config, target=target), self.assertRaises(sdk.InvalidArgumentError):
-                    sdk.Connection.open(config, target=target)
+                    sdk.Connection(config, target=target)
         for config in (sdk.LocalConfig(), sdk.SshConfig("unreachable"), sdk.EnvdConfig("http://127.0.0.1:1"),
                        sdk.SandboxdConfig("http://127.0.0.1:1"), sdk.PueueConfig(), sdk.TmuxConfig("/tmp/x")):
             with self.subTest(config=config), self.assertRaises(sdk.UnsupportedError):
-                sdk.SandboxManager.open(config)
+                sdk.SandboxManager(config)
         for config in (sdk.PueueConfig(), sdk.TmuxConfig("/tmp/x")):
             with self.assertRaises(sdk.InvalidArgumentError):
-                sdk.Backend.open(config)
+                sdk.Backend(config)
             with self.assertRaises(sdk.InvalidArgumentError):
-                sdk.ProcessManager.open(config)
-        local = sdk.Connection.open(sdk.LocalConfig())
-        context = sdk.Backend.open(sdk.TmuxConfig("/tmp/opensol-never-created.sock"), connection=local)
-        manager = sdk.ProcessManager.open(context)
+                sdk.ProcessManager(config)
+        local = sdk.Connection(sdk.LocalConfig())
+        context = sdk.Backend(sdk.TmuxConfig("/tmp/opensol-never-created.sock"), connection=local)
+        manager = sdk.ProcessManager(context)
         self.assertTrue(manager.capabilities()["list"])
         with self.assertRaises(sdk.InvalidArgumentError):
-            sdk.ProcessManager.open(context, connection=local)
+            sdk.ProcessManager(context, connection=local)
         with self.assertRaises(sdk.InvalidArgumentError):
-            sdk.Backend.open(sdk.LocalConfig(), connection=local)
+            sdk.Backend(sdk.LocalConfig(), connection=local)
         with self.assertRaises(sdk.InvalidArgumentError):
-            sdk.Connection.open({}, target="id")
+            sdk.Connection({}, target="id")
         del context, local
         gc.collect()
         self.assertIsInstance(manager.get(sdk.ProcessRef("tmux", "saved", True)), sdk.Process)
 
     def test_docker_specs_are_complete_and_structured_host_config_reaches_engine(self):
-        context = sdk.Backend.open(sdk.DockerConfig())
-        manager = sdk.SandboxManager.open(context)
+        context = sdk.Backend(sdk.DockerConfig())
+        manager = sdk.SandboxManager(context)
         image = os.environ["OPENSOL_TEST_IMAGE"]
         resources = []
         try:
@@ -107,7 +127,7 @@ class ConstructionTests(unittest.TestCase):
                 resources.append(sandbox)
                 self.assertEqual(sandbox.inspect().state, "stopped")
                 sandbox.start()
-                connection = sdk.Connection.open(context, target=sandbox.ref)
+                connection = sdk.Connection(context, target=sandbox.ref)
                 self.assertEqual(connection.shell("printf '%s:%s' \"$SPEC\" \"$PWD\"").stdout,
                                  f"{index}:{directory}".encode())
                 self.assertEqual(connection.shell("touch /tmp/opensol-native-write").success, index == 1)
@@ -117,35 +137,31 @@ class ConstructionTests(unittest.TestCase):
             del context, manager
             gc.collect()
             self.assertEqual(resources[0].inspect().labels["case"], "0")
-            self.assertEqual(sdk.SandboxManager.open(sdk.DockerConfig()).get(saved).inspect().state, "running")
+            self.assertEqual(sdk.SandboxManager(sdk.DockerConfig()).get(saved).inspect().state, "running")
         finally:
             for sandbox in reversed(resources):
                 sandbox.delete()
 
 
 class AsyncConstructionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_opens_are_lazy_and_share_the_sync_context_and_connection_semantics(self):
-        for opening in (aio.Backend.open(sdk.LocalConfig()), aio.Connection.open(sdk.LocalConfig()),
-                        aio.SandboxManager.open(sdk.OpenShellConfig("http://127.0.0.1:1")),
-                        aio.ProcessManager.open(sdk.EnvdConfig("http://127.0.0.1:1"))):
-            self.assertTrue(inspect.iscoroutine(opening))
-            task = asyncio.create_task(opening)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-        context = await aio.Backend.open(sdk.LocalConfig())
-        connection = await asyncio.create_task(aio.Connection.open(context))
-        sync_connection = sdk.Connection.open(context)
+    async def test_views_share_the_context_and_connection_semantics(self):
+        context = sdk.AsyncBackend(sdk.LocalConfig())
+        connection = sdk.AsyncConnection(context)
+        sync_connection = connection.to_connection()
+        converted = sync_connection.to_async_connection()
+        direct = sdk.Connection(context.to_backend())
         del context
         gc.collect()
         self.assertEqual((await connection.exec(["printf", "async"])).stdout, b"async")
         self.assertEqual(sync_connection.exec(["printf", "sync"]).stdout, b"sync")
-        tmux = await aio.Backend.open(sdk.TmuxConfig("/tmp/opensol-never-created.sock"), connection=connection)
-        manager = await aio.ProcessManager.open(tmux)
+        self.assertEqual((await converted.exec(["printf", "converted"])).stdout, b"converted")
+        self.assertEqual(direct.exec(["printf", "direct"]).stdout, b"direct")
+        tmux = sdk.AsyncBackend(sdk.TmuxConfig("/tmp/opensol-never-created.sock"), connection=connection)
+        manager = sdk.ProcessManager(tmux.to_backend()).to_async_process_manager()
         with self.assertRaises(sdk.InvalidArgumentError):
-            await aio.ProcessManager.open(tmux, connection=connection)
+            sdk.AsyncProcessManager(tmux, connection=connection)
         with self.assertRaises(sdk.InvalidArgumentError):
-            await aio.Connection.open(sdk.OpenShellConfig("http://127.0.0.1:1"))
+            sdk.AsyncConnection(sdk.OpenShellConfig("http://127.0.0.1:1"))
         with self.assertRaises(sdk.UnsupportedError):
-            await aio.ProcessManager.open(sdk.DockerConfig())
+            sdk.AsyncProcessManager(sdk.DockerConfig())
         self.assertTrue(manager.capabilities()["list"])

@@ -1,31 +1,53 @@
-"""Blocking public clients. Native I/O releases the GIL and shares the Rust construction path."""
+"""Blocking views of the async clients. Native Rust I/O releases the GIL.
+
+Each wrapper retains its async view; conversion shares the context and performs
+no I/O. Blocking calls drive the same Rust core without running a Python loop.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
 from . import _native
+from ._async import AsyncBackend, AsyncConnection, AsyncProcessManager, AsyncSandboxManager
 from .config import BackendConfig, SandboxSpec, _RuntimeBackend, _RuntimeConnection
-from .config import _connection, _invalid, _source, _spec, _target
+from .config import _spec, _target
 
 
 class Backend(_RuntimeBackend):
     """Opened access context. Releasing it never deletes sandboxes or kills processes."""
 
-    @staticmethod
-    def open(config: BackendConfig, *, connection: Connection | None = None) -> Backend:
-        value = _source(config)
-        if not isinstance(value, str):
-            raise _invalid("Backend.open requires a BackendConfig")
-        return Backend(_native._open_backend(value, _connection(connection)))
+    def __init__(self, config: BackendConfig, *, connection: AsyncConnection | Connection | None = None) -> None:
+        self._async = AsyncBackend(config, connection=connection)
+        self._native = self._async._native
+
+    @classmethod
+    def _from_async(cls, view: AsyncBackend) -> Backend:
+        result = cls.__new__(cls)
+        result._async = view
+        result._native = view._native
+        return result
+
+    def to_async_backend(self) -> AsyncBackend:
+        return self._async
 
 
 class Connection(_RuntimeConnection):
     """Completed commands on a fixed target; no physical long-lived connection is promised."""
 
-    @staticmethod
-    def open(source: BackendConfig | Backend, *, target: _native.SandboxRef | None = None) -> Connection:
-        return Connection(_native._open_connection(_source(source), _target(target)))
+    def __init__(self, source: BackendConfig | AsyncBackend | Backend, *, target: _native.SandboxRef | None = None) -> None:
+        self._async = AsyncConnection(source, target=target)
+        self._native = self._async._native._blocking()
+
+    @classmethod
+    def _from_async(cls, view: AsyncConnection) -> Connection:
+        result = cls.__new__(cls)
+        result._async = view
+        result._native = view._native._blocking()
+        return result
+
+    def to_async_connection(self) -> AsyncConnection:
+        return self._async
 
     @property
     def backend(self) -> str:
@@ -48,12 +70,19 @@ class Connection(_RuntimeConnection):
 class SandboxManager:
     """Lifecycle API scoped to one Backend. Each create receives a complete native spec."""
 
-    def __init__(self, native: _native.SandboxManager) -> None:
-        self._native = native
+    def __init__(self, source: BackendConfig | AsyncBackend | Backend) -> None:
+        self._async = AsyncSandboxManager(source)
+        self._native = self._async._native._blocking()
 
-    @staticmethod
-    def open(source: BackendConfig | Backend) -> SandboxManager:
-        return SandboxManager(_native._open_sandboxes(_source(source)))
+    @classmethod
+    def _from_async(cls, view: AsyncSandboxManager) -> SandboxManager:
+        result = cls.__new__(cls)
+        result._async = view
+        result._native = view._native._blocking()
+        return result
+
+    def to_async_sandbox_manager(self) -> AsyncSandboxManager:
+        return self._async
 
     @property
     def backend(self) -> str:
@@ -75,13 +104,20 @@ class SandboxManager:
 class ProcessManager:
     """Native task API; Pueue/Tmux depend on an explicitly injected Connection."""
 
-    def __init__(self, native: _native.ProcessManager) -> None:
-        self._native = native
+    def __init__(self, source: BackendConfig | AsyncBackend | Backend, *, target: _native.SandboxRef | None = None,
+                 connection: AsyncConnection | Connection | None = None) -> None:
+        self._async = AsyncProcessManager(source, target=target, connection=connection)
+        self._native = self._async._native._blocking()
 
-    @staticmethod
-    def open(source: BackendConfig | Backend, *, target: _native.SandboxRef | None = None,
-             connection: Connection | None = None) -> ProcessManager:
-        return ProcessManager(_native._open_processes(_source(source), _target(target), _connection(connection)))
+    @classmethod
+    def _from_async(cls, view: AsyncProcessManager) -> ProcessManager:
+        result = cls.__new__(cls)
+        result._async = view
+        result._native = view._native._blocking()
+        return result
+
+    def to_async_process_manager(self) -> AsyncProcessManager:
+        return self._async
 
     @property
     def backend(self) -> str:

@@ -124,7 +124,8 @@ pub struct OpenShellSandboxManager {
 }
 
 impl OpenShellSandboxManager {
-    pub async fn connect(config: GrpcConfig, workspace: impl Into<String>) -> Result<Self> {
+    /// Bind within a Tokio runtime. Validation is local; the first RPC connects.
+    pub fn new(config: GrpcConfig, workspace: impl Into<String>) -> Result<Self> {
         let workspace = workspace.into();
         if workspace.is_empty() || workspace.contains('\0') {
             return Err(Error::invalid(
@@ -134,10 +135,16 @@ impl OpenShellSandboxManager {
             ));
         }
         Ok(Self {
-            client: OpenShellClient::new(config.connect("openshell").await?),
+            client: OpenShellClient::new(config.bind("openshell")?),
             config,
             workspace,
         })
+    }
+
+    pub async fn connect(config: GrpcConfig, workspace: impl Into<String>) -> Result<Self> {
+        let mut client = Self::new(config, workspace)?;
+        client.client = OpenShellClient::new(client.config.connect("openshell").await?);
+        Ok(client)
     }
 
     fn scope(&self) -> Option<WorkspaceSelector> {

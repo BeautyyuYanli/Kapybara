@@ -1,4 +1,4 @@
-"""Three independent business APIs, opened from typed config or a shared Backend."""
+"""Async-first sandbox, command and process clients with optional blocking views."""
 
 from ._native import (
     BackendError,
@@ -32,6 +32,10 @@ from ._native import (
     UnsupportedError,
 )
 
+from ._async import (
+    AsyncBackend, AsyncConnection, AsyncProcessManager, AsyncSandboxManager,
+    AsyncSandbox, AsyncProcess, AsyncOutput, AsyncTerminal, AsyncOutputSubscription,
+)
 from ._sync import Backend, Connection, ProcessManager, SandboxManager
 from .config import (
     BackendConfig, SandboxSpec, LocalConfig, SshConfig, DockerConfig, DockerSandboxSpec,
@@ -39,10 +43,9 @@ from .config import (
     PueueConfig, TmuxConfig, SandboxdConfig, OpenShellConfig, OpenShellSandboxSpec,
 )
 
-from . import aio
-
 __all__ = [
-    "aio",
+    "AsyncBackend", "AsyncConnection", "AsyncProcessManager", "AsyncSandboxManager",
+    "AsyncSandbox", "AsyncProcess", "AsyncOutput", "AsyncTerminal", "AsyncOutputSubscription",
     "BackendError",
     "ConflictError",
     "Connection",

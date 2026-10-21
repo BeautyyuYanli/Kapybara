@@ -10,7 +10,6 @@ from pathlib import Path
 
 import grpc
 import opensol as sdk
-from opensol import aio
 import openshell_pb2 as native
 import datamodel_pb2 as datamodel
 
@@ -38,8 +37,8 @@ class OpenShellFixture:
 
 class OpenShellTests(OpenShellFixture, unittest.TestCase):
     def test_template_and_native_protobuf_are_per_create_requests(self):
-        backend = sdk.Backend.open(self.config)
-        manager = sdk.SandboxManager.open(backend)
+        backend = sdk.Backend(self.config)
+        manager = sdk.SandboxManager(backend)
         self.assertEqual(self.requests, [], "open never probes the gateway")
         first = manager.create(sdk.OpenShellSandboxSpec(workload_template="template-a", name="first", labels={"project": "a"}))
         native_spec = native.SandboxSpec(command=["python3", "main.py"], environment={"ITEM": "b"})
@@ -61,11 +60,11 @@ class OpenShellTests(OpenShellFixture, unittest.TestCase):
 
 class AsyncOpenShellTests(OpenShellFixture, unittest.IsolatedAsyncioTestCase):
     async def test_native_spec_serialization_is_shared_by_async_create(self):
-        backend = await aio.Backend.open(self.config)
-        manager = await aio.SandboxManager.open(backend)
+        backend = sdk.AsyncBackend(self.config)
+        manager = sdk.AsyncSandboxManager(backend)
         spec = native.SandboxSpec(command=["sleep", "infinity"])
         sandbox = await manager.create(sdk.OpenShellSandboxSpec(spec_protobuf=spec.SerializeToString(), name="async"))
-        self.assertIsInstance(sandbox, aio.Sandbox)
+        self.assertIsInstance(sandbox, sdk.AsyncSandbox)
         self.assertEqual(sandbox.ref.id, "async")
         self.assertEqual(self.requests[0].spec, spec)
         with self.assertRaises(sdk.InvalidArgumentError):
@@ -150,7 +149,7 @@ class KubernetesFixture:
 
 class KubernetesTests(KubernetesFixture, unittest.TestCase):
     def test_structured_pod_pvc_and_service_are_forwarded_per_create(self):
-        manager = sdk.SandboxManager.open(self.config)
+        manager = sdk.SandboxManager(self.config)
         self.assertEqual(manager.list(), [], "listing does not require a creation template")
         for index in range(2):
             pod = {"spec": {"containers": [{"name": "main", "image": str(index)}]}}
@@ -171,7 +170,7 @@ class KubernetesTests(KubernetesFixture, unittest.TestCase):
 
 class AsyncKubernetesTests(KubernetesFixture, unittest.IsolatedAsyncioTestCase):
     async def test_async_manager_encodes_the_same_structured_spec(self):
-        manager = await aio.SandboxManager.open(self.config)
+        manager = sdk.AsyncSandboxManager(self.config)
         pod = {"spec": {"containers": [{"name": "main", "image": "async"}]}}
         sandbox = await manager.create(sdk.AgentSandboxSpec(pod, service=False, name="async"))
         self.assertEqual(sandbox.ref.id, "async")

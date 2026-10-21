@@ -6,16 +6,17 @@ python examples/async_local.py [--pueue-config /path/to/pueue.yml --pueue-direct
 import argparse
 import asyncio
 
-from opensol import aio, LocalConfig, PueueConfig
+import opensol as sdk
+from opensol import LocalConfig, PueueConfig
 
 
 async def main(config_file: str | None, pueue_directory: str | None) -> None:
-    connection = await aio.Connection.open(LocalConfig())
+    connection = sdk.AsyncConnection(LocalConfig())
     result = await connection.exec(["printf", "%s", "OpenSOL\n"], timeout=5)
     print(result.stdout)
     if config_file is None:
         return
-    manager = await aio.ProcessManager.open(PueueConfig(config_file=config_file, pueue_directory=pueue_directory), connection=connection)
+    manager = sdk.AsyncProcessManager(PueueConfig(config_file=config_file, pueue_directory=pueue_directory), connection=connection)
     process = await manager.spawn(["python3", "-c", "print('managed task')"])
     subscription = await process.output.subscribe()
     print("native task ID", process.ref.id)

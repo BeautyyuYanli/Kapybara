@@ -17,7 +17,6 @@ from pathlib import Path
 
 import grpc
 import opensol as sdk
-from opensol import aio
 import test_sdk
 
 
@@ -68,35 +67,34 @@ async def cancel_before_delivery(handle):
 
 
 class CoroutineContractTests(unittest.TestCase):
-    def test_public_io_and_network_factories_are_coroutine_functions(self):
+    def test_public_io_methods_are_coroutines_and_constructors_are_local(self):
         # Coroutine functions are the public scheduling contract, including methods
         # that can reject unsupported operations when their coroutine is executed.
         methods = {
-            aio.Connection: ("exec", "shell"),
-            aio.SandboxManager: ("create", "list"),
-            aio.Sandbox: ("inspect", "start", "stop", "delete", "fork"),
-            aio.ProcessManager: ("probe", "list", "spawn"),
-            aio.Process: ("inspect", "wait", "pause", "start", "restart", "kill", "remove",
+            sdk.AsyncConnection: ("exec", "shell"),
+            sdk.AsyncSandboxManager: ("create", "list"),
+            sdk.AsyncSandbox: ("inspect", "start", "stop", "delete", "fork"),
+            sdk.AsyncProcessManager: ("probe", "list", "spawn"),
+            sdk.AsyncProcess: ("inspect", "wait", "pause", "start", "restart", "kill", "remove",
                           "signal", "send_input", "close_stdin", "resize"),
-            aio.Output: ("read", "tail", "subscribe"),
-            aio.Terminal: ("read", "tail", "screen"),
-            aio.OutputSubscription: ("next_event", "aclose", "__anext__"),
-            aio.Backend: ("open",),
+            sdk.AsyncOutput: ("read", "tail", "subscribe"),
+            sdk.AsyncTerminal: ("read", "tail", "screen"),
+            sdk.AsyncOutputSubscription: ("next_event", "aclose", "__anext__"),
         }
         for owner, names in methods.items():
             for name in names:
                 with self.subTest(owner=owner.__name__, name=name):
                     self.assertTrue(inspect.iscoroutinefunction(getattr(owner, name)))
-        for owner in (aio.Connection, aio.SandboxManager, aio.ProcessManager):
-            self.assertTrue(inspect.iscoroutinefunction(owner.open))
+        for owner in (sdk.AsyncBackend, sdk.AsyncConnection, sdk.AsyncSandboxManager, sdk.AsyncProcessManager):
+            self.assertFalse(inspect.iscoroutinefunction(owner.__init__))
         for config in (sdk.LocalConfig, sdk.DockerConfig, sdk.E2bConfig, sdk.EnvdConfig,
                        sdk.AgentSandboxConfig, sdk.OpenShellConfig, sdk.SandboxdConfig,
                        sdk.PueueConfig, sdk.TmuxConfig):
             self.assertFalse(inspect.iscoroutinefunction(config))
-        self.assertFalse(inspect.iscoroutinefunction(aio.Process.capabilities))
+        self.assertFalse(inspect.iscoroutinefunction(sdk.AsyncProcess.capabilities))
 
     def test_command_coroutine_can_be_created_before_the_loop(self):
-        connection = asyncio.run(aio.Connection.open(sdk.LocalConfig()))
+        connection = sdk.AsyncConnection(sdk.LocalConfig())
         command = connection.exec(["printf", "%s", "scheduled"])
 
         async def run():
@@ -107,7 +105,7 @@ class CoroutineContractTests(unittest.TestCase):
 
 class AsyncConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_wait_for_scheduling_and_cancel_before_start_has_no_effect(self):
-        connection = await aio.Connection.open(sdk.LocalConfig())
+        connection = sdk.AsyncConnection(sdk.LocalConfig())
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "marker"
             for operation in (
@@ -133,7 +131,7 @@ class AsyncConnectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(marker.exists(), "cancelling before execution must avoid I/O")
 
     async def test_native_exec_yields_loop_and_preserves_bytes_errors_and_timeout(self):
-        connection = await aio.Connection.open(sdk.LocalConfig())
+        connection = sdk.AsyncConnection(sdk.LocalConfig())
         future = asyncio.create_task(
             connection.exec(
                 ["python3", "-c", "import sys,time; time.sleep(.15); "
@@ -166,8 +164,8 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         test_sdk.PueueTests.setUp(self)
-        self.manager = await aio.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config)),
-                                                    connection=await aio.Connection.open(sdk.LocalConfig()))
+        self.manager = sdk.AsyncProcessManager(sdk.PueueConfig(config_file=str(self.config)),
+                                                    connection=sdk.AsyncConnection(sdk.LocalConfig()))
 
     async def running(self, process):
         for _ in range(100):
@@ -285,15 +283,15 @@ class AsyncPueueTests(unittest.IsolatedAsyncioTestCase):
 class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         test_sdk.EnvdBindingTests.setUp(self)
-        self.backend = await aio.Backend.open(sdk.EnvdConfig(self.endpoint))
-        self.processes = await aio.ProcessManager.open(self.backend)
-        self.connection = await aio.Connection.open(self.backend)
+        self.backend = sdk.AsyncBackend(sdk.EnvdConfig(self.endpoint))
+        self.processes = sdk.AsyncProcessManager(self.backend)
+        self.connection = sdk.AsyncConnection(self.backend)
 
     async def test_views_and_unscheduled_io_preserve_native_initial_stream(self):
         process = await self.processes.spawn(["stdin-program"], stdin=True)
         output, terminal = process.output, process.terminal
-        self.assertIsInstance(output, aio.Output)
-        self.assertIsInstance(terminal, aio.Terminal)
+        self.assertIsInstance(output, sdk.AsyncOutput)
+        self.assertIsInstance(terminal, sdk.AsyncTerminal)
         self.assertTrue(output.capabilities()["streaming_output"])
         self.assertFalse(terminal.capabilities()["read"])
         for coroutine in (output.subscribe(), output.read(), output.tail(), terminal.read(),
@@ -317,8 +315,8 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await initial.next_event(timeout=2)).data, b"\x00\xffterminal")
         self.assertEqual([method for method, _ in self.records], ["Start"])
         restored = sdk.ProcessRef("envd", process.ref.id, pty=True)
-        offline = (await aio.ProcessManager.open(sdk.EnvdConfig("http://127.0.0.1:1"))).get(restored)
-        self.assertIsInstance(offline, aio.Process)
+        offline = (sdk.AsyncProcessManager(sdk.EnvdConfig("http://127.0.0.1:1"))).get(restored)
+        self.assertIsInstance(offline, sdk.AsyncProcess)
         replay = await manager.get(restored).output.subscribe()
         self.assertFalse(hasattr(replay, "ref"))
         self.assertEqual((await replay.next_event(timeout=2)).data, b"\x00\xffterminal")
@@ -415,12 +413,12 @@ class AsyncEnvdTests(unittest.IsolatedAsyncioTestCase):
 
 class AsyncDockerTests(unittest.IsolatedAsyncioTestCase):
     async def test_lifecycle_explicit_delete_and_shared_dto(self):
-        backend = await aio.Backend.open(sdk.DockerConfig())
-        lifecycle = await aio.SandboxManager.open(backend)
+        backend = sdk.AsyncBackend(sdk.DockerConfig())
+        lifecycle = sdk.AsyncSandboxManager(backend)
         self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
         resource = await lifecycle.create(sdk.DockerSandboxSpec(os.environ["OPENSOL_TEST_IMAGE"],
                                               command=["sleep", "infinity"], labels={"project": "async-python"}))
-        self.assertIsInstance(resource, aio.Sandbox)
+        self.assertIsInstance(resource, sdk.AsyncSandbox)
         try:
             self.assertTrue(lifecycle.capabilities()["list"])
             listed = next(info for info in await lifecycle.list() if info.sandbox.id == resource.ref.id)
@@ -432,17 +430,17 @@ class AsyncDockerTests(unittest.IsolatedAsyncioTestCase):
             inspected = await resource.inspect()
             self.assertEqual((inspected.name, inspected.labels), (listed.name, listed.labels))
             rebound = lifecycle.get(listed.sandbox)
-            self.assertIsInstance(rebound, aio.Sandbox)
+            self.assertIsInstance(rebound, sdk.AsyncSandbox)
             self.assertEqual((await rebound.inspect()).state, "stopped")
             self.assertEqual((await resource.inspect()).state, "stopped")
             await resource.start()
-            connection = await aio.Connection.open(backend, target=resource.ref)
+            connection = sdk.AsyncConnection(backend, target=resource.ref)
             result = await connection.exec(
                 ["python3", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
                 stdin=b"\x00\xffdocker", timeout=5,
             )
             self.assertEqual(result.stdout, b"\x00\xffdocker")
-            direct = await aio.Connection.open(sdk.DockerConfig(), target=resource.ref)
+            direct = sdk.AsyncConnection(sdk.DockerConfig(), target=resource.ref)
             self.assertTrue((await direct.exec(["true"])).success)
             with self.assertRaises(sdk.UnsupportedError):
                 await resource.fork()
@@ -463,9 +461,16 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
             def handle_request(self):
-                assert self.headers["x-api-key"] == "secret"
                 records.append((self.command, self.path))
                 self.rfile.read(int(self.headers.get("content-length", 0)))
+                if self.path == "/process.Process/List":
+                    assert self.headers["x-access-token"] == "envd-secret"
+                    self.send_response(200)
+                    self.send_header("content-type", "application/proto")
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                assert self.headers["x-api-key"] == "secret"
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 value = [{"sandbox": {"sandboxID": "child"}}] if self.path.endswith("/fork") else {
@@ -483,8 +488,8 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
         worker.start()
         endpoint = f"http://127.0.0.1:{server.server_port}"
         try:
-            backend = await aio.Backend.open(sdk.E2bConfig("secret", api_endpoint=endpoint, envd_endpoint=endpoint))
-            lifecycle = await aio.SandboxManager.open(backend)
+            backend = sdk.AsyncBackend(sdk.E2bConfig("secret", api_endpoint=endpoint, envd_endpoint=endpoint))
+            lifecycle = sdk.AsyncSandboxManager(backend)
             self.assertTrue(lifecycle.capabilities()["stop_preserves_memory"])
             creation = lifecycle.create(sdk.E2bSandboxSpec())
             self.addCleanup(creation.close)
@@ -501,43 +506,48 @@ class AsyncProviderTests(unittest.IsolatedAsyncioTestCase):
             await resource.start()
             self.assertEqual((await resource.fork()).ref.id, "child")
             before = len(records)
-            connection = await aio.Connection.open(backend, target=resource.ref)
-            processes = await aio.ProcessManager.open(backend, target=resource.ref)
-            self.assertIsInstance(connection, aio.Connection)
-            self.assertIsInstance(processes, aio.ProcessManager)
-            self.assertEqual(records[before:], [("GET", "/sandboxes/parent")])
+            connection = sdk.AsyncConnection(backend, target=resource.ref)
+            processes = sdk.AsyncProcessManager(backend, target=resource.ref)
+            self.assertIsInstance(connection, sdk.AsyncConnection)
+            self.assertIsInstance(processes, sdk.AsyncProcessManager)
+            self.assertEqual(records[before:], [], "binding and conversion are local")
+            self.assertEqual(await processes.list(), [])
+            self.assertEqual(processes.to_process_manager().list(), [])
+            self.assertEqual(records[before:], [("GET", "/sandboxes/parent"),
+                                                ("POST", "/process.Process/List"),
+                                                ("POST", "/process.Process/List")])
             await resource.delete()
         finally:
             server.shutdown()
             worker.join(2)
             server.server_close()
 
-    async def test_network_factories_support_coroutine_task_scheduling(self):
-        # A real HTTP/2 gRPC server completes each native connection handshake.
+    async def test_grpc_io_supports_coroutine_task_scheduling(self):
+        # A real HTTP/2 gRPC server completes handshakes on the first native RPC.
         # Provider RPC payload/TLS contracts are covered by the Rust schema suite.
         server = grpc.server(ThreadPoolExecutor(max_workers=1))
         port = server.add_insecure_port("127.0.0.1:0")
         server.start()
         endpoint = f"http://127.0.0.1:{port}"
         try:
-            sandboxd = await asyncio.create_task(aio.Connection.open(sdk.SandboxdConfig(endpoint)))
-            backend = await asyncio.create_task(aio.Backend.open(sdk.OpenShellConfig(endpoint)))
-            lifecycle = await aio.SandboxManager.open(backend)
-            connection = await asyncio.create_task(aio.Connection.open(sdk.OpenShellConfig(endpoint), target=sdk.SandboxRef("openshell", "sandbox")))
-            self.assertIsInstance(sandboxd, aio.Connection)
-            self.assertIsInstance(lifecycle, aio.SandboxManager)
-            self.assertIsInstance(connection, aio.Connection)
-            self.assertIsInstance(await aio.Connection.open(backend, target=sdk.SandboxRef("openshell", "sandbox")), aio.Connection)
+            sandboxd = sdk.AsyncConnection(sdk.SandboxdConfig(endpoint))
+            backend = sdk.AsyncBackend(sdk.OpenShellConfig(endpoint))
+            lifecycle = sdk.AsyncSandboxManager(backend)
+            connection = sdk.AsyncConnection(sdk.OpenShellConfig(endpoint), target=sdk.SandboxRef("openshell", "sandbox"))
+            self.assertIsInstance(sandboxd, sdk.AsyncConnection)
+            self.assertIsInstance(lifecycle, sdk.AsyncSandboxManager)
+            self.assertIsInstance(connection, sdk.AsyncConnection)
+            self.assertIsInstance(sdk.AsyncConnection(backend, target=sdk.SandboxRef("openshell", "sandbox")), sdk.AsyncConnection)
             with self.assertRaises(sdk.InvalidArgumentError):
-                await aio.Connection.open(backend, target=sdk.SandboxRef("docker", "sandbox"))
-            synchronous = sdk.Backend.open(sdk.OpenShellConfig(endpoint))
-            self.assertIsInstance(sdk.SandboxManager.open(synchronous), sdk.SandboxManager)
-            self.assertIsInstance(sdk.Connection.open(synchronous, target=sdk.SandboxRef("openshell", "sandbox")), sdk.Connection)
+                sdk.AsyncConnection(backend, target=sdk.SandboxRef("docker", "sandbox"))
+            synchronous = sdk.Backend(sdk.OpenShellConfig(endpoint))
+            self.assertIsInstance(sdk.SandboxManager(synchronous), sdk.SandboxManager)
+            self.assertIsInstance(sdk.Connection(synchronous, target=sdk.SandboxRef("openshell", "sandbox")), sdk.Connection)
             self.assertFalse(lifecycle.capabilities()["stop_preserves_memory"])
             with self.assertRaises(sdk.UnsupportedError):
                 await lifecycle.get(sdk.SandboxRef("openshell", "sandbox")).fork()
             with self.assertRaises(sdk.UnsupportedError):
-                await sandboxd.exec(["unimplemented"])
+                await asyncio.create_task(sandboxd.exec(["unimplemented"]))
         finally:
             server.stop(0).wait(2)
 

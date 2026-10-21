@@ -34,7 +34,7 @@ impl GrpcConfig {
         }
     }
 
-    pub(crate) async fn connect(&self, backend: &str) -> Result<Channel> {
+    fn endpoint(&self, backend: &str) -> Result<Endpoint> {
         self.request((), backend)?;
         if self.request_timeout.is_zero()
             || !(self.endpoint.starts_with("http://") || self.endpoint.starts_with("https://"))
@@ -66,7 +66,16 @@ impl GrpcConfig {
                 "TLS credentials require an HTTPS endpoint",
             ));
         }
-        tokio::time::timeout(self.request_timeout, endpoint.connect())
+        Ok(endpoint.connect_timeout(self.request_timeout))
+    }
+
+    /// Bind locally; the channel performs its handshake on the first native request.
+    pub(crate) fn bind(&self, backend: &str) -> Result<Channel> {
+        Ok(self.endpoint(backend)?.connect_lazy())
+    }
+
+    pub(crate) async fn connect(&self, backend: &str) -> Result<Channel> {
+        tokio::time::timeout(self.request_timeout, self.endpoint(backend)?.connect())
             .await
             .map_err(|_| {
                 Error::new(

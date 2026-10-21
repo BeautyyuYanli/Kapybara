@@ -1,6 +1,6 @@
 # Python 集成
 
-OpenSOL（Open Sandbox Operation Layer）是 Rust 核心与适配器的薄绑定，不依赖 Python Docker/E2B SDK，也不反向调用 `kapy.*`。要求 Python 3.12+；PyO3 使用 `abi3-py312`。`import opensol` 提供释放 GIL 的阻塞接口，`from opensol import aio` 提供使用 `pyo3-async-runtimes` 的原生异步接口，不用线程池包装同步调用。两者复用同一核心、DTO、异常与能力含义。
+OpenSOL（Open Sandbox Operation Layer）是 Rust 异步核心与适配器的薄绑定，不依赖 Python Docker/E2B SDK，也不反向调用 `kapy.*`。要求 Python 3.12+；PyO3 使用 `abi3-py312`。主接口为 `from opensol import AsyncConnection, AsyncSandboxManager, AsyncProcessManager, AsyncBackend`，使用 `pyo3-async-runtimes` 接入 asyncio；同一模块中的无 Async 前缀类型提供释放 GIL 的阻塞视图。两者复用同一核心、DTO、异常与能力含义。
 
 ## 安装
 
@@ -17,20 +17,45 @@ maturin develop --manifest-path bindings/python/Cargo.toml
 
 ## 三层对象
 
+异步类型采用 `AsyncSandboxManager`、`AsyncConnection`、`AsyncProcessManager`，并返回 `AsyncSandbox`、`AsyncProcess`、`AsyncOutput`、`AsyncTerminal` 和 `AsyncOutputSubscription`。下文无前缀名称表示共同的业务职责；同步视图使用这些无前缀类型。
+
 - `SandboxManager`：`create/get/list`。create 返回 Sandbox；get(SandboxRef) 本地绑定，list 返回 SandboxInfo 列表。单个 Sandbox 提供 ref、inspect/start/stop/delete/fork，fork 返回子 Sandbox。`SandboxRef(backend, id)` 可保存并重建，不包含凭据；SandboxInfo.sandbox 为该引用。
 - `Connection`：`exec(argv, cwd=..., env=..., stdin=b"", timeout=...)`、显式 `.shell(script)`。返回 `ExecResult`，不返回后台任务 ID。
 - `ProcessManager`：除构造、backend 和 capabilities 外，只提供 `probe/list/get/spawn`。`get(ProcessRef(backend, id, pty=None))` 本地绑定轻量 Process 资源，单任务操作经由该资源执行；存在性与权限由后续 I/O 检查。
 
 每层都提供 `.backend` 和 `.capabilities()`，查询不做 I/O。`manager.capabilities()` 是配置下的能力上限；`process.capabilities()` 同步返回同一字典形状，按引用的已知模式裁剪。list 等管理器字段仍表达上限；查询不探测存在性、权限、运行状态或 stdin 是否仍可用，支持也不保证调用成功。公共任务操作使用同一份裁剪结果，在派发 I/O 前拒绝不支持的操作。能力字典除布尔项外，`ProcessManagerCapabilities.supported_signals` 是信号编号列表；`SandboxManagerCapabilities.stop_preserves_memory` 表达 stop 是否保留进程内存，E2B 为 true，Docker、Kubernetes 与 OpenShell 为 false。
 
-## 统一打开与数据对象
+## 统一构造与数据对象
 
-`Backend.open(config, *, connection=None)` 打开可共享的访问上下文；
-`SandboxManager.open(source)`、`Connection.open(source, *, target=None)`、
-`ProcessManager.open(source, *, target=None, connection=None)` 直接返回业务客户端。
-source 接受 BackendConfig 或已打开的 Backend。传配置会打开并持有一个独立上下文；
-传 Backend 复用同一客户端、pool/channel、凭据与作用域，不按配置值全局缓存。
-Pueue/Tmux 的 connection 必须显式注入，既有 Backend 的依赖不可通过后续 open 重写。
+`AsyncBackend(config, *, connection=None)` 构造可共享的访问上下文；
+`AsyncSandboxManager(source)`、`AsyncConnection(source, *, target=None)`、
+`AsyncProcessManager(source, *, target=None, connection=None)` 直接返回业务客户端。
+source 接受 BackendConfig、AsyncBackend 或同步 Backend。传配置构造并持有一个独立上下文；
+传上下文复用同一客户端、pool/channel、凭据与作用域，不按配置值全局缓存。
+Pueue/Tmux 的 connection 必须显式注入，可以是异步或同步 Connection，已有 Backend 的依赖不可被后续构造覆盖。
+
+与 [OpenDAL 的 AsyncOperator/Operator](https://opendal.apache.org/docs/bindings/python/getting-started/#blocking-vs-async) 相同，构造客户端是普通调用，只有 I/O 方法需要 await。构造和转换不发网络请求，也不需要运行中的 Python 事件循环：
+
+```python
+from opensol import AsyncConnection, LocalConfig
+
+connection = AsyncConnection(LocalConfig())
+result = await connection.exec(["printf", "hello"])
+
+# 同步调用方可取阻塞视图，或直接使用 Connection(LocalConfig())。
+blocking = connection.to_connection()
+result = blocking.exec(["printf", "hello"])
+connection = blocking.to_async_connection()
+```
+
+| 异步主接口 | 阻塞视图 | 转换方法 |
+| --- | --- | --- |
+| AsyncBackend | Backend | to_backend / to_async_backend |
+| AsyncSandboxManager | SandboxManager | to_sandbox_manager / to_async_sandbox_manager |
+| AsyncConnection | Connection | to_connection / to_async_connection |
+| AsyncProcessManager | ProcessManager | to_process_manager / to_async_process_manager |
+
+转换保留同一原生上下文和目标；阻塞方法驱动 Rust 异步核心，不运行 Python 事件循环。
 
 | 配置类型 | 业务入口与绑定 |
 | --- | --- |
@@ -43,9 +68,9 @@ Pueue/Tmux 的 connection 必须显式注入，既有 Backend 的依赖不可通
 | SandboxdConfig | Connection；显式 endpoint，不从沙盒身份猜测 |
 | PueueConfig、TmuxConfig | ProcessManager；显式注入 Connection，路径属于该执行目标 |
 
-open 只实例化客户端、绑定目标，及进行协议必需的连接或只读发现，不 create/start/probe、
-不启动 daemon，也不保证统一就绪。E2B 的两个入口在同一上下文和 target 首次只读发现 envd，
-复用同一原生 envd 客户端及 HTTP pool，不恢复暂停沙盒。新 Backend 可重新发现访问参数。
+构造只实例化客户端、绑定目标；协议握手及只读发现延迟到首次 I/O，不 create/start/probe、
+不启动 daemon，也不保证统一就绪。E2B 的两个入口在同一上下文和 target 首次 I/O 时只读发现 envd，
+并发请求共享发现及同一原生 envd 客户端和 HTTP pool，不恢复暂停沙盒。取消或失败的只读发现可在下一次 I/O 重试；不重试结果不确定的副作用。新 Backend 可重新发现访问参数。
 缺少必需目标/依赖、冲突参数或错误引用在目标 I/O 前报告 InvalidArgument；
 不支持的业务入口报告 Unsupported。SDK 不猜测备用执行方式。
 
@@ -76,32 +101,32 @@ Backend、业务 API、绑定对象及订阅是运行时对象。API 保留 Back
 Pueue/Tmux Backend 保留 Connection；丢弃局部变量不会使已绑定资源失效，也不产生公共 API 缓存环。
 释放客户端不 delete 沙盒、kill 任务或关闭调用方 daemon。
 
-同步 I/O 阻塞并释放 GIL。aio 的四个 open 和所有 I/O 都是显式 `async def`；
+同步 I/O 阻塞并释放 GIL。Async* 的所有 I/O 都是显式 `async def`；
 调用只创建 coroutine，运行时才转换参数并 await 原生 Future，可直接传给 asyncio.create_task。
 在首次执行前取消 Task 不发起 I/O。配置/规格构造、get、ref、output/terminal 属性和 capabilities 同步。
-旧供应商工厂与 Docker/E2b/Envd/OpenShell 中间容器已由统一入口替换，不提供兼容别名。
+未发布的旧供应商工厂、中间容器、`.open()` 工厂和 `opensol.aio` 命名空间已移除，不提供兼容别名。
 
 ## 沙盒发现与绑定
 
 ```python
 import opensol as sdk
 
-backend = sdk.Backend.open(sdk.DockerConfig())
-manager = sdk.SandboxManager.open(backend)
-sandbox = manager.create(sdk.DockerSandboxSpec("my-image", command=["sleep", "infinity"], labels={"project": "example"}))
+backend = sdk.AsyncBackend(sdk.DockerConfig())
+manager = sdk.AsyncSandboxManager(backend)
+sandbox = await manager.create(sdk.DockerSandboxSpec("my-image", command=["sleep", "infinity"], labels={"project": "example"}))
 try:
     saved = sandbox.ref
     rebound = manager.get(saved)
-    rebound.start()
-    print(rebound.inspect().state)
-    for info in manager.list():
+    await rebound.start()
+    print((await rebound.inspect()).state)
+    for info in await manager.list():
         if info.labels.get("project") == "example":
-            print(info.name, manager.get(info.sandbox).inspect().state)
+            print(info.name, (await manager.get(info.sandbox).inspect()).state)
 finally:
-    sandbox.delete()
+    await sandbox.delete()
 ```
 
-同步与 aio 形状相同；aio 的 create/list 和 Sandbox 的 inspect/start/stop/delete/fork 需要 await，get、ref 和 capabilities 保持同步。list 能力通过 `manager.capabilities()["list"]` 声明；Docker 包含当前 Engine 的停止容器，agent-sandbox 限定 namespace，E2B 限定 API key 可见范围且包含 running/paused，OpenShell 限定 workspace。原生分页由适配器读取完毕后返回，创建规格不作为隐式列表过滤条件。SandboxRef 可保存、重建；执行入口通过 target=sandbox.ref 绑定。
+异步 create/list 和 AsyncSandbox 的 inspect/start/stop/delete/fork 需要 await，构造、get、ref 和 capabilities 保持同步。同步视图提供相同操作。list 能力通过 `manager.capabilities()["list"]` 声明；Docker 包含当前 Engine 的停止容器，agent-sandbox 限定 namespace，E2B 限定 API key 可见范围且包含 running/paused，OpenShell 限定 workspace。原生分页由适配器读取完毕后返回，创建规格不作为隐式列表过滤条件。SandboxRef 可保存、重建；执行入口通过 target=sandbox.ref 绑定。
 
 SandboxInfo.name 是只读 `str | None`，labels 是只读属性，每次返回 `dict[str, str]` 副本。它们来自此次原生 list/inspect 响应，缺少 name 为 None，缺少标签为空字典；不缓存创建元数据，也不在 list 后逐项 inspect。Docker 读取原生 Name/Names、Config.Labels/Labels 并移除名称开头 `/`；agent-sandbox/OpenShell 读取 metadata.name/labels；E2B 将 metadata["name"] 映射为 name，全部 metadata（含 name 项）作为 labels。E2B create 依次合并本次规格的 metadata、labels，最后由显式 name 覆盖 name 项；名称不保证唯一。
 
@@ -109,7 +134,7 @@ SandboxRef/ProcessRef 仅在原管理器配置作用域有效，恢复时需相�
 
 ## 沙盒操作返回时点
 
-create/start/stop/delete/fork 成功共同承诺对应原生请求已成功返回，不是统一的就绪、OS 执行可用、状态收敛或资源消失屏障。create/fork 返回可绑定 Sandbox；get 本地绑定，Connection.open 可能进行协议必需的连接或只读发现。Docker create 后需显式 start；Kubernetes 创建 CR、修改 operatingMode 后仍需 controller 收敛，inspect 只信任当前 generation 的 observed conditions；OpenShell 可能继续 provisioning/starting/deleting；E2B 保留原生创建和内存 pause/resume。
+create/start/stop/delete/fork 成功共同承诺对应原生请求已成功返回，不是统一的就绪、OS 执行可用、状态收敛或资源消失屏障。create/fork 返回可绑定沙盒；get 和 Connection 构造只本地绑定，首次 I/O 才握手或只读发现。Docker create 后需显式 start；Kubernetes 创建 CR、修改 operatingMode 后仍需 controller 收敛，inspect 只信任当前 generation 的 observed conditions；OpenShell 可能继续 provisioning/starting/deleting；E2B 保留原生创建和内存 pause/resume。
 
 使用现有 inspect 观察状态，将每次请求与休眠放在同一个整体 deadline 内：
 
@@ -140,7 +165,7 @@ async def start_then_delete(sandbox):
                 await asyncio.sleep(0.2)
 ```
 
-Pending/Unknown 不当作就绪，Failed/Completed 立即报告。循环次数、单次请求 timeout 和同步循环检查时间都不能代替整体超时；同步原生 request timeout 只限制单次调用，循环时间检查无法中断正在进行的阻塞请求。[可运行的 Docker aio 示例](../../examples/async_sandbox.py) 展示创建、发现恢复、启动和删除；SDK 不增加 wait-ready 接口或通用异步操作对象。
+Pending/Unknown 不当作就绪，Failed/Completed 立即报告。循环次数、单次请求 timeout 和同步循环检查时间都不能代替整体超时；同步原生 request timeout 只限制单次调用，循环时间检查无法中断正在进行的阻塞请求。[可运行的 Docker 异步示例](../../examples/async_sandbox.py) 展示创建、发现恢复、启动和删除；SDK 不增加 wait-ready 接口或通用异步操作对象。
 
 ## 原生任务和输出资源
 
@@ -151,11 +176,12 @@ envd 的 `process.capabilities()` 在 pty=None 时禁用 stdin/binary_stdin/clos
 同步资源方法是阻塞调用；异步资源的相同 I/O 方法可 await，DTO 与异常相同。`get(ref)` 本地绑定任务，Process 的只读 `.ref` 返回 ProcessRef，不做 I/O；订阅不公开任务引用：
 
 ```python
-from opensol import aio, OutputCursor, PueueConfig, LocalConfig
+import opensol as sdk
+from opensol import OutputCursor, PueueConfig, LocalConfig
 
 async def read_pages(config_file, pueue_directory):
-    connection = await aio.Connection.open(LocalConfig())
-    manager = await aio.ProcessManager.open(PueueConfig(config_file=config_file,
+    connection = sdk.AsyncConnection(LocalConfig())
+    manager = sdk.AsyncProcessManager(PueueConfig(config_file=config_file,
                          pueue_directory=pueue_directory), connection=connection)
     await manager.probe()
     process = await manager.spawn(["python3", "-c", "print('resource')"])
@@ -180,7 +206,7 @@ kill 的共同保证是原生控制请求成功，不统一保证 OS 已退出�
 
 `process.terminal` 表示上游已渲染文本，提供 `capabilities()`、`read(cursor=None, direction="forward", lines=200)`、`tail(lines=200)`、`screen()`。TerminalPage 的只读属性是 lines、before/after、at_head/at_tail；TerminalScreen 是 cols、rows、lines。OutputCursor 和 TerminalCursor 均可用 value 保存、重建，但类型不可互换。Output 的 terminal channel 是 PTY 合并原始字节，可含控制序列，仍不等于 Terminal 文本；SDK 不增加终端解释器。
 
-Output 大小须为 1–1,048,576 的整数，限制 chunks 合计字节数；Terminal 行数须为 1–10,000 的整数，方向只接受 forward/backward。参数在目标 I/O 前校验，查询在目标侧有界读取，立即返回当前数据，不下载全量再切片。视图构造、属性和 capabilities 只本地绑定，不探测或采集。同步方法阻塞并释放 GIL，aio 的属性同步返回视图，其 I/O 方法需要 await。
+Output 大小须为 1–1,048,576 的整数，限制 chunks 合计字节数；Terminal 行数须为 1–10,000 的整数，方向只接受 forward/backward。参数在目标 I/O 前校验，查询在目标侧有界读取，立即返回当前数据，不下载全量再切片。视图构造、属性和 capabilities 只本地绑定，不探测或采集。同步方法阻塞并释放 GIL，异步接口的属性同步返回视图，其 I/O 方法需要 await。
 
 能力按表示分别查询：OutputCapabilities 有 read/tail/subscribe 和只描述订阅的 historical_output/streaming_output；TerminalCapabilities 有 read/tail/screen。Pueue 配置目录时支持 Output.read/tail；不论是否配置目录，订阅均是历史 true、实时 false。envd 只有 Output.subscribe 和 streaming_output 为 true。Tmux 支持 Output.subscribe，但只交付 Completed，历史/实时均 false；Terminal.tail/screen 为 true，read 为 false。subscribe=true 本身不承诺实时、历史或无丢失重连。
 
@@ -190,13 +216,14 @@ cursor.value 是可保存的不透明字符串，绑定同一目标、任务、�
 
 ## tmux 任务与终端文本
 
-同步与 aio 通过 ProcessManager.open(TmuxConfig(...), connection=...) 打开，构造不做目标 I/O。socket_path 必须为 Connection 目标上的绝对路径，session_prefix 为非空 ASCII 字母、数字、下划线或连字符。调用方安装 tmux >= 3.5，启动并保留 server；SDK 的 tmux 管理请求使用显式 socket 和 `-N`，不启动/关闭 server 或修改全局配置。probe 实际访问 server 并报告可确认的 client/server version。目标环境还需 `env` 和 `/usr/bin/nice`（支持 `-n 0 --`），任务环境不覆盖管理客户端环境。
+异步通过 AsyncProcessManager(TmuxConfig(...), connection=...) 构造，同步使用对应阻塞视图，构造不做目标 I/O。socket_path 必须为 Connection 目标上的绝对路径，session_prefix 为非空 ASCII 字母、数字、下划线或连字符。调用方安装 tmux >= 3.5，启动并保留 server；SDK 的 tmux 管理请求使用显式 socket 和 `-N`，不启动/关闭 server 或修改全局配置。probe 实际访问 server 并报告可确认的 client/server version。目标环境还需 `env` 和 `/usr/bin/nice`（支持 `-n 0 --`），任务环境不覆盖管理客户端环境。
 
 ```python
-from opensol import aio, LocalConfig, PueueConfig, TmuxConfig
+import opensol as sdk
+from opensol import LocalConfig, PueueConfig, TmuxConfig
 
 async def terminal_job(connection, socket_path):
-    manager = await aio.ProcessManager.open(TmuxConfig(socket_path=socket_path), connection=connection)
+    manager = sdk.AsyncProcessManager(TmuxConfig(socket_path=socket_path), connection=connection)
     process = await manager.spawn(["python3", "-c", "print('screen')"], pty=(80, 24))
     outcome = await process.wait(timeout=5)
     screen = await process.terminal.screen()  # TerminalScreen，cols / rows / lines。
@@ -224,7 +251,7 @@ Tmux 的 state、wait 和 Completed 均以原生 pane 生命周期为准，pane 
 ```python
 import opensol as sdk
 
-connection = sdk.Connection.open(sdk.LocalConfig())
+connection = sdk.Connection(sdk.LocalConfig())
 result = connection.exec(
     ["python3", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()); sys.exit(7)"],
     stdin=b"\x00\xffbytes", timeout=5,
@@ -240,10 +267,11 @@ stdout/stderr 永远是 `bytes`，解码策略由应用决定。非零退出码�
 
 ```python
 import asyncio
-from opensol import aio, LocalConfig, PueueConfig, TmuxConfig
+import opensol as sdk
+from opensol import LocalConfig, PueueConfig, TmuxConfig
 
 async def main():
-    connection = await aio.Connection.open(LocalConfig())
+    connection = sdk.AsyncConnection(LocalConfig())
     task = asyncio.create_task(connection.exec(["printf", "%s", "hello"], timeout=5))
     result = await task
     print(result.stdout)
@@ -260,42 +288,46 @@ import os
 import opensol as sdk
 
 key = os.environ["E2B_API_KEY"]
-backend = sdk.Backend.open(sdk.E2bConfig(key))
-sandbox = sdk.SandboxManager.open(backend).create(sdk.E2bSandboxSpec())
+backend = sdk.AsyncBackend(sdk.E2bConfig(key))
+sandbox = await sdk.AsyncSandboxManager(backend).create(sdk.E2bSandboxSpec())
 try:
-    connection = sdk.Connection.open(backend, target=sandbox.ref)
-    processes = sdk.ProcessManager.open(backend, target=sandbox.ref)
-    result = connection.exec(["printf", "%s", "short command"], timeout=10)
-    process = processes.spawn(["python3", "-c", "print('managed')"])
-    subscription = process.output.subscribe()
-    while (event := subscription.next_event(timeout=10)) is not None:
-        if event.outcome is not None:
-            break
-        print(event.channel, event.data)
+    connection = sdk.AsyncConnection(backend, target=sandbox.ref)
+    processes = sdk.AsyncProcessManager(backend, target=sandbox.ref)
+    result = await connection.exec(["printf", "%s", "short command"], timeout=10)
+    process = await processes.spawn(["python3", "-c", "print('managed')"])
+    subscription = await process.output.subscribe()
+    try:
+        async for event in subscription:
+            if event.outcome is not None:
+                break
+            print(event.channel, event.data)
+    finally:
+        await subscription.aclose()
 finally:
-    sandbox.delete()
+    await sandbox.delete()
 ```
 
-envd 的两个业务入口独立使用，均直接返回 Connection 或 ProcessManager；绑定 E2B target 只读发现，不隐式恢复暂停沙盒。直接 EnvdConfig(endpoint, access_token=...) 不需要 E2B 生命周期。E2bSandboxSpec.sandbox_timeout 是本次创建的初始生存时间，默认 300 秒；start/resume 和 fork 分别明确使用 300 秒，不继承创建规格，也不与 request_timeout 混用。
+envd 的两个异步业务入口独立使用，直接构造 AsyncConnection 或 AsyncProcessManager；E2B target 的首次 I/O 只读发现端点，不隐式恢复暂停沙盒。直接 EnvdConfig(endpoint, access_token=...) 不需要 E2B 生命周期。E2bSandboxSpec.sandbox_timeout 是本次创建的初始生存时间，默认 300 秒；start/resume 和 fork 分别明确使用 300 秒，不继承创建规格，也不与 request_timeout 混用。
 
 ## 输出订阅与取消
 
 `OutputSubscription.next_event(timeout=...)` 返回一条字节输出或完成事件；订阅结束后返回 None。正常输出事件 `.channel` 为 stdout/stderr/terminal/combined，`.data` 为 bytes，`.outcome` 为 None；完成事件 `.outcome` 是 ProcessOutcome，channel 为 None、data 为空 bytes。缺少完成证据的意外断流报告 TransportError。Pueue 在读取可用日志后交付完成事件；权限、传输、协议和日志读取失败仍返回 SDK 异常。
 
-同步 `process = manager.spawn(...)` 和 aio 的 `process = await manager.spawn(...)` 均只返回 Process。Pueue/Tmux 不保存 spawn 初始订阅，每次 subscribe 都调用原生订阅路径，绑定本次可观察的执行；spawn 对象、clone、已有 Output 视图及重新绑定对象遵循同一时点。envd 固定协议不支持 restart，保留必要 Start 原始流：首次 subscribe 接管，不建立替代 Connect，也不提前读取；Process/Output clone 和不同视图共享一次移交，并发接管至多一方取得 Start，其余走原生 Connect。Start/Connect 的历史覆盖各遵循上游保留窗口。初始流只保留到接管或最后一个持有它的 Process/Output 被丢弃，不预取、归档或后台采集。任务引用通过 `process.ref` 保存，订阅不公开 `.ref`；`manager.get(saved_ref)` 只绑定任务，其订阅走原生路径。
+同步 `process = manager.spawn(...)` 返回 Process，异步 `process = await manager.spawn(...)` 返回 AsyncProcess。Pueue/Tmux 不保存 spawn 初始订阅，每次 subscribe 都调用原生订阅路径，绑定本次可观察的执行；spawn 对象、clone、已有 Output 视图及重新绑定对象遵循同一时点。envd 固定协议不支持 restart，保留必要 Start 原始流：首次 subscribe 接管，不建立替代 Connect，也不提前读取；Process/Output clone 和不同视图共享一次移交，并发接管至多一方取得 Start，其余走原生 Connect。Start/Connect 的历史覆盖各遵循上游保留窗口。初始流只保留到接管或最后一个持有它的 Process/Output 被丢弃，不预取、归档或后台采集。任务引用通过 `process.ref` 保存，订阅不公开 `.ref`；`manager.get(saved_ref)` 只绑定任务，其订阅走原生路径。
 
 `subscription.next_event(timeout=...)` 的超时只中止本次读取，保留订阅，可以继续读取。只关心任务完成时调用 `process.wait(timeout=...)`；需要输出时消费订阅，从完成事件的 outcome 获取结果。完成事件交付后 next_event 返回 None，订阅不提供 wait 或完成结果查询接口。同步读取释放 GIL，close 释放订阅并唤醒阻塞读取，不杀死进程。可保存 `process.ref`，再用 `manager.get(saved_ref).output.subscribe()` 按原生能力重新订阅。每个订阅的事件读取串行化；并发消费由应用层扇出。
 
-Pueue 每次 subscribe 建立时记录 created/enqueued/start 执行标识，复用分页输出的规则。同一 Queued 执行开始是合法转换，无法确认同次执行的 Stashed 转换、原地重启或 task ID 替换返回 ConflictError，原生任务清理返回 NotFoundError；未消费的旧订阅也不返回新执行的输出或结果。SDK 在消费前、wait 后和 follow 后核对，确认同次执行后才交付日志与完成事件；完成事件交付后订阅结束，不再查询当前任务。与 restart 并发的 subscribe 可以绑定建立期间观察到的执行，不提供跨进程原子快照；restart 完成后建立的新订阅必须观察新执行。检查不增加日志归档或后台监控，也不能恢复已覆盖的旧日志。aio 的绑定发生在 `await process.output.subscribe()`，不在 `await manager.spawn()`。
+Pueue 每次 subscribe 建立时记录 created/enqueued/start 执行标识，复用分页输出的规则。同一 Queued 执行开始是合法转换，无法确认同次执行的 Stashed 转换、原地重启或 task ID 替换返回 ConflictError，原生任务清理返回 NotFoundError；未消费的旧订阅也不返回新执行的输出或结果。SDK 在消费前、wait 后和 follow 后核对，确认同次执行后才交付日志与完成事件；完成事件交付后订阅结束，不再查询当前任务。与 restart 并发的 subscribe 可以绑定建立期间观察到的执行，不提供跨进程原子快照；restart 完成后建立的新订阅必须观察新执行。检查不增加日志归档或后台监控，也不能恢复已覆盖的旧日志。异步接口的绑定发生在 `await process.output.subscribe()`，不在 `await manager.spawn()`。
 
 异步订阅使用 `await subscription.next_event(timeout=...)` 和 `await subscription.aclose()`，并支持 `async for`。next_event 的 timeout 从该读取获得消费权后开始。取消读取或超时不会关闭订阅；Rust 已消费但 Python 尚未收到的事件或终结错误仍保留，下次读取保持顺序。每个订阅至多保留一条待交付事件，不预取或后台分发。aclose 可重复调用并唤醒阻塞读取；它不发信号，不删除环境。
 
 ```python
-from opensol import aio, LocalConfig, PueueConfig, TmuxConfig
+import opensol as sdk
+from opensol import LocalConfig, PueueConfig, TmuxConfig
 
 async def watch(config_file):
-    connection = await aio.Connection.open(LocalConfig())
-    manager = await aio.ProcessManager.open(PueueConfig(config_file=config_file), connection=connection)
+    connection = sdk.AsyncConnection(LocalConfig())
+    manager = sdk.AsyncProcessManager(PueueConfig(config_file=config_file), connection=connection)
     process = await manager.spawn(["python3", "-c", "print('managed')"])
     subscription = await process.output.subscribe()
     try:
@@ -321,4 +353,4 @@ Pueue 订阅完成后才返回合并日志，并要求 CLI 与 daemon 在同一�
 
 超时与断连都可能留下正在运行的远端操作；SDK 不自行重做不确定的副作用。不将异常字符串当成日志存档，原生输出通过正常返回值消费。
 
-绑定验证由 SDK 根目录的 `Dockerfile.tests` / `scripts/check.sh` 执行，测试安装后的 wheel，而不导入未编译的源码。真实 Local/Pueue/Tmux/Docker 验证同步与异步进程、字节与资源边界；Tmux 验证渲染快照、8192 字节二进制输入、resize、代次绑定、取消和目标侧 socket/文件。本地 E2B HTTP fixture 验证资源包装和异常转换，envd ConnectRPC fixture 验证二进制 stdin/关闭、PTY 维度与终端字节及 resize。异步覆盖事件循环推进、读取/等待取消、输出及完成事件交付前取消、无退出码的终态、意外断流、显式关闭和统一 open 的真实 gRPC 握手。供应商 RPC/TLS 的固定 schema 契约另由 Rust fixture 验证，不调用真实云服务。测试脚本从固定的上游 schema 在临时目录生成 Python protobuf 类型，grpcio-tools 仅为测试依赖。
+绑定验证由 SDK 根目录的 `Dockerfile.tests` / `scripts/check.sh` 执行，测试安装后的 wheel，而不导入未编译的源码。真实 Local/Pueue/Tmux/Docker 验证同步与异步进程、字节与资源边界；Tmux 验证渲染快照、8192 字节二进制输入、resize、代次绑定、取消和目标侧 socket/文件。本地 E2B HTTP fixture 验证资源包装和异常转换，envd ConnectRPC fixture 验证二进制 stdin/关闭、PTY 维度与终端字节及 resize。异步覆盖事件循环推进、读取/等待取消、输出及完成事件交付前取消、无退出码的终态、意外断流、显式关闭、首次 I/O 的真实 gRPC 握手和同步/异步视图转换。供应商 RPC/TLS 的固定 schema 契约另由 Rust fixture 验证，不调用真实云服务。测试脚本从固定的上游 schema 在临时目录生成 Python protobuf 类型，grpcio-tools 仅为测试依赖。

@@ -279,14 +279,14 @@ def _source(source):
         return source._native
     if type(source) in _CONFIGS:
         return source.to_json()
-    raise _invalid("source must be a BackendConfig or an open Backend")
+    raise _invalid("source must be a BackendConfig, AsyncBackend or Backend")
 
 
 def _connection(connection):
     if connection is None:
         return None
     if not isinstance(connection, _RuntimeConnection):
-        raise _invalid("connection must be a public Connection")
+        raise _invalid("connection must be an AsyncConnection or Connection")
     native = connection._native
     return native._blocking() if hasattr(native, "_blocking") else native
 

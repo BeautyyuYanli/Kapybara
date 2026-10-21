@@ -188,6 +188,10 @@ impl E2bSandboxManager {
         Ok(sandbox)
     }
 
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.config.request_timeout
+    }
+
     /// Discovers credentials using read-only inspect, then binds both layer 2 and layer 3 to envd.
     pub async fn envd(&self, resource: &SandboxRef) -> Result<Envd> {
         resource.validate("e2b", "envd")?;

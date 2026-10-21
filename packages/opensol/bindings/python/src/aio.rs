@@ -1,4 +1,4 @@
-//! Awaitables share the blocking wrappers' clients, DTOs and conversions.
+//! Async clients drive the native core; blocking views clone those same clients.
 //!
 //! Stream consumption and Python delivery are separate: one pending event remains
 //! reserved until the Python coroutine resumes and acknowledges it synchronously.
@@ -77,6 +77,12 @@ pub(super) struct AsyncSandboxManager {
 
 #[pymethods]
 impl AsyncSandboxManager {
+    fn _blocking(&self) -> PySandboxManager {
+        PySandboxManager {
+            inner: self.inner.clone(),
+        }
+    }
+
     #[getter]
     fn backend(&self) -> &'static str {
         self.inner.backend()
@@ -275,6 +281,12 @@ pub(super) struct AsyncProcessManager {
 
 #[pymethods]
 impl AsyncProcessManager {
+    fn _blocking(&self) -> PyProcessManager {
+        PyProcessManager {
+            inner: self.inner.clone(),
+        }
+    }
+
     #[getter]
     fn backend(&self) -> &'static str {
         self.inner.backend()

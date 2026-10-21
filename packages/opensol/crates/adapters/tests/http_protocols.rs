@@ -446,21 +446,25 @@ async fn unified_e2b_entries_share_native_envd_without_caching_create_requests()
     sandbox.start().await.unwrap();
     sandbox.fork().await.unwrap();
     let reference = sandbox.reference().clone();
+    let before = fixture.records.lock().unwrap().len();
     let (connection, processes) = tokio::try_join!(
         Connection::open(&backend, Some(reference.clone())),
         ProcessManager::open(&backend, Some(reference.clone()), None),
     )
     .unwrap();
-    drop((backend, manager, sandbox));
     assert_eq!(
-        connection
-            .exec(ExecRequest::new(Command::shell("true")))
-            .await
-            .unwrap()
-            .exit
-            .code,
-        Some(7)
+        fixture.records.lock().unwrap().len(),
+        before,
+        "binding performs no discovery"
     );
+    drop((backend, manager, sandbox));
+    let (result, listed) = tokio::try_join!(
+        connection.exec(ExecRequest::new(Command::shell("true"))),
+        processes.list(),
+    )
+    .unwrap();
+    assert!(!listed.is_empty());
+    assert_eq!(result.exit.code, Some(7));
     let process = processes
         .spawn(SpawnRequest::new(Command::shell("true")))
         .await
@@ -483,7 +487,7 @@ async fn unified_e2b_entries_share_native_envd_without_caching_create_requests()
                 .filter(|r| r.path == "/sandboxes/parent" && r.method == "GET")
                 .count(),
             1,
-            "both views reuse one per-target native client, including concurrent opens"
+            "both views reuse one per-target native client, including concurrent first I/O"
         );
         let creates: Vec<Value> = records
             .iter()
@@ -516,7 +520,12 @@ async fn unified_e2b_entries_share_native_envd_without_caching_create_requests()
         );
     }
     // Equal configuration values do not select a global native-client cache.
-    Connection::open(config, Some(reference)).await.unwrap();
+    Connection::open(config, Some(reference))
+        .await
+        .unwrap()
+        .exec(ExecRequest::new(Command::shell("true")))
+        .await
+        .unwrap();
     assert_eq!(
         fixture
             .records
@@ -530,7 +539,7 @@ async fn unified_e2b_entries_share_native_envd_without_caching_create_requests()
 }
 
 #[tokio::test]
-async fn unified_e2b_binding_to_a_paused_target_only_discovers_without_resuming() {
+async fn unified_e2b_binding_is_local_and_first_io_does_not_resume_paused_targets() {
     use opensol_core::{Backend, Connection, ProcessManager};
     let fixture = Fixture::start().await;
     let mut config = E2bConfig::new(Secret::new("api-secret"));
@@ -538,18 +547,22 @@ async fn unified_e2b_binding_to_a_paused_target_only_discovers_without_resuming(
     config.envd_endpoint = Some(fixture.endpoint.clone());
     let backend = Backend::open(config, None).await.unwrap();
     let reference = SandboxRef::new("e2b", "paused");
-    Connection::open(&backend, Some(reference.clone()))
+    let connection = Connection::open(&backend, Some(reference.clone()))
         .await
         .unwrap();
-    ProcessManager::open(&backend, Some(reference), None)
+    let processes = ProcessManager::open(&backend, Some(reference), None)
         .await
         .unwrap();
+    assert!(fixture.records.lock().unwrap().is_empty());
+    assert!(connection.capabilities().stdin);
+    processes.list().await.unwrap();
     let records = fixture.records.lock().unwrap();
-    assert_eq!(records.len(), 1);
+    assert_eq!(records.len(), 2);
     assert_eq!(
         (&*records[0].method, &*records[0].path),
         ("GET", "/sandboxes/paused")
     );
+    assert_eq!(records[1].path, "/process.Process/List");
 }
 
 #[tokio::test]
@@ -611,6 +624,72 @@ async fn envd_resources_use_native_list_and_kill_without_simulating_missing_oper
     let request = protocol::SendSignalRequest::decode(killed.body.as_slice()).unwrap();
     assert_eq!(request.signal, 9);
     assert_selector(request.process);
+}
+
+#[tokio::test]
+async fn cancelled_first_e2b_discovery_can_be_retried_without_remote_side_effects() {
+    use opensol_core::{Backend, ProcessManager};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let router = Router::new()
+        .route(
+            "/sandboxes/parent",
+            axum::routing::get({
+                let attempts = attempts.clone();
+                let started = started.clone();
+                let release = release.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                        json_response(StatusCode::OK, sandbox("parent"))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/process.Process/List",
+            axum::routing::post(|| async {
+                Response::builder()
+                    .header("content-type", "application/proto")
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut config = E2bConfig::new(Secret::new("api-secret"));
+    config.api_endpoint = endpoint.clone();
+    config.envd_endpoint = Some(endpoint);
+    let backend = Backend::open(config, None).await.unwrap();
+    let manager = ProcessManager::open(&backend, Some(SandboxRef::new("e2b", "parent")), None)
+        .await
+        .unwrap();
+    let first = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.probe().await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), manager.probe())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    server.abort();
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 //! Typed Python data crosses this private JSON boundary; no public provider factories remain.
-//! Both scheduling modes use the same core construction and preflight validation.
+//! Construction only binds local clients; I/O is driven by the async core on first use.
 
 use super::*;
 use async_trait::async_trait;
@@ -144,7 +144,7 @@ impl BackendSource for Source {
 
 #[pyfunction]
 #[pyo3(signature = (value, connection=None))]
-fn _open_backend(
+fn _new_backend(
     py: Python<'_>,
     value: &str,
     connection: Option<PyRef<'_, PyConnection>>,
@@ -158,122 +158,51 @@ fn _open_backend(
 }
 
 #[pyfunction]
-fn _open_sandboxes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<PySandboxManager> {
+fn _new_sandboxes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<aio::AsyncSandboxManager> {
     let source = source(value)?;
     let runtime = runtime()?;
     py.detach(move || runtime.block_on(SandboxManager::open(source)))
-        .map(|inner| PySandboxManager { inner })
+        .map(|inner| aio::AsyncSandboxManager { inner })
         .map_err(exception)
 }
 
 #[pyfunction]
 #[pyo3(signature = (value, target=None))]
-fn _open_connection(
+fn _new_connection(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
     target: Option<PyRef<'_, PySandboxRef>>,
-) -> PyResult<PyConnection> {
+) -> PyResult<aio::AsyncConnection> {
     let source = source(value)?;
     let target = target.map(|r| r.inner.clone());
     let runtime = runtime()?;
     py.detach(move || runtime.block_on(Connection::open(source, target)))
-        .map(|inner| PyConnection { inner })
+        .map(|inner| aio::AsyncConnection { inner })
         .map_err(exception)
 }
 
 #[pyfunction]
 #[pyo3(signature = (value, target=None, connection=None))]
-fn _open_processes(
+fn _new_processes(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
     target: Option<PyRef<'_, PySandboxRef>>,
     connection: Option<PyRef<'_, PyConnection>>,
-) -> PyResult<PyProcessManager> {
+) -> PyResult<aio::AsyncProcessManager> {
     let source = source(value)?;
     let target = target.map(|r| r.inner.clone());
     let connection = connection.map(|c| c.inner.clone());
     let runtime = runtime()?;
     py.detach(move || runtime.block_on(ProcessManager::open(source, target, connection)))
-        .map(|inner| PyProcessManager { inner })
+        .map(|inner| aio::AsyncProcessManager { inner })
         .map_err(exception)
-}
-
-#[pyfunction]
-#[pyo3(signature = (value, connection=None))]
-fn _aio_open_backend<'py>(
-    py: Python<'py>,
-    value: &str,
-    connection: Option<PyRef<'_, PyConnection>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let config = config(value)?;
-    let connection = connection.map(|c| c.inner.clone());
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        Backend::open(config, connection)
-            .await
-            .map(|inner| PyBackend { inner })
-            .map_err(exception)
-    })
-}
-
-#[pyfunction]
-fn _aio_open_sandboxes<'py>(
-    py: Python<'py>,
-    value: &Bound<'_, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let source = source(value)?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        SandboxManager::open(source)
-            .await
-            .map(|inner| aio::AsyncSandboxManager { inner })
-            .map_err(exception)
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (value, target=None))]
-fn _aio_open_connection<'py>(
-    py: Python<'py>,
-    value: &Bound<'_, PyAny>,
-    target: Option<PyRef<'_, PySandboxRef>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let source = source(value)?;
-    let target = target.map(|r| r.inner.clone());
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        Connection::open(source, target)
-            .await
-            .map(|inner| aio::AsyncConnection { inner })
-            .map_err(exception)
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (value, target=None, connection=None))]
-fn _aio_open_processes<'py>(
-    py: Python<'py>,
-    value: &Bound<'_, PyAny>,
-    target: Option<PyRef<'_, PySandboxRef>>,
-    connection: Option<PyRef<'_, PyConnection>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let source = source(value)?;
-    let target = target.map(|r| r.inner.clone());
-    let connection = connection.map(|c| c.inner.clone());
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        ProcessManager::open(source, target, connection)
-            .await
-            .map(|inner| aio::AsyncProcessManager { inner })
-            .map_err(exception)
-    })
 }
 
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyBackend>()?;
-    module.add_function(wrap_pyfunction!(_open_backend, module)?)?;
-    module.add_function(wrap_pyfunction!(_open_sandboxes, module)?)?;
-    module.add_function(wrap_pyfunction!(_open_connection, module)?)?;
-    module.add_function(wrap_pyfunction!(_open_processes, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_open_backend, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_open_sandboxes, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_open_connection, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_open_processes, module)?)?;
+    module.add_function(wrap_pyfunction!(_new_backend, module)?)?;
+    module.add_function(wrap_pyfunction!(_new_sandboxes, module)?)?;
+    module.add_function(wrap_pyfunction!(_new_connection, module)?)?;
+    module.add_function(wrap_pyfunction!(_new_processes, module)?)?;
     Ok(())
 }

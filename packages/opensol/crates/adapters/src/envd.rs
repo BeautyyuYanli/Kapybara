@@ -69,13 +69,30 @@ impl std::fmt::Debug for EnvdConfig {
     }
 }
 
-/// A reusable native client. There is no SDK-side process registry or output archive.
+/// A reusable native client, optionally bound to an E2B target for lazy discovery.
+/// Failed or cancelled read-only discovery can be retried; only success is retained.
+/// There is no SDK-side process registry or output archive.
 #[derive(Clone)]
 pub struct Envd {
+    transport: Arc<TransportSource>,
+    request_timeout: Duration,
+}
+
+#[derive(Clone)]
+struct Transport {
     client: Client,
     endpoint: Url,
     headers: HeaderMap,
-    request_timeout: Duration,
+}
+
+enum TransportSource {
+    Ready(Transport),
+    #[cfg(feature = "e2b")]
+    Sandbox {
+        client: Box<crate::e2b::E2bSandboxManager>,
+        target: opensol_core::SandboxRef,
+        transport: tokio::sync::OnceCell<Transport>,
+    },
 }
 
 impl std::fmt::Debug for Envd {
@@ -116,6 +133,46 @@ fn rpc_error(code: &str, operation: &str) -> Error {
 }
 
 impl Envd {
+    /// A local sandbox binding. Concurrent first requests share one read-only discovery.
+    #[cfg(feature = "e2b")]
+    pub(crate) fn for_sandbox(
+        client: crate::e2b::E2bSandboxManager,
+        target: opensol_core::SandboxRef,
+    ) -> Self {
+        Self {
+            request_timeout: client.request_timeout(),
+            transport: Arc::new(TransportSource::Sandbox {
+                client: Box::new(client),
+                target,
+                transport: Default::default(),
+            }),
+        }
+    }
+
+    async fn transport(&self) -> Result<&Transport> {
+        match self.transport.as_ref() {
+            TransportSource::Ready(transport) => Ok(transport),
+            #[cfg(feature = "e2b")]
+            TransportSource::Sandbox {
+                client,
+                target,
+                transport,
+            } => {
+                transport
+                    .get_or_try_init(|| async {
+                        let discovered = client.envd(target).await?;
+                        match discovered.transport.as_ref() {
+                            TransportSource::Ready(transport) => Ok(transport.clone()),
+                            TransportSource::Sandbox { .. } => {
+                                unreachable!("discovery returns a concrete endpoint")
+                            }
+                        }
+                    })
+                    .await
+            }
+        }
+    }
+
     /// Both views share this client's configured endpoint, headers and HTTP pool.
     pub fn connection(&self) -> Connection {
         Connection::new(self.clone())
@@ -167,9 +224,11 @@ impl Envd {
             headers.insert("e2b-sandbox-port", HeaderValue::from_static("49983"));
         }
         Ok(Self {
-            client,
-            endpoint: http::endpoint(&config.endpoint, "envd")?,
-            headers,
+            transport: Arc::new(TransportSource::Ready(Transport {
+                client,
+                endpoint: http::endpoint(&config.endpoint, "envd")?,
+                headers,
+            })),
             request_timeout: config.request_timeout,
         })
     }
@@ -179,10 +238,11 @@ impl Envd {
         method: &str,
         request: Request,
     ) -> Result<Response> {
-        let response = self
+        let transport = self.transport().await?;
+        let response = transport
             .client
-            .post(http::url(&self.endpoint, &["process.Process", method]))
-            .headers(self.headers.clone())
+            .post(http::url(&transport.endpoint, &["process.Process", method]))
+            .headers(transport.headers.clone())
             .header("content-type", "application/proto")
             .timeout(self.request_timeout)
             .body(request.encode_to_vec())
@@ -221,11 +281,12 @@ impl Envd {
         framed.push(0);
         framed.extend(length.to_be_bytes());
         framed.extend(body);
+        let transport = self.transport().await?;
         let response = deadline(Some(self.request_timeout), "envd", method, async {
-            let response = self
+            let response = transport
                 .client
-                .post(http::url(&self.endpoint, &["process.Process", method]))
-                .headers(self.headers.clone())
+                .post(http::url(&transport.endpoint, &["process.Process", method]))
+                .headers(transport.headers.clone())
                 .header("content-type", "application/connect+proto")
                 .body(framed)
                 .send()

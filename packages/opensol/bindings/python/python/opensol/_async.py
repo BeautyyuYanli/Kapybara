@@ -1,8 +1,8 @@
 """Native Rust I/O on the caller's asyncio loop, with shared OpenSOL DTOs.
 
-Public I/O methods and all four open methods are coroutines: native Futures are
-created only when the coroutine runs. Data construction and get remain synchronous.
-Each OutputSubscription owns one native stream. Read operations are serialized;
+Constructors and conversions only bind local clients and require no running loop.
+I/O methods are coroutines: native Futures are created only when they run.
+Each AsyncOutputSubscription owns one native stream. Read operations are serialized;
 cancellation retains a reserved event until a Python consumer acknowledges it.
 Closing a subscription never signals the process or deletes its environment.
 """
@@ -11,16 +11,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from . import _native
 from .config import BackendConfig, SandboxSpec, _RuntimeBackend, _RuntimeConnection
-from .config import (
-    LocalConfig, SshConfig, DockerConfig, DockerSandboxSpec, E2bConfig, E2bSandboxSpec,
-    EnvdConfig, AgentSandboxConfig, AgentSandboxSpec, PueueConfig, TmuxConfig,
-    SandboxdConfig, OpenShellConfig, OpenShellSandboxSpec,
-)
 from .config import _connection, _invalid, _source, _spec, _target
+
+if TYPE_CHECKING:
+    from ._sync import Backend, Connection, ProcessManager, SandboxManager
 from ._native import (
     ExecResult,
     ManagerInfo,
@@ -38,26 +36,31 @@ from ._native import (
 )
 
 
-class Backend(_RuntimeBackend):
+class AsyncBackend(_RuntimeBackend):
     """Native access context, with no ownership of remote resource lifetimes."""
 
-    @staticmethod
-    async def open(config: BackendConfig, *, connection: Connection | None = None) -> Backend:
+    def __init__(self, config: BackendConfig, *, connection: AsyncConnection | Connection | None = None) -> None:
         value = _source(config)
         if not isinstance(value, str):
-            raise _invalid("Backend.open requires a BackendConfig")
-        return Backend(await _native._aio_open_backend(value, _connection(connection)))
+            raise _invalid("AsyncBackend requires a BackendConfig")
+        self._native = _native._new_backend(value, _connection(connection))
+
+    def to_backend(self) -> Backend:
+        """Return a blocking view of this context, without I/O."""
+        from ._sync import Backend
+        return Backend._from_async(self)
 
 
-class Connection(_RuntimeConnection):
+class AsyncConnection(_RuntimeConnection):
     """Completed commands on one target, scheduled when their coroutine runs."""
 
-    def __init__(self, native: _native.AsyncConnection) -> None:
-        self._native = native
+    def __init__(self, source: BackendConfig | AsyncBackend | Backend, *, target: SandboxRef | None = None) -> None:
+        self._native = _native._new_connection(_source(source), _target(target))
 
-    @staticmethod
-    async def open(source: BackendConfig | Backend, *, target: SandboxRef | None = None) -> Connection:
-        return Connection(await _native._aio_open_connection(_source(source), _target(target)))
+    def to_connection(self) -> Connection:
+        """Return a blocking view of the same client and target, without I/O."""
+        from ._sync import Connection
+        return Connection._from_async(self)
 
     @property
     def backend(self) -> str:
@@ -89,15 +92,16 @@ class Connection(_RuntimeConnection):
         return await self._native.shell(script, cwd=cwd, env=env, stdin=stdin, timeout=timeout)
 
 
-class SandboxManager:
+class AsyncSandboxManager:
     """Create, discover and locally bind sandboxes within one backend scope."""
 
-    def __init__(self, native: _native.AsyncSandboxManager) -> None:
-        self._native = native
+    def __init__(self, source: BackendConfig | AsyncBackend | Backend) -> None:
+        self._native = _native._new_sandboxes(_source(source))
 
-    @staticmethod
-    async def open(source: BackendConfig | Backend) -> SandboxManager:
-        return SandboxManager(await _native._aio_open_sandboxes(_source(source)))
+    def to_sandbox_manager(self) -> SandboxManager:
+        """Return a blocking view of this manager, without I/O."""
+        from ._sync import SandboxManager
+        return SandboxManager._from_async(self)
 
     @property
     def backend(self) -> str:
@@ -106,18 +110,18 @@ class SandboxManager:
     def capabilities(self) -> _native.SandboxManagerCapabilities:
         return self._native.capabilities()
 
-    def get(self, sandbox: SandboxRef) -> Sandbox:
+    def get(self, sandbox: SandboxRef) -> AsyncSandbox:
         """Bind locally; existence and permissions are checked on later I/O."""
-        return Sandbox(self._native.get(sandbox))
+        return AsyncSandbox(self._native.get(sandbox))
 
     async def list(self) -> list[SandboxInfo]:
         return await self._native.list()
 
-    async def create(self, spec: SandboxSpec) -> Sandbox:
-        return Sandbox(await self._native.create(_spec(spec)))
+    async def create(self, spec: SandboxSpec) -> AsyncSandbox:
+        return AsyncSandbox(await self._native.create(_spec(spec)))
 
 
-class Sandbox:
+class AsyncSandbox:
     """Native requests without a common readiness or state-convergence barrier.
 
     Observe state with inspect; dropping this object never deletes the environment.
@@ -142,11 +146,11 @@ class Sandbox:
     async def delete(self) -> None:
         await self._native.delete()
 
-    async def fork(self) -> Sandbox:
-        return Sandbox(await self._native.fork())
+    async def fork(self) -> AsyncSandbox:
+        return AsyncSandbox(await self._native.fork())
 
 
-class OutputSubscription(AsyncIterator[ProcessEvent]):
+class AsyncOutputSubscription(AsyncIterator[ProcessEvent]):
     """One subscription; completion arrives as an event, ``aclose`` only detaches.
 
     The asyncio lock is owned by the Python coroutine, so it is released on
@@ -183,7 +187,7 @@ class OutputSubscription(AsyncIterator[ProcessEvent]):
         """Detach and wake blocked readers; safe to call repeatedly."""
         await self._native.aclose()
 
-    def __aiter__(self) -> OutputSubscription:
+    def __aiter__(self) -> AsyncOutputSubscription:
         return self
 
     async def __anext__(self) -> ProcessEvent:
@@ -193,16 +197,17 @@ class OutputSubscription(AsyncIterator[ProcessEvent]):
         return event
 
 
-class ProcessManager:
+class AsyncProcessManager:
     """Find and spawn native tasks; use ``get`` to bind a Process for task operations."""
 
-    def __init__(self, native: _native.AsyncProcessManager) -> None:
-        self._native = native
+    def __init__(self, source: BackendConfig | AsyncBackend | Backend, *, target: SandboxRef | None = None,
+                 connection: AsyncConnection | Connection | None = None) -> None:
+        self._native = _native._new_processes(_source(source), _target(target), _connection(connection))
 
-    @staticmethod
-    async def open(source: BackendConfig | Backend, *, target: SandboxRef | None = None,
-                   connection: Connection | None = None) -> ProcessManager:
-        return ProcessManager(await _native._aio_open_processes(_source(source), _target(target), _connection(connection)))
+    def to_process_manager(self) -> ProcessManager:
+        """Return a blocking view of this manager, without I/O."""
+        from ._sync import ProcessManager
+        return ProcessManager._from_async(self)
 
     @property
     def backend(self) -> str:
@@ -211,9 +216,9 @@ class ProcessManager:
     def capabilities(self) -> _native.ProcessManagerCapabilities:
         return self._native.capabilities()
 
-    def get(self, process: ProcessRef) -> Process:
+    def get(self, process: ProcessRef) -> AsyncProcess:
         """Bind a resource locally; existence is checked on its next native operation."""
-        return Process(self._native.get(process))
+        return AsyncProcess(self._native.get(process))
 
     async def probe(self) -> ManagerInfo:
         return await self._native.probe()
@@ -229,14 +234,14 @@ class ProcessManager:
         env: dict[str, str] | None = None,
         stdin: bool = False,
         pty: tuple[int, int] | None = None,
-    ) -> Process:
+    ) -> AsyncProcess:
         """Create a task, preserving an indispensable Start stream only on envd."""
-        return Process(
+        return AsyncProcess(
             await self._native.spawn(argv, cwd=cwd, env=env, stdin=stdin, pty=pty)
         )
 
 
-class Process:
+class AsyncProcess:
     """Bound task operations, logs and screen; no cached status or lifecycle ownership."""
 
     def __init__(self, native: _native.AsyncProcess) -> None:
@@ -284,15 +289,15 @@ class Process:
         await self._native.resize(cols, rows)
 
     @property
-    def output(self) -> Output:
-        return Output(self._native.output)
+    def output(self) -> AsyncOutput:
+        return AsyncOutput(self._native.output)
 
     @property
-    def terminal(self) -> Terminal:
-        return Terminal(self._native.terminal)
+    def terminal(self) -> AsyncTerminal:
+        return AsyncTerminal(self._native.terminal)
 
 
-class Output:
+class AsyncOutput:
     """Locally bound raw bytes; page cursors and subscriptions consume independently."""
 
     def __init__(self, native: _native.AsyncOutput) -> None:
@@ -308,11 +313,11 @@ class Output:
     async def tail(self, *, max_bytes: int = 65536) -> OutputPage:
         return await self._native.tail(max_bytes=max_bytes)
 
-    async def subscribe(self) -> OutputSubscription:
-        return OutputSubscription(await self._native.subscribe())
+    async def subscribe(self) -> AsyncOutputSubscription:
+        return AsyncOutputSubscription(await self._native.subscribe())
 
 
-class Terminal:
+class AsyncTerminal:
     """Native rendered text, read without interpreting bytes or owning a process."""
 
     def __init__(self, native: _native.AsyncTerminal) -> None:
@@ -333,8 +338,6 @@ class Terminal:
 
 
 __all__ = [
-    "Backend", "Connection", "SandboxManager", "Sandbox", "ProcessManager", "OutputSubscription", "Process", "Output", "Terminal",
-    "BackendConfig", "SandboxSpec", "LocalConfig", "SshConfig", "DockerConfig", "DockerSandboxSpec",
-    "E2bConfig", "E2bSandboxSpec", "EnvdConfig", "AgentSandboxConfig", "AgentSandboxSpec",
-    "PueueConfig", "TmuxConfig", "SandboxdConfig", "OpenShellConfig", "OpenShellSandboxSpec",
+    "AsyncBackend", "AsyncConnection", "AsyncSandboxManager", "AsyncSandbox", "AsyncProcessManager",
+    "AsyncOutputSubscription", "AsyncProcess", "AsyncOutput", "AsyncTerminal",
 ]

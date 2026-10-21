@@ -6,7 +6,6 @@ import tempfile
 import unittest
 
 import opensol as sdk
-from opensol import aio
 
 import test_sdk
 
@@ -23,8 +22,8 @@ class ResourceTests(unittest.TestCase):
 
     def setUp(self):
         test_sdk.PueueTests.setUp(self)
-        self.manager = sdk.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config),
-                                 pueue_directory=str(self.directory)), connection=sdk.Connection.open(sdk.LocalConfig()))
+        self.manager = sdk.ProcessManager(sdk.PueueConfig(config_file=str(self.config),
+                                 pueue_directory=str(self.directory)), connection=sdk.Connection(sdk.LocalConfig()))
 
     def test_first_subscription_after_rebound_restart_uses_current_execution(self):
         script = self.directory / "command.sh"
@@ -136,7 +135,7 @@ class ResourceTests(unittest.TestCase):
             process.output.read(cursor=saved)
 
     def test_failed_to_spawn_completes_without_exit_or_private_error_text(self):
-        sdk.Connection.open(sdk.LocalConfig()).exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
+        sdk.Connection(sdk.LocalConfig()).exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
         with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
             process = self.manager.spawn(["true"], cwd=cwd)
             handle = process.output.subscribe()
@@ -155,14 +154,14 @@ class ResourceTests(unittest.TestCase):
         process.remove()
 
     def test_resources_bind_locally_and_native_pause_kill_remain_explicit(self):
-        unavailable = sdk.ProcessManager.open(sdk.PueueConfig(config_file="/no-opensol-config"),
-                                             connection=sdk.Connection.open(sdk.LocalConfig()))
+        unavailable = sdk.ProcessManager(sdk.PueueConfig(config_file="/no-opensol-config"),
+                                             connection=sdk.Connection(sdk.LocalConfig()))
         missing = unavailable.get(sdk.ProcessRef("pueue", "123"))
         self.assertEqual(missing.ref.id, "123", "binding must not contact a daemon")
         self.assertTrue(missing.output.capabilities()["subscribe"])
         self.assertFalse(missing.terminal.capabilities()["screen"])
-        manager = sdk.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config)),
-                                         connection=sdk.Connection.open(sdk.LocalConfig()))
+        manager = sdk.ProcessManager(sdk.PueueConfig(config_file=str(self.config)),
+                                         connection=sdk.Connection(sdk.LocalConfig()))
         process = manager.spawn(["sleep", "30"])
         handle = process.output.subscribe()
         self.assertFalse(process.output.capabilities()["read"])
@@ -200,8 +199,8 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         test_sdk.PueueTests.setUp(self)
-        self.manager = await aio.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config),
-                                 pueue_directory=str(self.directory)), connection=await aio.Connection.open(sdk.LocalConfig()))
+        self.manager = sdk.AsyncProcessManager(sdk.PueueConfig(config_file=str(self.config),
+                                 pueue_directory=str(self.directory)), connection=sdk.AsyncConnection(sdk.LocalConfig()))
 
     async def test_first_subscription_after_external_restart_uses_current_execution(self):
         from test_async import collect
@@ -211,7 +210,7 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         output = process.output
         await process.wait(timeout=5)
         script.write_text("printf 9; exit 9")
-        restarted = await (await aio.Connection.open(sdk.LocalConfig())).exec(["pueue", "--config", str(self.config),
+        restarted = await (sdk.AsyncConnection(sdk.LocalConfig())).exec(["pueue", "--config", str(self.config),
                                             "restart", "--in-place", process.ref.id])
         self.assertTrue(restarted.success)
         self.assertEqual((await process.wait(timeout=5)).exit.code, 9)
@@ -225,7 +224,7 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         await process.remove()
 
     async def test_failed_to_spawn_is_delivered_as_completion_then_ends(self):
-        await (await aio.Connection.open(sdk.LocalConfig())).exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
+        await (sdk.AsyncConnection(sdk.LocalConfig())).exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
         with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
             process = await self.manager.spawn(["true"], cwd=cwd)
             handle = await process.output.subscribe()
@@ -254,8 +253,8 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
                                           "sys.stdout.buffer.write(b'last'); sys.exit(7)"])
         handle = await process.output.subscribe()
 
-        self.assertIsInstance(process, aio.Process)
-        self.assertIsInstance(handle, aio.OutputSubscription)
+        self.assertIsInstance(process, sdk.AsyncProcess)
+        self.assertIsInstance(handle, sdk.AsyncOutputSubscription)
         self.assertFalse(hasattr(handle, "ref"))
         self.assertFalse(hasattr(handle, "wait"))
         with self.assertRaises(AttributeError):

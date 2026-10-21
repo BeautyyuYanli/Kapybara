@@ -1,7 +1,7 @@
 //! Unified built-in configuration and dispatch. The core does not enumerate providers.
 //!
-//! Opening never creates resources, starts daemons or probes readiness. E2B caches only native
-//! envd clients per target; public clients are freshly bound and retain the owning Backend.
+//! Binding performs no network I/O. E2B shares lazy envd clients per target, discovering
+//! the endpoint on the first request; public clients retain the owning Backend.
 
 use async_trait::async_trait;
 use opensol_core::{
@@ -131,7 +131,7 @@ struct Context {
     config: BackendConfig,
     native: Native,
     #[cfg(feature = "e2b")]
-    envd: tokio::sync::Mutex<std::collections::HashMap<String, crate::envd::Envd>>,
+    envd: std::sync::Mutex<std::collections::HashMap<String, crate::envd::Envd>>,
 }
 
 #[async_trait]
@@ -161,16 +161,15 @@ impl opensol_core::BackendConfig for BackendConfig {
                 crate::agent_sandbox::AgentSandboxManager::new(config.clone())?,
             ),
             #[cfg(feature = "openshell")]
-            Self::OpenShell(config) => Native::OpenShell(
-                crate::openshell::OpenShellSandboxManager::connect(
+            Self::OpenShell(config) => {
+                Native::OpenShell(crate::openshell::OpenShellSandboxManager::new(
                     config.grpc.clone(),
                     config.workspace.clone(),
-                )
-                .await?,
-            ),
+                )?)
+            }
             #[cfg(feature = "sandboxd")]
             Self::Sandboxd(config) => {
-                Native::Sandboxd(crate::sandboxd::Sandboxd::connect(config.grpc.clone()).await?)
+                Native::Sandboxd(crate::sandboxd::Sandboxd::new(config.grpc.clone())?)
             }
             #[cfg(feature = "pueue")]
             Self::Pueue(config) => Native::Pueue(crate::pueue::Pueue::new(
@@ -194,18 +193,17 @@ impl opensol_core::BackendConfig for BackendConfig {
 
 impl Context {
     #[cfg(feature = "e2b")]
-    async fn envd(
+    fn envd(
         &self,
         client: &crate::e2b::E2bSandboxManager,
         target: &SandboxRef,
-    ) -> Result<crate::envd::Envd> {
-        let mut contexts = self.envd.lock().await;
-        if let Some(envd) = contexts.get(&target.id) {
-            return Ok(envd.clone());
-        }
-        let envd = client.envd(target).await?;
-        contexts.insert(target.id.clone(), envd.clone());
-        Ok(envd)
+    ) -> crate::envd::Envd {
+        self.envd
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(target.id.clone())
+            .or_insert_with(|| crate::envd::Envd::for_sandbox(client.clone(), target.clone()))
+            .clone()
     }
 }
 
@@ -242,7 +240,6 @@ impl BackendAccess for Context {
             #[cfg(feature = "e2b")]
             Native::E2b(client) => Ok(self
                 .envd(client, _target.expect("validated target"))
-                .await?
                 .connection()),
             #[cfg(feature = "envd")]
             Native::Envd(client) => Ok(client.connection()),
@@ -259,7 +256,6 @@ impl BackendAccess for Context {
             #[cfg(feature = "e2b")]
             Native::E2b(client) => Ok(self
                 .envd(client, _target.expect("validated target"))
-                .await?
                 .processes()),
             #[cfg(feature = "envd")]
             Native::Envd(client) => Ok(client.processes()),
