@@ -1,4 +1,4 @@
-"""Ordinary sequential tools share run State; only successful final snapshots are saved."""
+"""Sequential tools share State; complete checkpoints preserve scopes across resume."""
 
 import asyncio
 import json
@@ -21,6 +21,8 @@ from kapy.control.sessions.models import SessionRow
 from kapy.layers.shell import runtime
 from kapy.lifecycle import LifecycleStatus
 from kapy.runner.activities import RunnerActivity
+from kapy.runner.checkpoints import Checkpoint, decode_state
+from kapy.runner.recording import Recorder
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -52,7 +54,7 @@ async def worker_service(database):
     async with Worker(
         client,
         task_queue=queue,
-        activities=[runner.create, runner.run, runner.close],
+        activities=[runner.create, runner.run, runner.resume, runner.close],
     ):
         yield (
             SessionService(database.sessions, temporal_client=client, temporal_task_queue=queue),
@@ -173,7 +175,7 @@ async def test_two_sequential_tools_resume_and_partial_close(
             assert caught.value.code == "job_not_found"
 
 
-async def test_model_failure_preserves_previous_successful_snapshot(runner_database, shell_server):
+async def test_model_failure_preserves_last_complete_tool_batch(runner_database, shell_server):
     async with worker_service(runner_database) as (service, temporal):
         session = await create_shell_session(runner_database, service, shell_server)
         first = await start_runner(
@@ -194,10 +196,54 @@ async def test_model_failure_preserves_previous_successful_snapshot(runner_datab
         )
         with pytest.raises(ActivityFailureError):
             await handle.result()
-        assert await state(runner_database, session.id) == before
+        current = await state(runner_database, session.id)
+        assert before["jobs"].items() <= current["jobs"].items()
+        assert len(current["jobs"]) == 2
+        assert (await service.get_session(session.id)).status == LifecycleStatus.READY
+        async with runner_database.sessions.begin() as db:
+            saved = decode_state((await db.get(SessionRow, session.id)).runner_state)
+            assert isinstance(saved, Checkpoint) and saved.checkpoint == "tools_node_completed"
+            assert saved.next.kind == "model_request"
         assert (
             await service.close_session(session.id, activity_id=uuid4())
         ).status == LifecycleStatus.CLOSED
+
+
+async def test_explicit_resume_retains_shell_scope_job_and_cursor(
+    runner_database, shell_server, monkeypatch
+):
+    original = Recorder.persist_messages
+    stopped = []
+
+    async def lose_reply(self, deps, messages, *, candidate, **kwargs):
+        accepted = await original(self, deps, messages, candidate=candidate, **kwargs)
+        if candidate.checkpoint == "tools_node_completed" and not stopped:
+            stopped.append(candidate)
+            raise RuntimeError("lost tool-batch commit acknowledgment")
+        return accepted
+
+    monkeypatch.setattr(Recorder, "persist_messages", lose_reply)
+    async with worker_service(runner_database) as (service, temporal):
+        session = await create_shell_session(runner_database, service, shell_server)
+        first = await service.start_runner(
+            session.id,
+            activity_id=uuid4(),
+            user_prompt=prompt((run("printf 'saved\\n'; sleep 30"),)),
+        )
+        with pytest.raises(ActivityFailureError):
+            await first.result()
+        before = await state(runner_database, session.id)
+        assert len(before["jobs"]) == 1
+        resumed = await service.resume_runner(session.id, activity_id=uuid4())
+        assert "saved" in await resumed.result()
+        assert await state(runner_database, session.id) == before
+        assert before["scope_id"] == str(session.id)
+        await service.close_session(session.id, activity_id=uuid4())
+        remote, _ = shell_server
+        for job_id in before["jobs"]:
+            with pytest.raises(ShellctlClientError) as error:
+                await remote.status(job_id)
+            assert error.value.code == "job_not_found"
 
 
 @pytest.mark.parametrize("signal", [ModelRetry, UserError])

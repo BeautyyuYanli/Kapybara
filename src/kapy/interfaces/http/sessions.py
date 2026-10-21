@@ -28,7 +28,7 @@ from kapy.pagination import Page
 
 from .dependencies import HistoryPage, LiveCursor, OffsetPage
 from .errors import ControlRoute
-from .types import CloseSession, CreateSessionRequest, StartRunner
+from .types import CloseSession, CreateSessionRequest, ResumeRunner, StartRunner
 
 _logger = logging.getLogger(__name__)
 _output_adapter = TypeAdapter(list[OutputEvent])
@@ -69,6 +69,14 @@ def create_session_router(sessions: SessionService) -> APIRouter:
         handle = await sessions.start_runner(
             session_id, activity_id=data.activity_id, user_prompt=data.user_prompt
         )
+        assert handle.run_id is not None
+        return ActivityReference(activity_id=UUID(handle.id), run_id=handle.run_id)
+
+    @router.post(
+        "/sessions/{session_id}/runner/resume", status_code=202, operation_id="resume_runner"
+    )
+    async def resume_runner(session_id: UUID, data: ResumeRunner) -> ActivityReference:
+        handle = await sessions.resume_runner(session_id, activity_id=data.activity_id)
         assert handle.run_id is not None
         return ActivityReference(activity_id=UUID(handle.id), run_id=handle.run_id)
 

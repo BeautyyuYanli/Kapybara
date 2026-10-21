@@ -1092,6 +1092,16 @@ export type RequestUsage = {
 };
 
 /**
+ * ResumeRunner
+ */
+export type ResumeRunner = {
+    /**
+     * Activity Id
+     */
+    activity_id: string;
+};
+
+/**
  * RetryPromptPart
  *
  * A message back to a model asking it to try again.
@@ -3021,6 +3031,36 @@ export type StartRunnerResponses = {
 };
 
 export type StartRunnerResponse = StartRunnerResponses[keyof StartRunnerResponses];
+
+export type ResumeRunnerData = {
+    body: ResumeRunner;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/runner/resume';
+};
+
+export type ResumeRunnerErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ResumeRunnerError = ResumeRunnerErrors[keyof ResumeRunnerErrors];
+
+export type ResumeRunnerResponses = {
+    /**
+     * Successful Response
+     */
+    202: ActivityReference;
+};
+
+export type ResumeRunnerResponse = ResumeRunnerResponses[keyof ResumeRunnerResponses];
 
 export type GetSessionActivityData = {
     body?: never;

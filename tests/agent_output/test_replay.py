@@ -18,7 +18,8 @@ from kapy.agent_history.repository import HistoryRepository
 from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent, TextDelta
 from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
-from kapy.runner import Recorder, RunnerDeps
+from kapy.runner import RunnerDeps
+from kapy.runner.checkpoints import CallToolsNext
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -77,20 +78,8 @@ async def test_live_replays_completed_activity_batches(database, valkey_client, 
     outputs = AgentOutputService(valkey_client)
     sessions = SessionService(database.sessions, output_service=outputs)
     for seq, prompt in ((0, "first"), (2, "second")):
-        await Recorder().persist_messages(
-            *(
-                RunnerDeps(
-                    session_id=session_id,
-                    session_factory=database.sessions,
-                    output_service=outputs,
-                    activity_id=session_id,
-                    activity_run_id="test-run",
-                ),
-                [
-                    HistoryMessage(session_id, seq, ModelRequest([UserPromptPart(prompt)])),
-                    HistoryMessage(session_id, seq + 1, response("one two")),
-                ],
-            )
+        await append(
+            database, session_id, [ModelRequest([UserPromptPart(prompt)]), response("one two")], seq
         )
     async with individual_events(sessions, session_id) as events:
         async with asyncio.timeout(2):
@@ -360,20 +349,18 @@ async def test_unstarted_session_can_follow_new_execution(
 
     async def produce():
         await replayed.wait()
-        await Recorder().persist_messages(
-            *(
-                RunnerDeps(
-                    session_id=session_id,
-                    session_factory=database.sessions,
-                    output_service=outputs,
-                    activity_id=session_id,
-                    activity_run_id="test-run",
-                ),
-                [
-                    HistoryMessage(session_id, 0, ModelRequest([UserPromptPart("go")])),
-                    HistoryMessage(session_id, 1, response()),
-                ],
-            )
+        deps = RunnerDeps(
+            session_id=session_id,
+            session_factory=database.sessions,
+            output_service=outputs,
+            activity_id=session_id,
+            activity_run_id="test-run",
+        )
+        await deps.recorder.record_messages(
+            deps,
+            [ModelRequest([UserPromptPart("go")]), response()],
+            checkpoint="model_node_completed",
+            next=CallToolsNext(),
         )
 
     task = asyncio.create_task(produce())

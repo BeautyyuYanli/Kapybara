@@ -31,6 +31,7 @@ from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
 from kapy.lifecycle import LifecycleStatus
 from kapy.runner import RunnerActivity, RunnerDeps, activities
+from kapy.runner.checkpoints import Checkpoint, decode_state
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -139,10 +140,13 @@ async def test_competing_workers_admit_one_idle_session_without_loser_side_effec
             row = await service.get_session(session_id)
             assert (row.current_activity_id, row.current_activity_run_id) == identity
             assert row.status == LifecycleStatus.READY and row.model_settings == {}
-            assert (await service.read_history(session_id)).items == []
+            assert [entry.seq for entry in (await service.read_history(session_id)).items] == [0]
             async with database.sessions.begin() as db:
                 stored = await db.get(SessionRow, session_id)
-                assert stored.runner_state is None and stored.layer_states == {}
+                checkpoint = decode_state(stored.runner_state)
+                assert isinstance(checkpoint, Checkpoint)
+                assert checkpoint.checkpoint == "before_model_request"
+                assert stored.layer_states == {}
             release_model.set()
             assert await asyncio.wait_for(next(iter(pending)), 10) == "done"
             row = await service.get_session(session_id)

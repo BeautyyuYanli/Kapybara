@@ -17,3 +17,7 @@ class CloseSession(DTO):
 class StartRunner(DTO):
     activity_id: UUID
     user_prompt: str
+
+
+class ResumeRunner(DTO):
+    activity_id: UUID

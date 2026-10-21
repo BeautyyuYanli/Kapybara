@@ -36,7 +36,8 @@ need new UUIDs; retries keep the original request. Same-key changed prompt/confi
 uses the first accepted input. Only session/type identity is checked, directly
 against Temporal. Deduplication and old-result retrieval end with native retention.
 
-`start_runner` returns `ActivityHandle[str]`. Create and close await native
+`start_runner` and explicit `resume_runner(session_id, activity_id=new_uuid)`
+return `ActivityHandle[str]`. Create and close await native
 `handle.result()` and return SessionRecord, or raise a safe SessionExecutionError
 with session/Activity/run identities. Canceling a local wait does not cancel remote
 execution. `get_activity(session_id, activity_id, run_id=...)` reads native status,
@@ -51,28 +52,36 @@ The database stores no queued phase, execution outcome, input, error or deadline
 | Action | Business mutation in the executing Worker |
 | --- | --- |
 | create | Insert creating, validated fixed Config and native writer; publish all initial States with ready and release |
-| run | Claim unowned ready; atomically read current model/provider, settings, snapshot and States |
-| run success | Commit snapshot/all States with ready and release, after model/tool clients exit |
-| run failure | Preserve preceding snapshot and history; set closing and release after resource exit |
+| run | Claim unowned ready with NULL/compatible legacy/done; validate history and read current execution configuration/State |
+| resume | Claim ready, optionally CAS a confirmed stale exact owner; validate latest checkpoint/history, return done or rebuild execution |
+| checkpoint | Atomically save complete history, runner_state and all layer States under the full native writer |
+| run success | Save done/final State with ready and release after after_run and all resources exit |
+| run/resume failure | Preserve actual committed checkpoint/State; release to ready when resumable, otherwise closing |
 | close | Claim unowned ready/closing, save each exit's progress, then close and release |
 
 Submission does not reserve a session or guarantee order. Several queued Activities
 can be accepted; Worker competition chooses the writer, and a loser fails finally
 without calling models/tools/hooks. Edits require ready and both identity fields
-empty, competing with Worker admission on that same row. Every history/snapshot/
+empty and no unfinished checkpoint, competing with Worker admission on that same row. Every history/snapshot/
 cleanup write checks session ID, full execution identity and permitted lifecycle
 in one short transaction. No transaction spans RPC, hook, model or publication I/O.
 
-Only explicit close can recover an abandoned writer. It reads the old identity,
+Only explicit close or resume can recover an abandoned writer. It reads the old identity,
 queries that exact native execution outside its transaction, and replaces it by
 CAS only for a confirmed terminal status or NOT_FOUND. RUNNING/PAUSED, unknown
 nonterminal states and temporary RPC failure preserve the old writer. A changed
 identity prevents takeover; an old execution cannot write after replacement.
-Queries, configuration edits and run admission never reconcile abandoned ownership.
+Queries, configuration edits and ordinary run admission never reconcile abandoned ownership.
+Resume requires ready and checks the latest history/runner snapshot in its claim
+transaction. Closing/closed scopes cannot resume. Done returns its saved string
+without loading execution configuration or entering the SDK; it does not rewrite
+the old Activity's native status. Unfinished checkpoints block prompts/title and
+execution edits until explicit resume or close. See [runner checkpoints](../runner/README.md).
 
 Every Activity has one Temporal attempt, a one-hour schedule/start-to-close budget
 and heartbeat cancellation. There is no database deadline, local timeout sealing,
-background recovery or automatic Agent replay. A business commit can coexist with
+background recovery or automatic Agent replay. Explicit resume uses a new Activity
+UUID and the saved model_request/call_tools/finish action. A business commit can coexist with
 a native failure/timeout; current session/history show business facts without
 pretending to reconstruct an old Activity result.
 

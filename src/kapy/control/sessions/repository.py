@@ -108,7 +108,7 @@ class SessionRepository:
         close: bool,
         previous: tuple[UUID, str, LifecycleStatus] | None = None,
     ) -> SessionRow | None:
-        """Claim empty ownership, or CAS a terminal execution confirmed by close.
+        """Claim empty ownership, or CAS an execution confirmed by explicit close/resume.
 
         A takeover replaces both identity fields directly. The caller queries
         Temporal outside this transaction and supplies the exact observed owner.
@@ -125,8 +125,8 @@ class SessionRepository:
                 ),
             )
         else:
-            if not close:
-                raise ValueError("Only close can replace ownership")
+            if not close and previous[2] != LifecycleStatus.READY:
+                raise ValueError("Resume requires ready business scopes")
             statement = statement.where(
                 col(SessionRow.current_activity_id) == previous[0],
                 col(SessionRow.current_activity_run_id) == previous[1],
@@ -195,3 +195,24 @@ class SessionRepository:
         row.current_activity_id = row.current_activity_run_id = None
         await self._db.flush()
         return SessionRecord.model_validate(row)
+
+    async def _save_checkpoint(
+        self,
+        row: SessionRow,
+        *,
+        runner_state: str,
+        layer_states: dict[str, Any],
+        release: bool,
+    ) -> None:
+        """Apply to the row Recorder already guarded in this transaction.
+
+        Internal to checkpoint persistence: the full writer guard precedes all
+        history reads/appends and holds its row lock through this flush/commit.
+        Other completion callers continue to use the guarded complete().
+        """
+        if row.layers.keys() != layer_states.keys():
+            raise ValueError("Saved layer states must match configured layers")
+        row.runner_state, row.layer_states = runner_state, layer_states
+        if release:
+            row.current_activity_id = row.current_activity_run_id = None
+        await self._db.flush()

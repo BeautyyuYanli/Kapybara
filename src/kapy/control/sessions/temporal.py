@@ -14,6 +14,7 @@ from .types import OwnershipLost, SessionAlreadyExists, SessionBusy
 
 CREATE = "kapy.create_session"
 RUN = "kapy.run_agent"
+RESUME = "kapy.resume_agent"
 CLOSE = "kapy.close_session"
 TERMINAL_STATUSES = frozenset(
     {

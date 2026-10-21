@@ -49,7 +49,9 @@ from kapy.agent_history.models import AgentHistoryRow
 from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 from kapy.application.resources import connect_temporal
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
+from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
+from kapy.lifecycle import LifecycleStatus
 from kapy.runner import (
     ExecutionConfig,
     MessageRecordCapability,
@@ -58,6 +60,7 @@ from kapy.runner import (
     RunnerInput,
     agent,
 )
+from kapy.runner.checkpoints import Checkpoint, FinishNext, decode_state, state_messages
 from kapy.runner.recording import Recorder
 from kapy.runner.worker import serve
 
@@ -349,7 +352,10 @@ async def test_database_history_reproduces_model_input(
             profile={"context_window": config.context_window},
         ) as model,
     ):
-        recorder = Recorder()
+
+        async def prepare(ctx, request):
+            return await ctx.deps.recorder.before_model_request(ctx, request)
+
         recording_agent = Agent(
             model,
             deps_type=RunnerDeps,
@@ -357,9 +363,9 @@ async def test_database_history_reproduces_model_input(
             instructions=instructions,
             tools=[work],
             capabilities=[
-                MessageRecordCapability(recorder),
+                MessageRecordCapability(),
                 Hooks(
-                    before_model_request=recorder.predict_response_seq,
+                    before_model_request=prepare,
                     ordering=CapabilityOrdering(
                         position="innermost", requires=[MessageRecordCapability]
                     ),
@@ -375,10 +381,12 @@ async def test_database_history_reproduces_model_input(
         )
         assert result.output == "done" and len(requests) == 1
         if with_tools:
+            restored_deps = runner_database.deps()
+            restored_deps.recorder = Recorder(result.all_messages())
             result = await recording_agent.run(
                 "follow-up",
                 message_history=result.all_messages(),
-                deps=runner_database.deps(),
+                deps=restored_deps,
                 model_settings=cast(ModelSettings, config.model_settings),
                 event_stream_handler=drain,
             )
@@ -531,16 +539,17 @@ async def test_activity_restores_state_and_records_after_run_tail_once(
                         runner_database.session_id
                     )
                 assert first_state is not None
-                first_messages = ModelMessagesTypeAdapter.validate_json(first_state)
+                first_messages = state_messages(decode_state(first_state))
                 tail = first_messages[-1]
                 assert isinstance(tail, ModelRequest) and len(tail.parts) == 1
                 part = tail.parts[0]
                 assert isinstance(part, UserPromptPart) and part.content == "after-run tail"
-                assert first_messages[-1].metadata == {"source": "after_run"}
-                assert [entry.seq for entry in first_entries] == [0, 1]
+                assert first_messages[-1].metadata == {"source": "after_run", "seq": 2}
+                assert [entry.seq for entry in first_entries] == [0, 1, 2]
                 assert [e.message.seq for e in broadcasts if isinstance(e, MessageCommitted)] == [
                     0,
                     1,
+                    2,
                 ]
     assert len(requests) == 2
     assert [(m["role"], m["content"]) for m in requests[1]["body"]["messages"]] == [
@@ -553,7 +562,7 @@ async def test_activity_restores_state_and_records_after_run_tail_once(
         state = await SessionRepository(db).read_runner_state(runner_database.session_id)
         entries = await HistoryRepository(db).read_history_entries(runner_database.session_id)
     assert state is not None
-    messages = ModelMessagesTypeAdapter.validate_json(state)
+    messages = state_messages(decode_state(state))
     assert [m.metadata for m in messages] == [
         {"seq": 0},
         {"seq": 1},
@@ -917,8 +926,17 @@ async def test_model_failure_executes_once_closes_resources_and_keeps_previous_s
     assert len(models) == 1 and models[0].provider._own_http_client.is_closed
     assert requests == []
     async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) == "[]"
-        assert await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
+        saved = decode_state(
+            await SessionRepository(db).read_runner_state(runner_database.session_id)
+        )
+        assert isinstance(saved, Checkpoint) and saved.checkpoint == "before_model_request"
+        assert [
+            e.seq
+            for e in await HistoryRepository(db).read_history_entries(runner_database.session_id)
+        ] == [0]
+        assert (
+            await SessionRepository(db).get_session(runner_database.session_id)
+        ).status.value == "ready"
 
 
 @pytest.mark.integration
@@ -972,7 +990,10 @@ async def test_cancellation_waits_for_model_cleanup_and_preserves_snapshot(
                 await handle.cancel()
     assert requests == []
     async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
+        saved = decode_state(
+            await SessionRepository(db).read_runner_state(runner_database.session_id)
+        )
+        assert isinstance(saved, Checkpoint) and saved.checkpoint == "before_model_request"
 
 
 @pytest.mark.integration
@@ -982,12 +1003,15 @@ async def test_final_save_failure_does_not_retry_agent_or_undo_history(
 ):
     base_url, requests = endpoint
     saves = []
+    save = SessionRepository._save_checkpoint
 
     async def fail_save(self, *args, **kwargs):
-        saves.append(kwargs)
-        raise RuntimeError("database save unavailable")
+        if kwargs["release"]:
+            saves.append(kwargs)
+            raise RuntimeError("database save unavailable")
+        return await save(self, *args, **kwargs)
 
-    monkeypatch.setattr(SessionRepository, "complete", fail_save)
+    monkeypatch.setattr(SessionRepository, "_save_checkpoint", fail_save)
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-save-failure-{uuid4()}"
     runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
@@ -1007,9 +1031,15 @@ async def test_final_save_failure_does_not_retry_agent_or_undo_history(
         )
         with pytest.raises(ActivityFailureError):
             await asyncio.wait_for(handle.result(), 35)
-    assert len(requests) == 1 and len(saves) == 2
+    assert len(requests) == 1 and len(saves) == 1
     async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
+        saved = decode_state(
+            await SessionRepository(db).read_runner_state(runner_database.session_id)
+        )
+        assert isinstance(saved, Checkpoint) and isinstance(saved.next, FinishNext)
+        row = await db.get(SessionRow, runner_database.session_id)
+        assert row.status == LifecycleStatus.READY
+        assert row.current_activity_id is row.current_activity_run_id is None
         assert [
             entry.seq
             for entry in await HistoryRepository(db).read_history_entries(

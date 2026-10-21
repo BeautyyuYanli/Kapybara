@@ -9,6 +9,7 @@ from typing import Self
 from uuid import UUID
 
 from pydantic import Field, SecretStr, model_validator
+from pydantic_ai.messages import ModelMessage
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kapy.agent_output import AgentOutputService
@@ -16,6 +17,9 @@ from kapy.control.models.runtime import provider_arguments
 from kapy.control.models.types import ProviderConfig, ProviderInput
 from kapy.control.types import DTO, JsonObject, Name
 from pydantic_ai_layer_protocol.types import LayerData
+
+from .checkpoints import Checkpoint
+from .recording import Recorder
 
 
 class ExecutionConfig(DTO):
@@ -55,7 +59,8 @@ class RunnerInput(DTO):
 
     session_id: UUID
     runner_state: str | None
-    user_prompt: str
+    user_prompt: str | None
+    resuming: bool = False
     config: ExecutionConfig
     layers: dict[str, LayerData] = Field(default_factory=dict)
 
@@ -71,3 +76,6 @@ class RunnerDeps:
     output_service: AgentOutputService
     layers: dict[str, LayerData] = field(default_factory=dict)
     response_seq: int | None = None
+    recorder: Recorder = field(default_factory=Recorder)
+    messages: list[ModelMessage] = field(default_factory=list)
+    resume: Checkpoint | None = None

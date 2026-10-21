@@ -1,6 +1,6 @@
 """Standalone Temporal Activity runner; callers own Client and Worker lifecycle.
 
-Register RunnerActivity.run on a Worker using Temporal's native Pydantic converter.
+Register RunnerActivity run/resume/create/close using Temporal's native Pydantic converter.
 The static Agent and ordinary hooks execute entirely inside that Activity.
 """
 

@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
-from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelResponse
+from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
@@ -74,6 +74,15 @@ def _decode_history(rows: Sequence[AgentHistoryRow]) -> tuple[HistoryMessage, ..
     )
 
 
+def history_projection(message: ModelMessage) -> dict[str, Any]:
+    """Compare complete SDK payloads using exactly the stored usage projection."""
+    payload = ModelMessagesTypeAdapter.dump_python([message], mode="json")[0]
+    if isinstance(message, ModelResponse):
+        payload.pop("usage", None)
+        payload["tokens"] = response_tokens(message)
+    return payload
+
+
 class HistoryRepository:
     """Append and replay participant; callers own locking and commit decisions."""
 
@@ -134,6 +143,15 @@ class HistoryRepository:
             seen.add(seq)
         if not messages:
             return ()
+        old_boundary = await self.max_seq(session_id)
+        accepted = tuple(message for message in messages if message.seq > old_boundary)
+        rows = _encode_history(accepted)
+        if rows:
+            await self._db.execute(insert(AgentHistoryRow), rows)
+        return accepted
+
+    async def max_seq(self, session_id: UUID) -> int:
+        """Read the sealed boundary in the caller's ownership transaction."""
         last_seq = (
             await self._db.execute(
                 select(AgentHistoryRow.seq)
@@ -144,9 +162,4 @@ class HistoryRepository:
                 .limit(1)
             )
         ).scalar_one_or_none()
-        old_boundary = -1 if last_seq is None else last_seq
-        accepted = tuple(message for message in messages if message.seq > old_boundary)
-        rows = _encode_history(accepted)
-        if rows:
-            await self._db.execute(insert(AgentHistoryRow), rows)
-        return accepted
+        return -1 if last_seq is None else last_seq

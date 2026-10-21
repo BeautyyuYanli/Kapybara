@@ -29,8 +29,12 @@ independent of durable snapshot encoding.
 Worker resources from run deps, confirms session ID/native UUID/run_id using conditional
 writes in a short transaction, then
 publishes accepted messages through [agent_output](../agent_output/README.md) after
-commit. Recording and final runner-state saving remain separate transactions: a
-failure before the final save commits can leave recorded history while the
-previous successful snapshot remains. SessionService's
-[Worker admission](../control/README.md) prevents executing a new run after such
-failure. `live()` combines these immutable messages with best-effort previews.
+commit. The same transaction saves the runner checkpoint and every layer State.
+The first model request, successful model nodes, complete tool batches and final
+after_run/resource teardown each form a checkpoint, including empty message tails.
+The runner validates its confirmed boundary and rejects occupied old positions
+before append_history; an incomplete accepted batch rolls back the whole save.
+Acknowledged seq is applied before best-effort broadcast. Uncertain commits stop
+execution without retries; explicit resume validates the actual stored checkpoint
+and every history position/content projection. `live()` combines these immutable
+messages with best-effort previews. See [runner](../runner/README.md).

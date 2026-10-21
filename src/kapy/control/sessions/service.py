@@ -22,7 +22,7 @@ from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent,
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 
 from .repository import SessionRepository
-from .temporal import CLOSE, CREATE, RUN, failure_category
+from .temporal import CLOSE, CREATE, RESUME, RUN, failure_category
 from .types import (
     ActivityIdentityConflict,
     CreateSession,
@@ -37,7 +37,12 @@ from .types import (
 
 _TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
 _ACTIVITY_TIMEOUT = timedelta(hours=1)
-_INPUT_TYPES = {CREATE: CreateSessionActivity, RUN: RunAgentActivity, CLOSE: SessionActivityRequest}
+_INPUT_TYPES = {
+    CREATE: CreateSessionActivity,
+    RUN: RunAgentActivity,
+    RESUME: SessionActivityRequest,
+    CLOSE: SessionActivityRequest,
+}
 
 
 class SessionService:
@@ -212,6 +217,12 @@ class SessionService:
             raise SessionExecutionError(session_id, activity_id, None, "UnableToConfirm") from None
         return await self._wait_session(session_id, activity_id, handle)
 
+    async def resume_runner(self, session_id: UUID, *, activity_id: UUID) -> ActivityHandle[str]:
+        """Submit explicit recovery; the Worker reads the latest consistent checkpoint."""
+        return await self._start(
+            RESUME, SessionActivityRequest(session_id=session_id), activity_id, str
+        )
+
     async def get_activity(
         self,
         session_id: UUID,
@@ -227,7 +238,7 @@ class SessionService:
                 raise LookupError("Activity not found; its outcome cannot be confirmed") from None
             raise
         result = await description.result(
-            str if description.activity_type == RUN else SessionRecord
+            str if description.activity_type in (RUN, RESUME) else SessionRecord
         )
         failure = await description.outcome_failure()
         assert description.activity_run_id is not None
@@ -286,10 +297,14 @@ class SessionService:
             )
 
     async def update_session(self, session_id: UUID, data: UpdateSession) -> SessionRecord:
+        from kapy.runner.checkpoints import decode_state, require_new_prompt
+
         async with self._session_factory() as db, db.begin():
-            return await SessionRepository(db).update_session(
-                session_id, data.model_dump(exclude_unset=True)
-            )
+            repo = SessionRepository(db)
+            record = await repo.update_session(session_id, data.model_dump(exclude_unset=True))
+            # The conditional edit holds the row through validation and commit.
+            require_new_prompt(decode_state(await repo.read_runner_state(session_id)))
+            return record
 
     async def read_history(
         self, session_id: UUID, *, before_seq: int | None = None, limit: int = 100

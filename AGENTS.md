@@ -124,16 +124,19 @@ runner snapshot 与 layer State 原子保存，以及固定 history 和实时输
 创建、运行和关闭使用调用方提供的 Activity UUID，由 Temporal 在保留期内去重并保存执行记录。
 数据库生命周期只含 creating/ready/closing/closed；Worker 执行时通过成对的
 current_activity_id/current_activity_run_id 原子取得当前写入权，排队不占用 session。
-所有进度保存校验完整身份；只有显式 close 查询 Temporal 并 CAS 接管终态或不存在的旧执行。
+所有进度保存校验完整身份；显式 close/resume 查询 Temporal 并 CAS 接管终态或不存在的旧执行。
 RPC 和 hooks 均不持有事务或显式锁。整轮最多一个 Temporal
-尝试，不恢复 Agent 内部步骤。迁移将旧 creating/starting/running/closing 转为 closing，
+尝试。显式 resume 使用新的 Activity UUID，从最新一致业务检查点续接，不自动重试。
+迁移将旧 creating/starting/running/closing 转为 closing，
 保留 ready/closed、Config、State、快照和历史，清空旧占用并删除操作账本。
 
 `live(session_id, after_seq=-1)` 返回历史回放并继续监听的异步 generator，
 提前结束时使用 `aclosing`。消费者以最后完整应用消息的 `seq` 作为 `after_seq`，尚无该位置时使用 -1；
 delta 不推进游标。完整消息写入后内容和位置固定，数据库中的数值缺口也保持封闭。
-Pub/Sub 是尽力广播，断线后清空临时预览并从该位置续接。执行 Activity 仅在模型节点结束后记录消息，最终输出工具回执及 after-run
-追加内容先保存在 runner_state，后续模型节点才记录。核心与 Telegram 的固定消息迁移
+Pub/Sub 是尽力广播，断线后清空临时预览并从该位置续接。首次模型请求前、模型节点成功后、
+整批工具成功后及 after_run/全部资源退出后，history、runner_state 和所有 layer State
+在完整 writer guard 下原子保存。未完成检查点只允许显式 resume 或 close；closing/closed
+不恢复 Agent。核心与 Telegram 的固定消息迁移
 需离线执行，不兼容旧 Workflow 执行。
 
 ```sh

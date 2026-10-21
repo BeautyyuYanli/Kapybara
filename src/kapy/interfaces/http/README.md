@@ -52,11 +52,12 @@ Session routes are:
 | PATCH /sessions/{id} | update_session | SessionRecord |
 | POST /sessions/{id}/close | close_session | SessionRecord |
 | POST /sessions/{id}/runner | start_runner | 202 ActivityReference |
+| POST /sessions/{id}/runner/resume | resume_runner | 202 ActivityReference |
 | GET /sessions/{id}/activities/{activity_id} | get_session_activity | SessionActivity |
 | GET /sessions/{id}/history | read_history | Page[HistoryMessage] |
 | WS /sessions/{id}/live?after_seq=N | live_ws | one nonempty OutputEvent[] per text frame |
 
-Create/run/close require an Activity UUID. Its string is the native Activity ID.
+Create/run/resume/close require an Activity UUID. Its string is the native Activity ID.
 Temporal provides deduplication and result retrieval only while records are retained.
 Use a new UUID for new work and preserve the original request on retries. Same-key
 changed prompt/config uses the first accepted input; another session/type receives
@@ -72,10 +73,20 @@ native run ID. Create is queryable even before its business row exists.
 
 A Worker acquires an unowned ready session only when executing, then loads current
 business data/model/provider. Competing runs can therefore fail after 202. READY
-with both current identity fields empty permits edits. One Temporal attempt owns
-all model/tool resources. A failed run becomes closing; cleanup uses explicit close.
-Only close queries and CAS-replaces a terminal/missing old execution. A live/unknown
+with both current identity fields empty and no unfinished checkpoint permits edits.
+One Temporal attempt owns all model/tool resources. Failures with a committed
+checkpoint retain ready for explicit resume/close; failures before a checkpoint
+become closing. Close and resume query and CAS-replace a terminal/missing old execution. A live/unknown
 old execution or RPC failure preserves its occupancy. Reads never reconcile state.
+
+POST /sessions/{id}/runner/resume accepts only `{"activity_id": "new UUID"}`.
+The Worker claims ready and validates the latest consistent checkpoint/history;
+the caller does not pre-read a snapshot. Its 202 response has the same native
+reference and lookup semantics as start. Legacy arrays/NULL cannot resume, and
+closing/closed scopes reject recovery. Saved done returns its output without
+models/tools/hooks, even if execution configuration is no longer installed.
+Unfinished checkpoints block new prompts and configuration/title edits.
+See [continuation and side-effect limits](../../runner/README.md).
 
 Caller disconnect/cancel does not cancel the Activity. For a lost response, query
 the original reference and business resource before deciding on a new request.

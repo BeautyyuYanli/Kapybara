@@ -46,9 +46,18 @@ model/hook signatures, including the required optional State on exit.
 `runner/test_layers.py` uses deterministic SDK streaming with real
 PostgreSQL, standalone Temporal Activities and a private shellctl server. It covers
 sequential calls, cross-run cursors, native ModelRetry, failure/cancellation keeping
-the preceding snapshot and session-close retry progress. The runner tests also
+the preceding complete checkpoint and session-close retry progress. The runner tests also
 exercise three model protocols, single-attempt failures, final-save failure and
-resource cleanup. Native ownership, tool flags and deferred capability/Toolset
+resource cleanup. Checkpoint tests cover atomic history/State saves, frozen
+messages, sealed gaps, legacy admission, preview/publication failures, four
+explicit continuation kinds, lost commit replies, native stale-owner takeover,
+HTTP resume, successful pending-tool recovery with complete receipts/State, and
+done without execution configuration. Callback fencing covers awaited-hook
+takeover, swallowed native cancellation, ordinary owned recovery, stopped-save
+error dispatch, run-local registrations and marked event listeners. Event waits
+and native result waits in those regressions are bounded. Lifecycle rejection
+uses valid resumable checkpoints and checks the public failure category.
+Native ownership, tool flags and deferred capability/Toolset
 instructions are checked through ordinary Agent runs. No external model API is called.
 
 Shared PostgreSQL/Valkey fixtures live in `tests/conftest.py`. `tests/control`

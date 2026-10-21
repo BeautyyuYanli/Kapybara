@@ -52,7 +52,11 @@ Nested causes/groups, invalid State and ordinary errors are not retry signals.
 The fixed ID/Config survives those attempts; State progress is validated and saved
 before the next exit attempt. Storage/validation failure does not retry a hook.
 This is the existing business-hook contract; Temporal itself uses one attempt and
-never restores the Agent or automatically replays enter.
+never automatically restores the Agent or replays enter. Explicit runner resume
+loads the latest checkpoint's States with fixed Config, without enter_scope.
+Each complete tool-batch checkpoint saves all States atomically with messages;
+failed partial batches keep the preceding State and may replay external effects.
+Closing/closed scopes cannot resume because their States now track cleanup progress.
 
 Every new scope/model/tool call checks the session's current UUID/native run_id.
 Progress writes conditionally check full writer identity and lifecycle in one short

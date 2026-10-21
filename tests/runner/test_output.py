@@ -1,5 +1,7 @@
 """Ordinary Agent streams borrow Worker resources from per-run deps."""
 
+from contextlib import asynccontextmanager
+
 import pytest
 from pydantic_ai import RunContext
 from pydantic_ai.messages import (
@@ -58,3 +60,34 @@ async def test_handler_drains_stream_and_flushes_text_with_optional_prediction(
                 TextDelta(session_id, 7, 1, "thinking", "replace", "reasoning"),
             ]
     assert consumed == source
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["open", "publish", "close"])
+async def test_preview_failure_drains_the_model_stream(runner_database, monkeypatch, failure):
+    deps = runner_database.deps()
+    deps.response_seq = 1
+    consumed = []
+
+    @asynccontextmanager
+    async def publisher(*args):
+        if failure == "open":
+            raise RuntimeError("unavailable")
+
+        async def publish(event):
+            if failure == "publish":
+                raise RuntimeError("unavailable")
+
+        yield publish
+        if failure == "close":
+            raise RuntimeError("unavailable")
+
+    async def events():
+        for index in range(3):
+            consumed.append(index)
+            yield PartStartEvent(index=index, part=TextPart("preview"))
+
+    monkeypatch.setattr(deps.output_service, "publisher", publisher)
+    await handle_deltas(RunContext(deps=deps, model=TestModel(), usage=RunUsage()), events())
+    assert consumed == [0, 1, 2]

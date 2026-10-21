@@ -1,421 +1,288 @@
-"""PostgreSQL write boundaries and committed full-message broadcasts."""
+"""Real PostgreSQL atomic checkpoints, sealed history and post-commit broadcasts."""
 
 import asyncio
-from contextlib import aclosing, asynccontextmanager
+from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import replace
 from uuid import uuid4
 
 import pytest
-from pydantic_ai.messages import (
-    ModelMessagesTypeAdapter,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
-    UserPromptPart,
-)
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.usage import RequestUsage
 from sqlalchemy import event
-from sqlmodel import col, select
 
-from kapy.agent_history import HistoryMessage
+from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_history.models import AgentHistoryRow
-from kapy.agent_history.repository import HistoryRepository
 from kapy.agent_output import MessageCommitted
-from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
 from kapy.control.sessions.types import OwnershipLost
 from kapy.lifecycle import LifecycleStatus
-from kapy.runner import Recorder, RunnerDeps
-
-pytestmark = pytest.mark.asyncio
-
-
-@pytest.mark.integration
-async def test_stored_message_is_immutable_and_broadcast_preserves_complete_input(
-    runner_database, monkeypatch
-):
-    session_id, outputs = runner_database.session_id, runner_database.outputs
-    response = ModelResponse(
-        parts=[TextPart("original")],
-        metadata={"seq": "opaque", "source": "business"},
-        finish_reason="stop",
-        provider_name="provider",
-        provider_details={"key": "value"},
-        usage=RequestUsage(
-            input_tokens=100, output_tokens=20, cache_read_tokens=50, details={"extra": 7}
-        ),
-    )
-    entry = HistoryMessage(session_id, 10, response)
-    published = []
-    publish = outputs._publish
-
-    async def check_committed(requested_session, payload):
-        async with runner_database.sessions.begin() as db:
-            row = await db.get(AgentHistoryRow, (session_id, 10))
-            assert row is not None
-        published.append(payload)
-        await publish(requested_session, payload)
-
-    monkeypatch.setattr(outputs, "_publish", check_committed)
-    async with outputs.subscribe(session_id) as events:
-        batch = (
-            RunnerDeps(
-                session_id=session_id,
-                session_factory=runner_database.sessions,
-                output_service=runner_database.outputs,
-                activity_id=session_id,
-                activity_run_id="test-run",
-            ),
-            [entry],
-        )
-        await Recorder().persist_messages(*batch)
-        assert await anext(events) == [MessageCommitted(entry)]
-        async with runner_database.sessions.begin() as db:
-            row = await db.get(AgentHistoryRow, (session_id, 10))
-            created_at = row.created_at
-            assert (row.finish_reason, row.input_tokens, row.output_tokens) == ("stop", 100, 20)
-        await Recorder().persist_messages(*batch)
-        await Recorder().persist_messages(
-            *(
-                RunnerDeps(
-                    session_id=session_id,
-                    session_factory=runner_database.sessions,
-                    output_service=runner_database.outputs,
-                    activity_id=session_id,
-                    activity_run_id="test-run",
-                ),
-                [replace(entry, message=ModelRequest([UserPromptPart("changed")]))],
-            )
-        )
-    assert len(published) == 1
-    async with runner_database.sessions.begin() as db:
-        row = await db.get(AgentHistoryRow, (session_id, 10))
-        assert row.kind == "response" and row.created_at == created_at
-        assert row.message == {
-            "parts": ModelMessagesTypeAdapter.dump_python([response], mode="json")[0]["parts"]
-        }
-        stored = await HistoryRepository(db).read_history_entries(session_id)
-        assert stored[0].seq == 10 and stored[0].message.metadata == response.metadata
-        assert isinstance(stored[0].message, ModelResponse)
-        assert stored[0].message.usage.input_tokens == 100
-        assert stored[0].message.usage.output_tokens == 20
-        assert await HistoryRepository(db).read_history_entries(session_id, after_seq=10) == ()
-        assert await SessionRepository(db).read_runner_state(session_id) is None
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "invalid",
-    [
-        {"seq": None},
-        {"seq": True},
-        {"seq": -1},
-        {"seq": "1"},
-        {"seq": 1.5},
-        {"seq": 0},
-        {"session_id": uuid4()},
-    ],
+from kapy.runner.checkpoints import (
+    Checkpoint,
+    DoneNext,
+    FinishNext,
+    ModelRequestNext,
+    decode_state,
+    validate_history,
 )
-async def test_invalid_batch_does_not_write_or_broadcast(runner_database, monkeypatch, invalid):
-    outputs = runner_database.outputs
-    published = []
 
-    async def publish(*args):
-        published.append(args)
+pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
-    monkeypatch.setattr(outputs, "_publish", publish)
-    session_id = runner_database.session_id
-    valid = HistoryMessage(session_id, 0, ModelRequest(parts=[UserPromptPart("valid")]))
-    other = replace(valid, seq=1, **{k: v for k, v in invalid.items() if k != "seq"})
-    if "seq" in invalid:
-        other = replace(other, seq=invalid["seq"])
-    data = (
-        RunnerDeps(
-            session_id=session_id,
-            session_factory=runner_database.sessions,
-            output_service=runner_database.outputs,
-            activity_id=session_id,
-            activity_run_id="test-run",
-        ),
-        [valid, other],
+
+async def checkpoint(deps, messages, *, done=False):
+    await deps.recorder.record_messages(
+        deps,
+        messages,
+        checkpoint="run_completed" if done else "before_model_request",
+        next=DoneNext(output="done") if done else ModelRequestNext(),
+        release=done,
     )
-    with pytest.raises(ValueError):
-        await Recorder().persist_messages(*data)
-    assert published == []
-    async with runner_database.sessions.begin() as db:
-        assert await HistoryRepository(db).read_history_entries(session_id) == ()
 
 
 def history(session_id, seq, content="message"):
     return HistoryMessage(session_id, seq, ModelRequest([UserPromptPart(content)]))
 
 
-@pytest.mark.integration
-async def test_boundary_filters_in_input_order_and_seals_old_gaps(runner_database, monkeypatch):
-    session_id = runner_database.session_id
-    initial = [history(session_id, 0), history(session_id, 10)]
-    await Recorder().persist_messages(
-        *(
-            RunnerDeps(
-                session_id=session_id,
-                session_factory=runner_database.sessions,
-                output_service=runner_database.outputs,
-                activity_id=session_id,
-                activity_run_id="test-run",
+async def test_history_snapshot_state_and_release_use_one_transaction(runner_database):
+    deps = runner_database.deps()
+    config = {"cwd": "/tmp"}
+    state = {"scope_id": str(deps.session_id), "jobs": {"job": 7}}
+    deps.layers = {"shell": {"config": config, "state": deepcopy(state)}}
+    async with runner_database.sessions.begin() as db:
+        row = await db.get(SessionRow, deps.session_id)
+        row.layers = {"shell": config}
+    messages: list[ModelMessage] = [
+        ModelRequest([UserPromptPart("input")], metadata={"business": "input"})
+    ]
+    async with deps.output_service.subscribe(deps.session_id) as events:
+        await checkpoint(deps, messages)
+        assert await anext(events) == [
+            MessageCommitted(HistoryMessage(deps.session_id, 0, messages[0]))
+        ]
+    messages.append(
+        ModelResponse(
+            [TextPart("answer")],
+            usage=RequestUsage(
+                input_tokens=100, output_tokens=20, cache_read_tokens=50, details={"extra": 7}
             ),
-            initial,
+            finish_reason="stop",
         )
     )
+    await deps.recorder.record_messages(
+        deps, messages, checkpoint="tools_node_completed", next=FinishNext(output="answer")
+    )
+    deps.layers["shell"]["state"]["jobs"]["job"] = 9
+    await checkpoint(deps, messages, done=True)
     async with runner_database.sessions.begin() as db:
-        created_at = (await db.get(AgentHistoryRow, (session_id, 10))).created_at
+        row = await db.get(SessionRow, deps.session_id)
+        saved = decode_state(row.runner_state)
+        entries = await HistoryRepository(db).read_history_entries(deps.session_id)
+        assert isinstance(saved, Checkpoint) and isinstance(saved.next, DoneNext)
+        validate_history(saved, entries)
+        assert row.layer_states["shell"]["jobs"] == {"job": 9}
+        assert row.status == LifecycleStatus.READY
+        assert row.current_activity_id is row.current_activity_run_id is None
+        assert isinstance(saved.messages[-1], ModelResponse)
+        assert saved.messages[-1].usage.cache_read_tokens == 50
+        assert isinstance(entries[-1].message, ModelResponse)
+        assert entries[-1].message.usage.cache_read_tokens == 0
+        assert [e.seq for e in entries] == [0, 1]
 
-    published = []
+
+@pytest.mark.parametrize("failure", ["save", "accepted", "codec", "state"])
+async def test_checkpoint_failure_rolls_back_history_state_and_live_metadata(
+    runner_database, monkeypatch, failure
+):
+    deps = runner_database.deps()
+    messages = [ModelRequest([UserPromptPart("input")])]
+
+    if failure == "save":
+        save = SessionRepository._save_checkpoint
+
+        async def fail_save(self, *args, **kwargs):
+            await save(self, *args, **kwargs)
+            raise ValueError("failure")
+
+        monkeypatch.setattr(SessionRepository, "_save_checkpoint", fail_save)
+    elif failure == "accepted":
+        append = HistoryRepository.append_history
+
+        async def reject_part(self, *args):
+            await append(self, *args)
+            return ()
+
+        monkeypatch.setattr(HistoryRepository, "append_history", reject_part)
+    elif failure == "codec":
+
+        def fail_codec(*args, **kwargs):
+            raise ValueError("failure")
+
+        monkeypatch.setattr(Checkpoint, "model_dump_json", fail_codec)
+    else:
+        deps.layers = {"shell": {"config": {"cwd": "/tmp"}, "state": {"jobs": {}}}}
+    with pytest.raises(ValueError):
+        await checkpoint(deps, messages)
+    assert messages[0].metadata is None and deps.recorder.boundary == -1
+    async with runner_database.sessions.begin() as db:
+        row = await db.get(SessionRow, deps.session_id)
+        assert row.runner_state is None and row.layer_states == {}
+        assert row.current_activity_id == deps.activity_id
+        assert await HistoryRepository(db).read_history_entries(deps.session_id) == ()
+
+
+async def test_empty_suffix_still_saves_checkpoint_and_state(runner_database):
+    deps = runner_database.deps()
+    messages = [ModelRequest([UserPromptPart("input")])]
+    await checkpoint(deps, messages)
+    async with runner_database.sessions.begin() as db:
+        created_at = (await db.get(AgentHistoryRow, (deps.session_id, 0))).created_at
+    await deps.recorder.record_messages(
+        deps, messages, checkpoint="tools_node_completed", next=FinishNext(output="candidate")
+    )
+    async with runner_database.sessions.begin() as db:
+        saved = decode_state((await db.get(SessionRow, deps.session_id)).runner_state)
+        assert isinstance(saved, Checkpoint) and isinstance(saved.next, FinishNext)
+        assert (await db.get(AgentHistoryRow, (deps.session_id, 0))).created_at == created_at
+
+
+async def test_failed_broadcast_keeps_acknowledged_seq_and_can_continue(
+    runner_database, monkeypatch
+):
+    deps = runner_database.deps()
+    messages: list[ModelMessage] = [ModelRequest([UserPromptPart("input")])]
+
+    def fail_publish(*args):
+        raise RuntimeError("live transport unavailable")
+
+    monkeypatch.setattr(deps.output_service, "publisher", fail_publish)
+    await checkpoint(deps, messages)
+    assert messages[0].metadata == {"seq": 0} and deps.recorder.boundary == 0
+    messages.append(ModelResponse([TextPart("done")]))
+    await checkpoint(deps, messages, done=True)
+    async with runner_database.sessions.begin() as db:
+        saved = decode_state((await db.get(SessionRow, deps.session_id)).runner_state)
+        validate_history(saved, await HistoryRepository(db).read_history_entries(deps.session_id))
+        assert isinstance(saved, Checkpoint) and saved.next == DoneNext(output="done")
+
+
+async def test_real_broadcast_cancellation_preserves_committed_checkpoint(
+    runner_database, monkeypatch
+):
+    deps = runner_database.deps()
+    messages = [ModelRequest([UserPromptPart("input")])]
 
     @asynccontextmanager
-    async def publisher(requested_session):
-        assert requested_session == session_id
-        async with runner_database.sessions.begin() as db:
-            await db.execute(
-                select(SessionRow.id)
-                .where(col(SessionRow.id) == session_id)
-                .with_for_update(nowait=True)
-            )
-            stored = await HistoryRepository(db).read_history_entries(session_id)
-            assert [e.seq for e in stored] == [0, 10, 12, 13, 15, 16]
+    async def publisher(*args):
+        async def cancelled(event):
+            raise asyncio.CancelledError
 
-        async def publish(message):
-            published.append(message)
+        yield cancelled
 
-        yield publish
-
-    monkeypatch.setattr(runner_database.outputs, "publisher", publisher)
-    batch = [
-        history(session_id, 5, "old gap"),
-        history(session_id, 10, "changed stored row"),
-        history(session_id, 15),
-        history(session_id, 12),
-        history(session_id, 13),
-        history(session_id, 16),
-    ]
-    await Recorder().persist_messages(
-        *(
-            RunnerDeps(
-                session_id=session_id,
-                session_factory=runner_database.sessions,
-                output_service=runner_database.outputs,
-                activity_id=session_id,
-                activity_run_id="test-run",
-            ),
-            batch,
-        )
-    )
-    assert published == [MessageCommitted(entry) for entry in batch[2:]]
+    monkeypatch.setattr(deps.output_service, "publisher", publisher)
+    with pytest.raises(asyncio.CancelledError):
+        await checkpoint(deps, messages)
+    assert deps.recorder.boundary == 0 and messages[0].metadata == {"seq": 0}
     async with runner_database.sessions.begin() as db:
-        stored = await HistoryRepository(db).read_history_entries(session_id)
-        assert stored[:2] == tuple(initial)
-        assert (await db.get(AgentHistoryRow, (session_id, 10))).created_at == created_at
-
-    published.clear()
-    await Recorder().persist_messages(
-        *(
-            RunnerDeps(
-                session_id=session_id,
-                session_factory=runner_database.sessions,
-                output_service=runner_database.outputs,
-                activity_id=session_id,
-                activity_run_id="test-run",
-            ),
-            [
-                history(session_id, 12, "changed retry"),
-                history(session_id, 14, "sealed gap"),
-            ],
-        )
-    )
-    await Recorder().persist_messages(
-        *(
-            RunnerDeps(
-                session_id=session_id,
-                session_factory=runner_database.sessions,
-                output_service=runner_database.outputs,
-                activity_id=session_id,
-                activity_run_id="test-run",
-            ),
-            [],
-        )
-    )
-    assert published == []
-    async with runner_database.sessions.begin() as db:
-        assert await HistoryRepository(db).read_history_entries(session_id) == stored
+        saved = decode_state((await db.get(SessionRow, deps.session_id)).runner_state)
+        assert isinstance(saved, Checkpoint)
+        validate_history(saved, await HistoryRepository(db).read_history_entries(deps.session_id))
 
 
-@pytest.mark.integration
-async def test_append_borrows_transaction_and_returns_accepted_inputs(runner_database):
-    session_id = runner_database.session_id
-    initial = [
-        history(session_id, 0),
-        history(session_id, 1),
-        history(session_id, 4),
-    ]
-    async with runner_database.sessions.begin() as db:
-        await db.get(SessionRow, session_id)
-        assert await HistoryRepository(db).append_history(session_id, initial) == tuple(initial)
-    with pytest.raises(RuntimeError, match="rollback"):
-        async with runner_database.sessions.begin() as db:
-            await db.get(SessionRow, session_id)
-            entry = history(session_id, 7)
-            assert await HistoryRepository(db).append_history(session_id, [entry]) == (entry,)
-            assert [
-                e.seq for e in await HistoryRepository(db).read_history_entries(session_id)
-            ] == [
-                0,
-                1,
-                4,
-                7,
-            ]
-            raise RuntimeError("rollback")
-    async with runner_database.sessions.begin() as db:
-        assert await HistoryRepository(db).read_history_entries(session_id) == tuple(initial)
-
-
-@pytest.mark.integration
-async def test_record_missing_session_does_not_publish(runner_database, monkeypatch):
-    session_id = uuid4()
-
-    def unexpected_publisher(*args):
-        pytest.fail("missing sessions must not publish")
-
-    monkeypatch.setattr(runner_database.outputs, "publisher", unexpected_publisher)
+async def test_full_native_identity_is_required_to_save(runner_database):
+    deps = runner_database.deps()
+    deps.activity_run_id = "different-native-run"
     with pytest.raises(OwnershipLost):
-        await Recorder().persist_messages(
-            *(
-                RunnerDeps(
-                    session_id=session_id,
-                    session_factory=runner_database.sessions,
-                    output_service=runner_database.outputs,
-                    activity_id=session_id,
-                    activity_run_id="test-run",
-                ),
-                [history(session_id, 0)],
-            )
-        )
+        await checkpoint(deps, [ModelRequest([UserPromptPart("input")])])
     async with runner_database.sessions.begin() as db:
-        assert await HistoryRepository(db).read_history_entries(session_id) == ()
+        assert (await db.get(SessionRow, deps.session_id)).runner_state is None
 
 
-@pytest.mark.integration
-async def test_record_serializes_session_writes_before_reading_boundary(runner_database):
-    session_id, other_id = runner_database.session_id, uuid4()
-    async with runner_database.sessions.begin() as db:
-        db.add(
-            SessionRow(
-                id=other_id,
-                provider_id=uuid4(),
-                model_name="test",
-                status=LifecycleStatus.READY,
-                current_activity_id=other_id,
-                current_activity_run_id="test-run",
-            )
-        )
-    attempted_lock = asyncio.Event()
+async def test_history_boundary_is_read_after_conditional_guard(runner_database):
+    deps = runner_database.deps()
+    attempted = asyncio.Event()
     engine = runner_database.sessions.kw["bind"]
+    task = None
 
     def before_execute(connection, cursor, statement, parameters, context, executemany):
         if statement.startswith("UPDATE sessions"):
-            attempted_lock.set()
+            attempted.set()
 
-    task = None
     try:
         async with runner_database.sessions.begin() as db:
             await SessionRepository(db).guard(
-                session_id, session_id, "test-run", (LifecycleStatus.READY,)
+                deps.session_id, deps.activity_id, deps.activity_run_id, (LifecycleStatus.READY,)
             )
-            await HistoryRepository(db).append_history(session_id, [history(session_id, 2)])
+            await HistoryRepository(db).append_history(
+                deps.session_id, [history(deps.session_id, 2)]
+            )
             event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
-            task = asyncio.create_task(
-                Recorder().persist_messages(
-                    *(
-                        RunnerDeps(
-                            session_id=session_id,
-                            session_factory=runner_database.sessions,
-                            output_service=runner_database.outputs,
-                            activity_id=session_id,
-                            activity_run_id="test-run",
-                        ),
-                        [history(session_id, 1)],
-                    )
-                )
-            )
-            async with asyncio.timeout(2):
-                await attempted_lock.wait()
-                # A different session must commit while the first writer holds its lock.
-                await Recorder().persist_messages(
-                    *(
-                        RunnerDeps(
-                            session_id=other_id,
-                            session_factory=runner_database.sessions,
-                            output_service=runner_database.outputs,
-                            activity_id=other_id,
-                            activity_run_id="test-run",
-                        ),
-                        [history(other_id, 1)],
-                    )
-                )
+            task = asyncio.create_task(checkpoint(deps, [ModelRequest([UserPromptPart("input")])]))
+            await asyncio.wait_for(attempted.wait(), 2)
             assert not task.done()
-        async with asyncio.timeout(2):
-            await task
+        with pytest.raises(ValueError, match="boundary changed"):
+            await asyncio.wait_for(task, 2)
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", before_execute)
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
     async with runner_database.sessions.begin() as db:
-        assert [e.seq for e in await HistoryRepository(db).read_history_entries(session_id)] == [2]
-        assert [e.seq for e in await HistoryRepository(db).read_history_entries(other_id)] == [1]
+        assert [
+            e.seq for e in await HistoryRepository(db).read_history_entries(deps.session_id)
+        ] == [2]
+        assert (await db.get(SessionRow, deps.session_id)).runner_state is None
 
 
-@pytest.mark.integration
-async def test_commit_before_broadcast_failure_recovers_without_retry_publication(
-    runner_database, monkeypatch
-):
-    session_id, outputs = runner_database.session_id, runner_database.outputs
-    sessions = SessionService(
-        runner_database.sessions, output_service=outputs, live_poll_interval=0.02
-    )
-    first = history(session_id, 1)
-    await Recorder().persist_messages(
-        *(
-            RunnerDeps(
-                session_id=session_id,
-                session_factory=runner_database.sessions,
-                output_service=runner_database.outputs,
-                activity_id=session_id,
-                activity_run_id="test-run",
-            ),
-            [first],
+async def test_repository_filters_at_one_prewrite_maximum_and_preserves_old_gaps(runner_database):
+    session_id = runner_database.session_id
+    initial = [history(session_id, 0), history(session_id, 10)]
+    async with runner_database.sessions.begin() as db:
+        assert await HistoryRepository(db).append_history(session_id, initial) == tuple(initial)
+    batch = [
+        history(session_id, 5, "old gap"),
+        history(session_id, 10, "changed"),
+        history(session_id, 15),
+        history(session_id, 12),
+        history(session_id, 16),
+    ]
+    async with runner_database.sessions.begin() as db:
+        assert await HistoryRepository(db).append_history(session_id, batch) == tuple(batch[2:])
+    async with runner_database.sessions.begin() as db:
+        stored = await HistoryRepository(db).read_history_entries(session_id)
+        assert [e.seq for e in stored] == [0, 10, 12, 15, 16]
+        assert stored[:2] == tuple(initial)
+        assert await HistoryRepository(db).max_seq(session_id) == 16
+        assert (
+            await HistoryRepository(db).append_history(
+                session_id, [history(session_id, 14, "still sealed")]
+            )
+            == ()
         )
-    )
-    final = history(session_id, 7)
-    data = (
-        RunnerDeps(
-            session_id=session_id,
-            session_factory=runner_database.sessions,
-            output_service=runner_database.outputs,
-            activity_id=session_id,
-            activity_run_id="test-run",
-        ),
-        [final],
-    )
 
-    def lose_broadcast(*args):
-        raise RuntimeError("lost before broadcast")
 
-    async with aclosing(sessions.live(session_id)) as batches:
-        assert await anext(batches) == [MessageCommitted(first)]
-        monkeypatch.setattr(outputs, "publisher", lose_broadcast)
-        with pytest.raises(RuntimeError, match="lost before broadcast"):
-            await Recorder().persist_messages(*data)
-        # An acknowledged database write must not retry its failed publication.
-        await Recorder().persist_messages(*data)
-        async with asyncio.timeout(2):
-            assert await anext(batches) == [MessageCommitted(final)]
+@pytest.mark.parametrize("invalid", [True, -1, "1", None, 1.5, "duplicate", "session"])
+async def test_repository_rejects_invalid_batches_without_writes(runner_database, invalid):
+    session_id = runner_database.session_id
+    first = history(session_id, 0)
+    other = replace(
+        first, seq=0 if invalid == "duplicate" else 1 if invalid == "session" else invalid
+    )
+    if invalid == "session":
+        other = replace(other, session_id=uuid4())
+    with pytest.raises(ValueError):
+        async with runner_database.sessions.begin() as db:
+            await HistoryRepository(db).append_history(session_id, [first, other])
+    async with runner_database.sessions.begin() as db:
+        assert await HistoryRepository(db).read_history_entries(session_id) == ()
+
+
+async def test_repository_borrows_transaction_and_does_not_commit(runner_database):
+    session_id = runner_database.session_id
+    with pytest.raises(RuntimeError, match="rollback"):
+        async with runner_database.sessions.begin() as db:
+            entry = history(session_id, 7)
+            assert await HistoryRepository(db).append_history(session_id, [entry]) == (entry,)
+            raise RuntimeError("rollback")
+    async with runner_database.sessions.begin() as db:
+        assert await HistoryRepository(db).read_history_entries(session_id) == ()
