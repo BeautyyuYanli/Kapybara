@@ -21,4 +21,19 @@ def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
+# Business layer contract:
+# Edit only working history already carrying metadata.seq. Preserve the last
+# assigned seq value (message content may change), keep retained seq values valid
+# and strictly increasing, and leave the unnumbered tail unchanged without assigning
+# it seq values. Preserve valid message structure and tool call/result pairing,
+# including pairs spanning the numbered/unnumbered boundary.
+# Any capability method may be retried. Hooks need not be strictly idempotent:
+# acceptable non-critical repeated side effects are allowed, but critical ones are not.
+# Execute tools only for explicit model calls already saved in the snapshot at the
+# end of the model response. Execution must match the saved call semantics (tool
+# identity, call ID and business arguments); no implicit calls or silent changes
+# to the recorded intent.
+# Layer exit_scope hooks must use scope_id to find or clean upstream resources
+# when supported. Otherwise, cleanup may rely on State, but the implementation
+# must document that State may be stale or incomplete and leave orphaned resources.
 layer_registry = LayerRegistry({"shell": shell.make, "mcps": mcps.make}, get_layers=get_layers)

@@ -29,9 +29,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kapy.agent_output import AgentOutputService
 from kapy.runner import (
-    MessageRecordCapability,
     Recorder,
     RunnerDeps,
+    RunnerPersistenceCapability,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -45,6 +45,14 @@ def make_deps() -> RunnerDeps:
         activity_id=uuid4(),
         activity_run_id="test-run",
     )
+
+
+@pytest.fixture(autouse=True)
+def stub_snapshots(monkeypatch):
+    async def save(self, deps, messages):
+        pass
+
+    monkeypatch.setattr(Recorder, "save_snapshot", save)
 
 
 @pytest.fixture
@@ -67,7 +75,7 @@ def metadata(message: ModelMessage) -> dict[str, Any]:
 def request_hook(recorder: Recorder) -> Hooks:
     return Hooks(
         before_model_request=recorder.predict_response_seq,
-        ordering=CapabilityOrdering(position="innermost", requires=[MessageRecordCapability]),
+        ordering=CapabilityOrdering(position="innermost", requires=[RunnerPersistenceCapability]),
     )
 
 
@@ -128,7 +136,11 @@ async def test_prediction_then_node_recording_leaves_after_run_tail_unrecorded(r
     agent = Agent(
         FunctionModel(respond),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(recorder), FinishMessages(), request_hook(recorder)],
+        capabilities=[
+            RunnerPersistenceCapability(recorder),
+            FinishMessages(),
+            request_hook(recorder),
+        ],
     )
     result = await agent.run("go", deps=deps)
     assert [[m.seq for m in b.messages] for b in recorded] == [[0, 1]]
@@ -176,7 +188,7 @@ async def test_tools_and_output_tool_tail_use_same_recording_boundaries(recorded
         TestModel(custom_output_args=["one"]),
         output_type=list[str],
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
+        capabilities=[RunnerPersistenceCapability(recorder), request_hook(recorder)],
     )
 
     @agent.tool_plain
@@ -200,7 +212,7 @@ async def test_restore_tail_starts_after_last_recorded_position(recorded):
     agent = Agent(
         TestModel(),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
+        capabilities=[RunnerPersistenceCapability(recorder), request_hook(recorder)],
     )
     history = [
         ModelRequest(parts=[UserPromptPart("first")], metadata={"seq": 5}),
@@ -289,7 +301,7 @@ async def test_model_failure_records_no_history(recorded):
     agent = Agent(
         FunctionModel(fail),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
+        capabilities=[RunnerPersistenceCapability(recorder), request_hook(recorder)],
     )
     with pytest.raises(RuntimeError, match="model failed"):
         await agent.run("go", deps=deps)
@@ -315,7 +327,7 @@ async def test_recording_failure_occurs_after_model_dispatch(monkeypatch):
     agent = Agent(
         FunctionModel(respond),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
+        capabilities=[RunnerPersistenceCapability(recorder), request_hook(recorder)],
     )
     with pytest.raises(RuntimeError, match="database unavailable"):
         await agent.run("go", deps=deps)
@@ -328,7 +340,7 @@ async def test_shared_agent_runs_keep_independent_positions(recorded):
     agent = Agent(
         TestModel(),
         deps_type=RunnerDeps,
-        capabilities=[MessageRecordCapability(recorder), request_hook(recorder)],
+        capabilities=[RunnerPersistenceCapability(recorder), request_hook(recorder)],
     )
     results = await asyncio.gather(
         agent.run("first", deps=make_deps()), agent.run("second", deps=make_deps())

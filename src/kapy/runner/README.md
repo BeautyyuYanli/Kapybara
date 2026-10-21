@@ -2,7 +2,7 @@
 
 The Worker registers kapy.create_session, kapy.run_agent and kapy.close_session.
 A complete Agent run is one standalone Activity; there are no Workflows, model/tool
-sub-Activities, checkpoints or internal Agent recovery.
+sub-Activities or automatic internal Agent recovery.
 
 ## Ownership and requests
 
@@ -64,16 +64,54 @@ and permits bounded shielded local cleanup/creation compensation. Replacement of
 a writer prevents later writes but cannot revoke already-issued external I/O.
 
 After model/provider/tool exit, run commits latest SDK messages, all validated
-States, ready and ownership release atomically. Failure preserves the preceding
-snapshot and committed history, then releases to closing. Business commit and
-Temporal outcome are separate facts: a lost commit/result response can leave
-committed business state alongside native failure or timeout. No saved result
+States, ready and ownership release atomically. Failure preserves the last saved
+node-boundary snapshot and committed history, then releases to closing. Business
+commit and Temporal outcome are separate facts: a lost commit/result response can
+leave committed business state alongside native failure or timeout. No saved result
 can override native status or reconstruct a forgotten execution.
 
 Complete messages are recorded after each model node under conditional ownership,
 then published after commit. Positions/gaps stay sealed. Output-tool receipts and
 after-run tails first enter runner_state and are recorded at a later model node.
 See [history](../agent_history/README.md) and [control](../control/README.md).
+
+`RunnerPersistenceCapability` runs after inner node hooks and saves messages and
+validated layer States atomically for these transitions:
+
+| Transition | Intermediate snapshot |
+| --- | --- |
+| model → tool | Working history plus a new request containing the interruption retry prompt below |
+| model → model | Working history plus the next model node's pending request, including its retry prompt |
+| tool → model | Working history plus the next model node's pending request, including tool returns or retry feedback |
+| tool → end | Keep the preceding snapshot |
+
+The model → tool request contains an unbound `RetryPromptPart` with this content:
+
+```text
+Unexpected interruption. Your messages may or may not be delivered. If your messages were intended to make changes, retry only if the operation is idempotent; otherwise, verify the outcome before taking further action.
+```
+
+Every intermediate snapshot ends in a detached `ModelRequest(state="interrupted")`.
+Live messages and immutable history are unchanged. No transaction or snapshot is
+added for tool → end. Successful Activity completion still saves the final SDK
+messages and States, including output-tool receipts and after-run tails, after
+model/provider/tool resources close.
+
+Without a new prompt, decoded messages can be passed to
+`agent.run(message_history=messages, deps=restored_deps)`. The SDK reuses the trailing
+request and always requests the model, even for a saved plain text response with
+no instructions. For unanswered tool calls it inserts
+`ToolReturnPart(outcome="interrupted")` before the unbound interruption prompt;
+those old calls are skipped. Actual tool returns and tool-bound retry feedback
+remain intact. Model-lifecycle and output-function retries keep their original
+retry request.
+
+If final output processing reached tool → end but the final Activity save did not
+commit, resumption uses the preceding snapshot and asks the model again. An output
+function that already ran may therefore run again on new output; its result and
+the graph's `End` are not in the intermediate snapshot. Resumption uses saved layer
+State while graph-local retry counters start fresh. Failed Activities still leave
+the session closing; the runner does not automatically restart them.
 
 ## Worker and verification
 

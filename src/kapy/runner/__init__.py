@@ -6,15 +6,15 @@ The static Agent and ordinary hooks execute entirely inside that Activity.
 
 from .activities import RunnerActivity
 from .agent import agent
-from .recording import MessageRecordCapability, Recorder
+from .recording import Recorder, RunnerPersistenceCapability
 from .types import ExecutionConfig, RunnerDeps, RunnerInput
 
 __all__ = [
     "ExecutionConfig",
-    "MessageRecordCapability",
     "Recorder",
     "RunnerActivity",
     "RunnerDeps",
     "RunnerInput",
+    "RunnerPersistenceCapability",
     "agent",
 ]

@@ -1,4 +1,4 @@
-"""Ordinary sequential tools share run State; only successful final snapshots are saved."""
+"""Sequential tools share State; completed node boundaries survive later failure."""
 
 import asyncio
 import json
@@ -173,7 +173,7 @@ async def test_two_sequential_tools_resume_and_partial_close(
             assert caught.value.code == "job_not_found"
 
 
-async def test_model_failure_preserves_previous_successful_snapshot(runner_database, shell_server):
+async def test_model_failure_preserves_completed_tool_snapshot(runner_database, shell_server):
     async with worker_service(runner_database) as (service, temporal):
         session = await create_shell_session(runner_database, service, shell_server)
         first = await start_runner(
@@ -194,7 +194,9 @@ async def test_model_failure_preserves_previous_successful_snapshot(runner_datab
         )
         with pytest.raises(ActivityFailureError):
             await handle.result()
-        assert await state(runner_database, session.id) == before
+        saved = await state(runner_database, session.id)
+        assert saved["scope_id"] == before["scope_id"]
+        assert set(saved["jobs"]) > set(before["jobs"])
         assert (
             await service.close_session(session.id, activity_id=uuid4())
         ).status == LifecycleStatus.CLOSED

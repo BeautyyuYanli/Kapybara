@@ -14,7 +14,7 @@ from pydantic_ai.tools import ToolDefinition
 from kapy.layers.registry import layer_registry
 from kapy.lifecycle import LifecycleStatus
 
-from .recording import MessageRecordCapability, Recorder
+from .recording import Recorder, RunnerPersistenceCapability
 from .scopes import check_owner
 from .types import RunnerDeps
 
@@ -54,14 +54,14 @@ agent = Agent(
     name="runner",
     deps_type=RunnerDeps,
     capabilities=[
-        MessageRecordCapability(recorder),
+        RunnerPersistenceCapability(recorder),
         layer_registry,
         Hooks(
             before_model_request=before_request,
             before_tool_execute=before_tool,
             ordering=CapabilityOrdering(
                 position="innermost",
-                requires=[MessageRecordCapability],
+                requires=[RunnerPersistenceCapability],
             ),
         ),
     ],

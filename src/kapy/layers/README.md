@@ -31,6 +31,12 @@ business state; hooks never hold a database transaction. Without enter,
 State is initialized from `{}`; returned State can require fields without defaults.
 Config and State remain JSON, while SDK component/client lifetimes stay separate.
 
+When upstream supports resource discovery or cleanup by scope, `exit_scope` must
+use the stable `scope_id` to clean that scope's resources, including resources never
+recorded in saved State. Otherwise, cleanup may rely on State, but its implementation
+must document that State may lag or incompletely represent upstream reality and
+can therefore leave orphaned resources.
+
 Complete State, ready and ownership release commit together. Failed creation
 moves to closing while retaining its writer through compensation, exits
 all configured layers in reverse with None, including partial/uncalled enters, then
@@ -105,6 +111,8 @@ exactly-once protocol. For abandoned initialization, shell exit accepts None and
 makes no request because enter allocated no resources and tools could not run before
 ready. Ready close requires its valid saved jobs inventory. shellctl's jobs listing
 has no scope ownership field; cleanup cannot discover jobs missing from the snapshot.
+Saved State may lag upstream after a crash or an unacknowledged job creation, so
+jobs omitted from that inventory can remain as orphaned upstream resources.
 
 ## MCPs layer
 

@@ -46,7 +46,12 @@ model/hook signatures, including the required optional State on exit.
 `runner/test_layers.py` uses deterministic SDK streaming with real
 PostgreSQL, standalone Temporal Activities and a private shellctl server. It covers
 sequential calls, cross-run cursors, native ModelRetry, failure/cancellation keeping
-the preceding snapshot and session-close retry progress. The runner tests also
+the last saved node boundary and session-close retry progress. `runner/test_snapshots.py`
+checks the three interrupted transitions through real SDK runs and PostgreSQL,
+including prompt-free resumption, interruption feedback, pending tool returns,
+layer State, model/output retries and tool failure feedback. It also checks that
+tool → end retains the preceding snapshot for text, TextOutput and output tools,
+and that recovery requests the model with or without instructions. The runner tests also
 exercise three model protocols, single-attempt failures, final-save failure and
 resource cleanup. Native ownership, tool flags and deferred capability/Toolset
 instructions are checked through ordinary Agent runs. No external model API is called.

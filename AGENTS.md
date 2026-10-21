@@ -135,6 +135,30 @@ delta 不推进游标。完整消息写入后内容和位置固定，数据库�
 Pub/Sub 是尽力广播，断线后清空临时预览并从该位置续接。执行 Activity 仅在模型节点结束后记录消息，最终输出工具回执及 after-run
 追加内容先保存在 runner_state，后续模型节点才记录。核心与 Telegram 的固定消息迁移
 需离线执行，不兼容旧 Workflow 执行。
+仅 model→tool、model→model 和 tool→model 转移最末原子保存消息与 layer State 快照，保留当前写入身份。
+model→tool 在快照副本追加含 `RetryPromptPart` 的 request，内容为
+`Unexpected interruption. Your messages may or may not be delivered. If your messages were intended to make changes, retry only if the operation is idempotent; otherwise, verify the outcome before taking further action.`；
+model→model 和 tool→model 则追加尚未进入 history 的下一条 request，保留工具回执或重试提示。
+所有中间快照的末条 request 标记为 SDK `interrupted`。恢复时总会请求模型；未获回执的调用
+由 SDK 补齐 `outcome="interrupted"` 的回执并跳过。tool→end 不更新中间快照。
+整轮成功后再保存最终快照并释放身份；失败保留最近保存的节点快照并进入 closing，不自动恢复执行。
+
+业务 layers 在 [layer registry](src/kapy/layers/registry.py) 中统一组装，必须遵守以下约束：
+
+1. 修改运行中的 history 时，只能修改已经带有 `metadata.seq` 的部分；最后一个已分配的
+   `seq` 数值在修改前后必须相同（对应消息内容可以变化），其后尚未分配 `seq` 的消息
+   必须保持原样。尚无已分配 `seq` 时，不得修改 history。
+   保留的 `seq` 必须合法且严格递增，不得擅自为未编号消息分配 `seq`；修改后必须保持
+   消息结构及工具调用/回执配对有效，尤其不能破坏跨越已编号/未编号边界的配对。
+2. 所有业务 capability 定义的方法都可能被重试。hooks 不要求严格幂等，可酌情允许
+   非 critical 的重复副作用，但重试不得造成 critical 的重复业务效果。
+   工具只能响应模型的显式调用，并且执行前，该调用必须已记录在 model response
+   末尾保存的 snapshot 中。实际执行必须与快照中的工具身份、调用标识和业务参数语义
+   一致；不得从 hooks 或其他路径隐式调用工具，也不得静默改变已记录调用的语义。
+3. 上游支持按 scope 查询或清理资源时，layer 的 `exit_scope` hook 应依赖稳定的
+   `scope_id` 清理该 scope 的上游资源，覆盖未写入 State 的资源。上游不支持时，
+   可以依赖 State 中的资源记录清理，但必须在具体实现中注明其局限性：State 可能
+   无法忠实记录上游最新状态，因此可能遗漏资源并留下孤儿资源。
 
 ```sh
 # 停止并保留 PostgreSQL 和 runtime 数据

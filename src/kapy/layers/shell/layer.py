@@ -147,6 +147,9 @@ async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> Non
     None denotes abandoned initialization. Enter allocates nothing, and tools
     cannot run before ready, so that case has no jobs to release. Ready cleanup
     must receive its saved inventory; shellctl cannot discover jobs by scope.
+    State may not reflect the latest upstream state after a crash, an unsaved tool
+    mutation or an unacknowledged job creation. Jobs missing from that inventory
+    cannot be discovered here and may remain as orphaned upstream resources.
     """
     if state is None or not state.jobs:
         return

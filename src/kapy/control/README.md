@@ -52,8 +52,10 @@ The database stores no queued phase, execution outcome, input, error or deadline
 | --- | --- |
 | create | Insert creating, validated fixed Config and native writer; publish all initial States with ready and release |
 | run | Claim unowned ready; atomically read current model/provider, settings, snapshot and States |
+| model → tool/model, tool → model | Save interrupted request snapshot/all States without releasing ownership |
+| tool → end | Keep the preceding intermediate snapshot |
 | run success | Commit snapshot/all States with ready and release, after model/tool clients exit |
-| run failure | Preserve preceding snapshot and history; set closing and release after resource exit |
+| run failure | Preserve last saved node boundary and history; set closing and release after resource exit |
 | close | Claim unowned ready/closing, save each exit's progress, then close and release |
 
 Submission does not reserve a session or guarantee order. Several queued Activities

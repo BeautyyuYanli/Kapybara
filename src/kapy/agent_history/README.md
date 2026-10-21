@@ -29,8 +29,11 @@ independent of durable snapshot encoding.
 Worker resources from run deps, confirms session ID/native UUID/run_id using conditional
 writes in a short transaction, then
 publishes accepted messages through [agent_output](../agent_output/README.md) after
-commit. Recording and final runner-state saving remain separate transactions: a
-failure before the final save commits can leave recorded history while the
-previous successful snapshot remains. SessionService's
+commit. Recording and runner-state saving remain separate transactions. At
+model → tool/model and tool → model transitions, the runner saves a detached
+interrupted request snapshot with layer State. tool → end keeps the preceding
+snapshot until the Activity's final save. A failed snapshot write preserves
+the preceding saved boundary while already recorded history remains committed.
+SessionService's
 [Worker admission](../control/README.md) prevents executing a new run after such
 failure. `live()` combines these immutable messages with best-effort previews.

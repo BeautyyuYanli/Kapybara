@@ -26,6 +26,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
     ToolCallPart,
@@ -52,10 +53,10 @@ from kapy.control.models.runtime import build_model, build_provider, resolve_cla
 from kapy.control.sessions.repository import SessionRepository
 from kapy.runner import (
     ExecutionConfig,
-    MessageRecordCapability,
     RunnerActivity,
     RunnerDeps,
     RunnerInput,
+    RunnerPersistenceCapability,
     agent,
 )
 from kapy.runner.recording import Recorder
@@ -357,11 +358,11 @@ async def test_database_history_reproduces_model_input(
             instructions=instructions,
             tools=[work],
             capabilities=[
-                MessageRecordCapability(recorder),
+                RunnerPersistenceCapability(recorder),
                 Hooks(
                     before_model_request=recorder.predict_response_seq,
                     ordering=CapabilityOrdering(
-                        position="innermost", requires=[MessageRecordCapability]
+                        position="innermost", requires=[RunnerPersistenceCapability]
                     ),
                 ),
             ],
@@ -554,6 +555,7 @@ async def test_activity_restores_state_and_records_after_run_tail_once(
         entries = await HistoryRepository(db).read_history_entries(runner_database.session_id)
     assert state is not None
     messages = ModelMessagesTypeAdapter.validate_json(state)
+    assert all(message.state == "complete" for message in messages)
     assert [m.metadata for m in messages] == [
         {"seq": 0},
         {"seq": 1},
@@ -1009,7 +1011,19 @@ async def test_final_save_failure_does_not_retry_agent_or_undo_history(
             await asyncio.wait_for(handle.result(), 35)
     assert len(requests) == 1 and len(saves) == 2
     async with runner_database.sessions.begin() as db:
-        assert await SessionRepository(db).read_runner_state(runner_database.session_id) is None
+        state = await SessionRepository(db).read_runner_state(runner_database.session_id)
+        assert state is not None
+        snapshot = ModelMessagesTypeAdapter.validate_json(state)
+        assert snapshot[-1].state == "interrupted"
+        assert isinstance(snapshot[-1], ModelRequest)
+        assert isinstance(snapshot[-1].parts[0], RetryPromptPart)
+        assert snapshot[-1].parts[0].content == (
+            "Unexpected interruption. Your messages may or may not be delivered. "
+            "If your messages were intended to make changes, "
+            "retry only if the operation is idempotent; otherwise, "
+            "verify the outcome before taking further action."
+        )
+        assert snapshot[-2].parts == [TextPart("done")]
         assert [
             entry.seq
             for entry in await HistoryRepository(db).read_history_entries(

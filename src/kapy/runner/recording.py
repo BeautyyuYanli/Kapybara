@@ -1,13 +1,14 @@
-"""Predict response positions before dispatch and append immutable post-node history.
+"""Record immutable model-node history and save interrupted node-boundary snapshots.
 
 SDK metadata.seq marks successfully recorded messages. Storage independently
 seals all positions through its last row; discarded input is not restored into
-SDK history. Unrecorded run tails remain only in runner_state until another node.
+SDK history. Unrecorded run tails remain only in runner_state until another model node.
+Snapshots copy messages and layer State without releasing the current writer.
 """
 
 from copy import deepcopy
 
-from pydantic_ai import ModelRequestNode, RunContext
+from pydantic_ai import CallToolsNode, ModelRequestNode, RunContext
 from pydantic_ai.capabilities import (
     AbstractCapability,
     AgentNode,
@@ -15,19 +16,25 @@ from pydantic_ai.capabilities import (
     NodeResult,
 )
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    RetryPromptPart,
+)
 from pydantic_ai.models import ModelRequestContext
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_output import MessageCommitted
 from kapy.control.sessions.repository import SessionRepository
+from kapy.layers.registry import layer_registry
 from kapy.lifecycle import LifecycleStatus
 
 from .types import RunnerDeps
 
 
 class Recorder:
-    """Shared, stateless numbering and persistence for recording and prediction hooks.
+    """Stateless history numbering, recording and runner snapshot persistence.
 
     Run-local predictions live in RunnerDeps. Only acknowledged writes mark
     live SDK messages; prediction never changes messages or performs I/O.
@@ -84,7 +91,7 @@ class Recorder:
                 }
 
     async def persist_messages(self, deps: RunnerDeps, messages: list[HistoryMessage]) -> None:
-        """Confirm the current owner, commit accepted messages, then publish snapshots.
+        """Confirm the current owner, commit accepted messages, then publish them.
 
         Sealed positions are discarded. A missed broadcast is recovered by the
         existing history follower; no transaction spans publisher I/O.
@@ -101,9 +108,37 @@ class Recorder:
                 for message in accepted:
                     await publish(MessageCommitted(message))
 
+    async def save_snapshot(self, deps: RunnerDeps, messages: list[ModelMessage]) -> None:
+        """Save messages and validated State atomically, retaining write ownership.
 
-class MessageRecordCapability(AbstractCapability[RunnerDeps]):
-    """Record model-node request/response history using an injected Recorder."""
+        Only the detached trailing request is marked interrupted; live SDK messages and
+        immutable history keep their original state. A later failure retains
+        the last saved transition, rather than partial in-flight work.
+        An interrupted request after pending calls makes the SDK synthesize
+        interrupted tool returns on resume instead of executing those calls.
+        """
+        snapshot = deepcopy(messages)
+        snapshot[-1].state = "interrupted"
+        runner_state = ModelMessagesTypeAdapter.dump_json(snapshot).decode("utf-8")
+        layer_states = layer_registry.snapshot(deps)
+        async with deps.session_factory() as db, db.begin():
+            session = await SessionRepository(db).guard(
+                deps.session_id, deps.activity_id, deps.activity_run_id, (LifecycleStatus.READY,)
+            )
+            if layer_states.keys() != session.layers.keys():
+                raise ValueError("Saved layer states must match configured layers")
+            session.runner_state = runner_state
+            session.layer_states = layer_states
+
+
+class RunnerPersistenceCapability(AbstractCapability[RunnerDeps]):
+    """Record model history; snapshot model→tool/model and tool→model transitions.
+
+    Inner node hooks finish before persistence. A model→tool snapshot adds
+    interruption feedback even for a plain text response; resumption always
+    requests another model response. tool→end retains the preceding snapshot
+    until the Activity saves final messages and State after resource cleanup.
+    """
 
     def __init__(self, recorder: Recorder) -> None:
         self.recorder = recorder
@@ -120,4 +155,28 @@ class MessageRecordCapability(AbstractCapability[RunnerDeps]):
     ) -> NodeResult[RunnerDeps]:
         if isinstance(node, ModelRequestNode):
             await self.recorder.record_messages(ctx.deps, ctx.messages)
+        if isinstance(node, (ModelRequestNode, CallToolsNode)):
+            if isinstance(node, ModelRequestNode) and isinstance(result, CallToolsNode):
+                messages = [
+                    *ctx.messages,
+                    ModelRequest(
+                        parts=[
+                            RetryPromptPart(
+                                content=(
+                                    "Unexpected interruption. "
+                                    "Your messages may or may not be delivered. "
+                                    "If your messages were intended to make changes, "
+                                    "retry only if the operation is idempotent; otherwise, "
+                                    "verify the outcome before taking further action."
+                                )
+                            )
+                        ]
+                    ),
+                ]
+            elif isinstance(result, ModelRequestNode):
+                # The SDK appends this request only when its model node starts.
+                messages = [*ctx.messages, result.request]
+            else:
+                return result
+            await self.recorder.save_snapshot(ctx.deps, messages)
         return result
