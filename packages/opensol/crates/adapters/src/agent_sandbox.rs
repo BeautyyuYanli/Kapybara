@@ -10,35 +10,29 @@ use std::{path::PathBuf, time::Duration};
 use async_trait::async_trait;
 use opensol_core::{
     Command, Connection, CreateOptions, Error, ErrorKind, ExecRequest, Result, SandboxInfo,
-    SandboxManagerCapabilities, SandboxRef, SandboxState, raw::SandboxManagerAccess,
+    SandboxManagerCapabilities, SandboxRef, SandboxSpec, SandboxState, raw::SandboxManagerAccess,
 };
 use serde_json::{Value, json};
 
 use crate::local::Local;
 
-/// Native PodTemplate/PVC JSON follows the upstream CRD schema and is validated by Kubernetes.
-#[derive(Clone)]
+/// Kubernetes access scope only; creation specs are supplied separately on each create.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentSandboxConfig {
     pub namespace: String,
     pub context: Option<String>,
     pub kubeconfig: Option<PathBuf>,
     pub program: PathBuf,
-    pub pod_template: Value,
-    pub volume_claim_templates: Vec<Value>,
-    pub service: bool,
     pub request_timeout: Duration,
 }
 
 impl AgentSandboxConfig {
-    pub fn new(namespace: impl Into<String>, pod_template: Value) -> Self {
+    pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
             context: None,
             kubeconfig: None,
             program: "kubectl".into(),
-            pod_template,
-            volume_claim_templates: Vec::new(),
-            service: true,
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -49,8 +43,23 @@ impl std::fmt::Debug for AgentSandboxConfig {
         formatter
             .debug_struct("AgentSandboxConfig")
             .field("namespace", &self.namespace)
-            .field("pod_template", &"[redacted]")
             .finish()
+    }
+}
+
+/// Native PodTemplate/PVC JSON is validated by Kubernetes, without an SDK policy model.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentSandboxSpec {
+    #[serde(flatten)]
+    pub options: CreateOptions,
+    pub pod_template: Value,
+    pub volume_claim_templates: Vec<Value>,
+    pub service: bool,
+}
+
+impl From<AgentSandboxSpec> for SandboxSpec {
+    fn from(spec: AgentSandboxSpec) -> Self {
+        Self::new("agent-sandbox", spec.options.clone(), spec)
     }
 }
 
@@ -64,15 +73,11 @@ impl AgentSandboxManager {
         if config.namespace.is_empty()
             || config.namespace.starts_with('-')
             || config.request_timeout.is_zero()
-            || !config
-                .pod_template
-                .get("spec")
-                .is_some_and(Value::is_object)
         {
             return Err(Error::invalid(
                 "agent-sandbox",
                 "configure",
-                "namespace, PodTemplate.spec and positive timeout are required",
+                "namespace and positive timeout are required",
             ));
         }
         Ok(Self { config })
@@ -250,15 +255,28 @@ impl SandboxManagerAccess for AgentSandboxManager {
             .collect()
     }
 
-    async fn create(&self, options: CreateOptions) -> Result<SandboxRef> {
-        let name = options
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        let config = spec.payload::<AgentSandboxSpec>("agent-sandbox")?;
+        if !config
+            .pod_template
+            .get("spec")
+            .is_some_and(Value::is_object)
+        {
+            return Err(Error::invalid(
+                "agent-sandbox",
+                "create",
+                "PodTemplate.spec is required",
+            ));
+        }
+        let name = spec
+            .options
             .name
+            .clone()
             .unwrap_or_else(|| format!("opensol-{}", uuid::Uuid::new_v4().simple()));
-        let metadata =
-            json!({ "namespace": self.config.namespace, "labels": options.labels, "name": name });
+        let metadata = json!({ "namespace": self.config.namespace, "labels": spec.options.labels, "name": name });
         let manifest = json!({ "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox", "metadata": metadata,
-            "spec": { "podTemplate": self.config.pod_template, "volumeClaimTemplates": self.config.volume_claim_templates,
-                "service": self.config.service, "operatingMode": "Running" } });
+            "spec": { "podTemplate": config.pod_template, "volumeClaimTemplates": config.volume_claim_templates,
+                "service": config.service, "operatingMode": "Running" } });
         let result = self
             .run(
                 vec!["create".into(), "-f=-".into(), "-o=json".into()],

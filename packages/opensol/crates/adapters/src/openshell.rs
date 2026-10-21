@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use opensol_core::{
     Connection, ConnectionCapabilities, CreateOptions, Error, ErrorKind, ExecRequest, ExecResult,
     ExitStatus, Result, SandboxInfo, SandboxManager, SandboxManagerCapabilities, SandboxRef,
-    SandboxState,
+    SandboxSpec, SandboxState,
     raw::{ConnectionAccess, SandboxManagerAccess},
 };
 use tonic::transport::Channel;
@@ -47,17 +47,68 @@ use protocol::{
     v1::{self as native, open_shell_client::OpenShellClient},
 };
 
+/// Explicit gateway access and workspace; no workload or sandbox creation state.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OpenShellConfig {
+    pub grpc: GrpcConfig,
+    pub workspace: String,
+}
+
+impl OpenShellConfig {
+    pub fn new(endpoint: impl Into<String>, workspace: impl Into<String>) -> Self {
+        Self {
+            grpc: GrpcConfig::new(endpoint),
+            workspace: workspace.into(),
+        }
+    }
+}
+
 /// Choose a native spec or a named workload template. The gateway owns policy and template validation.
-#[derive(Clone, Default)]
-pub struct OpenShellCreate {
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OpenShellSandboxSpec {
+    #[serde(flatten)]
+    pub options: CreateOptions,
+    #[serde(with = "native_spec")]
     pub spec: Option<native::SandboxSpec>,
     pub workload_template: Option<String>,
 }
 
-impl std::fmt::Debug for OpenShellCreate {
+// Persist the pinned native protobuf bytes; do not generate a second public policy schema.
+mod native_spec {
+    use super::native;
+    use prost::Message;
+    use serde::{Deserialize, Serialize};
+
+    pub fn serialize<S: serde::Serializer>(
+        spec: &Option<native::SandboxSpec>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        spec.as_ref()
+            .map(Message::encode_to_vec)
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<native::SandboxSpec>, D::Error> {
+        Option::<Vec<u8>>::deserialize(deserializer)?
+            .map(|bytes| {
+                native::SandboxSpec::decode(bytes.as_slice())
+                    .map_err(|_| serde::de::Error::custom("invalid native SandboxSpec protobuf"))
+            })
+            .transpose()
+    }
+}
+
+impl From<OpenShellSandboxSpec> for SandboxSpec {
+    fn from(spec: OpenShellSandboxSpec) -> Self {
+        Self::new("openshell", spec.options.clone(), spec)
+    }
+}
+
+impl std::fmt::Debug for OpenShellSandboxSpec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("OpenShellCreate")
+            .debug_struct("OpenShellSandboxSpec")
             .field("spec", &"[redacted]")
             .field("workload_template", &self.workload_template)
             .finish()
@@ -70,28 +121,22 @@ pub struct OpenShellSandboxManager {
     client: OpenShellClient<Channel>,
     config: GrpcConfig,
     workspace: String,
-    create: OpenShellCreate,
 }
 
 impl OpenShellSandboxManager {
-    pub async fn connect(
-        config: GrpcConfig,
-        workspace: impl Into<String>,
-        create: OpenShellCreate,
-    ) -> Result<Self> {
+    pub async fn connect(config: GrpcConfig, workspace: impl Into<String>) -> Result<Self> {
         let workspace = workspace.into();
-        if workspace.is_empty() || create.spec.is_some() && create.workload_template.is_some() {
+        if workspace.is_empty() || workspace.contains('\0') {
             return Err(Error::invalid(
                 "openshell",
                 "configure",
-                "workspace is required; choose spec or workload template, not both",
+                "workspace is required and must contain no NUL",
             ));
         }
         Ok(Self {
             client: OpenShellClient::new(config.connect("openshell").await?),
             config,
             workspace,
-            create,
         })
     }
 
@@ -200,13 +245,26 @@ impl SandboxManagerAccess for OpenShellSandboxManager {
         Ok(sandboxes)
     }
 
-    async fn create(&self, options: CreateOptions) -> Result<SandboxRef> {
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        let create = spec.payload::<OpenShellSandboxSpec>("openshell")?;
+        if create.spec.is_some() == create.workload_template.is_some()
+            || create
+                .workload_template
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.contains('\0'))
+        {
+            return Err(Error::invalid(
+                "openshell",
+                "create",
+                "choose exactly one native spec or workload template",
+            ));
+        }
         let message = native::CreateSandboxRequest {
             workspace_scope: self.scope(),
-            spec: self.create.spec.clone(),
-            name: options.name.unwrap_or_default(),
-            labels: options.labels.into_iter().collect(),
-            workload_template: self.create.workload_template.clone().unwrap_or_default(),
+            spec: create.spec.clone(),
+            name: spec.options.name.clone().unwrap_or_default(),
+            labels: spec.options.labels.clone().into_iter().collect(),
+            workload_template: create.workload_template.clone().unwrap_or_default(),
             ..Default::default()
         };
         let response = self

@@ -4,7 +4,11 @@
 //! Dropping clients never destroys environments. References contain identity, not credentials.
 //! A transport failure or cancelled call does not imply that a remote side effect was undone.
 
+mod backend;
 pub mod raw;
+pub use backend::{
+    Api, Backend, BackendAccess, BackendConfig, BackendSource, OpenOptions, SandboxSpec,
+};
 
 use std::{
     collections::BTreeMap,
@@ -127,8 +131,8 @@ pub struct SandboxInfo {
     pub native_state: String,
 }
 
-/// Common creation metadata. Provider images, templates and policies belong to adapter configs.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Common creation metadata. Provider images, templates and policies belong to per-call specs.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateOptions {
     pub name: Option<String>,
     pub labels: BTreeMap<String, String>,
@@ -165,13 +169,21 @@ impl SandboxManagerCapabilities {
 #[derive(Clone)]
 pub struct SandboxManager {
     access: Arc<dyn raw::SandboxManagerAccess>,
+    owner: Option<Backend>,
 }
 
 impl SandboxManager {
     pub fn new(access: impl raw::SandboxManagerAccess + 'static) -> Self {
         Self {
             access: Arc::new(access),
+            owner: None,
         }
+    }
+    pub async fn open(source: impl BackendSource) -> Result<Self> {
+        source
+            .resolve(Api::Sandboxes, OpenOptions::default())
+            .await?
+            .sandboxes()
     }
     pub fn backend(&self) -> &'static str {
         self.access.backend()
@@ -189,7 +201,9 @@ impl SandboxManager {
         self.access.list().await
     }
     /// Confirms the native create request and binds its result; does not promise readiness.
-    pub async fn create(&self, options: CreateOptions) -> Result<Sandbox> {
+    pub async fn create(&self, spec: impl Into<SandboxSpec>) -> Result<Sandbox> {
+        let spec = spec.into();
+        let options = &spec.options;
         if options
             .name
             .as_ref()
@@ -207,7 +221,7 @@ impl SandboxManager {
         }
         self.require(self.capabilities().create, "create")?;
         self.access
-            .create(options)
+            .create(spec)
             .await
             .map(|reference| self.get(reference))
     }
@@ -438,13 +452,27 @@ pub struct ConnectionCapabilities {
 #[derive(Clone)]
 pub struct Connection {
     access: Arc<dyn raw::ConnectionAccess>,
+    owner: Option<Backend>,
 }
 
 impl Connection {
     pub fn new(access: impl raw::ConnectionAccess + 'static) -> Self {
         Self {
             access: Arc::new(access),
+            owner: None,
         }
+    }
+    pub async fn open(source: impl BackendSource, target: Option<SandboxRef>) -> Result<Self> {
+        let backend = source
+            .resolve(
+                Api::Connection,
+                OpenOptions {
+                    target: target.clone(),
+                    connection: None,
+                },
+            )
+            .await?;
+        backend.connection(target.as_ref()).await
     }
     pub fn backend(&self) -> &'static str {
         self.access.backend()
@@ -688,6 +716,7 @@ pub struct Output {
     access: Arc<dyn raw::OutputAccess>,
     reference: ProcessRef,
     initial_subscription: Arc<Mutex<Option<OutputSubscription>>>,
+    owner: Option<Backend>,
 }
 
 impl Output {
@@ -696,6 +725,7 @@ impl Output {
             access: Arc::new(access),
             reference,
             initial_subscription: Arc::new(Mutex::new(None)),
+            owner: None,
         }
     }
     pub fn backend(&self) -> &'static str {
@@ -742,14 +772,17 @@ impl Output {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(subscription) = initial {
-            return Ok(subscription);
+            return Ok(subscription.retain(self.owner.clone()));
         }
         require(
             self.capabilities().subscribe,
             self.backend(),
             "subscribe_output",
         )?;
-        self.access.subscribe(&self.reference).await
+        self.access
+            .subscribe(&self.reference)
+            .await
+            .map(|subscription| subscription.retain(self.owner.clone()))
     }
 }
 
@@ -758,6 +791,7 @@ impl Output {
 pub struct Terminal {
     access: Arc<dyn raw::TerminalAccess>,
     reference: ProcessRef,
+    _owner: Option<Backend>,
 }
 
 impl Terminal {
@@ -765,6 +799,7 @@ impl Terminal {
         Self {
             access: Arc::new(access),
             reference,
+            _owner: None,
         }
     }
     pub fn backend(&self) -> &'static str {
@@ -854,6 +889,16 @@ impl OutputSubscription {
     pub fn backend(&self) -> &str {
         &self.reference.backend
     }
+    // Keep context ownership with the stream even when a language bridge extracts `events`.
+    fn retain(mut self, owner: Option<Backend>) -> Self {
+        self.events = Box::pin(futures::stream::unfold(
+            (self.events, owner),
+            |(mut events, owner)| async move {
+                events.next().await.map(|event| (event, (events, owner)))
+            },
+        ));
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -900,13 +945,31 @@ impl Signal {
 #[derive(Clone)]
 pub struct ProcessManager {
     access: Arc<dyn raw::ProcessManagerAccess>,
+    owner: Option<Backend>,
 }
 
 impl ProcessManager {
     pub fn new(access: impl raw::ProcessManagerAccess + 'static) -> Self {
         Self {
             access: Arc::new(access),
+            owner: None,
         }
+    }
+    pub async fn open(
+        source: impl BackendSource,
+        target: Option<SandboxRef>,
+        connection: Option<Connection>,
+    ) -> Result<Self> {
+        let backend = source
+            .resolve(
+                Api::Processes,
+                OpenOptions {
+                    target: target.clone(),
+                    connection,
+                },
+            )
+            .await?;
+        backend.processes(target.as_ref()).await
     }
     pub fn backend(&self) -> &'static str {
         self.access.backend()
@@ -1097,6 +1160,7 @@ impl Process {
                 .unwrap_or_else(|| Arc::new(UnavailableView(self.manager.backend()))),
             reference: self.reference.clone(),
             initial_subscription: self.initial_subscription.clone(),
+            owner: self.manager.owner.clone(),
         }
     }
     pub fn terminal(&self) -> Terminal {
@@ -1107,6 +1171,7 @@ impl Process {
                 .terminal_access()
                 .unwrap_or_else(|| Arc::new(UnavailableView(self.manager.backend()))),
             reference: self.reference.clone(),
+            _owner: self.manager.owner.clone(),
         }
     }
 }

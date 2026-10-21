@@ -26,16 +26,24 @@ use futures::StreamExt;
 use opensol_core::{
     Connection, ConnectionCapabilities, CreateOptions, Error, ErrorKind, ExecRequest, ExecResult,
     ExitStatus, Result, SandboxInfo, SandboxManager, SandboxManagerCapabilities, SandboxRef,
-    SandboxState,
+    SandboxSpec, SandboxState,
     raw::{ConnectionAccess, SandboxManagerAccess},
 };
 use tokio::io::AsyncWriteExt;
 
 use crate::util::deadline;
 
-/// Native container creation settings; caller controls isolation through Docker's HostConfig.
-#[derive(Clone, Default)]
+/// Engine access only. None uses Bollard's environment/default socket selection.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DockerConfig {
+    pub endpoint: Option<String>,
+}
+
+/// Native per-container settings; caller controls isolation through Docker's HostConfig.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DockerSandboxSpec {
+    #[serde(flatten)]
+    pub options: CreateOptions,
     pub image: String,
     pub command: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -43,10 +51,16 @@ pub struct DockerConfig {
     pub host_config: Option<HostConfig>,
 }
 
-impl std::fmt::Debug for DockerConfig {
+impl From<DockerSandboxSpec> for SandboxSpec {
+    fn from(spec: DockerSandboxSpec) -> Self {
+        Self::new("docker", spec.options.clone(), spec)
+    }
+}
+
+impl std::fmt::Debug for DockerSandboxSpec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DockerConfig")
+            .debug_struct("DockerSandboxSpec")
             .field("image", &self.image)
             .field("command", &"[redacted]")
             .field("env", &"[redacted]")
@@ -59,25 +73,23 @@ impl std::fmt::Debug for DockerConfig {
 #[derive(Clone)]
 pub struct DockerSandboxManager {
     client: Arc<Docker>,
-    config: DockerConfig,
 }
 
 impl DockerSandboxManager {
-    pub fn new(client: Docker, config: DockerConfig) -> Result<Self> {
-        if config.image.is_empty() {
-            return Err(Error::invalid("docker", "configure", "image is required"));
-        }
+    pub fn new(client: Docker) -> Result<Self> {
         Ok(Self {
             client: Arc::new(client),
-            config,
         })
     }
 
     pub fn connect_defaults(config: DockerConfig) -> Result<Self> {
-        Self::new(
-            Docker::connect_with_defaults().map_err(|error| docker_error(error, "connect"))?,
-            config,
-        )
+        let client = match config.endpoint {
+            Some(endpoint) if endpoint.starts_with("unix://") => Docker::connect_with_socket(&endpoint, 120, bollard::API_DEFAULT_VERSION),
+            Some(endpoint) if endpoint.starts_with("http://") => Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION),
+            Some(_) => return Err(Error::invalid("docker", "configure", "endpoint must use unix:// or http://; use a native client for other transports")),
+            None => Docker::connect_with_defaults(),
+        }.map_err(|error| docker_error(error, "connect"))?;
+        Self::new(client)
     }
 
     pub fn sandboxes(&self) -> SandboxManager {
@@ -173,28 +185,47 @@ impl SandboxManagerAccess for DockerSandboxManager {
             .collect()
     }
 
-    async fn create(&self, options: CreateOptions) -> Result<SandboxRef> {
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        let config = spec.payload::<DockerSandboxSpec>("docker")?;
+        if config.image.is_empty() || config.image.contains('\0') {
+            return Err(Error::invalid(
+                "docker",
+                "create",
+                "image is required and must contain no NUL",
+            ));
+        }
+        opensol_core::Command {
+            argv: if config.command.is_empty() {
+                vec![config.image.clone()]
+            } else {
+                config.command.clone()
+            },
+            cwd: config.working_dir.clone(),
+            env: config.env.clone(),
+        }
+        .validate("docker", "create")?;
+        let options = &spec.options;
         let query: Option<CreateContainerOptions> = options
             .name
             .as_deref()
             .map(|name| CreateContainerOptionsBuilder::default().name(name).build());
         let config = ContainerCreateBody {
-            image: Some(self.config.image.clone()),
-            cmd: if self.config.command.is_empty() {
+            image: Some(config.image.clone()),
+            cmd: if config.command.is_empty() {
                 None
             } else {
-                Some(self.config.command.clone())
+                Some(config.command.clone())
             },
             env: Some(
-                self.config
+                config
                     .env
                     .iter()
                     .map(|(key, value)| format!("{key}={value}"))
                     .collect(),
             ),
-            working_dir: self.config.working_dir.clone(),
-            host_config: self.config.host_config.clone(),
-            labels: Some(HashMap::from_iter(options.labels)),
+            working_dir: config.working_dir.clone(),
+            host_config: config.host_config.clone(),
+            labels: Some(HashMap::from_iter(options.labels.clone())),
             ..Default::default()
         };
         let response = self

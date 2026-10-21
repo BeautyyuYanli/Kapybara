@@ -35,7 +35,7 @@ pub mod protocol {
 }
 
 /// Explicit envd endpoint, sandbox proxy identity and optional authentication.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnvdConfig {
     pub endpoint: String,
     pub access_token: Option<Secret>,

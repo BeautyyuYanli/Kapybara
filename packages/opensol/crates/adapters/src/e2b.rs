@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use opensol_core::{
     CreateOptions, Error, ErrorKind, Result, SandboxInfo, SandboxManager,
-    SandboxManagerCapabilities, SandboxRef, SandboxState, raw::SandboxManagerAccess,
+    SandboxManagerCapabilities, SandboxRef, SandboxSpec, SandboxState, raw::SandboxManagerAccess,
 };
 use reqwest::{Client, Method, Url, header::HeaderValue};
 use serde::Deserialize;
@@ -23,31 +23,24 @@ use crate::{
     secret::Secret,
 };
 
-/// E2B-specific creation options. Resource names map to metadata["name"], not a server identity.
-#[derive(Clone)]
+/// Default lifetime for each create, resume and fork operation, independently of HTTP deadlines.
+pub const DEFAULT_SANDBOX_TIMEOUT: u32 = 300;
+
+/// Control plane access and envd routing, without a cached creation request.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct E2bConfig {
     pub api_endpoint: String,
     pub api_key: Secret,
-    pub template: String,
-    pub sandbox_timeout: u32,
-    pub auto_pause: bool,
-    pub metadata: BTreeMap<String, String>,
-    pub env: BTreeMap<String, String>,
     pub request_timeout: Duration,
     pub sandbox_domain: String,
     pub envd_endpoint: Option<String>,
 }
 
 impl E2bConfig {
-    pub fn new(api_key: Secret, template: impl Into<String>) -> Self {
+    pub fn new(api_key: Secret) -> Self {
         Self {
             api_endpoint: "https://api.e2b.app".into(),
             api_key,
-            template: template.into(),
-            sandbox_timeout: 300,
-            auto_pause: false,
-            metadata: BTreeMap::new(),
-            env: BTreeMap::new(),
             request_timeout: Duration::from_secs(30),
             sandbox_domain: "e2b.app".into(),
             envd_endpoint: None,
@@ -59,11 +52,40 @@ impl std::fmt::Debug for E2bConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("E2bConfig")
-            .field("template", &self.template)
             .field("api_key", &self.api_key)
-            .field("env", &"[redacted]")
             .field("endpoints", &"[configured]")
             .finish()
+    }
+}
+
+/// Per-create native options. Timeout is sandbox lifetime, not an HTTP request deadline.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct E2bSandboxSpec {
+    #[serde(flatten)]
+    pub options: CreateOptions,
+    pub template: String,
+    pub sandbox_timeout: u32,
+    pub auto_pause: bool,
+    pub metadata: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for E2bSandboxSpec {
+    fn default() -> Self {
+        Self {
+            options: CreateOptions::default(),
+            template: "base".into(),
+            sandbox_timeout: DEFAULT_SANDBOX_TIMEOUT,
+            auto_pause: false,
+            metadata: BTreeMap::new(),
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<E2bSandboxSpec> for SandboxSpec {
+    fn from(spec: E2bSandboxSpec) -> Self {
+        Self::new("e2b", spec.options.clone(), spec)
     }
 }
 
@@ -97,15 +119,11 @@ impl E2bSandboxManager {
     }
 
     pub fn new(config: E2bConfig) -> Result<Self> {
-        if config.template.is_empty()
-            || config.sandbox_timeout == 0
-            || config.sandbox_timeout > i32::MAX as u32
-            || config.request_timeout.is_zero()
-        {
+        if config.request_timeout.is_zero() {
             return Err(Error::invalid(
                 "e2b",
                 "configure",
-                "template and positive timeouts are required",
+                "positive request timeout is required",
             ));
         }
         if let Some(endpoint) = &config.envd_endpoint {
@@ -291,14 +309,32 @@ impl SandboxManagerAccess for E2bSandboxManager {
         Ok(sandboxes)
     }
 
-    async fn create(&self, options: CreateOptions) -> Result<SandboxRef> {
-        let mut metadata = self.config.metadata.clone();
-        metadata.extend(options.labels);
-        if let Some(name) = options.name {
-            metadata.insert("name".into(), name);
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        let config = spec.payload::<E2bSandboxSpec>("e2b")?;
+        if config.template.is_empty()
+            || config.template.contains('\0')
+            || config.sandbox_timeout == 0
+            || config.sandbox_timeout > i32::MAX as u32
+        {
+            return Err(Error::invalid(
+                "e2b",
+                "create",
+                "template and a positive native timeout are required",
+            ));
         }
-        let body = json!({ "templateID": self.config.template, "timeout": self.config.sandbox_timeout,
-            "autoPause": self.config.auto_pause, "autoPauseMemory": true, "metadata": metadata, "envVars": self.config.env });
+        opensol_core::Command {
+            argv: vec!["env".into()],
+            cwd: None,
+            env: config.env.clone(),
+        }
+        .validate("e2b", "create")?;
+        let mut metadata = config.metadata.clone();
+        metadata.extend(spec.options.labels.clone());
+        if let Some(name) = &spec.options.name {
+            metadata.insert("name".into(), name.clone());
+        }
+        let body = json!({ "templateID": config.template, "timeout": config.sandbox_timeout,
+            "autoPause": config.auto_pause, "autoPauseMemory": true, "metadata": metadata, "envVars": config.env });
         let sandbox = self.sandbox(
             self.request(Method::POST, &["v2", "sandboxes"], Some(body), "create")
                 .await?,
@@ -324,7 +360,7 @@ impl SandboxManagerAccess for E2bSandboxManager {
             self.request(
                 Method::POST,
                 &["v2", "sandboxes", &resource.id, "connect"],
-                Some(json!({ "timeout": self.config.sandbox_timeout, "memory": true })),
+                Some(json!({ "timeout": DEFAULT_SANDBOX_TIMEOUT, "memory": true })),
                 "start",
             )
             .await?,
@@ -355,7 +391,7 @@ impl SandboxManagerAccess for E2bSandboxManager {
             .request(
                 Method::POST,
                 &["sandboxes", &resource.id, "fork"],
-                Some(json!({ "count": 1, "timeout": self.config.sandbox_timeout })),
+                Some(json!({ "count": 1, "timeout": DEFAULT_SANDBOX_TIMEOUT })),
                 "fork",
             )
             .await?

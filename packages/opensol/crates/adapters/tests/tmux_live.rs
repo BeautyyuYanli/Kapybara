@@ -15,14 +15,14 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
 use opensol_adapters::{
-    docker::{DockerConfig, DockerSandboxManager},
+    docker::{DockerConfig, DockerSandboxManager, DockerSandboxSpec},
     local::Local,
     tmux::{Tmux, TmuxConfig},
 };
 use opensol_core::{
-    Command, Connection, ConnectionCapabilities, CreateOptions, ErrorKind, ExecRequest, ExecResult,
-    Process, ProcessEvent, ProcessManager, ProcessRef, ProcessState, PtySize, Result, Signal,
-    SpawnRequest, raw::ConnectionAccess,
+    Command, Connection, ConnectionCapabilities, ErrorKind, ExecRequest, ExecResult, Process,
+    ProcessEvent, ProcessManager, ProcessRef, ProcessState, PtySize, Result, Signal, SpawnRequest,
+    raw::ConnectionAccess,
 };
 use tempfile::TempDir;
 
@@ -921,14 +921,16 @@ async fn docker_connection_uses_target_program_socket_environment_and_screen() {
     let server = Server::new();
     let image =
         std::env::var("OPENSOL_TEST_IMAGE").expect("container checks provide the test image");
-    let backend = DockerSandboxManager::connect_defaults(DockerConfig {
-        image,
-        command: vec!["sleep".into(), "infinity".into()],
-        ..Default::default()
-    })
-    .unwrap();
+    let backend = DockerSandboxManager::connect_defaults(DockerConfig::default()).unwrap();
     let lifecycle = backend.sandboxes();
-    let resource = lifecycle.create(CreateOptions::default()).await.unwrap();
+    let resource = lifecycle
+        .create(DockerSandboxSpec {
+            image,
+            command: vec!["sleep".into(), "infinity".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     let result = AssertUnwindSafe(async {
         resource.start().await?;
         let connection = backend.connection(resource.reference())?;

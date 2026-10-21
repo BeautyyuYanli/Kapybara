@@ -900,6 +900,7 @@ dependencies = [
 name = "opensol-python"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "opensol-adapters",
  "opensol-core",

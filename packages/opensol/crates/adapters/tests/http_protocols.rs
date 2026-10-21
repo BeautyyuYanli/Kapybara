@@ -360,6 +360,11 @@ fn reply(
         ),
         ("POST", "/v2/sandboxes") => json_response(StatusCode::CREATED, sandbox("parent")),
         ("GET", "/sandboxes/parent") => json_response(StatusCode::OK, sandbox("parent")),
+        ("GET", "/sandboxes/paused") => {
+            let mut value = sandbox("paused");
+            value["state"] = "paused".into();
+            json_response(StatusCode::OK, value)
+        }
         ("GET", "/sandboxes/bad-metadata") => {
             let mut value = sandbox("bad-metadata");
             value["metadata"] = json!({"name": 12});
@@ -389,18 +394,162 @@ fn reply(
 #[tokio::test]
 async fn e2b_body_deadline_is_timeout_not_malformed_json() {
     let fixture = Fixture::start().await;
-    let mut config = E2bConfig::new(Secret::new("api-secret"), "body-timeout");
+    let mut config = E2bConfig::new(Secret::new("api-secret"));
     config.api_endpoint = fixture.endpoint.clone();
     config.request_timeout = Duration::from_millis(50);
     let error = E2bSandboxManager::new(config)
         .unwrap()
         .sandboxes()
-        .create(CreateOptions::default())
+        .create(opensol_adapters::e2b::E2bSandboxSpec {
+            template: "body-timeout".into(),
+            ..Default::default()
+        })
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Timeout);
     assert_eq!(error.operation, "create");
     assert_eq!(fixture.records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unified_e2b_entries_share_native_envd_without_caching_create_requests() {
+    use opensol_adapters::e2b::E2bSandboxSpec;
+    use opensol_core::{Backend, Connection, ProcessManager, SandboxManager};
+    let fixture = Fixture::start().await;
+    let mut config = E2bConfig::new(Secret::new("api-secret"));
+    config.api_endpoint = fixture.endpoint.clone();
+    config.envd_endpoint = Some(fixture.endpoint.clone());
+    let backend = Backend::open(config.clone(), None).await.unwrap();
+    let manager = SandboxManager::open(&backend).await.unwrap();
+    assert!(
+        fixture.records.lock().unwrap().is_empty(),
+        "open does not probe or create"
+    );
+    let sandbox = manager
+        .create(E2bSandboxSpec {
+            template: "first".into(),
+            sandbox_timeout: 17,
+            auto_pause: true,
+            env: [("ITEM".into(), "first".into())].into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    manager
+        .create(E2bSandboxSpec {
+            template: "second".into(),
+            sandbox_timeout: 41,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    sandbox.start().await.unwrap();
+    sandbox.fork().await.unwrap();
+    let reference = sandbox.reference().clone();
+    let (connection, processes) = tokio::try_join!(
+        Connection::open(&backend, Some(reference.clone())),
+        ProcessManager::open(&backend, Some(reference.clone()), None),
+    )
+    .unwrap();
+    drop((backend, manager, sandbox));
+    assert_eq!(
+        connection
+            .exec(ExecRequest::new(Command::shell("true")))
+            .await
+            .unwrap()
+            .exit
+            .code,
+        Some(7)
+    );
+    let process = processes
+        .spawn(SpawnRequest::new(Command::shell("true")))
+        .await
+        .unwrap();
+    let subscription = process.output().subscribe().await.unwrap();
+    assert_eq!(
+        opensol_core::wait_events(subscription.events, "envd")
+            .await
+            .unwrap()
+            .exit
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    {
+        let records = fixture.records.lock().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.path == "/sandboxes/parent" && r.method == "GET")
+                .count(),
+            1,
+            "both views reuse one per-target native client, including concurrent opens"
+        );
+        let creates: Vec<Value> = records
+            .iter()
+            .filter(|r| r.path == "/v2/sandboxes")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(creates[0]["templateID"], "first");
+        assert_eq!(creates[0]["timeout"], 17);
+        assert_eq!(creates[0]["envVars"]["ITEM"], "first");
+        assert_eq!(creates[1]["templateID"], "second");
+        assert_eq!(creates[1]["timeout"], 41);
+        assert_eq!(creates[1]["envVars"], json!({}));
+        assert_eq!(creates[1]["autoPause"], false);
+        for record in records
+            .iter()
+            .filter(|r| r.path.ends_with("/connect") || r.path.ends_with("/fork"))
+        {
+            let body: Value = serde_json::from_slice(&record.body).unwrap();
+            assert_eq!(
+                body["timeout"], 300,
+                "operation timeout is independent of both create requests"
+            );
+        }
+        assert!(
+            records
+                .iter()
+                .filter(|r| r.path.starts_with("/process.Process/"))
+                .all(|r| r.headers["e2b-sandbox-id"] == "parent"
+                    && r.headers["e2b-sandbox-port"] == "49983")
+        );
+    }
+    // Equal configuration values do not select a global native-client cache.
+    Connection::open(config, Some(reference)).await.unwrap();
+    assert_eq!(
+        fixture
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/sandboxes/parent" && r.method == "GET")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn unified_e2b_binding_to_a_paused_target_only_discovers_without_resuming() {
+    use opensol_core::{Backend, Connection, ProcessManager};
+    let fixture = Fixture::start().await;
+    let mut config = E2bConfig::new(Secret::new("api-secret"));
+    config.api_endpoint = fixture.endpoint.clone();
+    config.envd_endpoint = Some(fixture.endpoint.clone());
+    let backend = Backend::open(config, None).await.unwrap();
+    let reference = SandboxRef::new("e2b", "paused");
+    Connection::open(&backend, Some(reference.clone()))
+        .await
+        .unwrap();
+    ProcessManager::open(&backend, Some(reference), None)
+        .await
+        .unwrap();
+    let records = fixture.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (&*records[0].method, &*records[0].path),
+        ("GET", "/sandboxes/paused")
+    );
 }
 
 #[tokio::test]
@@ -855,7 +1004,7 @@ async fn envd_errors_do_not_become_success_or_implicit_kills() {
 #[tokio::test]
 async fn e2b_list_collects_native_pages_and_maps_running_and_paused_states() {
     let fixture = Fixture::start().await;
-    let mut config = E2bConfig::new(Secret::new("api-secret"), "base");
+    let mut config = E2bConfig::new(Secret::new("api-secret"));
     config.api_endpoint = fixture.endpoint.clone();
     let manager = E2bSandboxManager::new(config).unwrap().sandboxes();
     assert!(manager.capabilities().list);
@@ -906,7 +1055,7 @@ async fn e2b_list_collects_native_pages_and_maps_running_and_paused_states() {
 #[tokio::test]
 async fn e2b_rejects_non_string_native_metadata() {
     let fixture = Fixture::start().await;
-    let mut config = E2bConfig::new(Secret::new("api-secret"), "base");
+    let mut config = E2bConfig::new(Secret::new("api-secret"));
     config.api_endpoint = fixture.endpoint.clone();
     let manager = E2bSandboxManager::new(config).unwrap().sandboxes();
     assert_eq!(
@@ -923,10 +1072,10 @@ async fn e2b_rejects_non_string_native_metadata() {
 #[tokio::test]
 async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     let fixture = Fixture::start().await;
-    let mut config = E2bConfig::new(Secret::new("api-secret"), "base");
+    let mut config = E2bConfig::new(Secret::new("api-secret"));
     config.api_endpoint = fixture.endpoint.clone();
     config.envd_endpoint = Some(fixture.endpoint.clone());
-    config.metadata = [
+    let metadata = [
         ("name".into(), "config-name".into()),
         ("project".into(), "config-project".into()),
     ]
@@ -935,13 +1084,17 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
     let backend = E2bSandboxManager::new(config.clone()).unwrap();
     let lifecycle = backend.sandboxes();
     let resource = lifecycle
-        .create(CreateOptions {
-            name: Some("friendly".into()),
-            labels: [
-                ("name".into(), "label-name".into()),
-                ("project".into(), "label-project".into()),
-            ]
-            .into(),
+        .create(opensol_adapters::e2b::E2bSandboxSpec {
+            metadata,
+            options: CreateOptions {
+                name: Some("friendly".into()),
+                labels: [
+                    ("name".into(), "label-name".into()),
+                    ("project".into(), "label-project".into()),
+                ]
+                .into(),
+            },
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -978,11 +1131,13 @@ async fn e2b_v2_lifecycle_native_fork_and_envd_composition() {
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Backend);
     assert!(!format!("{error:?}").contains("api-secret"));
-    config.template = "http-fail".into();
     let error = E2bSandboxManager::new(config)
         .unwrap()
         .sandboxes()
-        .create(CreateOptions::default())
+        .create(opensol_adapters::e2b::E2bSandboxSpec {
+            template: "http-fail".into(),
+            ..Default::default()
+        })
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Backend);

@@ -9,7 +9,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, Response, StatusCode},
 };
-use opensol_adapters::agent_sandbox::{AgentSandboxConfig, AgentSandboxManager};
+use opensol_adapters::agent_sandbox::AgentSandboxConfig;
 use opensol_core::{CreateOptions, ErrorKind, SandboxManager, SandboxState};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -137,16 +137,13 @@ impl Fixture {
         resource["status"]["conditions"] = json!([{ "type": condition, "status": "True", "reason": reason, "observedGeneration": generation }]);
     }
 
-    fn sandboxes(&self, template: Value) -> (TempDir, SandboxManager) {
+    async fn sandboxes(&self) -> (TempDir, SandboxManager) {
         let directory = TempDir::new().unwrap();
         let kubeconfig = directory.path().join("config");
         std::fs::write(&kubeconfig, format!("apiVersion: v1\nkind: Config\nclusters:\n- name: fixture\n  cluster:\n    server: {}\ncontexts:\n- name: fixture\n  context:\n    cluster: fixture\n    user: fixture\ncurrent-context: fixture\nusers:\n- name: fixture\n  user: {{}}\n", self.endpoint)).unwrap();
-        let mut config = AgentSandboxConfig::new("work", template);
+        let mut config = AgentSandboxConfig::new("work");
         config.kubeconfig = Some(kubeconfig);
-        (
-            directory,
-            SandboxManager::new(AgentSandboxManager::new(config).unwrap()),
-        )
+        (directory, SandboxManager::open(config).await.unwrap())
     }
 }
 
@@ -154,13 +151,18 @@ impl Fixture {
 async fn kubectl_cr_lifecycle_preserves_observed_state_and_suspend_semantics() {
     let fixture = Fixture::start().await;
     let template = json!({ "spec": { "containers": [{ "name": "main", "image": "python:3.14", "command": ["sleep", "infinity"] }] } });
-    let (_directory, lifecycle) = fixture.sandboxes(template.clone());
+    let (_directory, lifecycle) = fixture.sandboxes().await;
     assert!(lifecycle.capabilities().list);
     assert!(lifecycle.list().await.unwrap().is_empty());
     let resource = lifecycle
-        .create(CreateOptions {
-            name: Some("demo".into()),
-            labels: [("project".into(), "created".into())].into(),
+        .create(opensol_adapters::agent_sandbox::AgentSandboxSpec {
+            options: CreateOptions {
+                name: Some("demo".into()),
+                labels: [("project".into(), "created".into())].into(),
+            },
+            pod_template: template.clone(),
+            volume_claim_templates: Vec::new(),
+            service: true,
         })
         .await
         .unwrap();
@@ -244,11 +246,13 @@ async fn kubectl_cr_lifecycle_preserves_observed_state_and_suspend_semantics() {
 async fn kubectl_retry_after_reuses_the_explicit_generated_resource_name() {
     let fixture = Fixture::start().await;
     fixture.state.lock().unwrap().retry_after = true;
-    let (_directory, lifecycle) = fixture.sandboxes(
-        json!({ "spec": { "containers": [{ "name": "main", "image": "python:3.14" }] } }),
-    );
+    let (_directory, lifecycle) = fixture.sandboxes().await;
     let error = lifecycle
-        .create(CreateOptions::default())
+        .create(opensol_adapters::agent_sandbox::AgentSandboxSpec {
+            options: CreateOptions::default(),
+            pod_template: json!({ "spec": { "containers": [{ "name": "main", "image": "python:3.14" }] } }),
+            volume_claim_templates: Vec::new(), service: true,
+        })
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Conflict);
@@ -261,4 +265,36 @@ async fn kubectl_retry_after_reuses_the_explicit_generated_resource_name() {
     assert_eq!(state.create_attempts[1]["metadata"]["name"], name);
     assert_eq!(state.resource.as_ref().unwrap()["metadata"]["name"], name);
     assert_eq!(state.mutations.len(), 1);
+}
+
+#[tokio::test]
+async fn unified_kubernetes_manager_uses_each_native_spec_without_template_defaults() {
+    use opensol_adapters::agent_sandbox::AgentSandboxSpec;
+    let fixture = Fixture::start().await;
+    let (_directory, manager) = fixture.sandboxes().await;
+    assert!(manager.list().await.unwrap().is_empty());
+    let templates = [
+        json!({"spec": {"containers": [{"name": "first", "image": "first"}]}}),
+        json!({"spec": {"containers": [{"name": "second", "image": "second"}]}}),
+    ];
+    for (index, template) in templates.iter().enumerate() {
+        let resource = manager.create(AgentSandboxSpec {
+            options: CreateOptions { name: Some("demo".into()), ..Default::default() },
+            pod_template: template.clone(),
+            volume_claim_templates: if index == 0 { vec![json!({"metadata":{"name":"data"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}}})] } else { vec![] },
+            service: index == 0,
+        }).await.unwrap();
+        resource.delete().await.unwrap();
+    }
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.create_attempts.len(), 2);
+    for (index, template) in templates.iter().enumerate() {
+        let spec = &state.create_attempts[index]["spec"];
+        assert_eq!(&spec["podTemplate"], template);
+        assert_eq!(spec["service"], index == 0);
+        assert_eq!(
+            spec["volumeClaimTemplates"].as_array().unwrap().len(),
+            usize::from(index == 0)
+        );
+    }
 }

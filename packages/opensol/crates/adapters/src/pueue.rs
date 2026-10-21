@@ -27,7 +27,7 @@ use crate::util::{deadline, shell_command};
 mod output;
 
 /// Native CLI selection and queue group. The SDK does not create groups or change concurrency limits.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PueueConfig {
     pub program: PathBuf,
     pub config_file: Option<String>,

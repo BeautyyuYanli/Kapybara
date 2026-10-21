@@ -19,6 +19,20 @@ pub mod protocol {
     tonic::include_proto!("process.v1");
 }
 
+/// Caller-supplied execution endpoint, never inferred from a Kubernetes identity.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SandboxdConfig {
+    pub grpc: GrpcConfig,
+}
+
+impl SandboxdConfig {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            grpc: GrpcConfig::new(endpoint),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Sandboxd {
     client: protocol::process_service_client::ProcessServiceClient<Channel>,

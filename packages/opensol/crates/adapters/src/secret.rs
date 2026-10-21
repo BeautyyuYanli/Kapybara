@@ -1,7 +1,9 @@
 //! Credential wrapper shared by native clients. Debug never exposes the contained value.
 
-/// An explicit secret. It is not serializable and is exposed only to build authenticated requests.
-#[derive(Clone)]
+/// Explicit credential. Debug is redacted; serializing a configuration deliberately includes it.
+/// Persisted configurations require the same protection as the original credentials.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct Secret(String);
 
 impl Secret {

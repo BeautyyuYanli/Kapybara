@@ -4,23 +4,33 @@ use std::{io::Write, time::Duration};
 
 use futures::StreamExt;
 use opensol_adapters::{
-    e2b::{E2bConfig, E2bSandboxManager},
+    e2b::{E2bConfig, E2bSandboxSpec},
     secret::Secret,
 };
-use opensol_core::{Command, CreateOptions, ExecRequest, ProcessEvent, SpawnRequest};
+use opensol_core::{
+    Backend, Command, Connection, ExecRequest, ProcessEvent, ProcessManager, SandboxManager,
+    SpawnRequest,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backend = E2bSandboxManager::new(E2bConfig::new(
-        Secret::new(std::env::var("E2B_API_KEY")?),
-        std::env::var("E2B_TEMPLATE").unwrap_or_else(|_| "base".into()),
-    ))?;
-    let lifecycle = backend.sandboxes();
-    let resource = lifecycle.create(CreateOptions::default()).await?;
+    let backend = Backend::open(
+        E2bConfig::new(Secret::new(std::env::var("E2B_API_KEY")?)),
+        None,
+    )
+    .await?;
+    let lifecycle = SandboxManager::open(&backend).await?;
+    let resource = lifecycle
+        .create(E2bSandboxSpec {
+            template: std::env::var("E2B_TEMPLATE").unwrap_or_else(|_| "base".into()),
+            ..Default::default()
+        })
+        .await?;
     let execution = async {
-        let native = backend.envd(resource.reference()).await?;
-        let result = native
-            .connection()
+        let connection = Connection::open(&backend, Some(resource.reference().clone())).await?;
+        let processes =
+            ProcessManager::open(&backend, Some(resource.reference().clone()), None).await?;
+        let result = connection
             .exec(ExecRequest {
                 command: Command::new("printf", ["%s", "completed command\n"]),
                 stdin: Vec::new(),
@@ -28,8 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         std::io::stdout().write_all(&result.stdout)?;
-        let process = native
-            .processes()
+        let process = processes
             .spawn(SpawnRequest::new(Command::shell(
                 "printf 'managed process\\n'",
             )))

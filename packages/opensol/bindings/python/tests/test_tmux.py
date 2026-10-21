@@ -23,13 +23,13 @@ class TmuxFixture:
                         "-s", "user-session", "sleep", "infinity"], check=True, capture_output=True)
         self.addCleanup(subprocess.run, ["tmux", "-N", "-S", self.socket, "kill-server"],
                         capture_output=True)
-        self.manager = sdk.tmux(sdk.local(), socket_path=self.socket)
+        self.manager = sdk.ProcessManager.open(sdk.TmuxConfig(socket_path=self.socket), connection=sdk.Connection.open(sdk.LocalConfig()))
 
 
 class TmuxTests(TmuxFixture, unittest.TestCase):
     def test_local_binding_capabilities_validation_and_native_failure(self):
         missing_socket = str(Path(self.directory.name) / "never-started.sock")
-        missing = sdk.tmux(sdk.local(), socket_path=missing_socket)
+        missing = sdk.ProcessManager.open(sdk.TmuxConfig(socket_path=missing_socket), connection=sdk.Connection.open(sdk.LocalConfig()))
         capabilities = missing.capabilities()
         for name in ("list", "restart", "kill", "remove", "stdin",
                      "binary_stdin", "pty", "resize", "detached", "reconnect"):
@@ -55,8 +55,8 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
                         {"socket_path": "/tmp/x", "session_prefix": ""},
                         {"socket_path": "/tmp/x", "program": ""}):
             with self.subTest(options=options), self.assertRaises(sdk.InvalidArgumentError):
-                sdk.tmux(sdk.local(), **options)
-        absent = sdk.tmux(sdk.local(), socket_path=self.socket, program="/no-private-tmux")
+                sdk.ProcessManager.open(sdk.TmuxConfig(**options), connection=sdk.Connection.open(sdk.LocalConfig()))
+        absent = sdk.ProcessManager.open(sdk.TmuxConfig(socket_path=self.socket, program="/no-private-tmux"), connection=sdk.Connection.open(sdk.LocalConfig()))
         with self.assertRaises(sdk.NotFoundError) as raised:
             absent.probe()
         self.assertEqual((raised.exception.backend, raised.exception.operation), ("tmux", "probe"))
@@ -184,7 +184,7 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
         self.assertIsNone(handle.next_event())
         self.assertEqual(process.wait(timeout=5).exit.code, 9)
         self.assertIn("new-screen", "\n".join(process.terminal.screen().lines))
-        rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(
+        rebound = sdk.ProcessManager.open(sdk.TmuxConfig(socket_path=self.socket), connection=sdk.Connection.open(sdk.LocalConfig())).get(
             sdk.ProcessRef("tmux", process.ref.id))
         self.assertEqual(rebound.output.subscribe().next_event(timeout=5).outcome.exit.code, 9)
         old = rebound.output.subscribe()
@@ -215,7 +215,7 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
             env={"SDK-TEST": "x '$()\n;", "PATH": "/task-only"}, pty=(80, 24))
         handle = process.output.subscribe()
         self.assertEqual(handle.next_event(timeout=5).outcome.exit.code, 7)
-        rebound = sdk.tmux(sdk.local(), socket_path=self.socket).get(process.ref)
+        rebound = sdk.ProcessManager.open(sdk.TmuxConfig(socket_path=self.socket), connection=sdk.Connection.open(sdk.LocalConfig())).get(process.ref)
         rebound.restart()
         self.assertEqual(rebound.wait(timeout=5).exit.code, 7)
         self.assertIn("relative-screen", "\n".join(rebound.terminal.screen().lines))
@@ -300,7 +300,7 @@ class TmuxTests(TmuxFixture, unittest.TestCase):
 
 class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
     async def test_async_input_snapshot_wait_cancellation_and_close(self):
-        manager = aio.tmux(aio.local(), socket_path=self.socket)
+        manager = await aio.ProcessManager.open(sdk.TmuxConfig(socket_path=self.socket), connection=await aio.Connection.open(sdk.LocalConfig()))
         self.assertEqual((await manager.probe()).backend, "tmux")
         process = await manager.spawn(["python3", "-u", "-c",
             "import os,tty; tty.setraw(0); print('READY',flush=True); data=b''\n"
@@ -344,16 +344,18 @@ class AsyncTmuxTests(TmuxFixture, unittest.IsolatedAsyncioTestCase):
         await stale.aclose()
 
     async def test_injected_docker_connection_uses_its_native_server_and_files(self):
-        backend = sdk.docker(os.environ["OPENSOL_TEST_IMAGE"], command=["sleep", "infinity"], working_dir="/")
-        resource = backend.sandboxes.create()
+        backend = sdk.Backend.open(sdk.DockerConfig())
+        resource = sdk.SandboxManager.open(backend).create(sdk.DockerSandboxSpec(os.environ["OPENSOL_TEST_IMAGE"],
+                                                                    command=["sleep", "infinity"], working_dir="/"))
         try:
             resource.start()
-            target = backend.connection(resource.ref)
+            target = sdk.Connection.open(backend, target=resource.ref)
             self.assertEqual(target.exec(["pwd", "-P"]).stdout, b"/\n")
             self.assertTrue(target.exec(["mkdir", "-p", self.directory.name]).success)
             self.assertTrue(target.exec(["tmux", "-S", self.socket, "-f", "/dev/null", "new-session", "-d",
                                          "-s", "remote-user", "sleep", "infinity"]).success)
-            manager = aio.tmux(aio.docker_connection(resource.ref.id), socket_path=self.socket)
+            manager = await aio.ProcessManager.open(sdk.TmuxConfig(socket_path=self.socket),
+                         connection=await aio.Connection.open(backend, target=resource.ref))
             self.assertEqual((await manager.probe()).backend, "tmux")
             process = await manager.spawn(["python3", "-u", "-c",
                 "from pathlib import Path; import os,tty; tty.setraw(0); print('remote-ready',flush=True); data=b''\n"

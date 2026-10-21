@@ -5,25 +5,28 @@ use std::{io::Write, time::Duration};
 
 use futures::StreamExt;
 use opensol_adapters::{
-    docker::{DockerConfig, DockerSandboxManager},
-    pueue::{Pueue, PueueConfig},
+    docker::{DockerConfig, DockerSandboxSpec},
+    pueue::PueueConfig,
 };
 use opensol_core::{
-    Command, CreateOptions, ExecRequest, ProcessEvent, ProcessManager, SpawnRequest,
+    Backend, Command, Connection, ExecRequest, ProcessEvent, ProcessManager, SandboxManager,
+    SpawnRequest,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backend = DockerSandboxManager::connect_defaults(DockerConfig {
-        image: std::env::var("PUEUE_IMAGE")?,
-        command: vec!["pueued".into()],
-        ..Default::default()
-    })?;
-    let lifecycle = backend.sandboxes();
-    let resource = lifecycle.create(CreateOptions::default()).await?;
+    let backend = Backend::open(DockerConfig::default(), None).await?;
+    let lifecycle = SandboxManager::open(&backend).await?;
+    let resource = lifecycle
+        .create(DockerSandboxSpec {
+            image: std::env::var("PUEUE_IMAGE")?,
+            command: vec!["pueued".into()],
+            ..Default::default()
+        })
+        .await?;
     let execution = async {
         resource.start().await?;
-        let connection = backend.connection(resource.reference())?;
+        let connection = Connection::open(&backend, Some(resource.reference().clone())).await?;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let result = connection
@@ -44,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pueue_directory: std::env::var("PUEUE_DIRECTORY").ok(),
             ..Default::default()
         };
-        let manager = ProcessManager::new(Pueue::new(connection, config)?);
+        let manager = ProcessManager::open(config, None, Some(connection)).await?;
         let process = manager
             .spawn(SpawnRequest::new(Command::new(
                 "printf",

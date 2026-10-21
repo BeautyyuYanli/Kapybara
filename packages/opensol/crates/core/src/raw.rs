@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    ConnectionCapabilities, CreateOptions, Error, ExecRequest, ExecResult, ManagerInfo,
-    OutputCapabilities, OutputCursor, OutputPage, OutputSubscription, ProcessInfo,
-    ProcessManagerCapabilities, ProcessOutcome, ProcessRef, PtySize, ReadDirection, Result,
-    SandboxInfo, SandboxManagerCapabilities, SandboxRef, Signal, SpawnRequest,
+    ConnectionCapabilities, Error, ExecRequest, ExecResult, ManagerInfo, OutputCapabilities,
+    OutputCursor, OutputPage, OutputSubscription, ProcessInfo, ProcessManagerCapabilities,
+    ProcessOutcome, ProcessRef, PtySize, ReadDirection, Result, SandboxInfo,
+    SandboxManagerCapabilities, SandboxRef, SandboxSpec, Signal, SpawnRequest,
     TerminalCapabilities, TerminalCursor, TerminalPage, TerminalScreen,
 };
 
@@ -24,7 +24,7 @@ pub trait SandboxManagerAccess: Send + Sync {
     async fn list(&self) -> Result<Vec<SandboxInfo>> {
         Err(Error::unsupported(self.backend(), "list"))
     }
-    async fn create(&self, options: CreateOptions) -> Result<SandboxRef>;
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxRef>;
     async fn inspect(&self, resource: &SandboxRef) -> Result<SandboxInfo>;
     async fn start(&self, resource: &SandboxRef) -> Result<()>;
     async fn stop(&self, resource: &SandboxRef) -> Result<()>;

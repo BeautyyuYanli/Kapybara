@@ -18,7 +18,7 @@ use futures::{Stream, stream};
 use opensol_adapters::{
     grpc::GrpcConfig,
     openshell::{
-        OpenShellCreate, OpenShellSandboxManager,
+        OpenShellSandboxSpec,
         protocol::{datamodel::v1 as datamodel, v1 as openshell},
     },
     sandboxd::{Sandboxd, protocol as sandboxd},
@@ -528,17 +528,16 @@ async fn sandboxd_execute_bytes_arguments_deadline_and_unsupported_stdin() {
 #[tokio::test]
 async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     let fixture = Fixture::start().await;
-    let backend = OpenShellSandboxManager::connect(
-        fixture.config.clone(),
-        "team",
-        OpenShellCreate {
-            workload_template: Some("python".into()),
-            ..Default::default()
+    let backend = opensol_core::Backend::open(
+        opensol_adapters::openshell::OpenShellConfig {
+            grpc: fixture.config.clone(),
+            workspace: "team".into(),
         },
+        None,
     )
     .await
     .unwrap();
-    let lifecycle = backend.sandboxes();
+    let lifecycle = opensol_core::SandboxManager::open(&backend).await.unwrap();
     let listed = lifecycle.list().await.unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].name.as_deref(), Some("sandbox"));
@@ -554,8 +553,12 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
         ("stopped", SandboxState::Stopped)
     );
     let resource = lifecycle
-        .create(CreateOptions {
-            name: Some("sandbox".into()),
+        .create(OpenShellSandboxSpec {
+            options: CreateOptions {
+                name: Some("sandbox".into()),
+                ..Default::default()
+            },
+            workload_template: Some("python".into()),
             ..Default::default()
         })
         .await
@@ -572,7 +575,9 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
         SandboxState::Stopped
     );
     resource.start().await.unwrap();
-    let connection = backend.connection(resource.reference()).unwrap();
+    let connection = Connection::open(&backend, Some(resource.reference().clone()))
+        .await
+        .unwrap();
     let mut command = Command::new("printf", ["%s", "' $()"]);
     command.cwd = Some("/work".into());
     command.env.insert("KEY".into(), "value".into());
@@ -631,4 +636,57 @@ async fn openshell_native_lifecycle_exec_routing_and_failure_boundaries() {
     assert!(command.no_login_shell);
     assert!(!command.tty);
     assert_eq!(command.execution_timeout.unwrap().seconds, 2);
+}
+
+#[tokio::test]
+async fn unified_openshell_create_selects_template_or_native_spec_per_request() {
+    let fixture = Fixture::start().await;
+    let config = opensol_adapters::openshell::OpenShellConfig {
+        grpc: fixture.config.clone(),
+        workspace: "team".into(),
+    };
+    let manager = opensol_core::SandboxManager::open(config).await.unwrap();
+    manager
+        .create(OpenShellSandboxSpec {
+            workload_template: Some("first".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .delete()
+        .await
+        .unwrap();
+    manager
+        .create(OpenShellSandboxSpec {
+            spec: Some(openshell::SandboxSpec::default()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .delete()
+        .await
+        .unwrap();
+    for spec in [
+        OpenShellSandboxSpec::default(),
+        OpenShellSandboxSpec {
+            spec: Some(openshell::SandboxSpec::default()),
+            workload_template: Some("both".into()),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            manager.create(spec).await.unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+    }
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(
+        state.creates.len(),
+        2,
+        "invalid mutually exclusive specs do not send an RPC"
+    );
+    assert_eq!(state.creates[0].workload_template, "first");
+    assert!(state.creates[0].spec.is_none());
+    assert!(state.creates[1].workload_template.is_empty());
+    assert!(state.creates[1].spec.is_some());
 }

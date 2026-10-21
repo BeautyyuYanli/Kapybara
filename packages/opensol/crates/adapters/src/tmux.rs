@@ -42,7 +42,7 @@ const POLL: Duration = Duration::from_millis(50);
 pub const MAX_INPUT_BYTES: usize = 8192;
 
 /// Explicit target socket and namespace. Construction is local and does not probe the server.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TmuxConfig {
     pub program: PathBuf,
     /// Absolute path on the Connection target, not necessarily on the SDK host.

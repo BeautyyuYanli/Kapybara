@@ -255,7 +255,7 @@ class SandboxManager:
     def capabilities(self) -> SandboxManagerCapabilities: ...
     def get(self, sandbox: SandboxRef) -> Sandbox: ...
     def list(self) -> list[SandboxInfo]: ...
-    def create(self, *, name: str | None = None, labels: dict[str, str] | None = None) -> Sandbox: ...
+    def create(self, spec: str) -> Sandbox: ...
 
 class Sandbox:
     @property
@@ -295,27 +295,9 @@ class ProcessManager:
         pty: tuple[int, int] | None = None,
     ) -> Process: ...
 
-class Envd:
+class Backend:
     @property
-    def connection(self) -> Connection: ...
-    @property
-    def processes(self) -> ProcessManager: ...
-
-class Docker:
-    @property
-    def sandboxes(self) -> SandboxManager: ...
-    def connection(self, resource: SandboxRef) -> Connection: ...
-
-class E2b:
-    @property
-    def sandboxes(self) -> SandboxManager: ...
-    def envd(self, resource: SandboxRef) -> Envd: ...
-    def _aio_envd(self, resource: SandboxRef) -> Awaitable[Envd]: ...
-
-class OpenShell:
-    @property
-    def sandboxes(self) -> SandboxManager: ...
-    def connection(self, resource: SandboxRef) -> Connection: ...
+    def backend(self) -> str: ...
 
 class AsyncConnection:
     @property
@@ -339,7 +321,7 @@ class AsyncSandboxManager:
     def capabilities(self) -> SandboxManagerCapabilities: ...
     def get(self, sandbox: SandboxRef) -> AsyncSandbox: ...
     def list(self) -> Awaitable[list[SandboxInfo]]: ...
-    def create(self, *, name: str | None = None, labels: dict[str, str] | None = None) -> Awaitable[AsyncSandbox]: ...
+    def create(self, spec: str) -> Awaitable[AsyncSandbox]: ...
 
 class AsyncSandbox:
     @property
@@ -401,117 +383,11 @@ class AsyncTerminal:
     def tail(self, *, lines: int = 200) -> Awaitable[TerminalPage]: ...
     def screen(self) -> Awaitable[TerminalScreen]: ...
 
-def _async_connection(connection: Connection) -> AsyncConnection: ...
-def _async_sandboxes(lifecycle: SandboxManager) -> AsyncSandboxManager: ...
-def _async_processes(manager: ProcessManager) -> AsyncProcessManager: ...
-def _aio_sandboxd(
-    endpoint: str, *, bearer_token: str | None = None,
-    ca_certificate: str | None = None, client_certificate: str | None = None,
-    client_key: str | None = None,
-) -> Awaitable[AsyncConnection]: ...
-def _aio_openshell(
-    endpoint: str, *, workspace: str = "default", workload_template: str | None = None,
-    spec_protobuf: bytes | None = None, bearer_token: str | None = None,
-    ca_certificate: str | None = None, client_certificate: str | None = None,
-    client_key: str | None = None,
-) -> Awaitable[OpenShell]: ...
-def _aio_openshell_connection(
-    endpoint: str, sandbox: str, *, workspace: str = "default",
-    bearer_token: str | None = None, ca_certificate: str | None = None,
-    client_certificate: str | None = None, client_key: str | None = None,
-) -> Awaitable[AsyncConnection]: ...
-
-def local() -> Connection: ...
-def ssh(
-    destination: str,
-    *,
-    port: int | None = None,
-    identity_file: str | None = None,
-    config_file: str | None = None,
-    program: str = "ssh",
-) -> Connection: ...
-def docker(
-    image: str,
-    *,
-    command: Sequence[str] | None = None,
-    env: dict[str, str] | None = None,
-    working_dir: str | None = None,
-    host_config_json: str | None = None,
-) -> Docker: ...
-def docker_connection(container: str) -> Connection: ...
-def pueue(
-    connection: Connection,
-    *,
-    config_file: str | None = None,
-    profile: str | None = None,
-    group: str | None = None,
-    pueue_directory: str | None = None,
-    program: str = "pueue",
-) -> ProcessManager: ...
-def tmux(
-    connection: Connection,
-    *,
-    socket_path: str,
-    session_prefix: str = "opensol",
-    program: str = "tmux",
-) -> ProcessManager: ...
-def envd(
-    endpoint: str,
-    *,
-    access_token: str | None = None,
-    user: str | None = None,
-    sandbox_id: str | None = None,
-    request_timeout: float = 30.0,
-) -> Envd: ...
-def e2b(
-    api_key: str,
-    template: str = "base",
-    *,
-    api_endpoint: str = "https://api.e2b.app",
-    sandbox_timeout: int = 300,
-    auto_pause: bool = False,
-    env: dict[str, str] | None = None,
-    metadata: dict[str, str] | None = None,
-    envd_endpoint: str | None = None,
-    sandbox_domain: str = "e2b.app",
-    request_timeout: float = 30.0,
-) -> E2b: ...
-def agent_sandbox(
-    namespace: str,
-    pod_template_json: str,
-    *,
-    context: str | None = None,
-    kubeconfig: str | None = None,
-    program: str = "kubectl",
-    service: bool = True,
-    volume_claim_templates_json: str | None = None,
-) -> SandboxManager: ...
-def sandboxd(
-    endpoint: str,
-    *,
-    bearer_token: str | None = None,
-    ca_certificate: str | None = None,
-    client_certificate: str | None = None,
-    client_key: str | None = None,
-) -> Connection: ...
-def openshell(
-    endpoint: str,
-    *,
-    workspace: str = "default",
-    workload_template: str | None = None,
-    spec_protobuf: bytes | None = None,
-    bearer_token: str | None = None,
-    ca_certificate: str | None = None,
-    client_certificate: str | None = None,
-    client_key: str | None = None,
-) -> OpenShell: ...
-def openshell_connection(
-    endpoint: str,
-    sandbox: str,
-    *,
-    workspace: str = "default",
-    bearer_token: str | None = None,
-    ca_certificate: str | None = None,
-    client_certificate: str | None = None,
-    client_key: str | None = None,
-) -> Connection: ...
+def _open_backend(value: str, connection: Connection | None = None) -> Backend: ...
+def _open_sandboxes(value: str | Backend) -> SandboxManager: ...
+def _open_connection(value: str | Backend, target: SandboxRef | None = None) -> Connection: ...
+def _open_processes(value: str | Backend, target: SandboxRef | None = None, connection: Connection | None = None) -> ProcessManager: ...
+def _aio_open_backend(value: str, connection: Connection | None = None) -> Awaitable[Backend]: ...
+def _aio_open_sandboxes(value: str | Backend) -> Awaitable[AsyncSandboxManager]: ...
+def _aio_open_connection(value: str | Backend, target: SandboxRef | None = None) -> Awaitable[AsyncConnection]: ...
+def _aio_open_processes(value: str | Backend, target: SandboxRef | None = None, connection: Connection | None = None) -> Awaitable[AsyncProcessManager]: ...

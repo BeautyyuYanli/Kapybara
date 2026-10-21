@@ -33,7 +33,7 @@ def combined_output(output):
 
 class ConnectionTests(unittest.TestCase):
     def test_argv_bytes_environment_working_directory_and_nonzero_exit(self):
-        connection = sdk.local()
+        connection = sdk.Connection.open(sdk.LocalConfig())
         with tempfile.TemporaryDirectory(prefix="sdk ' cwd ") as directory:
             value = "x '$()\n你好"
             data = b"\x00\xff\x80input" * 20_000
@@ -63,7 +63,7 @@ class ConnectionTests(unittest.TestCase):
         self.assertTrue(connection.capabilities()["stdin"])
 
     def test_errors_timeout_and_signal_are_distinct(self):
-        connection = sdk.local()
+        connection = sdk.Connection.open(sdk.LocalConfig())
         with self.assertRaises(sdk.NotFoundError) as caught:
             connection.exec(["/no-such-opensol-program"])
         self.assertEqual(caught.exception.backend, "local")
@@ -90,7 +90,7 @@ class ConnectionTests(unittest.TestCase):
         def execute():
             started.set()
             try:
-                sdk.local().exec(["sleep", "0.6"])
+                sdk.Connection.open(sdk.LocalConfig()).exec(["sleep", "0.6"])
             except BaseException as error:
                 failures.append(error)
             finally:
@@ -138,7 +138,8 @@ class PueueTests(unittest.TestCase):
             time.sleep(0.03)
         else:
             self.fail("pueued did not become ready")
-        self.manager = sdk.pueue(sdk.local(), config_file=str(self.config))
+        self.manager = sdk.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config)),
+                                              connection=sdk.Connection.open(sdk.LocalConfig()))
 
     def stop_daemon(self, daemon):
         subprocess.run(
@@ -421,10 +422,12 @@ class EnvdBindingTests(unittest.TestCase):
 
         self.addCleanup(close)
         self.endpoint = f"http://127.0.0.1:{server.server_port}"
-        self.native = sdk.envd(self.endpoint)
+        self.backend = sdk.Backend.open(sdk.EnvdConfig(self.endpoint))
+        self.processes = sdk.ProcessManager.open(self.backend)
+        self.connection = sdk.Connection.open(self.backend)
 
     def test_unexpected_end_is_an_error_then_ends_the_subscription(self):
-        process = self.native.processes.spawn(["disconnect"])
+        process = self.processes.spawn(["disconnect"])
         handle = process.output.subscribe()
         with self.assertRaises(sdk.TransportError):
             handle.next_event(timeout=2)
@@ -433,7 +436,7 @@ class EnvdBindingTests(unittest.TestCase):
 
 
     def test_initial_stream_and_additional_subscription_use_start_and_connect(self):
-        manager = self.native.processes
+        manager = self.processes
         process = manager.spawn(["pty-program"], stdin=True, pty=(80, 24))
         initial = process.output.subscribe()
 
@@ -441,7 +444,7 @@ class EnvdBindingTests(unittest.TestCase):
         self.assertEqual([method for method, _ in self.records], ["Start"])
         # Binding a saved reference stays local even for an unreachable endpoint.
         restored = sdk.ProcessRef("envd", process.ref.id, pty=True)
-        offline = sdk.envd("http://127.0.0.1:1").processes.get(restored)
+        offline = sdk.ProcessManager.open(sdk.EnvdConfig("http://127.0.0.1:1")).get(restored)
         self.assertIsInstance(offline, sdk.Process)
         replay = manager.get(restored).output.subscribe()
         self.assertFalse(hasattr(replay, "ref"))
@@ -459,7 +462,7 @@ class EnvdBindingTests(unittest.TestCase):
         replay.close()
 
     def test_binary_process_stdin_and_close_stdin(self):
-        manager = self.native.processes
+        manager = self.processes
         process = manager.spawn(["stdin-program"], stdin=True)
         handle = process.output.subscribe()
         self.assertFalse(process.ref.pty)
@@ -482,7 +485,7 @@ class EnvdBindingTests(unittest.TestCase):
         self.assertEqual(closed.process.pid, int(process.ref.id))
 
     def test_pty_dimensions_terminal_bytes_binary_input_and_resize(self):
-        manager = self.native.processes
+        manager = self.processes
         process = manager.spawn(["pty-program"], stdin=True, pty=(93, 27))
         handle = process.output.subscribe()
         self.assertTrue(process.ref.pty)
@@ -530,11 +533,12 @@ class EnvdBindingTests(unittest.TestCase):
 class DockerTests(unittest.TestCase):
     def test_lifecycle_explicit_cleanup_and_binary_exec(self):
         image = os.environ["OPENSOL_TEST_IMAGE"]
-        backend = sdk.docker(image, command=["sleep", "infinity"])
-        creator = backend.sandboxes
+        backend = sdk.Backend.open(sdk.DockerConfig())
+        creator = sdk.SandboxManager.open(backend)
         name = f"opensol-python-{time.time_ns()}"
-        resource = creator.create(name=name, labels={"project": "python"})
-        admin = sdk.docker(image).sandboxes
+        resource = creator.create(sdk.DockerSandboxSpec(image, command=["sleep", "infinity"],
+                                                     name=name, labels={"project": "python"}))
+        admin = sdk.SandboxManager.open(sdk.DockerConfig())
         try:
             self.assertIsInstance(resource, sdk.Sandbox)
             self.assertIsInstance(resource.ref, sdk.SandboxRef)
@@ -554,7 +558,7 @@ class DockerTests(unittest.TestCase):
             with self.assertRaises(AttributeError):
                 resource.ref = sdk.SandboxRef("docker", "other")
             self.assertEqual(resource.inspect().state, "stopped")
-            connection = backend.connection(resource.ref)
+            connection = sdk.Connection.open(backend, target=resource.ref)
             self.assertEqual(resource.inspect().state, "stopped", "binding must not start resources")
             resource.start()
             del creator, backend
@@ -571,7 +575,7 @@ class DockerTests(unittest.TestCase):
             )
             self.assertEqual(result.stdout, b"\x00\xffDocker")
             self.assertEqual(result.exit_code, 7)
-            self.assertTrue(sdk.docker_connection(resource.ref.id).exec(["true"]).success)
+            self.assertTrue(sdk.Connection.open(sdk.DockerConfig(), target=resource.ref).exec(["true"]).success)
             with self.assertRaises(sdk.UnsupportedError):
                 admin.get(resource.ref).fork()
             admin.get(resource.ref).stop()
@@ -626,9 +630,9 @@ class SandboxManagerBindingTests(unittest.TestCase):
         worker.start()
         endpoint = f"http://127.0.0.1:{server.server_port}"
         try:
-            backend = sdk.e2b("api-secret", api_endpoint=endpoint, envd_endpoint=endpoint)
-            lifecycle = backend.sandboxes
-            resource = lifecycle.create(name="label", labels={"owner": "test"})
+            backend = sdk.Backend.open(sdk.E2bConfig("api-secret", api_endpoint=endpoint, envd_endpoint=endpoint))
+            lifecycle = sdk.SandboxManager.open(backend)
+            resource = lifecycle.create(sdk.E2bSandboxSpec(name="label", labels={"owner": "test"}))
             self.assertIsInstance(resource, sdk.Sandbox)
             self.assertEqual((resource.ref.backend, resource.ref.id), ("e2b", "parent"))
             self.assertEqual(resource.inspect().state, "running")
@@ -638,12 +642,12 @@ class SandboxManagerBindingTests(unittest.TestCase):
             resource.start()
             self.assertEqual(resource.fork().ref.id, "child")
             before = len(records)
-            native = backend.envd(resource.ref)
+            connection = sdk.Connection.open(backend, target=resource.ref)
+            processes = sdk.ProcessManager.open(backend, target=resource.ref)
             self.assertEqual([(method, path) for method, path, *_ in records[before:]],
                              [("GET", "/sandboxes/parent")])
-            self.assertIsInstance(native, sdk.Envd)
-            self.assertIsInstance(native.connection, sdk.Connection)
-            self.assertIsInstance(native.processes, sdk.ProcessManager)
+            self.assertIsInstance(connection, sdk.Connection)
+            self.assertIsInstance(processes, sdk.ProcessManager)
             resource.delete()
             with self.assertRaises(sdk.NotFoundError) as caught:
                 lifecycle.get(sdk.SandboxRef("e2b", "missing")).inspect()

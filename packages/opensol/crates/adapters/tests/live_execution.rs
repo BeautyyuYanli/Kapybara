@@ -22,7 +22,7 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
 use opensol_adapters::{
-    docker::{DockerConfig, DockerSandboxManager},
+    docker::{DockerConfig, DockerSandboxManager, DockerSandboxSpec},
     local::Local,
     pueue::{Pueue, PueueConfig},
     ssh::{Ssh, SshConfig},
@@ -1764,18 +1764,18 @@ async fn real_pueue_stdin_signal_and_wait_deadline() {
 async fn real_docker_lifecycle_exec_and_in_container_pueue() {
     let image = std::env::var("OPENSOL_TEST_IMAGE")
         .expect("run scripts/check.sh in the test container with Docker socket mounted");
-    let backend = DockerSandboxManager::connect_defaults(DockerConfig {
-        image,
-        command: vec!["sleep".into(), "infinity".into()],
-        ..Default::default()
-    })
-    .unwrap();
+    let backend = DockerSandboxManager::connect_defaults(DockerConfig::default()).unwrap();
     let lifecycle = backend.sandboxes();
     let name = format!("opensol-contracts-{}", uuid::Uuid::new_v4());
     let resource = lifecycle
-        .create(CreateOptions {
-            name: Some(name.clone()),
-            labels: [("project".into(), "native".into())].into(),
+        .create(DockerSandboxSpec {
+            image,
+            command: vec!["sleep".into(), "infinity".into()],
+            options: CreateOptions {
+                name: Some(name.clone()),
+                labels: [("project".into(), "native".into())].into(),
+            },
+            ..Default::default()
         })
         .await
         .unwrap();

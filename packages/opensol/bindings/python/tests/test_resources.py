@@ -23,8 +23,8 @@ class ResourceTests(unittest.TestCase):
 
     def setUp(self):
         test_sdk.PueueTests.setUp(self)
-        self.manager = sdk.pueue(sdk.local(), config_file=str(self.config),
-                                 pueue_directory=str(self.directory))
+        self.manager = sdk.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config),
+                                 pueue_directory=str(self.directory)), connection=sdk.Connection.open(sdk.LocalConfig()))
 
     def test_first_subscription_after_rebound_restart_uses_current_execution(self):
         script = self.directory / "command.sh"
@@ -136,7 +136,7 @@ class ResourceTests(unittest.TestCase):
             process.output.read(cursor=saved)
 
     def test_failed_to_spawn_completes_without_exit_or_private_error_text(self):
-        sdk.local().exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
+        sdk.Connection.open(sdk.LocalConfig()).exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
         with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
             process = self.manager.spawn(["true"], cwd=cwd)
             handle = process.output.subscribe()
@@ -155,12 +155,14 @@ class ResourceTests(unittest.TestCase):
         process.remove()
 
     def test_resources_bind_locally_and_native_pause_kill_remain_explicit(self):
-        unavailable = sdk.pueue(sdk.local(), config_file="/no-opensol-config")
+        unavailable = sdk.ProcessManager.open(sdk.PueueConfig(config_file="/no-opensol-config"),
+                                             connection=sdk.Connection.open(sdk.LocalConfig()))
         missing = unavailable.get(sdk.ProcessRef("pueue", "123"))
         self.assertEqual(missing.ref.id, "123", "binding must not contact a daemon")
         self.assertTrue(missing.output.capabilities()["subscribe"])
         self.assertFalse(missing.terminal.capabilities()["screen"])
-        manager = sdk.pueue(sdk.local(), config_file=str(self.config))
+        manager = sdk.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config)),
+                                         connection=sdk.Connection.open(sdk.LocalConfig()))
         process = manager.spawn(["sleep", "30"])
         handle = process.output.subscribe()
         self.assertFalse(process.output.capabilities()["read"])
@@ -196,10 +198,10 @@ class ResourceTests(unittest.TestCase):
 class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
     stop_daemon = test_sdk.PueueTests.stop_daemon
 
-    def setUp(self):
+    async def asyncSetUp(self):
         test_sdk.PueueTests.setUp(self)
-        self.manager = aio.pueue(aio.local(), config_file=str(self.config),
-                                 pueue_directory=str(self.directory))
+        self.manager = await aio.ProcessManager.open(sdk.PueueConfig(config_file=str(self.config),
+                                 pueue_directory=str(self.directory)), connection=await aio.Connection.open(sdk.LocalConfig()))
 
     async def test_first_subscription_after_external_restart_uses_current_execution(self):
         from test_async import collect
@@ -209,7 +211,7 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         output = process.output
         await process.wait(timeout=5)
         script.write_text("printf 9; exit 9")
-        restarted = await aio.local().exec(["pueue", "--config", str(self.config),
+        restarted = await (await aio.Connection.open(sdk.LocalConfig())).exec(["pueue", "--config", str(self.config),
                                             "restart", "--in-place", process.ref.id])
         self.assertTrue(restarted.success)
         self.assertEqual((await process.wait(timeout=5)).exit.code, 9)
@@ -223,7 +225,7 @@ class AsyncResourceTests(unittest.IsolatedAsyncioTestCase):
         await process.remove()
 
     async def test_failed_to_spawn_is_delivered_as_completion_then_ends(self):
-        await aio.local().exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
+        await (await aio.Connection.open(sdk.LocalConfig())).exec(["pueue", "--config", str(self.config), "pause", "--group", "default"])
         with tempfile.TemporaryDirectory(prefix="opensol-private-cwd-") as cwd:
             process = await self.manager.spawn(["true"], cwd=cwd)
             handle = await process.output.subscribe()
@@ -319,7 +321,7 @@ class EnvdResourceTests(unittest.TestCase):
     setUp = test_sdk.EnvdBindingTests.setUp
 
     def test_native_list_probe_kill_and_unsupported_resource_operations(self):
-        manager = self.native.processes
+        manager = self.processes
         info = manager.probe()
         self.assertEqual((info.backend, info.client_version, info.server_version), ("envd", None, None))
         self.assertEqual(manager.list(), [])

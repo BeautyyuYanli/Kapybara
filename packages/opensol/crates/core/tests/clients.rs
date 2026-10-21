@@ -1,7 +1,7 @@
 //! Third-party raw implementations exercise the public validation and dispatch boundary.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -19,6 +19,174 @@ use opensol_core::{
 struct Backend {
     calls: Arc<Mutex<Vec<&'static str>>>,
     reconnect: bool,
+}
+
+struct ExtensionContext {
+    _token: Arc<()>,
+}
+
+#[async_trait]
+impl BackendAccess for ExtensionContext {
+    fn backend(&self) -> &'static str {
+        "extension"
+    }
+    fn validate_open(&self, _api: Api, target: Option<&SandboxRef>) -> Result<()> {
+        if target.is_some() {
+            return Err(Error::invalid("extension", "open", "unexpected target"));
+        }
+        Ok(())
+    }
+    fn sandboxes(&self) -> Result<SandboxManager> {
+        Ok(SandboxManager::new(Backend::default()))
+    }
+    async fn connection(&self, _target: Option<&SandboxRef>) -> Result<Connection> {
+        Ok(Connection::new(Backend::default()))
+    }
+    async fn processes(&self, _target: Option<&SandboxRef>) -> Result<ProcessManager> {
+        Ok(ProcessManager::new(Backend {
+            reconnect: true,
+            ..Default::default()
+        }))
+    }
+}
+
+fn context_with_lifetime_probe() -> (opensol_core::Backend, Weak<()>) {
+    let token = Arc::new(());
+    let weak = Arc::downgrade(&token);
+    (
+        opensol_core::Backend::new(ExtensionContext { _token: token }),
+        weak,
+    )
+}
+
+// Call only after dropping all other handles for this context. The weak probe observes
+// ownership without inspecting client fields or depending on a particular Arc count.
+fn assert_retains_context_without_cycle<T>(handle: T, weak: Weak<()>) {
+    assert!(
+        weak.upgrade().is_some(),
+        "the sole handle retains its context"
+    );
+    drop(handle);
+    assert!(
+        weak.upgrade().is_none(),
+        "dropping the last handle releases the context"
+    );
+}
+
+#[test]
+fn sandbox_manager_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let manager = SandboxManager::open(&backend).await.unwrap();
+        drop(backend);
+        assert_retains_context_without_cycle(manager, weak);
+    });
+}
+
+#[test]
+fn connection_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let connection = Connection::open(&backend, None).await.unwrap();
+        drop(backend);
+        assert_eq!(
+            connection
+                .exec(ExecRequest::new(Command::shell("true")))
+                .await
+                .unwrap()
+                .exit
+                .code,
+            Some(7)
+        );
+        assert_retains_context_without_cycle(connection, weak);
+    });
+}
+
+#[test]
+fn process_manager_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let manager = ProcessManager::open(&backend, None, None).await.unwrap();
+        drop(backend);
+        assert_retains_context_without_cycle(manager, weak);
+    });
+}
+
+#[test]
+fn sandbox_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let sandbox = SandboxManager::open(&backend)
+            .await
+            .unwrap()
+            .get(SandboxRef::new("extension", "id"));
+        drop(backend);
+        assert_retains_context_without_cycle(sandbox, weak);
+    });
+}
+
+#[test]
+fn process_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let process = ProcessManager::open(&backend, None, None)
+            .await
+            .unwrap()
+            .get(ProcessRef::new("extension", "id", Some(false)));
+        drop(backend);
+        assert_retains_context_without_cycle(process, weak);
+    });
+}
+
+#[test]
+fn output_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let output = ProcessManager::open(&backend, None, None)
+            .await
+            .unwrap()
+            .get(ProcessRef::new("extension", "id", Some(false)))
+            .output();
+        drop(backend);
+        assert_retains_context_without_cycle(output, weak);
+    });
+}
+
+#[test]
+fn terminal_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let terminal = ProcessManager::open(&backend, None, None)
+            .await
+            .unwrap()
+            .get(ProcessRef::new("extension", "id", Some(false)))
+            .terminal();
+        drop(backend);
+        assert_retains_context_without_cycle(terminal, weak);
+    });
+}
+
+#[test]
+fn extracted_subscription_stream_retains_its_context_without_cycles() {
+    block_on(async {
+        let (backend, weak) = context_with_lifetime_probe();
+        let mut events = ProcessManager::open(&backend, None, None)
+            .await
+            .unwrap()
+            .get(ProcessRef::new("extension", "id", Some(false)))
+            .output()
+            .subscribe()
+            .await
+            .unwrap()
+            .events;
+        drop(backend);
+        assert!(weak.upgrade().is_some());
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ProcessEvent::Completed(_)))
+        ));
+        assert_retains_context_without_cycle(events, weak);
+    });
 }
 
 impl Backend {
@@ -144,7 +312,7 @@ impl SandboxManagerAccess for Backend {
             ..Default::default()
         }
     }
-    async fn create(&self, _options: CreateOptions) -> Result<SandboxRef> {
+    async fn create(&self, _spec: SandboxSpec) -> Result<SandboxRef> {
         self.entered("create")
     }
     async fn inspect(&self, _resource: &SandboxRef) -> Result<SandboxInfo> {
@@ -205,13 +373,17 @@ fn lifecycle_checks_reference_and_optional_operations_without_native_calls() {
             ..Default::default()
         };
         assert_eq!(
-            client.create(invalid).await.unwrap_err().kind,
+            client
+                .create(SandboxSpec::new("extension", invalid, ()))
+                .await
+                .unwrap_err()
+                .kind,
             ErrorKind::InvalidArgument
         );
         assert!(adapter.calls.lock().unwrap().is_empty());
         assert_eq!(
             client
-                .create(CreateOptions::default())
+                .create(SandboxSpec::new("extension", CreateOptions::default(), ()))
                 .await
                 .unwrap_err()
                 .kind,

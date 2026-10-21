@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// OpenSSH configuration. The SDK never adds StrictHostKeyChecking=no or accepts password prompts.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SshConfig {
     pub destination: String,
     pub port: Option<u16>,

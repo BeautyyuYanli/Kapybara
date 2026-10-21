@@ -1,5 +1,32 @@
 //! Opt-in adapters. Each constructor binds a target; no global registry or automatic resource cleanup.
 
+#[cfg(any(
+    feature = "local",
+    feature = "ssh",
+    feature = "docker",
+    feature = "e2b",
+    feature = "envd",
+    feature = "agent-sandbox",
+    feature = "openshell",
+    feature = "sandboxd",
+    feature = "pueue",
+    feature = "tmux"
+))]
+pub mod backend;
+#[cfg(any(
+    feature = "local",
+    feature = "ssh",
+    feature = "docker",
+    feature = "e2b",
+    feature = "envd",
+    feature = "agent-sandbox",
+    feature = "openshell",
+    feature = "sandboxd",
+    feature = "pueue",
+    feature = "tmux"
+))]
+pub use backend::BackendConfig;
+
 #[cfg(feature = "agent-sandbox")]
 pub mod agent_sandbox;
 #[cfg(feature = "docker")]

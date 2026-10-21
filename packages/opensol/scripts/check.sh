@@ -18,5 +18,7 @@ python -m pip install --force-reinstall /tmp/opensol-wheels/*.whl
 mkdir -p /tmp/opensol-protocols
 python -m grpc_tools.protoc -I crates/adapters/protocols/envd \
     --python_out=/tmp/opensol-protocols crates/adapters/protocols/envd/process.proto
+python -m grpc_tools.protoc -I crates/adapters/protocols/openshell \
+    --python_out=/tmp/opensol-protocols crates/adapters/protocols/openshell/*.proto
 PYTHONPATH="/tmp/opensol-protocols${PYTHONPATH:+:$PYTHONPATH}" \
     python -m unittest discover -s bindings/python/tests -v

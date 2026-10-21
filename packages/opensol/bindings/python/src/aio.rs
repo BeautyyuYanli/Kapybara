@@ -11,7 +11,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 #[pyclass(name = "AsyncConnection", frozen)]
 pub(super) struct AsyncConnection {
-    inner: Connection,
+    pub(super) inner: Connection,
 }
 
 #[pymethods]
@@ -72,7 +72,7 @@ impl AsyncConnection {
 
 #[pyclass(name = "AsyncSandboxManager", frozen)]
 pub(super) struct AsyncSandboxManager {
-    inner: SandboxManager,
+    pub(super) inner: SandboxManager,
 }
 
 #[pymethods]
@@ -104,20 +104,12 @@ impl AsyncSandboxManager {
                 .map_err(exception)
         })
     }
-    #[pyo3(signature = (*, name=None, labels=None))]
-    fn create<'py>(
-        &self,
-        py: Python<'py>,
-        name: Option<String>,
-        labels: Option<BTreeMap<String, String>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn create<'py>(&self, py: Python<'py>, spec: &str) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
+        let spec = construction::sandbox_spec(spec)?;
         future_into_py(py, async move {
             client
-                .create(CreateOptions {
-                    name,
-                    labels: labels.unwrap_or_default(),
-                })
+                .create(spec)
                 .await
                 .map(|inner| AsyncSandbox { inner })
                 .map_err(exception)
@@ -277,8 +269,8 @@ impl AsyncOutputSubscription {
 }
 
 #[pyclass(name = "AsyncProcessManager", frozen)]
-struct AsyncProcessManager {
-    inner: ProcessManager,
+pub(super) struct AsyncProcessManager {
+    pub(super) inner: ProcessManager,
 }
 
 #[pymethods]
@@ -350,146 +342,11 @@ impl AsyncProcessManager {
     }
 }
 
-#[pyfunction]
-fn _async_connection(connection: PyRef<'_, PyConnection>) -> AsyncConnection {
-    AsyncConnection {
-        inner: connection.inner.clone(),
-    }
-}
-
-#[pyfunction]
-fn _async_sandboxes(lifecycle: PyRef<'_, PySandboxManager>) -> AsyncSandboxManager {
-    AsyncSandboxManager {
-        inner: lifecycle.inner.clone(),
-    }
-}
-
-#[pyfunction]
-fn _async_processes(manager: PyRef<'_, PyProcessManager>) -> AsyncProcessManager {
-    AsyncProcessManager {
-        inner: manager.inner.clone(),
-    }
-}
-
-#[pyfunction]
-#[pyo3(signature = (endpoint, *, bearer_token=None, ca_certificate=None, client_certificate=None, client_key=None))]
-fn _aio_sandboxd<'py>(
-    py: Python<'py>,
-    endpoint: String,
-    bearer_token: Option<String>,
-    ca_certificate: Option<String>,
-    client_certificate: Option<String>,
-    client_key: Option<String>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let config = grpc_config(
-        endpoint,
-        bearer_token,
-        ca_certificate,
-        client_certificate,
-        client_key,
-    )?;
-    future_into_py(py, async move {
-        Sandboxd::connect(config)
-            .await
-            .map(|inner| AsyncConnection {
-                inner: Connection::new(inner),
-            })
-            .map_err(exception)
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (endpoint, *, workspace="default", workload_template=None, spec_protobuf=None, bearer_token=None, ca_certificate=None, client_certificate=None, client_key=None))]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "typed keyword-only provider and TLS settings"
-)]
-fn _aio_openshell<'py>(
-    py: Python<'py>,
-    endpoint: String,
-    workspace: &str,
-    workload_template: Option<String>,
-    spec_protobuf: Option<&[u8]>,
-    bearer_token: Option<String>,
-    ca_certificate: Option<String>,
-    client_certificate: Option<String>,
-    client_key: Option<String>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let spec = spec_protobuf
-        .map(openshell_protocol::v1::SandboxSpec::decode)
-        .transpose()
-        .map_err(|_| {
-            exception(Error::invalid(
-                "openshell",
-                "configure",
-                "invalid OpenShell SandboxSpec protobuf",
-            ))
-        })?;
-    let create = OpenShellCreate {
-        spec,
-        workload_template,
-    };
-    let workspace = workspace.to_string();
-    let config = grpc_config(
-        endpoint,
-        bearer_token,
-        ca_certificate,
-        client_certificate,
-        client_key,
-    )?;
-    future_into_py(py, async move {
-        OpenShellSandboxManager::connect(config, workspace, create)
-            .await
-            .map(|inner| PyOpenShell { inner })
-            .map_err(exception)
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (endpoint, sandbox, *, workspace="default", bearer_token=None, ca_certificate=None, client_certificate=None, client_key=None))]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "typed keyword-only provider and TLS settings"
-)]
-fn _aio_openshell_connection<'py>(
-    py: Python<'py>,
-    endpoint: String,
-    sandbox: String,
-    workspace: &str,
-    bearer_token: Option<String>,
-    ca_certificate: Option<String>,
-    client_certificate: Option<String>,
-    client_key: Option<String>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let workspace = workspace.to_string();
-    let config = grpc_config(
-        endpoint,
-        bearer_token,
-        ca_certificate,
-        client_certificate,
-        client_key,
-    )?;
-    future_into_py(py, async move {
-        OpenShellConnection::connect(config, workspace, sandbox)
-            .await
-            .map(|inner| AsyncConnection {
-                inner: Connection::new(inner),
-            })
-            .map_err(exception)
-    })
-}
-
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AsyncConnection>()?;
     module.add_class::<AsyncSandboxManager>()?;
     module.add_class::<AsyncSandbox>()?;
     module.add_class::<AsyncProcessManager>()?;
     module.add_class::<AsyncOutputSubscription>()?;
-    module.add_function(wrap_pyfunction!(_async_connection, module)?)?;
-    module.add_function(wrap_pyfunction!(_async_sandboxes, module)?)?;
-    module.add_function(wrap_pyfunction!(_async_processes, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_sandboxd, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_openshell, module)?)?;
-    module.add_function(wrap_pyfunction!(_aio_openshell_connection, module)?)?;
     Ok(())
 }

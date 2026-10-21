@@ -14,7 +14,7 @@ use crate::secret::Secret;
 /// Native gRPC configuration. TLS verifies peers; optional CA and mTLS identity never disable verification.
 ///
 /// CLI login state, proxy tunnels and gateway discovery are deliberately not read automatically.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GrpcConfig {
     pub endpoint: String,
     pub bearer_token: Option<Secret>,
@@ -35,6 +35,7 @@ impl GrpcConfig {
     }
 
     pub(crate) async fn connect(&self, backend: &str) -> Result<Channel> {
+        self.request((), backend)?;
         if self.request_timeout.is_zero()
             || !(self.endpoint.starts_with("http://") || self.endpoint.starts_with("https://"))
             || self.endpoint.contains(['@', '?', '#'])

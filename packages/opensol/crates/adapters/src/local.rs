@@ -11,6 +11,10 @@ use tokio::{io::AsyncWriteExt, process::Command as TokioCommand};
 
 use crate::util::deadline;
 
+/// Local access has no target identity or creation settings.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct LocalConfig {}
+
 /// Executes argv locally, inheriting the parent environment with the command's explicit overlay.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Local;

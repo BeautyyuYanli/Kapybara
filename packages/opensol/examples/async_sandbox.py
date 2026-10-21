@@ -12,9 +12,9 @@ from opensol import aio
 
 
 async def main(image: str) -> None:
-    backend = aio.docker(image, command=["sleep", "infinity"])
-    manager = backend.sandboxes
-    sandbox = await manager.create(labels={"project": "opensol-example"})
+    backend = await aio.Backend.open(sdk.DockerConfig())
+    manager = await aio.SandboxManager.open(backend)
+    sandbox = await manager.create(sdk.DockerSandboxSpec(image, command=["sleep", "infinity"], labels={"project": "opensol-example"}))
     try:
         # Discovery fields come from the native list, without per-item inspect or SDK metadata.
         for info in await manager.list():
@@ -31,7 +31,8 @@ async def main(image: str) -> None:
                     raise RuntimeError(f"sandbox {info.state}: {info.native_state}")
                 await asyncio.sleep(0.2)
         # Running is a native observation; a later exec can still race or fail to connect.
-        result = await backend.connection(sandbox.ref).exec(["true"], timeout=5)
+        connection = await aio.Connection.open(backend, target=sandbox.ref)
+        result = await connection.exec(["true"], timeout=5)
         print("exec succeeded:", result.success)
     finally:
         async with asyncio.timeout(30):
