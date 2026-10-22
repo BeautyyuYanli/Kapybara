@@ -1,4 +1,4 @@
-# Standalone Activities and session scopes
+# Standalone Activities and conversations
 
 The Worker registers kapy.create_session, kapy.run_agent and kapy.close_session.
 A complete Agent run is one standalone Activity; there are no Workflows, model/tool
@@ -22,9 +22,11 @@ Native inputs are deliberately small:
 
 Create defaults session_id to its Activity UUID. It validates all Config/default
 States before inserting creating plus the native writer; duplicate session IDs
-never repeat enter. Initial States remain local until published atomically with
+never repeat `enter_conversation`. The Worker passes `str(session_id)` to the hook
+outside any transaction. Initial States remain local until published atomically with
 ready and ownership release. Failure conditionally changes its still-owned creating
-row to closing, then compensates all configured layers in reverse with None.
+row to closing, then compensates all configured layers in reverse through
+`exit_conversation(str(session_id), config, None)`, including partial/uncalled enters.
 A lost ready-commit response cannot trigger compensation after ownership cleared;
 an unavailable database does not authorize speculative cleanup.
 
@@ -34,6 +36,10 @@ validates settings/history/State and constructs process-local RunnerInput. Failu
 rolls back admission. Queueing neither reserves the session nor orders execution;
 a competing Worker can fail admission after HTTP 202, without model/tool/hook I/O.
 Provider credentials, snapshot and State never enter run's Temporal parameters.
+Every actual `agent.run` explicitly receives `conversation_id=str(session_id)`.
+The first, later and restored runs all use that host identity; historical message
+IDs remain unchanged. Tools and SDK hooks read `ctx.conversation_id`; the SDK run
+ID and Temporal Activity identity remain independent execution identifiers.
 
 Every history/snapshot/scope-progress write checks session ID, both native identity
 fields and allowed lifecycle. Checks also precede new model/tool/hook calls. No
@@ -44,8 +50,9 @@ Only explicit close queries an occupied session's exact old execution outside it
 transaction. Confirmed terminal or NOT_FOUND permits CAS replacement into closing;
 RUNNING/PAUSED/unknown states or temporary RPC failure preserve the old writer.
 A changed writer cannot be overwritten. Later explicit close uses a new UUID and
-may repeat idempotent exits. Each attempt saves validated State, including failure
-and cancellation; ordinary failures still attempt other layers. Only outer
+may repeat idempotent `exit_conversation` calls with the same string ID. Each attempt
+saves validated State, including failure and cancellation; ordinary failures still
+attempt other layers. Only outer
 RetryableScopeError permits three local hook attempts, separate from Temporal retry.
 
 ## Resources, cancellation and results
@@ -98,8 +105,8 @@ messages and States, including output-tool receipts and after-run tails, after
 model/provider/tool resources close.
 
 Without a new prompt, decoded messages can be passed to
-`agent.run(message_history=messages, deps=restored_deps)`. The SDK reuses the trailing
-request and always requests the model, even for a saved plain text response with
+`agent.run(message_history=messages, deps=restored_deps, conversation_id=str(session_id))`.
+The SDK reuses the trailing request and always requests the model, even for a saved plain text response with
 no instructions. For unanswered tool calls it inserts
 `ToolReturnPart(outcome="interrupted")` before the unbound interruption prompt;
 those old calls are skipped. Actual tool returns and tool-bound retry feedback

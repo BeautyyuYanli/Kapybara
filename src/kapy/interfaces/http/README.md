@@ -121,8 +121,11 @@ SessionRecord exposes creating/ready/closing/closed and current execution identi
 history and live remain available throughout; layer Config stays public and fixed,
 while State and message snapshots stay internal. Scope Activities run hooks outside
 transactions and publish business progress through full writer-identity predicates.
-Creation compensation exits every configured layer with None in reverse order;
-cleanup progress persists after each attempt. Only an outer RetryableScopeError
+Creation calls `enter_conversation(str(session_id), config)` once per selected hook;
+each Agent run passes that same SDK conversation ID. Close and creation compensation
+call `exit_conversation` with that ID. Compensation exits every configured layer
+with None in reverse order; cleanup progress persists after each attempt.
+Only an outer RetryableScopeError
 allows the existing three local hook attempts. Failed scope Activities return a
 safe native failure; explicit cleanup retry uses a new ID. See
 [control state machine](../../control/README.md#session-state-machine) and

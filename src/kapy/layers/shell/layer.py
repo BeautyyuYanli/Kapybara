@@ -1,20 +1,20 @@
 """Native shell layer; only explicit JSON writes retain job IDs and byte cursors.
 
 Config validation and factory assembly are pure. Each tool call owns one
-HTTP client. Remote tasks survive runs; exit_scope releases the known jobs while
+HTTP client. Remote tasks survive runs; exit_conversation releases the known jobs while
 SessionService saves cleanup progress. State owns neither the shellctl service
 nor the remote cwd/artifacts. Deps are opaque: injected access and Config/State
-supply all layer data, including the scope identity established by enter.
+supply business data. The SDK's RunContext.conversation_id supplies resource ownership.
 """
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from uuid import UUID
 
 import anyio
 import httpx2
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.capabilities import Capability
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.toolsets import FunctionToolset
 from shellctl import ShellctlClientError
 from shellctl.shared.constants import DEFAULT_TERMINATE_GRACE_SECONDS, DEFAULT_TIMEOUT_SECONDS
@@ -41,6 +41,9 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
 
     @asynccontextmanager
     async def operations(ctx: RunContext[D]) -> AsyncIterator[runtime.ShellOperations]:
+        conversation_id = ctx.conversation_id
+        if not conversation_id:
+            raise UserError("Shell tools require a nonempty conversation_id")
         config, state = read(ctx.deps)
 
         async def known(job_id: str) -> int | None:
@@ -62,7 +65,7 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
                 config,
                 client,
                 redact,
-                session_id=state.scope_id,
+                conversation_id=conversation_id,
                 provider="builtin",
                 name="shell",
                 known=known,
@@ -125,17 +128,17 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
                 )
             ],
         ),
-        enter_scope=enter_scope,
-        exit_scope=exit_scope,
+        enter_conversation=enter_conversation,
+        exit_conversation=exit_conversation,
     )
 
 
-async def enter_scope(scope_id: UUID, config: Config) -> State:
-    """Record scope identity with an empty inventory, without allocating resources."""
-    return State(scope_id=scope_id)
+async def enter_conversation(conversation_id: str, config: Config) -> State:
+    """Start an empty inventory without allocating remote resources."""
+    return State()
 
 
-async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> None:
+async def exit_conversation(conversation_id: str, config: Config, state: State | None) -> None:
     """Delete known jobs, removing only acknowledged or already absent IDs.
 
     The host supplies exclusive scope ownership and persists the mutated State
@@ -144,9 +147,10 @@ async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> Non
     HTTP availability errors opt into retry. Local configuration/protocol and
     authentication errors propagate unchanged.
 
-    None denotes abandoned initialization. Enter allocates nothing, and tools
-    cannot run before ready, so that case has no jobs to release. Ready cleanup
-    must receive its saved inventory; shellctl cannot discover jobs by scope.
+    shellctl's listing has no ownership fields or scope deletion endpoint, so
+    cleanup can only use the saved jobs inventory. None supplies no discoverable
+    job IDs; enter allocates nothing, but absent State is not proof that the
+    upstream has no resources.
     State may not reflect the latest upstream state after a crash, an unsaved tool
     mutation or an unacknowledged job creation. Jobs missing from that inventory
     cannot be discovered here and may remain as orphaned upstream resources.

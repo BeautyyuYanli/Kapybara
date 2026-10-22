@@ -8,6 +8,34 @@ import sqlalchemy as sa
 from alembic.operations import ops
 
 
+def shell_conversation_state(context, revision, directives) -> None:
+    """Remove only shell's persisted identity; ownership comes from the SDK context.
+
+    Missing or non-object shell State is left intact. Downgrade derives the old
+    identity from the row's session UUID, without touching messages or other data.
+    """
+    script = directives[0]
+    if script.upgrade_ops.ops or script.downgrade_ops.ops:
+        raise ValueError("shell-conversation-state plan requires no schema changes")
+    script.upgrade_ops = ops.UpgradeOps(
+        [
+            ops.ExecuteSQLOp("""UPDATE sessions
+SET layer_states = jsonb_set(layer_states::jsonb, '{shell}',
+    (layer_states::jsonb->'shell') - 'scope_id')::json
+WHERE jsonb_typeof(layer_states::jsonb->'shell') = 'object'
+    AND layer_states::jsonb->'shell' ? 'scope_id'"""),
+        ]
+    )
+    script.downgrade_ops = ops.DowngradeOps(
+        [
+            ops.ExecuteSQLOp("""UPDATE sessions
+SET layer_states = jsonb_set(layer_states::jsonb, '{shell,scope_id}',
+    to_jsonb(id::text))::json
+WHERE jsonb_typeof(layer_states::jsonb->'shell') = 'object'"""),
+        ]
+    )
+
+
 def shell_scope_state(context, revision, directives) -> None:
     """Backfill only existing shell State; creating/abandoned empty State stays empty.
 

@@ -11,7 +11,6 @@ no session data; the SDK owns per-run binding.
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypedDict
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from pydantic_ai.capabilities import AbstractCapability
@@ -27,18 +26,20 @@ class LayerData(TypedDict):
 
 @dataclass(frozen=True, kw_only=True)
 class Layer[D, C: BaseModel, S: BaseModel]:
-    """Installed models, capability and independent session-scope hooks.
+    """Installed models, capability and independent conversation hooks.
 
     Capability/Toolset IDs stay fixed after construction. Stateful SDK components
     use native ``for_run`` isolation. Exit must tolerate absent persisted State,
-    partial allocation and repeated cleanup using the host's scope UUID and Config.
+    partial allocation and repeated cleanup using the host's conversation ID and Config.
+    SDK tools/hooks read that string from RunContext.conversation_id; the host
+    passes it directly to the independent enter/exit hooks outside Agent runs.
     """
 
     config_type: type[C]
     state_type: type[S]
     capability: AbstractCapability[D]
-    enter_scope: Callable[[UUID, C], Awaitable[S]] | None = None
-    exit_scope: Callable[[UUID, C, S | None], Awaitable[None]] | None = None
+    enter_conversation: Callable[[str, C], Awaitable[S]] | None = None
+    exit_conversation: Callable[[str, C, S | None], Awaitable[None]] | None = None
 
     @property
     def id(self) -> str:

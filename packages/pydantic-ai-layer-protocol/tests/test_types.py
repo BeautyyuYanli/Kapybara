@@ -17,18 +17,18 @@ class Config(BaseModel):
 class State(BaseModel):
     resource: str
 
-async def enter(scope_id: UUID, config: Config) -> State:
+async def enter(conversation_id: str, config: Config) -> State:
     return State(resource=config.prefix)
 
-async def exit(scope_id: UUID, config: Config, state: State | None) -> None:
+async def exit(conversation_id: str, config: Config, state: State | None) -> None:
     pass
 
 layer = Layer[LayerDeps, Config, State](
     config_type=Config,
     state_type=State,
     capability=Capability[LayerDeps](id="typed"),
-    enter_scope=enter,
-    exit_scope=exit,
+    enter_conversation=enter,
+    exit_conversation=exit,
 )
 
 def make(layer_id: str, access: LayerAccess[LayerDeps]) -> Layer[LayerDeps, Config, State]:
@@ -46,19 +46,24 @@ assert_type(registry, LayerRegistry[LayerDeps])
     "old,new,diagnostic",
     [
         ("", "", None),
-        ("state: State | None", "state: State", "exit_scope"),
-        ("state: State | None", "state: Config | None", "exit_scope"),
+        ("state: State | None", "state: State", "exit_conversation"),
+        ("state: State | None", "state: Config | None", "exit_conversation"),
         (
-            "async def enter(scope_id: UUID, config: Config)",
-            "async def enter(scope_id: UUID, config: State)",
-            "enter_scope",
+            "async def enter(conversation_id: str, config: Config)",
+            "async def enter(conversation_id: str, config: State)",
+            "enter_conversation",
         ),
+        ("conversation_id: str", "conversation_id: UUID", "enter_conversation"),
         (
             "-> State:\n    return State(resource=config.prefix)",
             "-> Config:\n    return config",
-            "enter_scope",
+            "enter_conversation",
         ),
-        ("-> None:\n    pass", "-> State:\n    return State(resource=config.prefix)", "exit_scope"),
+        (
+            "-> None:\n    pass",
+            "-> State:\n    return State(resource=config.prefix)",
+            "exit_conversation",
+        ),
         ("Capability[LayerDeps]", "Capability[int]", "capability"),
         ('    capability=Capability[LayerDeps](id="typed"),\n', "", "capability"),
     ],
@@ -67,6 +72,7 @@ assert_type(registry, LayerRegistry[LayerDeps])
         "required_state_exit",
         "wrong_state",
         "wrong_config",
+        "uuid_identity",
         "enter_return",
         "exit_return",
         "wrong_deps",

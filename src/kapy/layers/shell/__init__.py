@@ -1,1 +1,1 @@
-"""Borrowed shellctl service; layer State owns scope identity, job IDs and cursors."""
+"""Borrowed shellctl service; State stores jobs/cursors, SDK context supplies identity."""

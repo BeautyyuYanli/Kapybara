@@ -22,9 +22,11 @@ on `app.state.resources`. SessionService resolves configuration per direct runne
 start, and submits the standalone Agent Activity to the common Temporal task queue.
 An independent `python -m kapy.runner.worker` owns Agent/model resources;
 interfaces submit Activity execution and do not start a Worker. Session creation
-dispatches its scope Activity and waits for readiness; its hooks perform business
+dispatches its creation Activity and waits for readiness; `enter_conversation`
+initializes business State with `str(session_id)` and may perform business
 I/O in the Worker. Closing likewise requires the Worker. Agent execution is a
-separate run operation.
+separate run operation using that same SDK conversation ID; `exit_conversation`
+belongs to explicit close and creation compensation.
 
 Common environment values (read only during command execution):
 

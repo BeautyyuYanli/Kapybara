@@ -34,8 +34,8 @@ def install_layer(
         config_type=config,
         state_type=state,
         capability=Capability(id=layer_id),
-        enter_scope=enter,
-        exit_scope=exit_hook,
+        enter_conversation=enter,
+        exit_conversation=exit_hook,
     )
     factories = {
         name: (lambda layer_id, access, definition=definition: definition)
@@ -76,7 +76,7 @@ async def test_enter_initializes_required_states_and_same_key_returns_original_r
     key = uuid4()
     data = selection(both={"prefix": "fixed:"}, default={})
     session = await service.create_session(data, activity_id=key)
-    assert enters == [(session.id, "fixed:")]
+    assert enters == [(str(session.id), "fixed:")]
     assert await stored(database, session.id) == {
         "both": {"resource": str(session.id)},
         "default": {"calls": 0},
@@ -89,7 +89,8 @@ async def test_enter_initializes_required_states_and_same_key_returns_original_r
     close_key = uuid4()
     closed = await service.close_session(session.id, activity_id=close_key)
     assert closed.status == LifecycleStatus.CLOSED
-    assert len(exits) == 1 and exits[0][1].resource == str(session.id)
+    assert len(exits) == 1 and exits[0][0] == str(session.id)
+    assert exits[0][1].resource == str(session.id)
     assert await service.close_session(session.id, activity_id=close_key) == closed
     assert await service.create_session(data, activity_id=key) == session
     assert len(enters) == len(exits) == 1
@@ -149,7 +150,7 @@ async def test_existing_scope_retry_contract_is_bounded_without_activity_retry(
         with pytest.raises(SessionExecutionError):
             await service.create_session(data, activity_id=key)
         assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
-    assert calls == [(session_id, "fixed")] * 3
+    assert calls == [(str(session_id), "fixed")] * 3
     assert (await session_runtime.client.get_activity_handle(str(key)).describe()).attempt == 1
 
 
@@ -184,7 +185,7 @@ async def test_creating_owns_session_and_local_wait_cancellation_does_not_cancel
         duplicate = asyncio.create_task(service.create_session(data, activity_id=key))
         release.set()
         assert (await duplicate).status == LifecycleStatus.READY
-        assert calls == [session_id]
+        assert calls == [str(session_id)]
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
@@ -201,7 +202,7 @@ async def test_real_creation_activity_cancellation_compensates_partial_and_uncal
         await asyncio.Future()
 
     async def exit_hook(session_id, config, state):
-        exits.append((config.prefix, state))
+        exits.append((session_id, config.prefix, state))
 
     install_layer(monkeypatch, "partial", enter=enter, exit_hook=exit_hook)
     install_layer(monkeypatch, "uncalled", enter=enter, exit_hook=exit_hook)
@@ -222,7 +223,7 @@ async def test_real_creation_activity_cancellation_compensates_partial_and_uncal
         await handle.result()
     with pytest.raises(SessionExecutionError):
         await task
-    assert exits == [("second", None), ("first", None)]
+    assert exits == [(str(session_id), "second", None), (str(session_id), "first", None)]
     assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
 
 
@@ -456,4 +457,4 @@ async def test_deleted_create_record_does_not_reenter_existing_session(
     with pytest.raises(SessionExecutionError) as conflict:
         await service.create_session(data, activity_id=key)
     assert conflict.value.category == "SessionAlreadyExists"
-    assert calls == [session.id]
+    assert calls == [str(session.id)]

@@ -468,6 +468,71 @@ def test_input_round_trip_and_validation():
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+@pytest.mark.parametrize("saved_conversation", [None, "previous-sdk-conversation"])
+async def test_activity_uses_session_conversation_for_first_later_and_restored_runs(
+    endpoint, runner_database, monkeypatch, saved_conversation
+):
+    base_url, requests = endpoint
+    seen = []
+
+    async def observe(ctx, request):
+        seen.append((ctx.conversation_id, ctx.run_id))
+        return request
+
+    observed_agent = Agent(
+        name=agent.name,
+        deps_type=RunnerDeps,
+        capabilities=[*agent.root_capability.capabilities, Hooks(before_model_request=observe)],
+    )
+    monkeypatch.setattr(import_module("kapy.runner.activities"), "agent", observed_agent)
+    initial = (
+        [
+            ModelRequest([UserPromptPart("old prompt")], conversation_id=saved_conversation),
+            ModelResponse([TextPart("old answer")], conversation_id=saved_conversation),
+        ]
+        if saved_conversation is not None
+        else []
+    )
+    snapshot = ModelMessagesTypeAdapter.dump_json(initial).decode() if initial else None
+    client = await connect_temporal(runner_database.settings)
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
+    queue = f"runner-conversation-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        activities=[runner.create, runner.run, runner.close],
+    ):
+        for prompt in ("first", "follow-up"):
+            assert (
+                await execute(
+                    client,
+                    queue,
+                    RunnerInput(
+                        session_id=runner_database.session_id,
+                        runner_state=snapshot,
+                        user_prompt=prompt,
+                        config=make_config(base_url),
+                    ),
+                    database=runner_database,
+                )
+                == "done"
+            )
+            async with runner_database.sessions.begin() as db:
+                snapshot = await SessionRepository(db).read_runner_state(runner_database.session_id)
+            assert snapshot is not None
+            messages = ModelMessagesTypeAdapter.validate_json(snapshot)
+            assert [message.conversation_id for message in messages] == (
+                [saved_conversation] * len(initial)
+                + [str(runner_database.session_id)] * (len(messages) - len(initial))
+            )
+    assert len(requests) == len(seen) == 2
+    assert [conversation for conversation, _ in seen] == [str(runner_database.session_id)] * 2
+    assert all(run_id and run_id != str(runner_database.session_id) for _, run_id in seen)
+    assert seen[0][1] != seen[1][1]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_activity_restores_state_and_records_after_run_tail_once(
     endpoint, runner_database, monkeypatch
 ):
@@ -584,17 +649,20 @@ async def test_activity_restores_state_and_records_after_run_tail_once(
             {
                 "shell": {
                     "config": {"cwd": "relative"},
-                    "state": {"scope_id": str(uuid4()), "jobs": {}},
+                    "state": {"jobs": {}},
                 }
             },
         ),
-        (None, {"shell": {"config": {"cwd": "/tmp"}, "state": {"jobs": {}}}}),
+        (
+            None,
+            {"shell": {"config": {"cwd": "/tmp"}, "state": {"scope_id": str(uuid4()), "jobs": {}}}},
+        ),
         (
             None,
             {
                 "shell": {
                     "config": {"cwd": "/tmp"},
-                    "state": {"scope_id": str(uuid4()), "jobs": {"job": -1}},
+                    "state": {"jobs": {"job": -1}},
                 }
             },
         ),

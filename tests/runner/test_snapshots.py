@@ -76,7 +76,7 @@ async def test_interrupted_snapshot_resumes_without_prompt(runner_database, boun
     async with runner_database.sessions.begin() as db:
         row = await db.get(SessionRow, deps.session_id)
         row.layers = {"shell": dump_object(Config(cwd="/tmp"))}
-        row.layer_states = {"shell": dump_object(State(scope_id=deps.session_id))}
+        row.layer_states = {"shell": dump_object(State())}
         deps.layers = layer_registry.load(row.layers, row.layer_states)
 
     calls = []

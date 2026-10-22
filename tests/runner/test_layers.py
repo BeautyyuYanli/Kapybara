@@ -102,7 +102,7 @@ async def test_two_sequential_tools_resume_and_partial_close(
     async with worker_service(runner_database) as (service, temporal):
         session = await create_shell_session(runner_database, service, shell_server)
         assert "layer_states" not in session.model_dump()
-        assert await state(runner_database, session.id) == {"scope_id": str(session.id), "jobs": {}}
+        assert await state(runner_database, session.id) == {"jobs": {}}
         first = await start_runner(
             service,
             temporal,
@@ -110,7 +110,7 @@ async def test_two_sequential_tools_resume_and_partial_close(
             user_prompt=prompt(
                 (
                     run(
-                        "printf 'ready\\n'; read -r answer; "
+                        "printf 'conversation:%s\\n' \"$KAPY_SESSION_ID\"; read -r answer; "
                         "printf 'echo:%s\\n' \"$answer\"; sleep 30"
                     ),
                     run("printf 'other\\n'; sleep 30"),
@@ -119,9 +119,10 @@ async def test_two_sequential_tools_resume_and_partial_close(
             activity_id=uuid4(),
         )
         outputs = json.loads(await first.result())
+        assert f"conversation:{session.id}" in outputs[0]
         job_a, job_b = [metadata(output)["job_id"] for output in outputs]
         saved = await state(runner_database, session.id)
-        assert saved["scope_id"] == str(session.id)
+        assert "scope_id" not in saved
         assert set(saved["jobs"]) == {job_a, job_b} and all(
             offset > 0 for offset in saved["jobs"].values()
         )
@@ -142,7 +143,7 @@ async def test_two_sequential_tools_resume_and_partial_close(
         )
         assert "echo:resume" in await second.result()
         resumed = await state(runner_database, session.id)
-        assert resumed["scope_id"] == str(session.id)
+        assert "scope_id" not in resumed
         assert resumed["jobs"][job_a] > saved["jobs"][job_a]
         deleted = []
         original = runtime.delete_job
@@ -164,7 +165,6 @@ async def test_two_sequential_tools_resume_and_partial_close(
             await service.close_session(session.id, activity_id=uuid4())
         ).status == LifecycleStatus.CLOSED
         assert (await state(runner_database, session.id)) == {
-            "scope_id": str(session.id),
             "jobs": {},
         }
         for job_id in (job_a, job_b):
@@ -195,7 +195,7 @@ async def test_model_failure_preserves_completed_tool_snapshot(runner_database, 
         with pytest.raises(ActivityFailureError):
             await handle.result()
         saved = await state(runner_database, session.id)
-        assert saved["scope_id"] == before["scope_id"]
+        assert "scope_id" not in saved
         assert set(saved["jobs"]) > set(before["jobs"])
         assert (
             await service.close_session(session.id, activity_id=uuid4())
@@ -232,7 +232,7 @@ async def test_tool_signal_keeps_mutated_local_state_until_run_outcome(
             with pytest.raises(ActivityFailureError):
                 await handle.result()
         saved = await state(runner_database, session.id)
-        assert saved["scope_id"] == str(session.id)
+        assert "scope_id" not in saved
         if signal is ModelRetry:
             assert list(saved["jobs"]) == jobs and len(jobs) == 2
             assert saved["jobs"][jobs[1]] > 0
@@ -299,7 +299,7 @@ async def test_cancel_after_job_registration_keeps_previous_snapshot(
                 await asyncio.wait_for(result, 20)
             await asyncio.wait_for(cleanup_finished.wait(), 5)
             saved = await state(runner_database, session.id)
-            assert saved == {"scope_id": str(session.id), "jobs": {}}
+            assert saved == {"jobs": {}}
         finally:
             release_cleanup.set()
             if not result.done():

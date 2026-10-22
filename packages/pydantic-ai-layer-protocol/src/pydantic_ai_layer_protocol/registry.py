@@ -10,8 +10,8 @@ stable for fixed Config: never generate them from mutable State through factorie
 This preserves model prefix caching. SDK callbacks may render fixed instructions;
 dynamic business information belongs in State and tool results.
 
-Optional async Layer hooks describe a longer business scope. The host supplies
-its UUID, drives enter/exit and owns persistence and retry scheduling; assembly,
+Optional async Layer hooks describe a longer conversation. The host supplies
+its string ID, drives enter/exit and owns persistence and retry scheduling; assembly,
 validation and snapshots never invoke those hooks. Exit must be idempotent and
 handle partial or unacknowledged initialization with None State. Constructors,
 validators and instructions must never allocate business-scope resources.
@@ -50,7 +50,7 @@ class LayerRegistry[D](WrapperCapability[D]):
 
     @property
     def definitions(self) -> Mapping[str, Layer[D, Any, Any]]:
-        """Read-only installed definitions for host-owned Config/State and scope hooks."""
+        """Read-only definitions for host-owned Config/State and conversation hooks."""
         return self._definitions
 
     def prepare_configs(self, configs: Mapping[str, JsonObject]) -> dict[str, BaseModel]:
@@ -99,7 +99,10 @@ def _make_layers[D](
                 raise UserError(f"Layer {layer_id!r} must declare a Pydantic {label}")
         if not isinstance(layer.capability, AbstractCapability):
             raise UserError(f"Layer {layer_id!r} must use a native AbstractCapability")
-        for label, hook in (("enter_scope", layer.enter_scope), ("exit_scope", layer.exit_scope)):
+        for label, hook in (
+            ("enter_conversation", layer.enter_conversation),
+            ("exit_conversation", layer.exit_conversation),
+        ):
             if hook is not None and not iscoroutinefunction(hook):
                 raise UserError(f"Layer {layer_id!r} {label} must be an async function")
         if layer.capability.id != layer_id:
@@ -122,7 +125,7 @@ def dump_object(model: BaseModel) -> JsonObject:
 def _prepare_configs[D](
     configs: Mapping[str, JsonObject], layers: Mapping[str, Layer[D, Any, Any]]
 ) -> dict[str, BaseModel]:
-    """Validate all names/Config before any scope hook; State may require enter."""
+    """Validate all names/Config before conversation hooks; State may require enter."""
     unknown = configs.keys() - layers.keys()
     if unknown:
         raise UserError(f"Unknown registered layer: {', '.join(sorted(unknown))}")

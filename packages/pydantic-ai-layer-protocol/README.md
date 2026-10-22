@@ -2,7 +2,7 @@
 
 A standalone Python package for typed layer definitions, registry assembly and
 native Pydantic AI capability composition. It supports Python 3.12 and later.
-Applications own installed layers, scope lifecycles and storage; this package has
+Applications own installed layers, conversation lifecycles and storage; this package has
 no application, database, shell service or credential dependency.
 
 Install from this repository:
@@ -17,7 +17,7 @@ The import name is `pydantic_ai_layer_protocol`. The package requires no Tempora
 
 A `Layer[D, Config, State]` is a static definition containing Pydantic model
 classes, one native `AbstractCapability[D]` instance and two independently
-optional business-scope hooks. An installed factory has the signature
+optional conversation hooks. An installed factory has the signature
 `make(layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]`.
 The concrete return annotation links the hook parameters and asynchronous return
 values to the models; exit must accept `State | None`.
@@ -91,15 +91,15 @@ agent = Agent(..., deps_type=Deps, capabilities=[layers])
 
 Factories, access rules, validators and instruction callbacks are deterministic
 and perform no external I/O. Static definitions never retain a session's deps,
-models, scope ID or clients. Tools (collection, names and argument schemas) and
+models, conversation ID or clients. Tools (collection, names and argument schemas) and
 instructions stay stable for fixed Config. SDK callbacks may render those fixed
 declarations; dynamic business information belongs in State and tool results,
 so it does not change the model prefix.
 
 `layers.prepare_configs(configs)` validates all names and Config before
-scope hooks, without constructing State. `layers.load(configs, states)`
+conversation hooks, without constructing State. `layers.load(configs, states)`
 validates and copies existing JSON; omitted State validates from `{}` and fails
-when required fields are missing. It calls no scope hooks. Unconfigured State and
+when required fields are missing. It calls no conversation hooks. Unconfigured State and
 unknown names fail. `layers.snapshot(deps)` uses the saved access rule to validate and copy
 only the selected States. Both models must serialize to JSON objects; inputs are
 copied before validation so custom validators cannot mutate caller-owned data.
@@ -127,22 +127,39 @@ are outside this static composition contract. Layer instructions have no applica
 ordering contract. Tools sharing mutable State must explicitly declare sequential
 behavior when required by their business semantics. Hosts own final persistence.
 
-## Business scopes
+## Conversations
 
 A Layer can explicitly supply either or both async hooks:
 
 ```python
-async def enter_scope(scope_id: UUID, config: Config) -> State: ...
-async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> None: ...
+async def enter_conversation(conversation_id: str, config: Config) -> State: ...
+async def exit_conversation(conversation_id: str, config: Config, state: State | None) -> None: ...
 ```
 
-The host chooses the UUID and owns initialization, cleanup, persistence and retry
+The host chooses the string ID and owns initialization, cleanup, persistence and retry
 scheduling. Assembly, selection, load/snapshot and SDK component lifecycles do not
 invoke these hooks. Their validated model arguments remain separate from execution
 deps. Enter may return State with required fields that cannot initialize from `{}`.
+Without enter, the host initializes State from `{}`. Config validation, default
+State initialization and serialization perform no external I/O; enter may do business I/O.
+The protocol does not require UUIDs and provides no aliases for the old hook names.
+
+Pass the same ID explicitly to `agent.run(..., conversation_id=conversation_id)`
+on every run and to these independent callbacks outside the run. SDK tools and
+hooks read `ctx.conversation_id`; they still use injected access for Config/State
+without depending on application-specific identity fields in deps. State stores
+business progress and necessary cleanup references, rather than conversation identity.
+
+Resource-creating tools/hooks must mark upstream resources or their scope with
+conversation ownership when supported. Determine or derive the marker from the
+conversation ID, layer ID and fixed Config as needed, using only information
+necessary to locate that conversation's resources; the model must not choose or
+override it. Exit must reconstruct the marker and reclaim all owned resources,
+including resources missing from State. If upstream cannot query or clean by
+ownership, State-based cleanup is best effort and must document possible orphans.
 
 Exit must be idempotent and clean partial or unacknowledged initialization using
-scope ID and Config even when State is None. None does not mean there are no
+conversation ID and Config even when State is None. None does not mean there are no
 resources. Enter need not be generally idempotent; a top-level RetryableScopeError
 explicitly promises that repeating this call with the same identity and Config is
 safe. The host chooses retry limits. Nested causes, exception groups and cancellation

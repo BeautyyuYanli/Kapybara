@@ -8,7 +8,10 @@ tool→end keeps the preceding snapshot until the final Activity save.
 CLOSING cleanup saves individual layer progress. CREATING stores fixed Config and
 empty States before enter;
 publication saves all initial States with READY, and abandoned creation keeps the
-States empty through cleanup. Model references may dangle; no physical FKs tie
+States empty through cleanup. The session UUID's string form is the SDK
+conversation_id and independent enter_conversation/exit_conversation identity;
+layer State stores business progress and cleanup references rather than identity.
+Model references may dangle; no physical FKs tie
 history retention to configuration.
 """
 

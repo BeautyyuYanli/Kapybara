@@ -49,9 +49,7 @@ async def test_http_layer_validation_defaults_and_immutable_configuration(
         session_id = UUID(created["id"])
         async with database.sessions.begin() as db:
             row = await db.get(SessionRow, session_id)
-            assert row is not None and row.layer_states == {
-                "shell": {"scope_id": str(session_id), "jobs": {}}
-            }
+            assert row is not None and row.layer_states == {"shell": {"jobs": {}}}
         for replacement in ({"layers": {}}, {"layer_states": {}}):
             response = await client.patch(f"/api/sessions/{session_id}", json=replacement)
             assert response.status_code == 422

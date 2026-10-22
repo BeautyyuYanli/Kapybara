@@ -14,28 +14,37 @@ SessionService and Activity use these same static definitions. Only the
 adapter knows the deps layout; shell obtains all data through injected access and
 Config/State. Changing the installed set requires reassembly.
 
-## Business scopes
+## Conversations
 
 A factory explicitly supplies either or both async functions on its Layer:
 
 ```python
-async def enter_scope(scope_id: UUID, config: Config) -> State: ...
-async def exit_scope(scope_id: UUID, config: Config, state: State | None) -> None: ...
+async def enter_conversation(conversation_id: str, config: Config) -> State: ...
+async def exit_conversation(conversation_id: str, config: Config, state: State | None) -> None: ...
 ```
 
-The scope ID is the host session UUID, stable across runs and process restarts.
+The conversation ID is `str(session_id)`, stable across runs and process restarts.
+Kapy supplies it explicitly to every `agent.run`, including restored history.
+Tools and SDK hooks read `ctx.conversation_id`; the independent enter/exit callbacks
+receive that same string directly from the host outside Agent runs. These callbacks
+run only at creation and explicit close/creation compensation, not on each Agent run.
 The create Worker validates Config and no-enter default States, then atomically
 inserts creating with fixed Config and its actual Activity UUID/native run_id.
 The default session ID is the Activity UUID. Only the executing Worker reserves
 business state; hooks never hold a database transaction. Without enter,
 State is initialized from `{}`; returned State can require fields without defaults.
-Config and State remain JSON, while SDK component/client lifetimes stay separate.
+Config validation, default State initialization and serialization have no external
+I/O; enter may perform business I/O. Config and State remain JSON, while SDK
+component/client lifetimes stay separate. State saves business progress and cleanup
+references; layers do not read Kapy-specific identity fields from deps.
 
-When upstream supports resource discovery or cleanup by scope, `exit_scope` must
-use the stable `scope_id` to clean that scope's resources, including resources never
-recorded in saved State. Otherwise, cleanup may rely on State, but its implementation
-must document that State may lag or incompletely represent upstream reality and
-can therefore leave orphaned resources.
+Resource-creating tools/hooks must mark upstream resources or their scope with
+conversation ownership when supported. Determine or derive the marker from
+`conversation_id`, `layer_id` and fixed Config as needed, using only information
+necessary to locate this conversation's resources; the model must not choose or
+override it. `exit_conversation` must reconstruct the marker and reclaim all owned
+resources, including those absent from State. If upstream cannot query or clean
+by ownership, State-based cleanup is best effort and must document possible orphans.
 
 Complete State, ready and ownership release commit together. Failed creation
 moves to closing while retaining its writer through compensation, exits
@@ -83,11 +92,14 @@ injected access defines where its data lives. Create a durable session with:
 server. Config also accepts `env`, optional `token_env`, and `redact_patterns`.
 The default server is `http://127.0.0.1:8765`. The process executing a tool call
 or scope exit reads the named token environment variable only at that boundary.
-State is `{"scope_id": "session-uuid", "jobs": {"job-id": byte_offset}}`; it contains
-no clients or secrets. Enter records its scope UUID without remote I/O. Every tool
-reads that identity from State for remote `KAPY_SESSION_ID` ownership metadata;
-it never reads a host identity field from deps. State requires scope_id, including
-when restoring saved JSON; there is no runtime inference for older payloads.
+State is `{"jobs": {"job-id": byte_offset}}`; it contains no identity, clients or
+secrets. `enter_conversation` starts an empty inventory without remote I/O. Every
+tool reads `ctx.conversation_id` for remote `KAPY_SESSION_ID` ownership metadata;
+missing or empty identity fails before opening the remote client. Kapy uses the
+session UUID's string form; standalone SDK consumers may use other strings.
+Provider/name markers remain `builtin`/`shell`; Config cannot override reserved
+environment keys. Tool parameters do not expose conversation identity. Saved State
+uses strict field validation; upgrade old `scope_id` data through the database migration.
 
 The tools retain the existing names and parameters: `builtin_shell_run`,
 `builtin_shell_wait`, `builtin_shell_input`, and `builtin_shell_interrupt`.
@@ -98,19 +110,19 @@ truncation, tail supplementation and redaction follow `layers.shell.output`.
 
 Tools explicitly run sequentially because their State shares one job inventory.
 Each tool owns and closes its HTTP client, with bounded shielded cleanup. The
-remote job survives client close and successful runner completion. `enter_scope`
-starts an empty inventory with its scope identity. `exit_scope` deletes known jobs one
-by one, forgetting confirmed deletions and `job_not_found` results; the host saves
+remote job survives client close and successful runner completion.
+`exit_conversation` deletes known jobs one by one, forgetting confirmed deletions
+and `job_not_found` results; the host saves
 that progress after each attempt. Transport/timeout and temporary availability
 failures explicitly opt into bounded retries; authentication and other errors do
 not. Failed cleanup leaves CLOSING and remaining jobs for an explicit close retry.
 Each exit attempt has a 60-second budget; client close remains bounded. It owns
 neither the shellctl server nor its directories and files. Ambiguous remote acknowledgements
 can leave an unrecorded job or an already applied input; there is no remote
-exactly-once protocol. For abandoned initialization, shell exit accepts None and
-makes no request because enter allocated no resources and tools could not run before
-ready. Ready close requires its valid saved jobs inventory. shellctl's jobs listing
-has no scope ownership field; cleanup cannot discover jobs missing from the snapshot.
+exactly-once protocol. Shell exit accepts None and makes no request because it has
+no saved jobs to discover; enter itself allocates nothing. None is not evidence of
+an empty upstream. shellctl's jobs listing has no scope ownership field or scope
+deletion endpoint; cleanup cannot discover jobs missing from the saved inventory.
 Saved State may lag upstream after a crash or an unacknowledged job creation, so
 jobs omitted from that inventory can remain as orphaned upstream resources.
 

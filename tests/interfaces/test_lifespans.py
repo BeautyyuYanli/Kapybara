@@ -512,7 +512,7 @@ async def test_failed_creation_cleanup_targets_its_uuid_and_preserves_binding(
         allocated.add(session_id)
         raise RuntimeError("partial creation")
 
-    async def exit_scope(session_id, config, state):
+    async def exit_conversation(session_id, config, state):
         assert state is None
         exited.append(session_id)
         if not allow_cleanup:
@@ -523,8 +523,8 @@ async def test_failed_creation_cleanup_targets_its_uuid_and_preserves_binding(
         config_type=echo.Config,
         state_type=echo.State,
         capability=Capability(id="failing"),
-        enter_scope=enter,
-        exit_scope=exit_scope,
+        enter_conversation=enter,
+        exit_conversation=exit_conversation,
     )
     registry = LayerRegistry(
         {"failing": lambda layer_id, access: definition}, get_layers=get_layers
@@ -581,7 +581,7 @@ async def test_failed_creation_cleanup_targets_its_uuid_and_preserves_binding(
         await send(2, "/new")
         await controller.process_once()  # Deliver the saved failure reply.
         assert len(entered) == 1
-        failed = entered[0]
+        failed = UUID(entered[0])
         assert (await sessions.get_session(failed)).status == LifecycleStatus.CLOSING
         assert await repository.route(42, 123, 0) == previous
         reply = client.send.await_args.args[-1]
@@ -605,5 +605,5 @@ async def test_failed_creation_cleanup_targets_its_uuid_and_preserves_binding(
         assert await repository.route(42, 123, 0) == previous
         if previous is not None:
             assert (await sessions.get_session(previous)).status == LifecycleStatus.READY
-        assert entered == [failed] and exited == [failed, failed] and not allocated
+        assert entered == [str(failed)] and exited == [str(failed), str(failed)] and not allocated
         assert not await controller.process_once()

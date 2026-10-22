@@ -33,7 +33,12 @@ def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
 # end of the model response. Execution must match the saved call semantics (tool
 # identity, call ID and business arguments); no implicit calls or silent changes
 # to the recorded intent.
-# Layer exit_scope hooks must use scope_id to find or clean upstream resources
-# when supported. Otherwise, cleanup may rely on State, but the implementation
-# must document that State may be stale or incomplete and leave orphaned resources.
+# Resource-creating tools/hooks must mark upstream resources or their scope with
+# conversation ownership when supported. Derive only the identity needed to locate
+# this conversation's resources from conversation_id, layer_id and fixed Config;
+# the model must not choose or override it. Tools/SDK hooks read ctx.conversation_id;
+# the host passes the same string to independent enter_conversation/exit_conversation.
+# exit_conversation must reconstruct the marker and reclaim all owned resources,
+# including those absent from State. If upstream cannot query/clean by ownership,
+# State-based cleanup is best effort and must document possible orphaned resources.
 layer_registry = LayerRegistry({"shell": shell.make, "mcps": mcps.make}, get_layers=get_layers)

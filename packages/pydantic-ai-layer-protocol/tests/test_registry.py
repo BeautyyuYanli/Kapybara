@@ -5,7 +5,6 @@ import json
 from copy import copy
 from dataclasses import replace
 from typing import Any, Self
-from uuid import UUID
 
 import pytest
 from pydantic import BaseModel, RootModel, ValidationError, model_validator
@@ -87,8 +86,8 @@ def test_factory_rejects_invalid_definitions_at_assembly(bad):
             "config": replace(layer, config_type=dict),  # pyrefly: ignore[bad-argument-type]
             "state": replace(layer, state_type=dict),  # pyrefly: ignore[bad-argument-type]
             "capability": replace(layer, capability=FunctionToolset()),  # pyrefly: ignore[bad-argument-type]
-            "enter": replace(layer, enter_scope=lambda scope, config: echo.State()),  # pyrefly: ignore[bad-argument-type]
-            "exit": replace(layer, exit_scope=lambda scope, config, state: None),  # pyrefly: ignore[bad-argument-type]
+            "enter": replace(layer, enter_conversation=lambda scope, config: echo.State()),  # pyrefly: ignore[bad-argument-type]
+            "exit": replace(layer, exit_conversation=lambda scope, config, state: None),  # pyrefly: ignore[bad-argument-type]
         }[bad]
 
     with pytest.raises(UserError):
@@ -205,10 +204,10 @@ async def test_factory_assembly_binds_independent_writable_access_for_arbitrary_
 
     constructed = []
 
-    async def enter(scope_id: UUID, config: Config) -> State:
+    async def enter(conversation_id: str, config: Config) -> State:
         pytest.fail("Static data operations must not initialize business resources")
 
-    async def exit(scope_id: UUID, config: Config, state: State | None) -> None:
+    async def exit(conversation_id: str, config: Config, state: State | None) -> None:
         pytest.fail("Static data operations must not close business resources")
 
     def make(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State]:
@@ -225,8 +224,8 @@ async def test_factory_assembly_binds_independent_writable_access_for_arbitrary_
             config_type=Config,
             state_type=State,
             capability=Capability(id=layer_id, tools=[Tool(count, name=f"{layer_id}_count")]),
-            enter_scope=enter,
-            exit_scope=exit,
+            enter_conversation=enter,
+            exit_conversation=exit,
         )
 
     def access(deps: Deps) -> dict[str, LayerData]:

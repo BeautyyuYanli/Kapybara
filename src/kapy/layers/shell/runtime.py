@@ -1,14 +1,13 @@
 """Shared shellctl calls; the caller owns job inventory and its write semantics.
 
 Remote effects are never repeated to resolve a state conflict. A lost creation
-response can leave an unknown job; ownership metadata supports reconciliation,
-not allocation atomicity or session security isolation.
+response can leave an unknown job; ownership metadata identifies the conversation
+but shellctl cannot query by it or provide allocation atomicity or security isolation.
 """
 
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from uuid import UUID
 
 import anyio
 import httpx2
@@ -78,7 +77,7 @@ class ShellOperations:
         client: ShellctlClient,
         redact: Redactor,
         *,
-        session_id: UUID,
+        conversation_id: str,
         provider: str,
         name: str,
         known: Callable[[str], Awaitable[int | None]],
@@ -86,7 +85,7 @@ class ShellOperations:
         change: Callable[[str, int | None], Awaitable[None]],
     ) -> None:
         self.config, self.client, self.redact = config, client, redact
-        self.session_id, self.provider, self.name = session_id, provider, name
+        self.conversation_id, self.provider, self.name = conversation_id, provider, name
         self.known, self.register, self.change = known, register, change
 
     async def _remote_error(self, error: Exception, job_id: str) -> str:
@@ -111,7 +110,7 @@ class ShellOperations:
     ) -> str:
         """Create one PTY job; a transport error can follow a successful creation."""
         env = self.config.env | {
-            "KAPY_SESSION_ID": str(self.session_id),
+            "KAPY_SESSION_ID": self.conversation_id,
             "KAPY_PLUGIN_PROVIDER": self.provider,
             "KAPY_PLUGIN_NAME": self.name,
         }

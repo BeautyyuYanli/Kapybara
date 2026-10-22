@@ -45,7 +45,7 @@ from pydantic_ai_layer_protocol import dump_object
 
 from .agent import agent
 from .output import handle_deltas
-from .scopes import check_owner, close_scopes, create_scopes
+from .scopes import check_owner, close_conversation, create_conversation
 from .types import ExecutionConfig, RunnerDeps, RunnerInput
 
 
@@ -119,7 +119,7 @@ class RunnerActivity:
             configs = layer_registry.prepare_configs(request.request.layers)
             for name in configs:
                 definition = layer_registry.definitions[name]
-                if definition.enter_scope is None:
+                if definition.enter_conversation is None:
                     definition.state_type.model_validate({})
             row = SessionRow(
                 **request.request.model_dump(exclude={"id", "layers"}),
@@ -132,7 +132,7 @@ class RunnerActivity:
             )
             async with self._session_factory() as db, db.begin():
                 await SessionRepository(db).create(row)
-            return await create_scopes(
+            return await create_conversation(
                 self._session_factory,
                 activity_id,
                 run_id,
@@ -192,7 +192,7 @@ class RunnerActivity:
             row = await self._claim_close(request.session_id, activity_id, run_id)
             if row.status == LifecycleStatus.CLOSED:
                 return SessionRecord.model_validate(row)
-            return await close_scopes(
+            return await close_conversation(
                 self._session_factory,
                 activity_id,
                 run_id,
@@ -270,6 +270,7 @@ class RunnerActivity:
                 model_settings=cast(ModelSettings, data.config.model_settings),
                 deps=deps,
                 message_history=history,
+                conversation_id=str(data.session_id),
                 event_stream_handler=handle_deltas,
             )
         await check_owner(

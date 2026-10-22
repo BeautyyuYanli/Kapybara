@@ -164,6 +164,9 @@ and can repeat idempotent exits. Only outer RetryableScopeError gets three local
 attempts; Temporal itself has one attempt. Failed creation compensates all configured
 layers with None, including partial/uncalled enters, before recording its terminal
 native failure. /status reads lifecycle plus Temporal references from the inbox and
-current writer. Forgotten execution results remain unconfirmed. Configuration/title
+current writer. Creation initializes each layer through `enter_conversation`;
+close/compensation use `exit_conversation`. Both receive `str(session_id)`, also
+passed explicitly to each Agent run as its SDK conversation ID.
+Forgotten execution results remain unconfirmed. Configuration/title
 updates require ready and no current writer. See the
 [control state machine](../../control/README.md#session-state-machine).

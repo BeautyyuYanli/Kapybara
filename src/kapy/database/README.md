@@ -55,23 +55,26 @@ cannot stop their execution. New code/schema and minimal native Activity request
 must be deployed together; UUID-only legacy inputs are incompatible. Revisions are
 generated from explicit plans and contain fixed SQL, never runtime plan imports.
 
-Shell layer State requires `scope_id` alongside `jobs`; its enter hook initializes
-the UUID from the session identity. The data-only revision fills a missing field
-in an existing shell State from that row's session UUID, preserving jobs, other
-layer States, configuration, runner snapshots and their versions. Creating or
-abandoned closing rows without shell State stay empty. Downgrade removes only
-scope_id from shell State.
+Shell layer State stores only `jobs` and byte cursors; `enter_conversation`
+initializes the empty inventory. Identity comes from the SDK's `ctx.conversation_id`,
+explicitly set to `str(session_id)` on every Agent run. Independent enter/exit
+callbacks receive that same string from the host, not from State.
+The shell-conversation-state data migration removes only `scope_id` from existing
+shell JSON objects, preserving jobs, other fields, other layer States and all other
+session/history data. Missing or non-object shell State remains unchanged.
+Downgrade restores `scope_id` from the row's session UUID.
 
 Generate against a disposable schema at the preceding revision:
 
 ```sh
-kapy db revision --message 'Record shell scope identity in layer state' --plan shell-scope-state
+kapy db revision --message 'Use SDK conversation identity for shell state' --plan shell-conversation-state
 ```
 
 The explicit plan requires no structural schema differences and emits fixed SQL.
 Run this migration with runners and interfaces stopped. It converts current
-database State, without rewriting recorded Temporal inputs or results;
-historical payloads missing scope_id have no runtime compatibility inference.
+database State without rewriting recorded Temporal inputs/results, fixed history
+or runner snapshots. `runner_state` stores SDK messages; layer State lives in its
+separate JSON column. New State uses strict validation without an old-field compatibility branch.
 
 `agent_history` retains complete SDK messages keyed by `(session_id, seq)`.
 Under the session row lock, append inserts only above the batch's pre-write maximum.
@@ -137,5 +140,7 @@ durable requests and unmarked their snapshot entries while keeping SDK content.
 It did not change snapshot versions. Telegram's matching conversion folded sent
 reply receipts into after_seq and kept unfinished pending-send offsets. These
 conversions also require stopped interfaces/runners and reject irreversible
-downgrades. The merged head removes legacy page/checkpoint storage and fills missing shell
-scope identity while retaining the complete history produced by those revisions.
+downgrades. The earlier shell-scope-state plan filled missing shell identity, and
+its downgrade removed it; the later shell-conversation-state revision removes that
+persisted identity again in favor of the SDK context. The current head retains
+complete history and durable snapshots without legacy page/checkpoint storage.

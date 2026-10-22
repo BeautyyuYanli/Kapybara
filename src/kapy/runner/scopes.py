@@ -1,4 +1,4 @@
-"""Worker-owned business scopes; hooks never run under a database transaction.
+"""Worker-owned conversations; hooks never run under a database transaction.
 
 Creation publishes all initial States together. Failed creation cleans every
 configured layer with None, including partial/uncalled enters, while retaining
@@ -43,7 +43,7 @@ async def check_owner(
         await SessionRepository(db).guard(session_id, activity_id, run_id, statuses)
 
 
-async def _exit_scope(
+async def _exit_conversation(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
     run_id: str,
@@ -56,7 +56,7 @@ async def _exit_scope(
 ) -> None:
     """Revalidate and save State before another local exit attempt."""
     definition = layer_registry.definitions[name]
-    exit_hook = definition.exit_scope
+    exit_hook = definition.exit_conversation
     if exit_hook is None:
         return
     state = (
@@ -72,7 +72,7 @@ async def _exit_scope(
             (LifecycleStatus.CLOSING,),
             allow_cancelled=compensation,
         )
-        await exit_hook(session_id, config.model_copy(deep=True), state)
+        await exit_hook(str(session_id), config.model_copy(deep=True), state)
 
     async def save_progress(name=name, state_type=definition.state_type):
         nonlocal state
@@ -91,7 +91,7 @@ async def _exit_scope(
     await retry_scope(attempt, after_attempt=save_progress)
 
 
-async def _exit_scopes(
+async def _exit_conversations(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
     run_id: str,
@@ -104,7 +104,7 @@ async def _exit_scopes(
     complete = True
     for name, config in reversed(configs.items()):
         try:
-            await _exit_scope(
+            await _exit_conversation(
                 factory,
                 activity_id,
                 run_id,
@@ -129,7 +129,7 @@ async def _exit_scopes(
     return complete
 
 
-async def create_scopes(
+async def create_conversation(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
     run_id: str,
@@ -140,7 +140,7 @@ async def create_scopes(
     try:
         for name, config in configs.items():
             definition = layer_registry.definitions[name]
-            enter = definition.enter_scope
+            enter = definition.enter_conversation
             if enter is None:
                 states[name] = dump_object(definition.state_type.model_validate({}))
                 continue
@@ -149,11 +149,11 @@ async def create_scopes(
                 await check_owner(
                     factory, session_id, activity_id, run_id, (LifecycleStatus.CREATING,)
                 )
-                return await enter(session_id, config.model_copy(deep=True))
+                return await enter(str(session_id), config.model_copy(deep=True))
 
             returned = await retry_scope(attempt)
             if not isinstance(returned, definition.state_type):
-                raise TypeError(f"Layer {name!r} enter_scope must return its State")
+                raise TypeError(f"Layer {name!r} enter_conversation must return its State")
             states[name] = dump_object(definition.state_type.model_validate(dump_object(returned)))
         await check_owner(factory, session_id, activity_id, run_id, (LifecycleStatus.CREATING,))
         async with factory() as db, db.begin():
@@ -177,7 +177,7 @@ async def create_scopes(
                 )
                 session.status = LifecycleStatus.CLOSING
                 await db.flush()
-            complete = await _exit_scopes(
+            complete = await _exit_conversations(
                 factory, activity_id, run_id, session_id, configs, {}, compensation=True
             )
             async with factory() as db, db.begin():
@@ -191,7 +191,7 @@ async def create_scopes(
         raise
 
 
-async def close_scopes(
+async def close_conversation(
     factory: async_sessionmaker[AsyncSession],
     activity_id: UUID,
     run_id: str,
@@ -202,7 +202,7 @@ async def close_scopes(
     states = frozen["layer_states"]
     if states and states.keys() != configs.keys():
         raise ValueError("Saved layer states must match configured layers")
-    complete = await _exit_scopes(
+    complete = await _exit_conversations(
         factory, activity_id, run_id, session_id, configs, states, compensation=False
     )
     if not complete:

@@ -155,10 +155,21 @@ model→model 和 tool→model 则追加尚未进入 history 的下一条 reques
    工具只能响应模型的显式调用，并且执行前，该调用必须已记录在 model response
    末尾保存的 snapshot 中。实际执行必须与快照中的工具身份、调用标识和业务参数语义
    一致；不得从 hooks 或其他路径隐式调用工具，也不得静默改变已记录调用的语义。
-3. 上游支持按 scope 查询或清理资源时，layer 的 `exit_scope` hook 应依赖稳定的
-   `scope_id` 清理该 scope 的上游资源，覆盖未写入 State 的资源。上游不支持时，
-   可以依赖 State 中的资源记录清理，但必须在具体实现中注明其局限性：State 可能
-   无法忠实记录上游最新状态，因此可能遗漏资源并留下孤儿资源。
+3. 业务 layer 的 tool 或 hook 创建上游资源时，上游支持则应为资源或其 scope
+   设置会话归属标识。标识根据当前会话的 `conversation_id`、`layer_id` 和固定
+   Config 按需确定或派生，只使用定位本 conversation 资源所必需的信息，
+   不得由模型指定或覆盖。
+4. `exit_conversation` 应能重建归属标识，找全并回收所属资源，包括未写入 State
+   的资源。上游不支持按归属查询或清理时，可依赖 State 尽力回收，但须在具体实现
+   中说明可能遗漏资源并留下孤儿资源的局限。
+
+Kapy 每次 Agent run 显式传入 `conversation_id=str(session_id)`；工具和 SDK hooks
+从 `ctx.conversation_id` 读取身份，不从 State 或 Kapy deps 身份字段推断。
+`enter_conversation(conversation_id, config)` 只在创建时初始化 State；
+`exit_conversation(conversation_id, config, state)` 用于显式关闭和创建失败补偿。
+这两个独立回调没有 RunContext，由宿主传入同一个字符串身份。State 只保存业务
+进度及必要的回收记录。配置校验、默认 State 初始化与序列化无外部 I/O；enter
+可执行业务 I/O。无 enter 时 State 必须能从 `{}` 初始化。
 
 ```sh
 # 停止并保留 PostgreSQL 和 runtime 数据
