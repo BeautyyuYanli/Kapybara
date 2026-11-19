@@ -90,7 +90,7 @@ class TelegramRepository:
             )
 
     async def latest_request(self, item: InboxRow) -> InboxRow | None:
-        """Read the last persisted execution reference for this chat/topic.
+        """Read the last persisted run reference for this chat/topic.
 
         No scheduling state or outcome is cached here; /status queries Temporal.
         """
@@ -110,9 +110,7 @@ class TelegramRepository:
             ).scalars()
             for row in rows:
                 action = row.resolved_action
-                if action and any(
-                    action.get(kind + "_activity_id") for kind in ("create", "run", "close")
-                ):
+                if action and action.get("run_activity_id"):
                     return row
         return None
 

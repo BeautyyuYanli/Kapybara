@@ -1,7 +1,7 @@
 """Process-local static Agent; each Activity supplies its own model and writable deps.
 
-Factories perform no I/O. Per-run native SDK scopes own tool resources; only the
-Activity constructs and closes its model and provider.
+Factories perform no I/O. The SDK owns Toolset lifecycles; the Activity supplies
+its model, provider and opened layer handles.
 """
 
 from pydantic_ai import Agent, RunContext
@@ -12,23 +12,15 @@ from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import ToolDefinition
 
 from kapy.layers.registry import layer_registry
-from kapy.lifecycle import LifecycleStatus
 
-from .recording import Recorder, RunnerPersistenceCapability
-from .scopes import check_owner
+from .recording import Recorder, RunnerPersistenceCapability, check_owner
 from .types import RunnerDeps
 
 
 async def before_request(
     ctx: RunContext[RunnerDeps], request: ModelRequestContext
 ) -> ModelRequestContext:
-    await check_owner(
-        ctx.deps.session_factory,
-        ctx.deps.session_id,
-        ctx.deps.activity_id,
-        ctx.deps.activity_run_id,
-        (LifecycleStatus.READY,),
-    )
+    await check_owner(ctx.deps)
     return await recorder.predict_response_seq(ctx, request)
 
 
@@ -39,13 +31,7 @@ async def before_tool(
     tool_def: ToolDefinition,
     args: ValidatedToolArgs,
 ) -> ValidatedToolArgs:
-    await check_owner(
-        ctx.deps.session_factory,
-        ctx.deps.session_id,
-        ctx.deps.activity_id,
-        ctx.deps.activity_run_id,
-        (LifecycleStatus.READY,),
-    )
+    await check_owner(ctx.deps)
     return args
 
 

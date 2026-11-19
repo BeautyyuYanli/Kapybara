@@ -1,1 +1,1 @@
-"""Borrowed shellctl service; State stores jobs/cursors, SDK context supplies identity."""
+"""Borrowed shellctl service with run-local clients and saved job cursors."""

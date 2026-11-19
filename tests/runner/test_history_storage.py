@@ -327,9 +327,7 @@ async def test_record_serializes_session_writes_before_reading_boundary(runner_d
     task = None
     try:
         async with runner_database.sessions.begin() as db:
-            await SessionRepository(db).guard(
-                session_id, session_id, "test-run", (LifecycleStatus.READY,)
-            )
+            await SessionRepository(db).guard(session_id, session_id, "test-run")
             await HistoryRepository(db).append_history(session_id, [history(session_id, 2)])
             event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
             task = asyncio.create_task(

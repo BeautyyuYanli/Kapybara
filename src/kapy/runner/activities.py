@@ -1,24 +1,21 @@
-"""Worker-owned session Activities; native Temporal executions own all resources.
+"""The standalone Agent Activity owns one run's runtime handles and writer.
 
-Only executing Workers acquire database ownership. The complete native identity
-fences progress; Temporal alone owns scheduling, timeouts, outcomes and inputs.
-No model/tool/hook or Temporal RPC runs inside an ownership transaction.
+Temporal owns scheduling, timeouts and outcomes. The native identity fences
+progress, and RPCs, resource hooks and Agent calls run outside database transactions.
 """
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
-from datetime import timedelta
+from contextlib import asynccontextmanager, nullcontext, suppress
 from typing import cast
 from uuid import UUID
 
 import anyio
-from pydantic_ai.messages import ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelResponse
 from pydantic_ai.settings import ModelSettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio import activity
 from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
-from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.agent_output import AgentOutputService
 from kapy.control.models.repository import ModelRepository
@@ -28,24 +25,15 @@ from kapy.control.models.runtime import (
     resolve_classes,
     validate_settings,
 )
-from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
-from kapy.control.sessions.temporal import TERMINAL_STATUSES, failure_category
-from kapy.control.sessions.types import (
-    CreateSessionActivity,
-    OwnershipLost,
-    RunAgentActivity,
-    SessionActivityRequest,
-    SessionBusy,
-    SessionRecord,
-)
+from kapy.control.sessions.temporal import RUN, ensure_activity_terminal, failure_category
+from kapy.control.sessions.types import OwnershipLost, RunAgentActivity, SessionBusy
 from kapy.layers.registry import layer_registry
-from kapy.lifecycle import LifecycleStatus
-from pydantic_ai_layer_protocol import dump_object
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 
 from .agent import agent
 from .output import handle_deltas
-from .scopes import check_owner, close_conversation, create_conversation
+from .recording import check_owner
 from .types import ExecutionConfig, RunnerDeps, RunnerInput
 
 
@@ -77,28 +65,15 @@ class RunnerActivity:
             with anyio.move_on_after(15, shield=True):
                 try:
                     async with self._session_factory() as db, db.begin():
-                        await SessionRepository(db).complete(
-                            session_id,
-                            activity_id,
-                            run_id,
-                            (
-                                LifecycleStatus.CREATING,
-                                LifecycleStatus.READY,
-                                LifecycleStatus.CLOSING,
-                            ),
-                            LifecycleStatus.CLOSING,
-                        )
+                        await SessionRepository(db).complete(session_id, activity_id, run_id)
                 except OwnershipLost:
                     pass
                 except Exception:
                     activity.logger.warning("Unable to release session writer after failure")
             if isinstance(error, asyncio.CancelledError):
                 raise
-            raise ApplicationError(
-                failure_category(error),
-                type=failure_category(error),
-                non_retryable=True,
-            ) from None
+            category = failure_category(error)
+            raise ApplicationError(category, type=category, non_retryable=True) from None
         finally:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
@@ -110,133 +85,87 @@ class RunnerActivity:
             activity.heartbeat()
             await asyncio.sleep(2)
 
-    @activity.defn(name="kapy.create_session")
-    async def create(self, request: CreateSessionActivity) -> SessionRecord:
-        async with self._invocation(request.session_id) as (activity_id, run_id):
-            if request.request.id is not None and request.request.id != request.session_id:
-                raise ValueError("Creation identities must agree")
-            # All Config/default validation precedes insertion and every enter.
-            configs = layer_registry.prepare_configs(request.request.layers)
-            for name in configs:
-                definition = layer_registry.definitions[name]
-                if definition.enter_conversation is None:
-                    definition.state_type.model_validate({})
-            row = SessionRow(
-                **request.request.model_dump(exclude={"id", "layers"}),
-                id=request.session_id,
-                layers={name: dump_object(config) for name, config in configs.items()},
-                layer_states={},
-                status=LifecycleStatus.CREATING,
-                current_activity_id=activity_id,
-                current_activity_run_id=run_id,
-            )
-            async with self._session_factory() as db, db.begin():
-                await SessionRepository(db).create(row)
-            return await create_conversation(
-                self._session_factory,
-                activity_id,
-                run_id,
-                request.session_id,
-                configs,
-            )
-
-    async def _claim_close(self, session_id: UUID, activity_id: UUID, run_id: str) -> SessionRow:
-        async with self._session_factory() as db, db.begin():
-            repo = SessionRepository(db)
-            row = await repo._session(session_id)
-            if row.current_activity_id is None:
-                if row.status == LifecycleStatus.CLOSED:
-                    return row
-                claimed = await repo.claim_close_or_run(session_id, activity_id, run_id, close=True)
-                if claimed is not None:
-                    return claimed
-                raise SessionBusy("Session cannot be closed")
-            assert row.current_activity_run_id is not None
-            previous = (row.current_activity_id, row.current_activity_run_id, row.status)
-        # Exact native lookup is restricted to explicit close; queries and run
-        # admission never release an abandoned writer.
-        try:
-            description = await self._temporal_client.get_activity_handle(
-                str(previous[0]),
-                run_id=previous[1],
-            ).describe(rpc_timeout=timedelta(seconds=10))
-        except RPCError as error:
-            if error.status != RPCStatusCode.NOT_FOUND:
-                raise ApplicationError("UnableToConfirm", type="UnableToConfirm") from None
-        else:
-            if description.status not in TERMINAL_STATUSES:
-                raise SessionBusy("Previous native execution may still be active")
-        async with self._session_factory() as db, db.begin():
-            repo = SessionRepository(db)
-            claimed = await repo.claim_close_or_run(
-                session_id,
-                activity_id,
-                run_id,
-                close=True,
-                previous=previous,
-            )
-            if claimed is not None:
-                return claimed
-            row = await repo._session(session_id)
-            if row.current_activity_id is None:
-                if row.status == LifecycleStatus.CLOSED:
-                    return row
-                claimed = await repo.claim_close_or_run(session_id, activity_id, run_id, close=True)
-                if claimed is not None:
-                    return claimed
-            raise SessionBusy("Another execution changed the session")
-
-    @activity.defn(name="kapy.close_session")
-    async def close(self, request: SessionActivityRequest) -> SessionRecord:
-        async with self._invocation(request.session_id) as (activity_id, run_id):
-            row = await self._claim_close(request.session_id, activity_id, run_id)
-            if row.status == LifecycleStatus.CLOSED:
-                return SessionRecord.model_validate(row)
-            return await close_conversation(
-                self._session_factory,
-                activity_id,
-                run_id,
-                row.id,
-                {"layers": row.layers, "layer_states": row.layer_states},
-            )
-
-    @activity.defn(name="kapy.run_agent")
+    @activity.defn(name=RUN)
     async def run(self, request: RunAgentActivity) -> str:
         async with self._invocation(request.session_id) as (activity_id, run_id):
-            async with self._session_factory() as db, db.begin():
-                session = await SessionRepository(db).claim_run(
-                    request.session_id, activity_id, run_id
-                )
-                catalog = ModelRepository(db)
-                model = await catalog.get_model(session.provider_id, session.model_name)
-                provider = await catalog.get_provider_config(session.provider_id)
-                _, model_class = resolve_classes(provider)
-                settings = validate_settings(model_class, model.settings | session.model_settings)
-                if session.runner_state is not None:
-                    ModelMessagesTypeAdapter.validate_json(session.runner_state)
-                data = RunnerInput(
-                    session_id=session.id,
-                    runner_state=session.runner_state,
-                    layers=layer_registry.load(session.layers, session.layer_states),
-                    user_prompt=request.user_prompt,
-                    config=ExecutionConfig(
-                        provider_class=provider.provider_class,
-                        model_class=provider.model_class,
-                        model_name=model.model_name,
-                        api_key=provider.api_key.get_secret_value(),
-                        base_url=provider.base_url,
-                        provider_kwargs=provider.provider_kwargs,
-                        model_settings=settings,
-                        context_window=model.context_window,
-                    ),
-                )
+            data = await self._claim_run(request, activity_id, run_id)
             return await self._run(activity_id, run_id, data)
+
+    async def _claim_run(
+        self, request: RunAgentActivity, activity_id: UUID, run_id: str
+    ) -> RunnerInput:
+        data = await self._try_claim_and_load(request, activity_id, run_id)
+        if data is not None:
+            return data
+        async with self._session_factory.begin() as db:
+            session = await SessionRepository(db).get_session(request.session_id)
+        if session.status == LifecycleStatus.CLOSED:
+            raise LifecycleError(f"Session {session.id} is closed")
+
+        previous = None
+        if session.current_activity_id is not None:
+            assert session.current_activity_run_id is not None
+            previous = (session.current_activity_id, session.current_activity_run_id)
+            await ensure_activity_terminal(self._temporal_client, *previous)
+        data = await self._try_claim_and_load(request, activity_id, run_id, previous=previous)
+        if data is not None:
+            return data
+        async with self._session_factory.begin() as db:
+            if await SessionRepository(db).get_status(session.id) == LifecycleStatus.CLOSED:
+                raise LifecycleError(f"Session {session.id} is closed")
+        raise SessionBusy(f"Session {session.id} is occupied")
+
+    async def _try_claim_and_load(
+        self,
+        request: RunAgentActivity,
+        activity_id: UUID,
+        run_id: str,
+        *,
+        previous: tuple[UUID, str] | None = None,
+    ) -> RunnerInput | None:
+        """Claim and validate the execution inputs atomically so failures roll back the writer."""
+        async with self._session_factory.begin() as db:
+            session = await SessionRepository(db).claim_run(
+                request.session_id, activity_id, run_id, previous=previous
+            )
+            if session is None:
+                return None
+            catalog = ModelRepository(db)
+            model = await catalog.get_model(session.provider_id, session.model_name)
+            provider = await catalog.get_provider_config(session.provider_id)
+            _, model_class = resolve_classes(provider)
+            settings = validate_settings(model_class, model.settings | session.model_settings)
+            if session.runner_state is not None:
+                ModelMessagesTypeAdapter.validate_json(session.runner_state)
+            return RunnerInput(
+                session_id=session.id,
+                runner_state=session.runner_state,
+                layers=layer_registry.load(session.layers, session.layer_states),
+                user_prompt=request.user_prompt,
+                config=ExecutionConfig(
+                    provider_class=provider.provider_class,
+                    model_class=provider.model_class,
+                    model_name=model.model_name,
+                    api_key=provider.api_key.get_secret_value(),
+                    base_url=provider.base_url,
+                    provider_kwargs=provider.provider_kwargs,
+                    model_settings=settings,
+                    context_window=model.context_window,
+                ),
+            )
 
     async def _run(self, activity_id: UUID, run_id: str, data: RunnerInput) -> str:
         history = (
             []
             if data.runner_state is None
             else ModelMessagesTypeAdapter.validate_json(data.runner_state)
+        )
+        tail = history[-1] if history else None
+        history_only = data.user_prompt is None and (
+            tail is None
+            or (
+                isinstance(tail, ModelResponse) and tail.state == "complete" and not tail.tool_calls
+            )
         )
         provider_config = data.config.provider_config()
         provider_class, model_class = resolve_classes(provider_config)
@@ -248,14 +177,10 @@ class RunnerActivity:
             output_service=self._output_service,
             layers=data.layers,
         )
-        await check_owner(
-            self._session_factory,
-            data.session_id,
-            activity_id,
-            run_id,
-            (LifecycleStatus.READY,),
-        )
+        await check_owner(deps)
+        layer_configs = {name: entry["config"] for name, entry in data.layers.items()}
         async with (
+            layer_registry.open_conversation(str(data.session_id), layer_configs) as resources,
             build_provider(provider_class, provider_config) as provider,
             build_model(
                 model_class,
@@ -264,29 +189,25 @@ class RunnerActivity:
                 profile={"context_window": data.config.context_window},
             ) as model,
         ):
-            result = await agent.run(
-                data.user_prompt,
-                model=model,
-                model_settings=cast(ModelSettings, data.config.model_settings),
-                deps=deps,
-                message_history=history,
-                conversation_id=str(data.session_id),
-                event_stream_handler=handle_deltas,
-            )
-        await check_owner(
-            self._session_factory,
-            data.session_id,
-            activity_id,
-            run_id,
-            (LifecycleStatus.READY,),
-        )
+            deps.layer_resources = resources
+            # SDK instructions alone can start a turn. When no prompt is supplied,
+            # let the SDK reject empty history or read a final response without them.
+            with agent.override(instructions=(), toolsets=[]) if history_only else nullcontext():
+                result = await agent.run(
+                    data.user_prompt,
+                    model=model,
+                    model_settings=cast(ModelSettings, data.config.model_settings),
+                    deps=deps,
+                    message_history=history,
+                    conversation_id=str(data.session_id),
+                    event_stream_handler=handle_deltas,
+                )
+        await check_owner(deps)
         async with self._session_factory() as db, db.begin():
             await SessionRepository(db).complete(
                 data.session_id,
                 activity_id,
                 run_id,
-                (LifecycleStatus.READY,),
-                LifecycleStatus.READY,
                 runner_state=result.all_messages_json().decode("utf-8"),
                 layer_states=layer_registry.snapshot(deps),
             )

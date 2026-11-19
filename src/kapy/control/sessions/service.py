@@ -1,43 +1,42 @@
 """Session configuration, native Temporal execution and immutable output replay.
 
-Submission never reserves business state. Workers compete for the current writer
-when they execute; Temporal retains inputs, scheduling, failures and results.
-Queries do not mutate sessions. Each live call owns its subscription/read task.
+Creation and closure are local database operations. Executing Workers compete for
+the current writer; Temporal retains run inputs, scheduling, failures and results.
+Each live call owns its subscription/read task.
 """
 
 import asyncio
 import math
 from collections.abc import AsyncGenerator
 from datetime import timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from temporalio.client import ActivityFailureError, ActivityHandle, Client
+from temporalio.client import ActivityExecutionDescription, ActivityHandle, Client
 from temporalio.common import ActivityIDConflictPolicy, ActivityIDReusePolicy, RetryPolicy
 from temporalio.exceptions import ActivityAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_output import AgentOutputService, MessageCommitted, OutputEvent, TextDelta
+from kapy.layers.registry import layer_registry
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.pagination import BeforeSeqPagination, Page, validate_pagination
 
+from .models import SessionRow
 from .repository import SessionRepository
-from .temporal import CLOSE, CREATE, RUN, failure_category
+from .temporal import RUN, TEMPORAL_RPC_TIMEOUT, ensure_activity_terminal, failure_category
 from .types import (
     ActivityIdentityConflict,
     CreateSession,
-    CreateSessionActivity,
     RunAgentActivity,
     SessionActivity,
-    SessionActivityRequest,
-    SessionExecutionError,
+    SessionBusy,
     SessionRecord,
     UpdateSession,
 )
 
-_TEMPORAL_RPC_TIMEOUT = timedelta(seconds=10)
 _ACTIVITY_TIMEOUT = timedelta(hours=1)
-_INPUT_TYPES = {CREATE: CreateSessionActivity, RUN: RunAgentActivity, CLOSE: SessionActivityRequest}
 
 
 class SessionService:
@@ -71,9 +70,8 @@ class SessionService:
         activity_id: UUID,
         run_id: str | None,
         *,
-        expected_type: str | None = None,
         include_outcome: bool = True,
-    ):
+    ) -> ActivityExecutionDescription:
         description = (
             await self._client()
             .get_activity_handle(
@@ -83,15 +81,12 @@ class SessionService:
             .describe(
                 include_input=True,
                 include_outcome=include_outcome,
-                rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
+                rpc_timeout=TEMPORAL_RPC_TIMEOUT,
             )
         )
-        input_type = _INPUT_TYPES.get(description.activity_type)
-        if input_type is None or (
-            expected_type is not None and description.activity_type != expected_type
-        ):
+        if description.activity_type != RUN:
             raise ActivityIdentityConflict(session_id, activity_id, description.activity_run_id)
-        inputs = await description.input([input_type])
+        inputs = await description.input([RunAgentActivity])
         if (
             not inputs
             or len(inputs) != 1
@@ -101,17 +96,41 @@ class SessionService:
             raise ActivityIdentityConflict(session_id, activity_id, description.activity_run_id)
         return description
 
-    async def _start[T](
-        self, name: str, request: SessionActivityRequest, activity_id: UUID, result_type: type[T]
-    ) -> ActivityHandle[T]:
+    async def create_session(self, data: CreateSession) -> SessionRecord:
+        """Validate fixed layer Config and insert an idle session with its default State."""
+        layers = layer_registry.load(data.layers, {})
+        row = SessionRow(
+            **data.model_dump(exclude={"id", "layers"}),
+            id=data.id or uuid4(),
+            layers={name: entry["config"] for name, entry in layers.items()},
+            layer_states={name: entry["state"] for name, entry in layers.items()},
+        )
+        async with self._session_factory.begin() as db:
+            await SessionRepository(db).create(row)
+        return SessionRecord.model_validate(row)
+
+    async def start_runner(
+        self,
+        session_id: UUID,
+        *,
+        activity_id: UUID,
+        user_prompt: str | None = None,
+    ) -> ActivityHandle[str]:
+        """Submit without reserving a writer. The Worker checks admission again."""
+        if user_prompt is not None and not isinstance(user_prompt, str):
+            raise ValueError("user_prompt must be a string or None")
+        async with self._session_factory.begin() as db:
+            if await SessionRepository(db).get_status(session_id) == LifecycleStatus.CLOSED:
+                raise LifecycleError(f"Session {session_id} is closed")
+
         client = self._client()
         if not self._temporal_task_queue:
             raise RuntimeError("Activity submission requires a task queue")
         try:
             handle = await client.start_activity(
-                name,
-                request,
-                result_type=result_type,
+                RUN,
+                RunAgentActivity(session_id=session_id, user_prompt=user_prompt),
+                result_type=str,
                 id=str(activity_id),
                 task_queue=self._temporal_task_queue,
                 id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
@@ -120,97 +139,53 @@ class SessionService:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 heartbeat_timeout=timedelta(seconds=10),
                 retry_policy=RetryPolicy(maximum_attempts=1),
-                rpc_timeout=_TEMPORAL_RPC_TIMEOUT,
+                rpc_timeout=TEMPORAL_RPC_TIMEOUT,
             )
         except ActivityAlreadyStartedError as error:
             # Retained terminal rejection supplies the precise execution to reuse.
-            handle = client.get_activity_handle(
-                str(activity_id),
-                run_id=error.run_id,
-                result_type=result_type,
-            )
-        try:
-            description = await self._describe(
-                request.session_id,
-                activity_id,
-                handle.run_id,
-                expected_type=name,
-                include_outcome=False,
-            )
-        except RPCError:
-            raise SessionExecutionError(
-                request.session_id,
-                activity_id,
-                handle.run_id,
-                "UnableToConfirm",
-            ) from None
+            run_id = error.run_id
+        else:
+            run_id = handle.run_id
+        description = await self._describe(session_id, activity_id, run_id, include_outcome=False)
         return client.get_activity_handle(
             str(activity_id),
             run_id=description.activity_run_id,
-            result_type=result_type,
+            result_type=str,
         )
 
-    async def _wait_session(
-        self, session_id: UUID, activity_id: UUID, handle: ActivityHandle[SessionRecord]
-    ) -> SessionRecord:
-        try:
-            return await handle.result(rpc_timeout=_TEMPORAL_RPC_TIMEOUT)
-        except ActivityFailureError as error:
-            raise SessionExecutionError(
-                session_id, activity_id, handle.run_id, failure_category(error.cause)
-            ) from None
-        except RPCError as error:
-            raise SessionExecutionError(
-                session_id,
-                activity_id,
-                handle.run_id,
-                "OutcomeUnavailable"
-                if error.status == RPCStatusCode.NOT_FOUND
-                else "UnableToConfirm",
-            ) from None
+    async def close_session(self, session_id: UUID) -> SessionRecord:
+        """Keep a tombstone, fencing on the exact writer if Temporal confirmed it ended."""
+        async with self._session_factory.begin() as db:
+            repo = SessionRepository(db)
+            closed = await repo.close_session(session_id)
+            if closed is not None:
+                return closed
+            session = await repo.get_session(session_id)
+        if session.status == LifecycleStatus.CLOSED:
+            return session
 
-    async def create_session(self, data: CreateSession, *, activity_id: UUID) -> SessionRecord:
-        """Wait for native create; canceling this await leaves the Activity running."""
-        session_id = data.id or activity_id
-        try:
-            handle = await self._start(
-                CREATE,
-                CreateSessionActivity(session_id=session_id, request=data),
-                activity_id,
-                SessionRecord,
-            )
-        except RPCError:
-            raise SessionExecutionError(session_id, activity_id, None, "UnableToConfirm") from None
-        return await self._wait_session(session_id, activity_id, handle)
+        previous = None
+        if session.current_activity_id is not None:
+            assert session.current_activity_run_id is not None
+            previous = (session.current_activity_id, session.current_activity_run_id)
+            await ensure_activity_terminal(self._client(), *previous)
 
-    async def start_runner(
-        self,
-        session_id: UUID,
-        *,
-        activity_id: UUID,
-        user_prompt: str,
-    ) -> ActivityHandle[str]:
-        """Return an accepted native execution; Worker admission can still fail."""
-        if not isinstance(user_prompt, str):
-            raise ValueError("user_prompt must be a string")
-        return await self._start(
-            RUN,
-            RunAgentActivity(session_id=session_id, user_prompt=user_prompt),
-            activity_id,
-            str,
-        )
-
-    async def close_session(self, session_id: UUID, *, activity_id: UUID) -> SessionRecord:
-        try:
-            handle = await self._start(
-                CLOSE,
-                SessionActivityRequest(session_id=session_id),
-                activity_id,
-                SessionRecord,
-            )
-        except RPCError:
-            raise SessionExecutionError(session_id, activity_id, None, "UnableToConfirm") from None
-        return await self._wait_session(session_id, activity_id, handle)
+        async with self._session_factory.begin() as db:
+            repo = SessionRepository(db)
+            closed = await repo.close_session(session_id, previous=previous)
+            if closed is not None:
+                return closed
+            session = await repo.get_session(session_id)
+            if (
+                previous is not None
+                and session.status == LifecycleStatus.READY
+                and session.current_activity_id is None
+            ):
+                # The old writer released itself after we observed its identity.
+                session = await repo.close_session(session_id) or await repo.get_session(session_id)
+            if session.status == LifecycleStatus.CLOSED:
+                return session
+        raise SessionBusy(f"Session {session_id} is occupied")
 
     async def get_activity(
         self,
@@ -219,53 +194,26 @@ class SessionService:
         *,
         run_id: str | None = None,
     ) -> SessionActivity:
-        """Read Temporal directly, even before create has inserted a session row."""
+        """Read a retained run's status and outcome directly from Temporal."""
         try:
             description = await self._describe(session_id, activity_id, run_id)
         except RPCError as error:
             if error.status == RPCStatusCode.NOT_FOUND:
                 raise LookupError("Activity not found; its outcome cannot be confirmed") from None
             raise
-        result = await description.result(
-            str if description.activity_type == RUN else SessionRecord
-        )
+        result = await description.result(str)
         failure = await description.outcome_failure()
         assert description.activity_run_id is not None
         return SessionActivity(
             session_id=session_id,
             activity_id=activity_id,
             run_id=description.activity_run_id,
-            activity_type=description.activity_type,
+            activity_type=RUN,
             status=description.status.name,
             run_state=description.run_state.name if description.run_state is not None else None,
             result=result,
             error=failure_category(failure) if failure is not None else None,
         )
-
-    async def wait_session_activity(
-        self,
-        session_id: UUID,
-        activity_id: UUID,
-        *,
-        run_id: str | None = None,
-        activity_type: str,
-    ) -> SessionRecord:
-        """Recover an attempted create/close by lookup only; never resubmit it."""
-        if activity_type not in (CREATE, CLOSE):
-            raise ValueError("Only create and close return a session")
-        description = await self._describe(
-            session_id,
-            activity_id,
-            run_id,
-            expected_type=activity_type,
-            include_outcome=False,
-        )
-        handle = self._client().get_activity_handle(
-            str(activity_id),
-            run_id=description.activity_run_id,
-            result_type=SessionRecord,
-        )
-        return await self._wait_session(session_id, activity_id, handle)
 
     async def get_session(self, session_id: UUID) -> SessionRecord:
         async with self._session_factory() as db, db.begin():

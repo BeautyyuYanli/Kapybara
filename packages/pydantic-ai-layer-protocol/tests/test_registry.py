@@ -77,8 +77,21 @@ def test_json_loading_restores_defaults_copies_data_and_requires_explicit_writeb
     assert ECHO.load({"echo": {}}, {})["echo"]["state"] == {"calls": 0}
 
 
-@pytest.mark.parametrize("bad", ["result", "config", "state", "capability", "enter", "exit"])
-def test_factory_rejects_invalid_definitions_at_assembly(bad):
+@pytest.mark.parametrize(
+    ("bad", "reason"),
+    [
+        ("result", "factory must return a Layer"),
+        ("config", "must declare a Pydantic Config"),
+        ("state", "must declare a Pydantic State"),
+        ("capability", "must use a native AbstractCapability"),
+        ("enter", "enter_conversation must be an async function"),
+        ("exit", "exit_conversation must be an async function"),
+    ],
+)
+def test_factory_rejects_invalid_definitions_at_assembly(bad, reason):
+    async def enter(conversation_id: str, config: echo.Config) -> None:
+        pass
+
     def factory(layer_id: str, access: LayerAccess[LayerDeps]) -> Any:
         layer = echo.make(layer_id, access)
         return {
@@ -86,12 +99,18 @@ def test_factory_rejects_invalid_definitions_at_assembly(bad):
             "config": replace(layer, config_type=dict),  # pyrefly: ignore[bad-argument-type]
             "state": replace(layer, state_type=dict),  # pyrefly: ignore[bad-argument-type]
             "capability": replace(layer, capability=FunctionToolset()),  # pyrefly: ignore[bad-argument-type]
-            "enter": replace(layer, enter_conversation=lambda scope, config: echo.State()),  # pyrefly: ignore[bad-argument-type]
-            "exit": replace(layer, exit_conversation=lambda scope, config, state: None),  # pyrefly: ignore[bad-argument-type]
+            "enter": replace(layer, enter_conversation=lambda conversation_id, config: None),  # pyrefly: ignore[bad-argument-type]
+            "exit": replace(
+                layer,
+                enter_conversation=enter,
+                exit_conversation=lambda resource: None,  # pyrefly: ignore[bad-argument-type]
+            ),
         }[bad]
 
-    with pytest.raises(UserError):
-        LayerRegistry({"invalid": factory}, get_layers=get_layers)
+    with pytest.raises(UserError, match=f"^Layer 'invalid' {reason}$"):
+        LayerRegistry(
+            {"invalid": factory}, get_layers=get_layers, get_resources=lambda deps: deps.resources
+        )
 
 
 @pytest.mark.parametrize("actual_id", [None, "", "other"])
@@ -100,7 +119,7 @@ def test_root_id_mismatch_reports_expected_and_actual_without_rewriting(actual_i
 
     def factory(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+    ) -> Layer[LayerDeps, echo.Config, echo.State, None]:
         return Layer(config_type=echo.Config, state_type=echo.State, capability=capability)
 
     with pytest.raises(UserError, match=f"'expected'.*{actual_id!r}"):
@@ -131,7 +150,7 @@ def test_unknown_names_invalid_json_and_nonobject_models_fail():
 
     def make_null(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, RootModel[None], echo.State]:
+    ) -> Layer[LayerDeps, RootModel[None], echo.State, None]:
         return Layer(
             config_type=RootModel[None],
             state_type=echo.State,
@@ -157,7 +176,7 @@ def test_load_copies_inputs_before_custom_validators():
 
     def make_copy(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, Config, echo.State]:
+    ) -> Layer[LayerDeps, Config, echo.State, None]:
         return Layer(
             config_type=Config,
             state_type=echo.State,
@@ -200,42 +219,32 @@ async def test_factory_assembly_binds_independent_writable_access_for_arbitrary_
         increment: int  # Assembly must not instantiate required models.
 
     class State(BaseModel):
-        calls: int
+        calls: int = 0
 
     constructed = []
 
-    async def enter(conversation_id: str, config: Config) -> State:
-        pytest.fail("Static data operations must not initialize business resources")
-
-    async def exit(conversation_id: str, config: Config, state: State | None) -> None:
-        pytest.fail("Static data operations must not close business resources")
-
-    def make(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State]:
+    def make(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State, None]:
         constructed.append(layer_id)
 
         def count(ctx: RunContext[Deps]) -> int:
-            data = access(ctx.deps)
+            data = access.data(ctx.deps)
             state = State.model_validate(data["state"])
             state.calls += Config.model_validate(data["config"]).increment
-            access(ctx.deps)["state"] = dump_object(state)
+            data["state"] = dump_object(state)
             return state.calls
 
         return Layer(
             config_type=Config,
             state_type=State,
             capability=Capability(id=layer_id, tools=[Tool(count, name=f"{layer_id}_count")]),
-            enter_conversation=enter,
-            exit_conversation=exit,
         )
 
-    def access(deps: Deps) -> dict[str, LayerData]:
+    def get_payload(deps: Deps) -> dict[str, LayerData]:
         return deps.payload
 
-    layers = LayerRegistry({"one": make, "two": make}, get_layers=access)
-    assert layers.prepare_configs({"one": {"increment": 1}}) == {"one": Config(increment=1)}
+    layers = LayerRegistry({"one": make, "two": make}, get_layers=get_payload)
     assert layers.definitions["one"].state_type is State
-    with pytest.raises(ValidationError):
-        layers.load({"one": {"increment": 1}}, {})
+    assert layers.load({"one": {"increment": 1}}, {})["one"]["state"] == {"calls": 0}
     deps = Deps(
         payload=layers.load(
             {"one": {"increment": 1}, "two": {"increment": 10}},
@@ -277,7 +286,7 @@ async def test_sdk_for_run_sees_finalized_capabilities_and_isolates_shared_tools
             assert ctx.capabilities["peer"].id == "peer"
             toolset = Toolset(self.access)
             toolset.resource_label = echo.Config.model_validate(
-                self.access(ctx.deps)["config"]
+                self.access.data(ctx.deps)["config"]
             ).prefix
             bindings.append(toolset.resource_label)
             return toolset
@@ -296,7 +305,7 @@ async def test_sdk_for_run_sees_finalized_capabilities_and_isolates_shared_tools
 
     def make(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+    ) -> Layer[LayerDeps, echo.Config, echo.State, None]:
         return Layer(
             config_type=echo.Config,
             state_type=echo.State,
@@ -332,7 +341,7 @@ async def test_selected_layers_preserve_leaf_hook_ordering():
 
     def make(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+    ) -> Layer[LayerDeps, echo.Config, echo.State, None]:
         def before_run(ctx: RunContext[LayerDeps]) -> None:
             calls.append(layer_id)
 
@@ -383,7 +392,7 @@ async def test_leaf_toolset_getter_runs_after_capability_binding_and_run_isolati
 
     def make(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+    ) -> Layer[LayerDeps, echo.Config, echo.State, None]:
         return Layer(
             config_type=echo.Config,
             state_type=echo.State,
@@ -483,7 +492,7 @@ async def test_tool_definitions_preserve_native_flags_and_declared_ownership():
 async def test_deferred_loading_preserves_native_capability_and_toolset_instructions(nested):
     def make(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+    ) -> Layer[LayerDeps, echo.Config, echo.State, None]:
         layer = deferred.make("lazy", access)
         return replace(
             layer, capability=CombinedCapability(id=layer_id, capabilities=[layer.capability])
@@ -507,7 +516,7 @@ async def test_deferred_loading_preserves_native_capability_and_toolset_instruct
 def test_nested_leaves_require_nonempty_declared_ids_during_preparation(capability_id):
     def make(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+    ) -> Layer[LayerDeps, echo.Config, echo.State, None]:
         def tool() -> str:
             return "result"
 
@@ -560,10 +569,10 @@ async def test_native_toolset_factories_expose_tools_and_isolate_concurrent_runs
 
     def make(
         layer_id: str, access: LayerAccess[LayerDeps]
-    ) -> Layer[LayerDeps, echo.Config, echo.State]:
+    ) -> Layer[LayerDeps, echo.Config, echo.State, None]:
         def factory(ctx: RunContext[LayerDeps]) -> Tools:
             assert ctx.capabilities[layer_id].id == layer_id
-            label = echo.Config.model_validate(access(ctx.deps)["config"]).prefix
+            label = echo.Config.model_validate(access.data(ctx.deps)["config"]).prefix
             factories.append(label)
             return Tools(label)
 

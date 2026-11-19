@@ -1,34 +1,19 @@
 # Standalone Activities and conversations
 
-The Worker registers kapy.create_session, kapy.run_agent and kapy.close_session.
-A complete Agent run is one standalone Activity; there are no Workflows, model/tool
-sub-Activities or automatic internal Agent recovery.
+The Worker registers one standalone Activity, `kapy.run_agent`. Each invocation
+runs the complete Agent graph within the Activity.
 
 ## Ownership and requests
 
 Submission uses USE_EXISTING and REJECT_DUPLICATE. A retained terminal rejection
 provides its native run_id; clients pin all later reads/waits/cancellation to that
-execution. Same-key prompt/config changes use the first accepted input. Only
+execution. Same-key prompt changes use the first accepted input. Only
 session/type identity is validated against Temporal. Deduplication and result
 retrieval end with retention; there is no permanent Kapy execution ledger.
 
-Native inputs are deliberately small:
-
-| Activity | Request |
-| --- | --- |
-| create | session_id and original CreateSession, including fixed layer Config |
-| run | session_id and user_prompt |
-| close | session_id |
-
-Create defaults session_id to its Activity UUID. It validates all Config/default
-States before inserting creating plus the native writer; duplicate session IDs
-never repeat `enter_conversation`. The Worker passes `str(session_id)` to the hook
-outside any transaction. Initial States remain local until published atomically with
-ready and ownership release. Failure conditionally changes its still-owned creating
-row to closing, then compensates all configured layers in reverse through
-`exit_conversation(str(session_id), config, None)`, including partial/uncalled enters.
-A lost ready-commit response cannot trigger compensation after ownership cleared;
-an unavailable database does not authorize speculative cleanup.
+The Activity payload contains `session_id` and optional `user_prompt`. Session
+creation and closure use the PostgreSQL lifecycle described in
+[control services](../control/README.md#session-state-machine).
 
 Run executes an UPDATE on an unowned ready row, storing actual activity.info()
 UUID and activity_run_id. The same short transaction copies current model/provider,
@@ -41,41 +26,37 @@ The first, later and restored runs all use that host identity; historical messag
 IDs remain unchanged. Tools and SDK hooks read `ctx.conversation_id`; the SDK run
 ID and Temporal Activity identity remain independent execution identifiers.
 
-Every history/snapshot/scope-progress write checks session ID, both native identity
-fields and allowed lifecycle. Checks also precede new model/tool/hook calls. No
-RPC, hook, model request or publication holds a transaction. Normal completion or
-failed cleanup clears both fields; they represent write authority only.
+Every history and snapshot write checks session ID, both native identity fields
+and ready status. The Worker checks ownership before opening runtime handles
+and before model and tool calls. RPC, hooks, model requests and publication run
+outside database transactions.
 
-Only explicit close queries an occupied session's exact old execution outside its
-transaction. Confirmed terminal or NOT_FOUND permits CAS replacement into closing;
-RUNNING/PAUSED/unknown states or temporary RPC failure preserve the old writer.
-A changed writer cannot be overwritten. Later explicit close uses a new UUID and
-may repeat idempotent `exit_conversation` calls with the same string ID. Each attempt
-saves validated State, including failure and cancellation; ordinary failures still
-attempt other layers. Only outer
-RetryableScopeError permits three local hook attempts, separate from Temporal retry.
+Run admission and close share an exact Temporal lookup for an occupied session.
+Confirmed terminal status or `NOT_FOUND` permits a conditional update matching
+both observed identity fields. Live executions and RPC failures preserve the
+writer. If input validation fails during admission, PostgreSQL rolls back the claim.
 
 ## Resources, cancellation and results
 
-Each Activity owns model/provider clients, writable deps, SDK tool resources and
-heartbeat task. The static Agent/registry retain no clients or mutable State. MCPs
-uses one inline stdio Gateway/native MCPToolset per Agent run, closed by the SDK.
-Shell remote jobs belong to the session scope and survive client shutdown until
-close. Jobs missing from the saved shellctl inventory remain undiscoverable.
+Each Activity owns model/provider clients, local Layer handles, writable deps
+and a heartbeat task. The Worker opens Layer handles before constructing the
+provider and model. The SDK manages the native Toolsets, including one inline
+stdio Gateway per selected MCPs run. Shell exit closes the local HTTP client,
+and shellctl manages remote jobs and log retention.
 
 Each Activity has one Temporal attempt, one-hour schedule-to-close/start-to-close
 budgets and ten-second heartbeat timeout. Heartbeats run every two seconds with
 no checkpoint details. There is no database deadline or local timeout sealing.
 Caller cancellation only stops waiting. Actual SDK cancellation stops new calls
-and permits bounded shielded local cleanup/creation compensation. Replacement of
-a writer prevents later writes but cannot revoke already-issued external I/O.
+and permits bounded local cleanup. The writer identity fences later progress
+after a takeover.
 
-After model/provider/tool exit, run commits latest SDK messages, all validated
-States, ready and ownership release atomically. Failure preserves the last saved
-node-boundary snapshot and committed history, then releases to closing. Business
-commit and Temporal outcome are separate facts: a lost commit/result response can
-leave committed business state alongside native failure or timeout. No saved result
-can override native status or reconstruct a forgotten execution.
+After all runtime handles exit, run commits the latest SDK messages and validated
+States and releases the writer atomically. Failure retains the last saved
+node-boundary snapshot, States and committed history, and attempts to release the
+writer in a shielded transaction bounded to 15 seconds. The Session stays ready.
+A lost acknowledgment can leave a committed snapshot alongside a Temporal
+failure or timeout.
 
 Complete messages are recorded after each model node under conditional ownership,
 then published after commit. Positions/gaps stay sealed. Output-tool receipts and
@@ -104,27 +85,27 @@ added for tool → end. Successful Activity completion still saves the final SDK
 messages and States, including output-tool receipts and after-run tails, after
 model/provider/tool resources close.
 
-Without a new prompt, decoded messages can be passed to
-`agent.run(message_history=messages, deps=restored_deps, conversation_id=str(session_id))`.
-The SDK reuses the trailing request and always requests the model, even for a saved plain text response with
-no instructions. For unanswered tool calls it inserts
-`ToolReturnPart(outcome="interrupted")` before the unbound interruption prompt;
-those old calls are skipped. Actual tool returns and tool-bound retry feedback
-remain intact. Model-lifecycle and output-function retries keep their original
-retry request.
+Submit a new Activity with `user_prompt=None` to resume the saved interrupted
+request. The SDK inserts `ToolReturnPart(outcome="interrupted")` for unanswered
+calls and sends the retained interruption feedback to the model. With a new
+prompt, the SDK includes that input in the same model request. Actual tool
+returns and tool-bound retry feedback are preserved. A prompt-free run with
+empty history fails as `InvalidParameters`. If the history ends in a final
+response, a prompt-free run returns its saved output without a model request.
 
 If final output processing reached tool → end but the final Activity save did not
 commit, resumption uses the preceding snapshot and asks the model again. An output
 function that already ran may therefore run again on new output; its result and
 the graph's `End` are not in the intermediate snapshot. Resumption uses saved layer
-State while graph-local retry counters start fresh. Failed Activities still leave
-the session closing; the runner does not automatically restart them.
+State while graph-local retry counters start fresh. The caller submits the next
+Activity explicitly.
 
 ## Worker and verification
 
 python -m kapy.runner.worker borrows database/output/Temporal resources for its
 lifespan. SIGTERM drains Activities for fifteen seconds before resources close.
-HTTP/Telegram create and close await native results; run returns an execution
-reference. Tests use real PostgreSQL/Valkey/Temporal, deterministic SDK models,
+HTTP/Telegram create and close return committed session records through the
+service. Run submission returns an execution reference. Tests use real
+PostgreSQL/Valkey/Temporal, deterministic SDK models,
 local model-protocol HTTP servers and an optional private shellctl service.
 Compose pins Server/admin-tools 1.32.1; the locked Python SDK is 1.33.0.

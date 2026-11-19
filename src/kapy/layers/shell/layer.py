@@ -1,77 +1,58 @@
 """Native shell layer; only explicit JSON writes retain job IDs and byte cursors.
 
-Config validation and factory assembly are pure. Each tool call owns one
-HTTP client. Remote tasks survive runs; exit_conversation releases the known jobs while
-SessionService saves cleanup progress. State owns neither the shellctl service
-nor the remote cwd/artifacts. Deps are opaque: injected access and Config/State
-supply business data. The SDK's RunContext.conversation_id supplies resource ownership.
+The host opens one local HTTP client for the run. Tools use the saved job
+inventory to route calls and track output; shellctl owns remote job retention.
 """
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-
-import anyio
-import httpx2
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.capabilities import Capability
-from pydantic_ai.exceptions import UserError
 from pydantic_ai.toolsets import FunctionToolset
-from shellctl import ShellctlClientError
 from shellctl.shared.constants import DEFAULT_TERMINATE_GRACE_SECONDS, DEFAULT_TIMEOUT_SECONDS
 
-from pydantic_ai_layer_protocol import RetryableScopeError
-from pydantic_ai_layer_protocol.registry import dump_object
-from pydantic_ai_layer_protocol.types import Layer, LayerAccess
+from pydantic_ai_layer_protocol import Layer, LayerAccess, dump_object
 
 from . import runtime
 from .models import Config, NonEmpty, RunTimeout, State, WaitTimeout
 from .output import Redactor
 
 
-def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
+def make[D](
+    layer_id: str, access: LayerAccess[D]
+) -> Layer[D, Config, State, runtime.ShellResource]:
     """Build fixed native tools; each call reads and writes its current deps entry."""
 
-    def read(deps: D) -> tuple[Config, State]:
-        entry = access(deps)
-        return Config.model_validate(entry["config"]), State.model_validate(entry["state"])
-
     def instructions(ctx: RunContext[D]) -> str:
-        config = Config.model_validate(access(ctx.deps)["config"])
+        config = Config.model_validate(access.data(ctx.deps)["config"])
         return runtime.instructions(config, "builtin_shell", Redactor(config.redact_patterns, ""))
 
-    @asynccontextmanager
-    async def operations(ctx: RunContext[D]) -> AsyncIterator[runtime.ShellOperations]:
-        conversation_id = ctx.conversation_id
-        if not conversation_id:
-            raise UserError("Shell tools require a nonempty conversation_id")
-        config, state = read(ctx.deps)
+    def operations(ctx: RunContext[D]) -> runtime.ShellOperations:
+        resource: runtime.ShellResource = access.resource(ctx.deps)
+        entry = access.data(ctx.deps)
+        config = Config.model_validate(entry["config"])
+        state = State.model_validate(entry["state"])
 
         async def known(job_id: str) -> int | None:
             return state.jobs.get(job_id)
 
         async def register(job_id: str) -> None:
             state.jobs.setdefault(job_id, 0)
-            access(ctx.deps)["state"] = dump_object(state)
+            entry["state"] = dump_object(state)
 
         async def change(job_id: str, offset: int | None) -> None:
             if offset is None:
                 state.jobs.pop(job_id, None)
             elif job_id in state.jobs:
                 state.jobs[job_id] = max(state.jobs[job_id], offset)
-            access(ctx.deps)["state"] = dump_object(state)
+            entry["state"] = dump_object(state)
 
-        async with runtime.open_client(config) as (client, redact):
-            yield runtime.ShellOperations(
-                config,
-                client,
-                redact,
-                conversation_id=conversation_id,
-                provider="builtin",
-                name="shell",
-                known=known,
-                register=register,
-                change=change,
-            )
+        return runtime.ShellOperations(
+            config,
+            resource.client,
+            resource.redact,
+            known=known,
+            register=register,
+            change=change,
+        )
 
     async def run(
         ctx: RunContext[D],
@@ -79,8 +60,7 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
         timeout: RunTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
         """Run a shell script in a new PTY job."""
-        async with operations(ctx) as tools:
-            return await tools.run(script, timeout)
+        return await operations(ctx).run(script, timeout)
 
     async def wait(
         ctx: RunContext[D],
@@ -88,8 +68,7 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
         timeout: WaitTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
         """Read more output from a session job."""
-        async with operations(ctx) as tools:
-            return await tools.wait(job_id, timeout)
+        return await operations(ctx).wait(job_id, timeout)
 
     async def input(
         ctx: RunContext[D],
@@ -98,8 +77,7 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
         timeout: RunTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
         """Send PTY input and read resulting output."""
-        async with operations(ctx) as tools:
-            return await tools.input(job_id, text, timeout)
+        return await operations(ctx).input(job_id, text, timeout)
 
     async def interrupt(
         ctx: RunContext[D],
@@ -107,8 +85,7 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
         grace_seconds: WaitTimeout = DEFAULT_TERMINATE_GRACE_SECONDS,
     ) -> str:
         """Interrupt a session job, retaining its log."""
-        async with operations(ctx) as tools:
-            return await tools.interrupt(job_id, grace_seconds)
+        return await operations(ctx).interrupt(job_id, grace_seconds)
 
     return Layer(
         config_type=Config,
@@ -128,49 +105,6 @@ def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
                 )
             ],
         ),
-        enter_conversation=enter_conversation,
-        exit_conversation=exit_conversation,
+        enter_conversation=runtime.enter_conversation,
+        exit_conversation=runtime.exit_conversation,
     )
-
-
-async def enter_conversation(conversation_id: str, config: Config) -> State:
-    """Start an empty inventory without allocating remote resources."""
-    return State()
-
-
-async def exit_conversation(conversation_id: str, config: Config, state: State | None) -> None:
-    """Delete known jobs, removing only acknowledged or already absent IDs.
-
-    The host supplies exclusive scope ownership and persists the mutated State
-    after every attempt. Deletion is idempotent, including lost acknowledgements.
-    Connection failures, timeouts, interrupted remote protocols and temporary
-    HTTP availability errors opt into retry. Local configuration/protocol and
-    authentication errors propagate unchanged.
-
-    shellctl's listing has no ownership fields or scope deletion endpoint, so
-    cleanup can only use the saved jobs inventory. None supplies no discoverable
-    job IDs; enter allocates nothing, but absent State is not proof that the
-    upstream has no resources.
-    State may not reflect the latest upstream state after a crash, an unsaved tool
-    mutation or an unacknowledged job creation. Jobs missing from that inventory
-    cannot be discovered here and may remain as orphaned upstream resources.
-    """
-    if state is None or not state.jobs:
-        return
-    try:
-        with anyio.fail_after(60):
-            async with runtime.open_client(config) as (client, _):
-                for job_id in sorted(state.jobs):
-                    await runtime.delete_job(client, job_id)
-                    del state.jobs[job_id]
-    except (
-        httpx2.NetworkError,
-        httpx2.TimeoutException,
-        httpx2.RemoteProtocolError,
-        TimeoutError,
-    ) as error:
-        raise RetryableScopeError("shellctl scope cleanup temporarily unavailable") from error
-    except ShellctlClientError as error:
-        if error.status_code in {429, 502, 503, 504}:
-            raise RetryableScopeError("shellctl scope cleanup temporarily unavailable") from error
-        raise

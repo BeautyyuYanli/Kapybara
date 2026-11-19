@@ -1,130 +1,53 @@
 # Kapy layers
 
-Kapy consumes the independent [Pydantic AI Layer Protocol](../../../packages/pydantic-ai-layer-protocol/README.md).
-The package owns Layer definitions, registry assembly, Config/State validation,
-native capability composition. The shell and MCP
-implementations, installed factory mapping, scope retry policy and SessionService
-remain in Kapy.
+Kapy uses the independent [Pydantic AI Layer Protocol](../../../packages/pydantic-ai-layer-protocol/README.md)
+for registry assembly, Config/State validation and native capability composition.
+The process-local registry installs shell and MCPs once. It reads JSON data through
+`RunnerDeps.layers` and runtime handles through `RunnerDeps.layer_resources`.
 
-`registry.layer_registry` is a process-local `LayerRegistry` constructed
-with `{"shell": shell.make, "mcps": mcps.make}` and Kapy's RunnerDeps.layers adapter once.
-The Agent installs it directly; SessionService and Activity use its
-`definitions`, `prepare_configs`, `load` and `snapshot` methods.
-SessionService and Activity use these same static definitions. Only the
-adapter knows the deps layout; shell obtains all data through injected access and
-Config/State. Changing the installed set requires reassembly.
+## Execution lifecycle
 
-## Conversations
+Session creation validates fixed Config and initializes State from `{}` locally.
+State saves business progress as JSON. The Worker uses the same layer definitions
+to restore both when it claims a run.
 
-A factory explicitly supplies either or both async functions on its Layer:
+The Worker enters `layer_registry.open_conversation(str(session_id), configs)`
+around each Agent Activity. A layer may supply an async
+`enter_conversation(conversation_id, config) -> Resource` to open a local handle
+and an async `exit_conversation(resource) -> None` to close it. Resource hooks
+run outside database transactions, with successful handles unwound in reverse
+order. The external service or its orchestrator manages long-lived remote entities.
+The SDK separately manages native Toolsets. See [business layer rules](../../../agent_lint/layers.md).
 
-```python
-async def enter_conversation(conversation_id: str, config: Config) -> State: ...
-async def exit_conversation(conversation_id: str, config: Config, state: State | None) -> None: ...
-```
-
-The conversation ID is `str(session_id)`, stable across runs and process restarts.
-Kapy supplies it explicitly to every `agent.run`, including restored history.
-Tools and SDK hooks read `ctx.conversation_id`; the independent enter/exit callbacks
-receive that same string directly from the host outside Agent runs. These callbacks
-run only at creation and explicit close/creation compensation, not on each Agent run.
-The create Worker validates Config and no-enter default States, then atomically
-inserts creating with fixed Config and its actual Activity UUID/native run_id.
-The default session ID is the Activity UUID. Only the executing Worker reserves
-business state; hooks never hold a database transaction. Without enter,
-State is initialized from `{}`; returned State can require fields without defaults.
-Config validation, default State initialization and serialization have no external
-I/O; enter may perform business I/O. Config and State remain JSON, while SDK
-component/client lifetimes stay separate. State saves business progress and cleanup
-references; layers do not read Kapy-specific identity fields from deps.
-
-Resource-creating tools/hooks must mark upstream resources or their scope with
-conversation ownership when supported. Determine or derive the marker from
-`conversation_id`, `layer_id` and fixed Config as needed, using only information
-necessary to locate this conversation's resources; the model must not choose or
-override it. `exit_conversation` must reconstruct the marker and reclaim all owned
-resources, including those absent from State. If upstream cannot query or clean
-by ownership, State-based cleanup is best effort and must document possible orphans.
-
-Complete State, ready and ownership release commit together. Failed creation
-moves to closing while retaining its writer through compensation, exits
-all configured layers in reverse with None, including partial/uncalled enters, then
-finishes closed or closing and releases ownership. Temporal records failure.
-None does not mean no remote resources.
-An uncertain ready commit is checked before compensation; a committed success
-cannot be overwritten or cleaned up by that failed acknowledgment.
-
-Close claims unowned ready/closing, or CAS-replaces an old exact execution after
-Temporal confirms terminal/NOT_FOUND, using a new UUID and native run_id.
-Exit hooks run in reverse and save validated mutable State after each attempt,
-including errors/cancellation. Ordinary failures still attempt remaining exits;
-all cleanup must succeed for closed. Failure saves progress and closing. Same-key
-terminal close returns its retained Temporal result; a new explicit close may repeat successful
-exits, so exits must always be idempotent and accept None for abandoned initialization.
-
-Only outer `RetryableScopeError` allows three hook attempts separated by 0.5 seconds.
-Nested causes/groups, invalid State and ordinary errors are not retry signals.
-The fixed ID/Config survives those attempts; State progress is validated and saved
-before the next exit attempt. Storage/validation failure does not retry a hook.
-This is the existing business-hook contract; Temporal itself uses one attempt and
-never restores the Agent or automatically replays enter.
-
-Every new scope/model/tool call checks the session's current UUID/native run_id.
-Progress writes conditionally check full writer identity and lifecycle in one short
-transaction, without SELECT FOR UPDATE or a lease. A stale owner cannot issue
-further calls or write back; already-issued remote I/O cannot be revoked. Layers
-must reclaim late allocations or provide terminal scope closure by ID/Config.
-Caller disconnect does not stop Worker hooks; actual Activity cancellation executes
-owned compensation/failure handling. There is no generic resource manager,
-background scope recovery or Workflow.
+Kapy passes `conversation_id=str(session_id)` on each Agent run, including when
+resuming saved history. Tools and SDK hooks that use the identity read
+`ctx.conversation_id`. Closing a Session records a PostgreSQL tombstone.
 
 ## Shell layer
 
-`shell.layer.make` returns `Layer[D, Config, State]` with the shared shell models,
-fixed native Toolset and explicit enter/exit hooks. It imposes no deps structure;
-injected access defines where its data lives. Create a durable session with:
+Create a session with:
 
 ```json
 {"layers": {"shell": {"cwd": "/workspace", "base_url": "http://shellctl:8765"}}}
 ```
 
-`cwd` must be an absolute POSIX directory that already exists on the remote
-server. Config also accepts `env`, optional `token_env`, and `redact_patterns`.
-The default server is `http://127.0.0.1:8765`. The process executing a tool call
-or scope exit reads the named token environment variable only at that boundary.
-State is `{"jobs": {"job-id": byte_offset}}`; it contains no identity, clients or
-secrets. `enter_conversation` starts an empty inventory without remote I/O. Every
-tool reads `ctx.conversation_id` for remote `KAPY_SESSION_ID` ownership metadata;
-missing or empty identity fails before opening the remote client. Kapy uses the
-session UUID's string form; standalone SDK consumers may use other strings.
-Provider/name markers remain `builtin`/`shell`; Config cannot override reserved
-environment keys. Tool parameters do not expose conversation identity. Saved State
-uses strict field validation; upgrade old `scope_id` data through the database migration.
+`cwd` is an existing absolute POSIX directory on the remote server. Config also
+accepts `env`, `token_env` and `redact_patterns`. The default server is
+`http://127.0.0.1:8765`. The Worker resolves the named token environment variable
+when opening the local HTTP client. Tools share that client and a redactor for the
+run and forward only configured `env` entries.
 
-The tools retain the existing names and parameters: `builtin_shell_run`,
-`builtin_shell_wait`, `builtin_shell_input`, and `builtin_shell_interrupt`.
-Run records a returned job ID before reading output. Wait/input resume from its
-saved byte cursor; cursors never decrease. Interrupt retains the job and its
-readable logs. Confirmed `job_not_found` removes the entry. Output limits,
-truncation, tail supplementation and redaction follow `layers.shell.output`.
+`builtin_shell_run`, `builtin_shell_wait`, `builtin_shell_input` and
+`builtin_shell_interrupt` execute sequentially. Run records the returned job ID
+before reading more output. Wait and input resume from the stored byte offset.
+Interrupt retains the job and its logs. Confirmed `job_not_found` removes the
+entry. State is `{"jobs": {"job-id": byte_offset}}` and cursors only move forward.
 
-Tools explicitly run sequentially because their State shares one job inventory.
-Each tool owns and closes its HTTP client, with bounded shielded cleanup. The
-remote job survives client close and successful runner completion.
-`exit_conversation` deletes known jobs one by one, forgetting confirmed deletions
-and `job_not_found` results; the host saves
-that progress after each attempt. Transport/timeout and temporary availability
-failures explicitly opt into bounded retries; authentication and other errors do
-not. Failed cleanup leaves CLOSING and remaining jobs for an explicit close retry.
-Each exit attempt has a 60-second budget; client close remains bounded. It owns
-neither the shellctl server nor its directories and files. Ambiguous remote acknowledgements
-can leave an unrecorded job or an already applied input; there is no remote
-exactly-once protocol. Shell exit accepts None and makes no request because it has
-no saved jobs to discover; enter itself allocates nothing. None is not evidence of
-an empty upstream. shellctl's jobs listing has no scope ownership field or scope
-deletion endpoint; cleanup cannot discover jobs missing from the saved inventory.
-Saved State may lag upstream after a crash or an unacknowledged job creation, so
-jobs omitted from that inventory can remain as orphaned upstream resources.
+Layer exit closes the HTTP client with a five-second shielded timeout. Remote jobs
+and logs survive Activity exit and Session closure according to shellctl's own
+retention and garbage collection. A lost response can leave a job absent from the
+inventory. Output limits, tail supplementation and redaction are implemented in
+`layers.shell.output`.
 
 ## MCPs layer
 
@@ -176,8 +99,7 @@ I/O. Each selected Agent run creates and enters a fresh MCPToolset; disabled run
 create none. The SDK closes the Gateway on success, error or cancellation. Kapy's
 standalone Activity executes the complete Agent run in the same native SDK scope, so tool
 discovery and all calls share one Gateway for that run. Later runs create fresh
-processes. State is always `{}` and there are no business-scope hooks or clients
-saved in the session.
+processes. State is always `{}`; the SDK owns the gateway client.
 
 Config fixes the upstream set for that session; different sessions may supply
 different configurations. The native MCPToolset discovers upstream tools for each
@@ -207,8 +129,8 @@ names, such as `await toolset.mcp.direct_call_tool("public.search", {...})` insi
 after discovery. The registered layer and standalone builder use the same wrapper.
 
 Kapy's Config JSON export deliberately retains plaintext upstream credentials so
-PostgreSQL session configuration and create's original Temporal request retain them; repr hides
-secret values. These credentials are part of the stored configuration and public
+PostgreSQL session configuration retains them. The representation hides secret
+values. These credentials are part of the stored configuration and public
 session DTO, like the supplied inline data. Processes, connections and JWE keys
 never enter State. The independent `InlineGatewayConfig` keeps its ordinary JSON
 export redacted and exposes plaintext only through its explicit startup export.

@@ -1,4 +1,4 @@
-"""Pure JSON configuration and cleanup references for the borrowed shellctl service."""
+"""Pure JSON configuration and job cursors for the borrowed shellctl service."""
 
 import re
 from typing import Annotated
@@ -10,7 +10,6 @@ from shellctl.shared.constants import (
     SHELL_TOOL_HARD_TIMEOUT_SECONDS,
 )
 
-OWNERSHIP_ENV = frozenset({"KAPY_SESSION_ID", "KAPY_PLUGIN_PROVIDER", "KAPY_PLUGIN_NAME"})
 type NonEmpty = Annotated[str, Field(min_length=1)]
 type WaitTimeout = Annotated[
     float, Field(ge=0, le=SHELL_TOOL_HARD_TIMEOUT_SECONDS, allow_inf_nan=False)
@@ -23,9 +22,8 @@ type RunTimeout = Annotated[
 class Config(BaseModel):
     """Remote cwd/env are ordinary persisted config, never a secret store.
 
-    Validation performs no I/O. token_env names an environment variable in the
-    calling process, resolved separately for every tool call and scope exit.
-    Ownership environment fields are metadata, not authorization or idempotency.
+    Validation performs no I/O. The local client reads token_env from the
+    executing process when the layer opens.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -55,8 +53,8 @@ class Config(BaseModel):
     def environment(cls, value: dict[str, str]) -> dict[str, str]:
         for name, content in value.items():
             cls.environment_name(name)
-            if name in OWNERSHIP_ENV or "\x00" in content:
-                raise ValueError("env contains reserved ownership metadata or NUL")
+            if "\x00" in content:
+                raise ValueError("env values must not contain NUL")
         return value
 
     @field_validator("redact_patterns")
@@ -71,11 +69,7 @@ class Config(BaseModel):
 
 
 class State(BaseModel):
-    """Layer inventory independent of the SDK's conversation identity.
-
-    State contains job IDs and byte cursors, not output or remote status caches.
-    Tools obtain resource ownership from RunContext.conversation_id, not State.
-    """
+    """Job IDs accepted by the tools and their current byte cursors."""
 
     model_config = ConfigDict(extra="forbid")
 

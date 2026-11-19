@@ -15,15 +15,18 @@ class Config(BaseModel):
     prefix: str
 
 class State(BaseModel):
-    resource: str
+    calls: int = 0
 
-async def enter(conversation_id: str, config: Config) -> State:
-    return State(resource=config.prefix)
-
-async def exit(conversation_id: str, config: Config, state: State | None) -> None:
+class Resource:
     pass
 
-layer = Layer[LayerDeps, Config, State](
+async def enter(conversation_id: str, config: Config) -> Resource:
+    return Resource()
+
+async def exit(resource: Resource) -> None:
+    pass
+
+layer = Layer[LayerDeps, Config, State, Resource](
     config_type=Config,
     state_type=State,
     capability=Capability[LayerDeps](id="typed"),
@@ -31,13 +34,18 @@ layer = Layer[LayerDeps, Config, State](
     exit_conversation=exit,
 )
 
-def make(layer_id: str, access: LayerAccess[LayerDeps]) -> Layer[LayerDeps, Config, State]:
+def make(
+    layer_id: str, access: LayerAccess[LayerDeps]
+) -> Layer[LayerDeps, Config, State, Resource]:
+    assert_type(access.data(LayerDeps()), LayerData)
     return layer
 
 def get_layers(deps: LayerDeps) -> dict[str, LayerData]:
     return deps.layers
 
-registry = LayerRegistry({"typed": make}, get_layers=get_layers)
+registry = LayerRegistry(
+    {"typed": make}, get_layers=get_layers, get_resources=lambda deps: deps.resources
+)
 assert_type(registry, LayerRegistry[LayerDeps])
 """
 
@@ -46,8 +54,8 @@ assert_type(registry, LayerRegistry[LayerDeps])
     "old,new,diagnostic",
     [
         ("", "", None),
-        ("state: State | None", "state: State", "exit_conversation"),
-        ("state: State | None", "state: Config | None", "exit_conversation"),
+        ("resource: Resource", "resource: State", "exit_conversation"),
+        ("resource: Resource", "resource: Config", "exit_conversation"),
         (
             "async def enter(conversation_id: str, config: Config)",
             "async def enter(conversation_id: str, config: State)",
@@ -55,22 +63,22 @@ assert_type(registry, LayerRegistry[LayerDeps])
         ),
         ("conversation_id: str", "conversation_id: UUID", "enter_conversation"),
         (
-            "-> State:\n    return State(resource=config.prefix)",
+            "-> Resource:\n    return Resource()",
             "-> Config:\n    return config",
             "enter_conversation",
         ),
         (
             "-> None:\n    pass",
-            "-> State:\n    return State(resource=config.prefix)",
+            "-> Resource:\n    return Resource()",
             "exit_conversation",
         ),
         ("Capability[LayerDeps]", "Capability[int]", "capability"),
         ('    capability=Capability[LayerDeps](id="typed"),\n', "", "capability"),
     ],
     ids=[
-        "optional_exit",
-        "required_state_exit",
-        "wrong_state",
+        "resource_exit",
+        "state_is_not_resource",
+        "config_is_not_resource",
         "wrong_config",
         "uuid_identity",
         "enter_return",

@@ -18,15 +18,11 @@ The equivalent direct entry is `python -m kapy.interfaces.<name>.main ...`.
 Each process creates its own core PostgreSQL pool, Valkey client, SessionService
 and Temporal Client through `open_resources()`. They communicate through core tables
 and a common Valkey output namespace. HTTP also exposes these borrowed resources
-on `app.state.resources`. SessionService resolves configuration per direct runner
-start, and submits the standalone Agent Activity to the common Temporal task queue.
-An independent `python -m kapy.runner.worker` owns Agent/model resources;
-interfaces submit Activity execution and do not start a Worker. Session creation
-dispatches its creation Activity and waits for readiness; `enter_conversation`
-initializes business State with `str(session_id)` and may perform business
-I/O in the Worker. Closing likewise requires the Worker. Agent execution is a
-separate run operation using that same SDK conversation ID; `exit_conversation`
-belongs to explicit close and creation compensation.
+on `app.state.resources`. SessionService commits session creation and closure
+in PostgreSQL and submits Agent execution to the common Temporal task queue.
+An independent `python -m kapy.runner.worker` loads current configuration on
+admission and owns the Agent's model, Toolsets and local Layer handles. It uses
+`str(session_id)` as the SDK conversation ID for every run.
 
 Common environment values (read only during command execution):
 

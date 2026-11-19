@@ -11,7 +11,6 @@ from .types import (
     SessionActivity,
     SessionAlreadyExists,
     SessionBusy,
-    SessionExecutionError,
     SessionRecord,
     UpdateSession,
 )
@@ -30,5 +29,4 @@ __all__ = [
     "ActivityReference",
     "SessionBusy",
     "SessionActivity",
-    "SessionExecutionError",
 ]

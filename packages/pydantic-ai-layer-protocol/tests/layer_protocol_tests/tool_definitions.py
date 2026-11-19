@@ -14,7 +14,7 @@ from pydantic_ai_layer_protocol.examples.echo import Config, State
 __all__ = ["make"]
 
 
-def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
+def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State, None]:
     def approved_echo(text: str) -> str:
         return text
 

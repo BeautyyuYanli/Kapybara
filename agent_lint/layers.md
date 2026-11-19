@@ -25,28 +25,12 @@ globs:
 6. 工具实际执行必须与快照中的工具身份、调用标识和业务参数语义一致，不得静默
    改变已记录调用的语义。
 
-7. 业务 layer 的 tool 或 hook 创建上游资源时，上游支持则应为资源或其 scope
-   设置会话归属标识。标识根据当前会话的 `conversation_id`、`layer_id` 和固定
-   Config 按需确定或派生，只使用定位本 conversation 资源所必需的信息，
-   不得由模型指定或覆盖。
+7. Kapy 每次 Agent run 显式传入 `conversation_id=str(session_id)`；工具和 SDK hooks
+   从 `ctx.conversation_id` 读取身份，不从 State 或 Kapy deps 身份字段推断。
 
-8. `exit_conversation` 应能重建归属标识，找全并回收所属资源，包括未写入 State
-   的资源。
+8. Config 仅保存固定配置及外部借用资源的定位信息。State 仅保存业务 JSON 进度。
+   配置验证、从 `{}` 初始化默认 State 和序列化均在本地完成。
 
-9. 上游不支持按归属查询或清理时，可依赖 State 尽力回收，但须在具体实现
-   中说明可能遗漏资源并留下孤儿资源的局限。
-
-10. Kapy 每次 Agent run 显式传入 `conversation_id=str(session_id)`；工具和 SDK hooks
-    从 `ctx.conversation_id` 读取身份，不从 State 或 Kapy deps 身份字段推断。
-
-11. `enter_conversation(conversation_id, config)` 只在创建时初始化 State。
-
-12. `exit_conversation(conversation_id, config, state)` 用于显式关闭和创建失败补偿。
-
-13. `enter_conversation` 和 `exit_conversation` 是独立回调，没有 RunContext，
-    由宿主传入同一个字符串身份。
-
-14. State 只保存业务进度及必要的回收记录。
-
-15. 配置校验、默认 State 初始化与序列化无外部 I/O；enter 可执行业务 I/O。
-    无 enter 时 State 必须能从 `{}` 初始化。
+9. `enter_conversation(conversation_id, config) -> R` 仅从 Config 水合本地句柄，
+   `exit_conversation(resource) -> None` 仅关闭该句柄。两者在数据库事务外执行。
+   State 由业务工具和 hooks 维护，长生命周期外部资源由外部系统或其编排方管理。

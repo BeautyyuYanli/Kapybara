@@ -1,7 +1,7 @@
 """Session HTTP composition and WebSocket transport; services own history/admission.
 
-Create/close wait for native Activity results. Runner submission returns a native
-execution reference; 202 acceptance does not imply Worker admission.
+Create and close return committed session records. Runner submission returns the
+Temporal reference before the Worker attempts admission.
 Borrowed services outlive requests and subscriptions.
 """
 
@@ -28,7 +28,7 @@ from kapy.pagination import Page
 
 from .dependencies import HistoryPage, LiveCursor, OffsetPage
 from .errors import ControlRoute
-from .types import CloseSession, CreateSessionRequest, StartRunner
+from .types import StartRunner
 
 _logger = logging.getLogger(__name__)
 _output_adapter = TypeAdapter(list[OutputEvent])
@@ -38,11 +38,8 @@ def create_session_router(sessions: SessionService) -> APIRouter:
     router = APIRouter(route_class=ControlRoute)
 
     @router.post("/sessions", status_code=201, operation_id="create_session")
-    async def create_session(data: CreateSessionRequest) -> SessionRecord:
-        return await sessions.create_session(
-            CreateSession.model_validate(data.model_dump(exclude={"activity_id"})),
-            activity_id=data.activity_id,
-        )
+    async def create_session(data: CreateSession) -> SessionRecord:
+        return await sessions.create_session(data)
 
     @router.get("/sessions", operation_id="list_sessions")
     async def list_sessions(
@@ -61,8 +58,8 @@ def create_session_router(sessions: SessionService) -> APIRouter:
         return await sessions.update_session(session_id, data)
 
     @router.post("/sessions/{session_id}/close", operation_id="close_session")
-    async def close_session(session_id: UUID, data: CloseSession) -> SessionRecord:
-        return await sessions.close_session(session_id, activity_id=data.activity_id)
+    async def close_session(session_id: UUID) -> SessionRecord:
+        return await sessions.close_session(session_id)
 
     @router.post("/sessions/{session_id}/runner", status_code=202, operation_id="start_runner")
     async def start_runner(session_id: UUID, data: StartRunner) -> ActivityReference:

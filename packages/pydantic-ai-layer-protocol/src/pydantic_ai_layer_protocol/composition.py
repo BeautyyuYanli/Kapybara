@@ -1,7 +1,7 @@
 """Select static layers and bind native capabilities and Toolsets to each run.
 
-Static definitions retain no execution deps or business-scope resources. Native
-SDK for_agent/for_run hooks keep capability and Toolset lifecycles independent.
+Static definitions retain no execution deps or runtime handles. Native SDK
+for_agent/for_run hooks keep capability and Toolset lifecycles independent.
 """
 
 from collections.abc import Callable, Mapping
@@ -21,9 +21,10 @@ from .types import Layer, LayerData
 class _SelectedLayers[DepsT](AbstractCapability[DepsT]):
     """Replace selection with a run-local composition of installed definitions."""
 
-    installed: Mapping[str, Layer[DepsT, Any, Any]]
+    installed: Mapping[str, Layer[DepsT, Any, Any, Any]]
     prepared: Mapping[str, AbstractCapability[DepsT]]
     get_layers: Callable[[DepsT], dict[str, LayerData]]
+    get_resources: Callable[[DepsT], Mapping[str, Any]] | None
 
     def for_agent(self, agent: AbstractAgent[DepsT, Any]) -> AbstractCapability[DepsT]:
         return replace(
@@ -40,15 +41,20 @@ class _SelectedLayers[DepsT](AbstractCapability[DepsT]):
             )
         except ValueError as exc:
             raise UserError("Invalid layer configuration or state") from exc
+        resources = self.get_resources(ctx.deps) if self.get_resources is not None else {}
+        for name in selected:
+            if self.installed[name].enter_conversation is not None and name not in resources:
+                raise UserError(f"Layer {name!r} has no open resource")
         return await CombinedCapability([self.prepared[name] for name in selected]).for_run(ctx)
 
 
 def _layers_capability[DepsT](
-    layers: Mapping[str, Layer[DepsT, Any, Any]],
+    layers: Mapping[str, Layer[DepsT, Any, Any, Any]],
     *,
     get_layers: Callable[[DepsT], dict[str, LayerData]],
+    get_resources: Callable[[DepsT], Mapping[str, Any]] | None,
 ) -> AbstractCapability[DepsT]:
-    """Prepare stable installed leaves; select current deps without business-scope hooks.
+    """Prepare stable installed leaves and select current deps without opening handles.
 
     Native containers retain their structure. Callable or dynamic leaf Toolsets
     are supported; capability factories producing unknown subtrees are outside
@@ -66,4 +72,5 @@ def _layers_capability[DepsT](
         installed=installed,
         prepared={name: layer.capability for name, layer in installed.items()},
         get_layers=get_layers,
+        get_resources=get_resources,
     )

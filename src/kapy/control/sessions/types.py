@@ -16,8 +16,8 @@ from kapy.lifecycle import LifecycleStatus
 class CreateSession(DTO):
     """Fixed execution configuration; optional id lets callers resolve lost responses.
 
-    The Activity UUID is the default session ID. Temporal retains deduplication
-    and results only for its retention period; the session primary key is permanent.
+    The service generates a session ID if omitted. The primary key stays
+    reserved even after closure.
     """
 
     id: UUID | None = None
@@ -56,23 +56,16 @@ class SessionRecord(DTO):
 
 
 class SessionAlreadyExists(RuntimeError):
-    """A fixed identity is already registered or owned; never replay creation."""
+    """A session identity is already registered, including closed sessions."""
 
     def __init__(self, session_id: UUID) -> None:
         self.session_id = session_id
-        super().__init__(f"Session {session_id} already exists or is being created")
+        super().__init__(f"Session {session_id} already exists")
 
 
-class SessionActivityRequest(DTO):
+class RunAgentActivity(DTO):
     session_id: UUID
-
-
-class CreateSessionActivity(SessionActivityRequest):
-    request: CreateSession
-
-
-class RunAgentActivity(SessionActivityRequest):
-    user_prompt: str
+    user_prompt: str | None = None
 
 
 class ActivityReference(DTO):
@@ -89,7 +82,7 @@ class SessionActivity(ActivityReference):
     activity_type: str
     status: str
     run_state: str | None
-    result: str | SessionRecord | None = None
+    result: str | None = None
     error: str | None = None
 
 
@@ -105,19 +98,6 @@ class ActivityIdentityConflict(RuntimeError):
         self.activity_id = activity_id
         self.run_id = run_id
         super().__init__("Activity identity conflict")
-
-
-class SessionExecutionError(RuntimeError):
-    """Safe native failure or uncertain RPC outcome, with recovery identities."""
-
-    def __init__(
-        self, session_id: UUID, activity_id: UUID, run_id: str | None, category: str
-    ) -> None:
-        self.session_id = session_id
-        self.activity_id = activity_id
-        self.run_id = run_id
-        self.category = category
-        super().__init__(category)
 
 
 class OwnershipLost(RuntimeError):

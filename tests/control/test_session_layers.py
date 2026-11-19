@@ -7,19 +7,18 @@ import pytest
 from fastapi import FastAPI
 
 from kapy.control.models import ModelService
+from kapy.control.sessions import SessionService
 from kapy.control.sessions.models import SessionRow
 from kapy.interfaces.http import create_router
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-async def test_http_layer_validation_defaults_and_immutable_configuration(
-    database, session_runtime
-):
-    service = session_runtime.service(database.sessions)
+async def test_http_layer_validation_defaults_and_immutable_configuration(database):
+    service = SessionService(database.sessions)
     app = FastAPI()
     app.include_router(create_router(ModelService(database.sessions), service))
-    base = {"activity_id": str(uuid4()), "provider_id": str(uuid4()), "model_name": "test"}
+    base = {"provider_id": str(uuid4()), "model_name": "test"}
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -33,9 +32,7 @@ async def test_http_layer_validation_defaults_and_immutable_configuration(
             },
             {"layer_states": {"shell": {"jobs": {"injected": 1}}}},
         ):
-            response = await client.post(
-                "/api/sessions", json=base | invalid | {"activity_id": str(uuid4())}
-            )
+            response = await client.post("/api/sessions", json=base | invalid)
             assert response.status_code == 422
         assert not (await service.list_sessions()).items
         response = await client.post(

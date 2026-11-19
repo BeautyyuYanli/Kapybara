@@ -16,9 +16,9 @@ class State(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State]:
+def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State, None]:
     def instructions(ctx: RunContext[DepsT]) -> str:
-        return Config.model_validate(access(ctx.deps)["config"]).instructions
+        return Config.model_validate(access.data(ctx.deps)["config"]).instructions
 
     return Layer(
         config_type=Config,

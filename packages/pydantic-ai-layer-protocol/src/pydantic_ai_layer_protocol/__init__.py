@@ -1,7 +1,6 @@
-"""Typed layer protocol independent of application storage and business scopes."""
+"""Typed layer protocol for native capabilities, JSON data and local handles."""
 
 from .registry import LayerRegistry, dump_object
-from .scopes import RetryableScopeError
 from .types import JsonObject, Layer, LayerAccess, LayerData, LayerDeps, LayerFactory
 
 __all__ = [
@@ -12,6 +11,5 @@ __all__ = [
     "LayerDeps",
     "LayerFactory",
     "LayerRegistry",
-    "RetryableScopeError",
     "dump_object",
 ]

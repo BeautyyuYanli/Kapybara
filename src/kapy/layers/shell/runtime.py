@@ -1,16 +1,17 @@
-"""Shared shellctl calls; the caller owns job inventory and its write semantics.
+"""Run-local shellctl handles and calls backed by the layer's job inventory.
 
-Remote effects are never repeated to resolve a state conflict. A lost creation
-response can leave an unknown job; ownership metadata identifies the conversation
-but shellctl cannot query by it or provide allocation atomicity or security isolation.
+A lost creation response can leave a remote job without a local inventory entry.
+Repeating that request could create another job.
 """
 
+import asyncio
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 import anyio
 import httpx2
+from anyio.lowlevel import checkpoint_if_cancelled
 from shellctl import JobMode, JobResult, ShellctlClient, ShellctlClientError
 from shellctl.shared.constants import DEFAULT_TERMINATE_GRACE_SECONDS, DEFAULT_TIMEOUT_SECONDS
 
@@ -20,29 +21,37 @@ from .output import Redactor, format_interrupt, format_output
 REMOTE_ERRORS = (ShellctlClientError, httpx2.HTTPError)
 
 
-@asynccontextmanager
-async def open_client(
-    config: Config, *, client_type: type[ShellctlClient] = ShellctlClient
-) -> AsyncIterator[tuple[ShellctlClient, Redactor]]:
-    """Resolve the token only at an execution/close boundary and always close HTTP."""
+@dataclass(frozen=True)
+class ShellResource:
+    client: ShellctlClient
+    redact: Redactor
+
+
+async def enter_conversation(conversation_id: str, config: Config) -> ShellResource:
+    """Resolve credentials and construct a local client for the configured service."""
     token = os.environ.get(config.token_env, "")
-    client = client_type(str(config.base_url), token=token)
+    redact = Redactor(config.redact_patterns, token)
+    return ShellResource(ShellctlClient(str(config.base_url), token=token), redact)
+
+
+async def exit_conversation(resource: ShellResource) -> None:
+    """Join the local HTTP close before propagating caller cancellation."""
+    # Give the close task a native deadline that also reaches the HTTP pool's shield.
+    close_task = asyncio.create_task(asyncio.wait_for(resource.client.close(), timeout=5))
+    cancelled: asyncio.CancelledError | None = None
+    with anyio.CancelScope(shield=True):
+        while not close_task.done():
+            try:
+                # Waiting for completion keeps native caller cancellation local to this task.
+                await asyncio.wait((close_task,))
+            except asyncio.CancelledError as exc:
+                cancelled = exc
     try:
-        yield client, Redactor(config.redact_patterns, token)
+        close_task.result()
     finally:
-        with anyio.fail_after(5, shield=True):
-            await client.close()
-
-
-async def delete_job(client: ShellctlClient, job_id: str) -> None:
-    """Require acknowledged deletion, accepting an already absent job for retries."""
-    try:
-        result = await client.delete(job_id, force=True, grace_seconds=0)
-        if not result.deleted:
-            raise RuntimeError(f"shellctl did not confirm deletion of job {job_id}")
-    except ShellctlClientError as error:
-        if error.code != "job_not_found":
-            raise
+        if cancelled is not None:
+            raise cancelled
+        await checkpoint_if_cancelled()
 
 
 def instructions(config: Config, prefix: str, redact: Redactor) -> str:
@@ -54,8 +63,8 @@ def instructions(config: Config, prefix: str, redact: Redactor) -> str:
         f"{prefix}_interrupt(job_id) to terminate a job. Only this session's "
         "registered jobs are accepted. Timeout limits waiting for output, not "
         "job lifetime: done=false means the job may still be running. Tasks "
-        "survive an execution and are cleaned up at session close; shellctl "
-        "may GC terminal jobs and logs sooner. Long output shows only head/tail "
+        "survive an execution. Shellctl manages job lifetime and garbage collection "
+        "of terminal jobs and logs. Long output shows only head/tail "
         "and a remote full-log path. For ordered interactions on one job, wait "
         "for each tool result before sending the next call. A failed run may "
         "already have created a job; repeating run is not idempotent."
@@ -67,8 +76,7 @@ class ShellOperations:
 
     Layer callbacks explicitly replace State JSON.
     Register the ID before any tail read to update the caller's inventory; the
-    caller owns persistence. Durable Activity failure/cancellation does not commit
-    its local layer State.
+    caller owns persistence. A failed Activity retains its last saved State.
     """
 
     def __init__(
@@ -77,15 +85,11 @@ class ShellOperations:
         client: ShellctlClient,
         redact: Redactor,
         *,
-        conversation_id: str,
-        provider: str,
-        name: str,
         known: Callable[[str], Awaitable[int | None]],
         register: Callable[[str], Awaitable[None]],
         change: Callable[[str, int | None], Awaitable[None]],
     ) -> None:
         self.config, self.client, self.redact = config, client, redact
-        self.conversation_id, self.provider, self.name = conversation_id, provider, name
         self.known, self.register, self.change = known, register, change
 
     async def _remote_error(self, error: Exception, job_id: str) -> str:
@@ -109,14 +113,9 @@ class ShellOperations:
         timeout: RunTimeout = DEFAULT_TIMEOUT_SECONDS,  # noqa: ASYNC109 - server wait budget
     ) -> str:
         """Create one PTY job; a transport error can follow a successful creation."""
-        env = self.config.env | {
-            "KAPY_SESSION_ID": self.conversation_id,
-            "KAPY_PLUGIN_PROVIDER": self.provider,
-            "KAPY_PLUGIN_NAME": self.name,
-        }
         try:
             result = await self.client.run(
-                script, cwd=self.config.cwd, env=env, mode=JobMode.PTY, timeout=timeout
+                script, cwd=self.config.cwd, env=self.config.env, mode=JobMode.PTY, timeout=timeout
             )
         except REMOTE_ERRORS as error:
             return self.redact.error(f"{error}; the job may already have been created")

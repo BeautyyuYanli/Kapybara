@@ -57,6 +57,7 @@ async def migrate(
             "durable-only",
             "session-operations",
             "temporal-session-ownership",
+            "local-session-lifecycle",
         }
     ):
         raise ValueError("plan must name a supported revision generation plan")
@@ -86,6 +87,7 @@ async def migrate(
                         "durable-only": revision_plans.durable_only,
                         "session-operations": revision_plans.session_operations,
                         "temporal-session-ownership": revision_plans.temporal_session_ownership,
+                        "local-session-lifecycle": revision_plans.local_session_lifecycle,
                     }[plan]
                 execute(config, operation, message=message)
 
@@ -106,6 +108,7 @@ def main(argv: list[str]) -> int:
             "durable-only",
             "session-operations",
             "temporal-session-ownership",
+            "local-session-lifecycle",
         ],
     )
     args = parser.parse_args(argv)

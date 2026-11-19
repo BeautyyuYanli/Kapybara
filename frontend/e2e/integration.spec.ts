@@ -38,7 +38,15 @@ test("actual FastAPI supports config CRUD and slash model identity", async ({ pa
   // Model references are weak: deleting configuration retains session identity/history.
   const session = await page.request.get(`http://127.0.0.1:8001/api/sessions/${sessionId}`);
   expect(session.ok()).toBe(true);
-  expect(await session.json()).toMatchObject({ id: sessionId, model_name: "vendor/model" });
+  expect(await session.json()).toMatchObject({
+    id: sessionId, model_name: "vendor/model", status: "ready",
+  });
+  const closed = await page.request.post(`http://127.0.0.1:8001/api/sessions/${sessionId}/close`);
+  expect(closed.status()).toBe(200);
+  expect(await closed.json()).toMatchObject({ id: sessionId, status: "closed" });
+  await page.goto(`${base}sessions/${sessionId}`);
+  await expect(page.getByText("会话已关闭。")).toBeVisible();
+  await expect(page.getByRole("button", { name: "保存 Session" })).toBeDisabled();
   await page.goto(`${base}providers/new`);
   await page.getByLabel("名称", { exact: true }).fill(`${name} unused`);
   await page.getByLabel("API key", { exact: true }).fill("local-test-not-a-real-key");

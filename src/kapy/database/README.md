@@ -38,7 +38,19 @@ current business write ownership. Normal completion clears both. A database CHEC
 requires both empty or both present. Temporal owns all execution status, input,
 results and timeouts; provider credentials and run snapshots never enter run
 Activity parameters. Run final save commits snapshot/all States and ownership
-release together; cleanup saves State progress in owned short transactions.
+release together. Failed runs keep the session ready and retain its most recent
+committed snapshot and history.
+
+The local session lifecycle revision archives historical `creating` and `closing`
+rows as `closed`, clears their writer identities, and narrows `sessions.status`
+to `VARCHAR(6)` with default `ready`. Existing `ready` and `closed` rows,
+configuration, State, snapshots and history are preserved. Downgrade is irreversible.
+Stop interfaces and Workers and drain or end their Activities before upgrading.
+Generate against a disposable schema at `1b9d8771d8cb`:
+
+```sh
+kapy db revision --message 'Use a local two-state session lifecycle' --plan local-session-lifecycle
+```
 
 The temporal-session-ownership revision drops session_operations without copying
 its private inputs/results into other storage. It maps legacy creating/starting/
@@ -55,10 +67,9 @@ cannot stop their execution. New code/schema and minimal native Activity request
 must be deployed together; UUID-only legacy inputs are incompatible. Revisions are
 generated from explicit plans and contain fixed SQL, never runtime plan imports.
 
-Shell layer State stores only `jobs` and byte cursors; `enter_conversation`
-initializes the empty inventory. Identity comes from the SDK's `ctx.conversation_id`,
-explicitly set to `str(session_id)` on every Agent run. Independent enter/exit
-callbacks receive that same string from the host, not from State.
+Shell layer State stores only `jobs` and byte cursors. Session creation
+initializes the empty inventory. Kapy passes `str(session_id)` to every Agent run
+as the SDK conversation ID.
 The shell-conversation-state data migration removes only `scope_id` from existing
 shell JSON objects, preserving jobs, other fields, other layer States and all other
 session/history data. Missing or non-object shell State remains unchanged.
@@ -139,8 +150,6 @@ retained confirmed history and checkpoint-session history, removed unconfirmed
 durable requests and unmarked their snapshot entries while keeping SDK content.
 It did not change snapshot versions. Telegram's matching conversion folded sent
 reply receipts into after_seq and kept unfinished pending-send offsets. These
-conversions also require stopped interfaces/runners and reject irreversible
-downgrades. The earlier shell-scope-state plan filled missing shell identity, and
-its downgrade removed it; the later shell-conversation-state revision removes that
-persisted identity again in favor of the SDK context. The current head retains
-complete history and durable snapshots without legacy page/checkpoint storage.
+conversions also require stopped interfaces and runners and reject irreversible
+downgrades. The earlier shell-scope-state plan filled missing shell identity.
+The shell-conversation-state revision removes that persisted field.

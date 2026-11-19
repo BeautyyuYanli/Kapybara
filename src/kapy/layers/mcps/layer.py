@@ -47,11 +47,11 @@ def make_toolset[DepsT](config: Config, *, id: str = "mcps") -> Toolset[DepsT]:
     )
 
 
-def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State]:
+def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State, None]:
     """Contribute a fresh MCPToolset for each selected run, with empty JSON State."""
 
     def toolset(ctx: RunContext[DepsT]) -> Toolset[DepsT]:
-        config = Config.model_validate(access(ctx.deps)["config"])
+        config = Config.model_validate(access.data(ctx.deps)["config"])
         return make_toolset(config, id=layer_id)
 
     return Layer(

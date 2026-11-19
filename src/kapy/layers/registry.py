@@ -21,4 +21,8 @@ def get_layers(deps: RunnerDeps) -> dict[str, LayerData]:
     return deps.layers
 
 
-layer_registry = LayerRegistry({"shell": shell.make, "mcps": mcps.make}, get_layers=get_layers)
+layer_registry = LayerRegistry(
+    {"shell": shell.make, "mcps": mcps.make},
+    get_layers=get_layers,
+    get_resources=lambda deps: deps.layer_resources,
+)

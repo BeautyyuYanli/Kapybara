@@ -138,16 +138,6 @@ export type CachePoint = {
 };
 
 /**
- * CloseSession
- */
-export type CloseSession = {
-    /**
-     * Activity Id
-     */
-    activity_id: string;
-};
-
-/**
  * CompactionPart
  *
  * A compaction part that summarizes previous conversation history.
@@ -222,9 +212,14 @@ export type CreateProvider = {
 };
 
 /**
- * CreateSessionRequest
+ * CreateSession
+ *
+ * Fixed execution configuration; optional id lets callers resolve lost responses.
+ *
+ * The service generates a session ID if omitted. The primary key stays
+ * reserved even after closure.
  */
-export type CreateSessionRequest = {
+export type CreateSession = {
     /**
      * Id
      */
@@ -245,10 +240,6 @@ export type CreateSessionRequest = {
      */
     title?: string;
     model_settings?: JsonObject;
-    /**
-     * Activity Id
-     */
-    activity_id: string;
 };
 
 /**
@@ -451,7 +442,7 @@ export type JsonValue = unknown;
 /**
  * LifecycleStatus
  */
-export type LifecycleStatus = 'creating' | 'ready' | 'closing' | 'closed';
+export type LifecycleStatus = 'ready' | 'closed';
 
 /**
  * LoadCapabilityArgs
@@ -1163,7 +1154,7 @@ export type SessionActivity = {
     /**
      * Result
      */
-    result?: string | SessionRecord | null;
+    result?: string | null;
     /**
      * Error
      */
@@ -1276,7 +1267,7 @@ export type StartRunner = {
     /**
      * User Prompt
      */
-    user_prompt: string;
+    user_prompt?: string | null;
 };
 
 /**
@@ -2878,7 +2869,7 @@ export type ListSessionsResponses = {
 export type ListSessionsResponse = ListSessionsResponses[keyof ListSessionsResponses];
 
 export type CreateSessionData = {
-    body: CreateSessionRequest;
+    body: CreateSession;
     path?: never;
     query?: never;
     url: '/api/sessions';
@@ -2963,7 +2954,7 @@ export type UpdateSessionResponses = {
 export type UpdateSessionResponse = UpdateSessionResponses[keyof UpdateSessionResponses];
 
 export type CloseSessionData = {
-    body: CloseSession;
+    body?: never;
     path: {
         /**
          * Session Id

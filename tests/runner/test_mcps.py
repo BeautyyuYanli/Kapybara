@@ -53,7 +53,7 @@ async def test_registered_mcps_layer_owns_gateway_per_run_and_reuses_saved_opera
     async with Worker(
         client,
         task_queue=queue,
-        activities=[runner.create, runner.run, runner.close],
+        activities=[runner.run],
     ):
         service = SessionService(
             runner_database.sessions, temporal_client=client, temporal_task_queue=queue
@@ -63,8 +63,7 @@ async def test_registered_mcps_layer_owns_gateway_per_run_and_reuses_saved_opera
                 provider_id=provider.id,
                 model_name="mcp-test",
                 layers={"mcps": config},
-            ),
-            activity_id=uuid4(),
+            )
         )
         assert not marker.exists(), "Session creation must not launch an MCP client"
         gateways = set()
@@ -100,4 +99,4 @@ async def test_registered_mcps_layer_owns_gateway_per_run_and_reuses_saved_opera
             assert confirmed.run_id == operation.run_id
             assert await confirmed.result() == "worker:durable:durable-secret"
             assert marker.read_text() == before
-        await service.close_session(session.id, activity_id=uuid4())
+        await service.close_session(session.id)

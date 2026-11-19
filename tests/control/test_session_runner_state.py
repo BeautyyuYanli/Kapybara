@@ -27,8 +27,6 @@ async def finish(repo, session_id, key, run_id, *, success):
         session_id,
         key,
         run_id,
-        (LifecycleStatus.READY,),
-        LifecycleStatus.READY if success else LifecycleStatus.CLOSING,
         runner_state="opaque 摘要" if success else None,
         layer_states={} if success else None,
     )
@@ -97,7 +95,7 @@ async def test_success_and_failure_race_commits_one_business_outcome(
         await asyncio.gather(first, second, return_exceptions=True)
     async with database.sessions.begin() as db:
         row = await db.get(SessionRow, session_id)
-        assert row.status == (LifecycleStatus.READY if winner else LifecycleStatus.CLOSING)
+        assert row.status == LifecycleStatus.READY
         assert row.runner_state == ("opaque 摘要" if winner else None)
         assert row.current_activity_id is row.current_activity_run_id is None
 
@@ -108,27 +106,19 @@ async def test_same_uuid_new_native_run_is_a_different_writer(database, seed_ses
     key, old_run = await running(database, session_id)
     new_run = str(uuid4())
     async with database.sessions.begin() as db:
-        row = await SessionRepository(db).claim_close_or_run(
+        row = await SessionRepository(db).claim_run(
             session_id,
             key,
             new_run,
-            close=True,
-            previous=(key, old_run, LifecycleStatus.READY),
+            previous=(key, old_run),
         )
         assert row is not None and row.current_activity_run_id == new_run
     with pytest.raises(OwnershipLost):
         async with database.sessions.begin() as db:
-            await SessionRepository(db).guard(session_id, key, old_run, (LifecycleStatus.CLOSING,))
+            await SessionRepository(db).guard(session_id, key, old_run)
     async with database.sessions.begin() as db:
         assert (
-            await SessionRepository(db).claim_close_or_run(
-                session_id,
-                uuid4(),
-                str(uuid4()),
-                close=True,
-                previous=(key, old_run, LifecycleStatus.READY),
-            )
-            is None
+            await SessionRepository(db).close_session(session_id, previous=(key, old_run)) is None
         )
         with pytest.raises(SessionBusy):
             await SessionRepository(db).update_session(session_id, {"title": "late edit"})

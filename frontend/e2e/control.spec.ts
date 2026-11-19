@@ -143,7 +143,7 @@ test("model slash identity uses router encoding once and nullable context PATCH"
   expect(saved.postDataJSON()).toEqual({ name: model.name, settings: {}, context_window: null });
 });
 
-test("session creation sends only model configuration without obsolete context controls", async ({
+test("session creation sends configuration and opens the returned session", async ({
   page,
 }) => {
   await page.goto("sessions/new");
@@ -154,12 +154,12 @@ test("session creation sends only model configuration without obsolete context c
   const request = page.waitForRequest((request) => request.method() === "POST");
   await page.getByRole("button", { name: "保存 Session" }).click();
   expect((await request).postDataJSON()).toEqual({
-    activity_id: expect.any(String),
     title: "",
     provider_id: id,
     model_name: model.model_name,
     model_settings: {},
-      });
+  });
+  await expect(page).toHaveURL(new RegExp(`/sessions/${id}$`));
   await expect(page.getByRole("heading", { name: "编辑 Session" })).toBeVisible();
 });
 
@@ -563,279 +563,56 @@ for (const key of ["provider_id", "model_name"] as const) {
   });
 }
 
-test("unconfirmed creation keeps its reference across reload until explicitly abandoned", async ({ page }) => {
-  const requests: Record<string, unknown>[] = [];
-  await page.route("**/api/sessions/**", (route) => {
-    if (new URL(route.request().url()).pathname === `/api/sessions/${id}`) return route.fallback();
-    return route.fulfill({ status: 404, json: { detail: "Resource not found" } });
-  });
+test("a failed session POST keeps the draft available to retry", async ({ page }) => {
+  const requests: unknown[] = [];
   await page.route("**/api/sessions", async (route) => {
     if (route.request().method() !== "POST") return route.fallback();
     requests.push(route.request().postDataJSON());
     if (requests.length === 1) return route.abort("failed");
-    await route.fulfill({ json: session });
+    await route.fulfill({ status: 201, json: session });
   });
   await page.goto("sessions/new");
-  await page.getByLabel("标题").fill("Retained intent");
+  await page.getByLabel("标题").fill("Draft title");
   await page.getByLabel("Provider").selectOption(id);
   await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
-  await page.getByRole("button", { name: "保存 Session" }).click();
-  await expect(page.getByRole("alert")).toContainText("结果无法确认");
-  const key = requests[0]!.activity_id as string;
-  await page.reload();
-  await expect(page.getByRole("alert")).toContainText("结果无法确认");
-  await expect(page.getByLabel("标题")).toHaveValue("Retained intent");
-  await expect(page.getByLabel("标题")).toBeDisabled();
-  await page.getByRole("button", { name: "查询创建结果" }).click();
-  await expect(page.getByRole("alert")).toContainText("结果无法确认");
-  expect(requests).toHaveLength(1);
-  expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("kapy:session-create")!).activity_id)).toBe(key);
-  await page.getByRole("button", { name: "放弃这次创建" }).click();
-  await page.getByLabel("标题").fill("New intent");
-  await page.getByRole("button", { name: "保存 Session" }).click();
+  const save = page.getByRole("button", { name: "保存 Session" });
+  await save.click();
+  await expect(page.getByRole("alert")).toContainText("网络连接失败");
+  await expect(page.getByLabel("标题")).toHaveValue("Draft title");
+  await expect(save).toBeEnabled();
+  await save.click();
   await expect(page).toHaveURL(new RegExp(`/sessions/${id}$`));
-  expect(requests).toHaveLength(2);
-  expect(requests[1]!.activity_id).not.toBe(key);
+  expect(requests).toEqual(Array(2).fill({
+    title: "Draft title", provider_id: id, model_name: model.model_name, model_settings: {},
+  }));
 });
 
-test("lost create response opens the committed business resource without resubmission", async ({ page }) => {
-  let created: SessionRecord | null = null;
-  let submits = 0;
-  await page.route("**/api/sessions", (route) => {
+test("a late session POST leaves the reopened form and its draft in place", async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/api/sessions", async (route) => {
     if (route.request().method() !== "POST") return route.fallback();
-    submits++;
-    const body = route.request().postDataJSON();
-    created = { ...session, id: body.activity_id };
-    return route.abort("failed");
+    await gate;
+    await route.fulfill({ status: 201, json: session });
   });
-  await page.route("**/api/sessions/**", (route) => route.fulfill({ json: created }));
   await page.goto("sessions/new");
   await page.getByLabel("Provider").selectOption(id);
   await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
+  const submitted = page.waitForRequest((request) => request.method() === "POST");
   await page.getByRole("button", { name: "保存 Session" }).click();
-  await expect(page.getByRole("heading", { name: "编辑 Session" })).toBeVisible();
-  expect(submits).toBe(1);
-  expect(await page.evaluate(() => sessionStorage.getItem("kapy:session-create"))).toBeNull();
+  await submitted;
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "Session", exact: true }).click();
+  await page.getByRole("link", { name: "创建 Session", exact: true }).click();
+  await page.getByLabel("标题").fill("Fresh draft");
+  const completed = page.waitForResponse((response) => response.request().method() === "POST");
+  release();
+  await (await completed).finished();
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+  );
+  await expect(page).toHaveURL(/\/sessions\/new$/);
+  await expect(page.getByLabel("标题")).toHaveValue("Fresh draft");
 });
-
-test("queued creation persists native run identity and only queries after reload", async ({ page }) => {
-  const key = "00000000-0000-4000-8000-000000000099";
-  const runId = "native-run";
-  const queries: string[] = [];
-  await page.addInitScript(({ key, id, modelName }) => {
-    if (sessionStorage.getItem("kapy:session-create")) return;
-    sessionStorage.setItem("kapy:session-create", JSON.stringify({
-      activity_id: key,
-      intent: JSON.stringify({ title: "Queued", provider_id: id, model_name: modelName, model_settings: {} }),
-    }));
-  }, { key, id, modelName: model.model_name });
-  await page.route(`**/api/sessions/${key}`, (route) => route.fulfill({ status: 404, json: { detail: "Not found" } }));
-  await page.route(`**/api/sessions/${key}/activities/${key}*`, (route) => {
-    queries.push(new URL(route.request().url()).search);
-    return route.fulfill({ json: {
-      session_id: key, activity_id: key, run_id: runId,
-      activity_type: "kapy.create_session", status: "RUNNING", run_state: "SCHEDULED", result: null, error: null,
-    } });
-  });
-  await page.goto("sessions/new");
-  await expect(page.getByRole("status")).toContainText("RUNNING / SCHEDULED");
-  await page.getByRole("button", { name: "查询创建结果" }).click();
-  await expect.poll(() => queries.length).toBe(2);
-  expect(queries[1]).toBe("?run_id=native-run");
-  await page.reload();
-  await expect(page.getByRole("status")).toContainText("RUNNING / SCHEDULED");
-  await expect(page.getByRole("button", { name: "保存 Session" })).toBeDisabled();
-});
-
-for (const status of [503, 500]) {
-  test(`create error ${status} pins its native run before an unavailable query and reload`, async ({ page }) => {
-    const runId = "accepted-run";
-    let submits = 0;
-    let key = "";
-    const queries: string[] = [];
-    await page.route("**/api/sessions", (route) => {
-      if (route.request().method() !== "POST") return route.fallback();
-      submits++;
-      key = route.request().postDataJSON().activity_id;
-      return route.fulfill({ status, json: {
-        detail: status === 503 ? "UnableToConfirm" : "ExecutionFailed",
-        session_id: key, activity_id: key, run_id: runId,
-      } });
-    });
-    await page.route("**/api/sessions/**", (route) => {
-      const url = new URL(route.request().url());
-      if (!url.pathname.includes("/activities/"))
-        return route.fulfill({ status: 404, json: { detail: "Not found" } });
-      queries.push(url.search);
-      if (url.searchParams.get("run_id") === runId)
-        return route.fulfill({ status: 503, json: { detail: "UnableToConfirm" } });
-      // A reused UUID can resolve to a different execution. Recovery must never
-      // fall back to that execution once the original run has been observed.
-      return route.fulfill({ json: {
-        session_id: key, activity_id: key, run_id: "replacement-run",
-        activity_type: "kapy.create_session", status: "FAILED", run_state: null,
-        result: null, error: "ExecutionFailed",
-      } });
-    });
-    await page.goto("sessions/new");
-    await page.getByLabel("Provider").selectOption(id);
-    await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
-    await page.getByRole("button", { name: "保存 Session" }).click();
-    await expect(page.getByRole("alert")).toContainText("结果无法确认");
-    const pending = () => page.evaluate(() => JSON.parse(sessionStorage.getItem("kapy:session-create")!));
-    expect(await pending()).toMatchObject({ activity_id: key, run_id: runId });
-    await page.reload();
-    await expect(page.getByRole("alert")).toContainText("结果无法确认");
-    expect(await pending()).toMatchObject({ activity_id: key, run_id: runId });
-    expect(queries).toEqual(["?run_id=accepted-run", "?run_id=accepted-run"]);
-    expect(submits).toBe(1);
-  });
-}
-
-// These branches select fixed navigation/abandonment cases, never an observed outcome.
-/* eslint-disable playwright/no-conditional-in-test */
-for (const reopened of [false, true]) {
-  test(`late create error retains its native run for a form reopened ${reopened ? "before" : "after"} the response`, async ({ page }) => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    let key = "";
-    let submits = 0;
-    const reads: string[] = [];
-    await page.route("**/api/sessions", async (route) => {
-      if (route.request().method() !== "POST") return route.fallback();
-      submits++;
-      key = route.request().postDataJSON().activity_id;
-      await gate;
-      await route.fulfill({ status: 503, json: {
-        detail: "UnableToConfirm", session_id: key, activity_id: key, run_id: "original-run",
-      } });
-    });
-    await page.route("**/api/sessions/**", (route) => {
-      const url = new URL(route.request().url());
-      reads.push(url.pathname + url.search);
-      if (!url.pathname.includes("/activities/"))
-        return route.fulfill({ status: 404, json: { detail: "Not found" } });
-      if (url.searchParams.get("run_id") !== "original-run")
-        return route.fulfill({ status: 503, json: { detail: "UnableToConfirm" } });
-      return route.fulfill({ json: {
-        session_id: key, activity_id: key, run_id: "original-run",
-        activity_type: "kapy.create_session", status: "RUNNING", run_state: "SCHEDULED",
-        result: null, error: null,
-      } });
-    });
-    await page.goto("sessions/new");
-    await page.getByLabel("标题").fill("Original intent");
-    await page.getByLabel("Provider").selectOption(id);
-    await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
-    const submitted = page.waitForRequest((request) => request.method() === "POST");
-    await page.getByRole("button", { name: "保存 Session" }).click();
-    await submitted;
-    await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "Session", exact: true }).click();
-    await expect(page).toHaveURL(/\/sessions$/);
-    if (reopened) await page.getByRole("link", { name: "创建 Session", exact: true }).click();
-    await expect(page.getByRole("alert")).toHaveCount(reopened ? 1 : 0);
-    const destination = page.url();
-    const priorReads = [...reads];
-    release();
-    await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem("kapy:session-create")!).run_id)).toBe("original-run");
-    await expect(page).toHaveURL(destination);
-    expect(reads).toEqual(priorReads);
-    if (reopened) await page.getByRole("button", { name: "查询创建结果" }).click();
-    else await page.getByRole("link", { name: "创建 Session", exact: true }).click();
-    await expect(page.getByRole("status")).toContainText("RUNNING / SCHEDULED");
-    expect(reads).toEqual([
-      ...priorReads,
-      `/api/sessions/${key}`,
-      `/api/sessions/${key}/activities/${key}?run_id=original-run`,
-    ]);
-    await expect(page.getByLabel("标题")).toHaveValue("Original intent");
-    expect(submits).toBe(1);
-  });
-}
-
-for (const newAttempt of [false, true]) {
-  test(`late create error cannot overwrite ${newAttempt ? "a new attempt" : "an explicitly abandoned reference"}`, async ({ page }) => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const requests: Record<string, unknown>[] = [];
-    const reads: string[] = [];
-    await page.route("**/api/sessions", async (route) => {
-      if (route.request().method() !== "POST") return route.fallback();
-      const body = route.request().postDataJSON();
-      requests.push(body);
-      const attempt = requests.length;
-      if (attempt === 1) await gate;
-      await route.fulfill({ status: 503, json: {
-        detail: "UnableToConfirm", session_id: body.activity_id, activity_id: body.activity_id,
-        run_id: attempt === 1 ? "original-run" : "new-run",
-      } });
-    });
-    await page.route("**/api/sessions/**", (route) => {
-      const url = new URL(route.request().url());
-      reads.push(url.pathname + url.search);
-      return route.fulfill({ status: 503, json: { detail: "UnableToConfirm" } });
-    });
-    await page.goto("sessions/new");
-    await page.getByLabel("标题").fill("Original intent");
-    await page.getByLabel("Provider").selectOption(id);
-    await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
-    const submitted = page.waitForRequest((request) => request.method() === "POST");
-    await page.getByRole("button", { name: "保存 Session" }).click();
-    await submitted;
-    await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "Session", exact: true }).click();
-    await expect(page).toHaveURL(/\/sessions$/);
-    await page.getByRole("link", { name: "创建 Session", exact: true }).click();
-    await expect(page.getByRole("alert")).toContainText("结果无法确认");
-    await page.getByRole("button", { name: "放弃这次创建" }).click();
-    await page.getByLabel("标题").fill("Fresh intent");
-    if (newAttempt) await page.getByRole("button", { name: "保存 Session" }).click();
-    await expect(page.getByRole("alert")).toHaveCount(newAttempt ? 1 : 0);
-    expect(requests).toHaveLength(newAttempt ? 2 : 1);
-    expect(requests[1]?.activity_id).not.toBe(requests[0]!.activity_id);
-    const stored = await page.evaluate(() => sessionStorage.getItem("kapy:session-create"));
-    expect(stored === null).toBe(!newAttempt);
-    expect(stored ? JSON.parse(stored).run_id : null).toBe(newAttempt ? "new-run" : null);
-    const priorReads = [...reads];
-    const completed = page.waitForResponse((response) =>
-      response.request().method() === "POST" &&
-      response.request().postDataJSON().activity_id === requests[0]!.activity_id,
-    );
-    release();
-    await (await completed).finished();
-    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-    expect(await page.evaluate(() => sessionStorage.getItem("kapy:session-create"))).toBe(stored);
-    expect(reads).toEqual(priorReads);
-    await expect(page.getByLabel("标题")).toHaveValue("Fresh intent");
-    await expect(page).toHaveURL(/\/sessions\/new$/);
-  });
-}
-/* eslint-enable playwright/no-conditional-in-test */
-
-for (const mismatch of ["session_id", "activity_id"]) {
-  test(`create recovery ignores an error reference for a different ${mismatch}`, async ({ page }) => {
-    const queries: string[] = [];
-    await page.route("**/api/sessions", (route) => {
-      if (route.request().method() !== "POST") return route.fallback();
-      const key = route.request().postDataJSON().activity_id;
-      return route.fulfill({ status: 503, json: {
-        detail: "UnableToConfirm", session_id: key, activity_id: key,
-        run_id: "unrelated-run", [mismatch]: id,
-      } });
-    });
-    await page.route("**/api/sessions/**", (route) => {
-      const url = new URL(route.request().url());
-      if (url.pathname.includes("/activities/")) queries.push(url.search);
-      return route.fulfill({ status: 404, json: { detail: "Not found" } });
-    });
-    await page.goto("sessions/new");
-    await page.getByLabel("Provider").selectOption(id);
-    await page.getByLabel("Model", { exact: true }).selectOption(model.model_name);
-    await page.getByRole("button", { name: "保存 Session" }).click();
-    await expect(page.getByRole("alert")).toContainText("结果无法确认");
-    expect(queries).toEqual([""]);
-    expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("kapy:session-create")!).run_id)).toBeUndefined();
-  });
-}
 
 test("an occupied ready session disables configuration editing", async ({ page }) => {
   await page.route(`**/api/sessions/${id}`, (route) => route.fulfill({ json: {

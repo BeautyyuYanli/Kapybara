@@ -33,7 +33,7 @@ commit. Recording and runner-state saving remain separate transactions. At
 model → tool/model and tool → model transitions, the runner saves a detached
 interrupted request snapshot with layer State. tool → end keeps the preceding
 snapshot until the Activity's final save. A failed snapshot write preserves
-the preceding saved boundary while already recorded history remains committed.
-SessionService's
-[Worker admission](../control/README.md) prevents executing a new run after such
-failure. `live()` combines these immutable messages with best-effort previews.
+the preceding saved boundary while already recorded history remains immutable.
+On failure, the Worker releases its writer and leaves the session ready. A later
+run can resume from the last committed snapshot. `live()` combines these
+immutable messages with best-effort previews. See [Worker admission](../control/README.md).

@@ -34,19 +34,21 @@ to a deployed shellctl instance.
 ```sh
 KAPY_SHELLCTL_TEST_BIN_DIR=/work/packages/shellctl/server/bin \
   python -m pytest -q -p no:cacheprovider \
-  tests/layers/test_shell_scopes.py \
+  tests/layers/test_shell.py \
   tests/runner/test_layers.py
 ```
 
-`tests/layers` checks Kapy shell behavior and host scope retries.
+`tests/layers` checks tool behavior, local client reuse and remote job retention.
 The independent package's `packages/pydantic-ai-layer-protocol/tests` checks
 typed factory assembly, arbitrary writable deps layouts,
 JSON snapshots, native for_run isolation, tool flags, hooks, instructions and ordinary run isolation. Its real Pyrefly probes use the project configuration to check
-model/hook signatures, including the required optional State on exit.
+model/hook signatures and the relationship between the enter result and exit input.
+Resource tests cover validation, reverse cleanup after partial failure and
+cancellation, and selection with missing handles.
 `runner/test_layers.py` uses deterministic SDK streaming with real
 PostgreSQL, standalone Temporal Activities and a private shellctl server. It covers
 sequential calls, cross-run cursors, native ModelRetry, failure/cancellation keeping
-the last saved node boundary and session-close retry progress. `runner/test_snapshots.py`
+the last saved node boundary and remote job retention after closure. `runner/test_snapshots.py`
 checks the three interrupted transitions through real SDK runs and PostgreSQL,
 including prompt-free resumption, interruption feedback, pending tool returns,
 layer State, model/output retries and tool failure feedback. It also checks that
@@ -58,9 +60,9 @@ instructions are checked through ordinary Agent runs. No external model API is c
 
 Shared PostgreSQL/Valkey fixtures live in `tests/conftest.py`. `tests/control`
 covers catalog, retained Temporal execution identity, conditional writer ownership,
-explicit close takeover and layer lifecycle.
+terminal writer takeover during admission and close, and the local Session lifecycle.
 `tests/agent_output` covers transport and history replay, and `tests/database`
-checks historical revisions and the ledger-removal/paired-identity migration. History fixtures
+checks historical revisions, paired writer identity and tombstone archival. History fixtures
 write through HistoryRepository in isolated short transactions; no legacy runner is
 used to seed current tests.
 

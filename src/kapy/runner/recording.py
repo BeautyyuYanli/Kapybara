@@ -6,6 +6,7 @@ SDK history. Unrecorded run tails remain only in runner_state until another mode
 Snapshots copy messages and layer State without releasing the current writer.
 """
 
+import asyncio
 from copy import deepcopy
 
 from pydantic_ai import CallToolsNode, ModelRequestNode, RunContext
@@ -23,14 +24,22 @@ from pydantic_ai.messages import (
     RetryPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext
+from temporalio import activity
 
 from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_output import MessageCommitted
 from kapy.control.sessions.repository import SessionRepository
 from kapy.layers.registry import layer_registry
-from kapy.lifecycle import LifecycleStatus
 
 from .types import RunnerDeps
+
+
+async def check_owner(deps: RunnerDeps) -> None:
+    """Check cancellation and the writer before issuing calls or finalizing a run."""
+    if activity.in_activity() and activity.is_cancelled():
+        raise asyncio.CancelledError
+    async with deps.session_factory.begin() as db:
+        await SessionRepository(db).guard(deps.session_id, deps.activity_id, deps.activity_run_id)
 
 
 class Recorder:
@@ -98,7 +107,7 @@ class Recorder:
         """
         async with deps.session_factory() as db, db.begin():
             session = await SessionRepository(db).guard(
-                deps.session_id, deps.activity_id, deps.activity_run_id, (LifecycleStatus.READY,)
+                deps.session_id, deps.activity_id, deps.activity_run_id
             )
             if session.id != deps.session_id:
                 raise ValueError("Recording identity does not match session")
@@ -123,7 +132,7 @@ class Recorder:
         layer_states = layer_registry.snapshot(deps)
         async with deps.session_factory() as db, db.begin():
             session = await SessionRepository(db).guard(
-                deps.session_id, deps.activity_id, deps.activity_run_id, (LifecycleStatus.READY,)
+                deps.session_id, deps.activity_id, deps.activity_run_id
             )
             if layer_states.keys() != session.layers.keys():
                 raise ValueError("Saved layer states must match configured layers")

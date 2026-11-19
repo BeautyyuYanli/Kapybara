@@ -1670,6 +1670,7 @@ name = "pydantic-ai-layer-protocol"
 version = "0.1.0"
 source = { editable = "packages/pydantic-ai-layer-protocol" }
 dependencies = [
+    { name = "anyio" },
     { name = "pydantic" },
     { name = "pydantic-ai-slim" },
 ]
@@ -1684,6 +1685,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.15.1,<5" },
     { name = "pydantic", specifier = ">=2.13.5,<3" },
     { name = "pydantic-ai-slim", specifier = ">=2.54.0,<3" },
 ]

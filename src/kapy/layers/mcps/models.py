@@ -1,10 +1,9 @@
 """Serializable inline MCP configuration; connection resources never enter State.
 
-Kapy persists Config as session JSON. Temporal retains the original create request,
-including inline MCP credentials. The JSON export deliberately preserves those
-plaintext credentials; repr hides them. Run Activity input contains only session
-ID and prompt, with provider credentials loaded in the Worker. No clients,
-processes or encryption keys are stored.
+Kapy persists Config as session JSON in PostgreSQL. The JSON export includes
+inline MCP credentials in the public session DTO. The model representation
+hides those credentials. Run Activity input contains only session ID and prompt,
+with provider credentials loaded in the Worker.
 Validation and serialization perform no external I/O.
 """
 

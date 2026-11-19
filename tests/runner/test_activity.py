@@ -45,12 +45,14 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ApplicationError, CancelledError
 from temporalio.worker import Worker
 
-from kapy.agent_history import HistoryRepository
+from kapy.agent_history import HistoryMessage, HistoryRepository
 from kapy.agent_history.models import AgentHistoryRow
 from kapy.agent_output import MessageCommitted, OutputEvent, TextDelta
 from kapy.application.resources import connect_temporal
 from kapy.control.models.runtime import build_model, build_provider, resolve_classes
+from kapy.control.sessions import SessionService
 from kapy.control.sessions.repository import SessionRepository
+from kapy.lifecycle import LifecycleStatus
 from kapy.runner import (
     ExecutionConfig,
     RunnerActivity,
@@ -500,7 +502,7 @@ async def test_activity_uses_session_conversation_for_first_later_and_restored_r
     async with Worker(
         client,
         task_queue=queue,
-        activities=[runner.create, runner.run, runner.close],
+        activities=[runner.run],
     ):
         for prompt in ("first", "follow-up"):
             assert (
@@ -569,7 +571,7 @@ async def test_activity_restores_state_and_records_after_run_tail_once(
     async with Worker(
         client,
         task_queue=queue,
-        activities=[runner.create, runner.run, runner.close],
+        activities=[runner.run],
     ):
         for prompt in ("first", "follow-up"):
             async with runner_database.sessions.begin() as db:
@@ -682,7 +684,7 @@ async def test_invalid_state_fails_activity_before_model_call(
     async with Worker(
         client,
         task_queue=queue,
-        activities=[runner.create, runner.run, runner.close],
+        activities=[runner.run],
     ):
         with pytest.raises(ActivityFailureError) as error:
             await execute(
@@ -706,6 +708,113 @@ async def test_invalid_state_fails_activity_before_model_call(
             await SessionRepository(db).get_session(runner_database.session_id)
         ).current_activity_id is None
         assert await HistoryRepository(db).read_history_entries(runner_database.session_id) == ()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_prompt", [None, "new prompt"])
+async def test_activity_resumes_interrupted_tool_snapshot(endpoint, runner_database, user_prompt):
+    base_url, requests = endpoint
+    session_id = runner_database.session_id
+    interruption = "A prior tool call may have been interrupted. Verify its outcome."
+    history = [
+        ModelRequest([UserPromptPart("original prompt")], metadata={"seq": 0}),
+        ModelResponse(
+            [
+                ToolCallPart(
+                    "builtin_shell_run", {"script": "true"}, tool_call_id="interrupted-call"
+                )
+            ],
+            metadata={"seq": 1},
+        ),
+        ModelRequest([RetryPromptPart(interruption)], state="interrupted"),
+    ]
+    async with runner_database.sessions.begin() as db:
+        await HistoryRepository(db).append_history(
+            session_id, [HistoryMessage(session_id, seq, history[seq]) for seq in range(2)]
+        )
+
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-interrupted-{uuid4()}"
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
+        result = await execute(
+            client,
+            queue,
+            RunnerInput(
+                session_id=session_id,
+                runner_state=ModelMessagesTypeAdapter.dump_json(history).decode(),
+                user_prompt=user_prompt,
+                config=make_config(base_url),
+                layers={"shell": {"config": {"cwd": "/tmp", "base_url": base_url}, "state": {}}},
+            ),
+            database=runner_database,
+        )
+    assert result == "done"
+    (request,) = requests
+    assert request["path"].endswith("/chat/completions")
+    sent = request["body"]["messages"]
+    (receipt,) = [message for message in sent if message["role"] == "tool"]
+    assert receipt["tool_call_id"] == "interrupted-call"
+    sent_user = [message["content"] for message in sent if message["role"] == "user"]
+    assert any(interruption in str(content) for content in sent_user)
+    assert any("new prompt" in str(content) for content in sent_user) == (user_prompt is not None)
+    async with runner_database.sessions.begin() as db:
+        repo = SessionRepository(db)
+        snapshot = await repo.read_runner_state(session_id)
+        assert snapshot is not None
+        restored = ModelMessagesTypeAdapter.validate_json(snapshot)
+        (returned,) = [
+            part
+            for message in restored
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        assert returned.tool_call_id == "interrupted-call" and returned.outcome == "interrupted"
+        session = await repo.get_session(session_id)
+        assert session.status == LifecycleStatus.READY and session.current_activity_id is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_no_prompt_requires_history_and_reuses_final_response_with_shell_layer(
+    endpoint, runner_database
+):
+    base_url, requests = endpoint
+    session_id = runner_database.session_id
+    client = await connect_temporal(runner_database.settings)
+    queue = f"runner-promptless-{uuid4()}"
+    runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
+    service = SessionService(
+        runner_database.sessions, temporal_client=client, temporal_task_queue=queue
+    )
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
+        failed = await start(
+            client,
+            queue,
+            RunnerInput(
+                session_id=session_id,
+                runner_state=None,
+                config=make_config(base_url),
+                layers={"shell": {"config": {"cwd": "/tmp"}, "state": {"jobs": {}}}},
+            ),
+            database=runner_database,
+        )
+        with pytest.raises(ActivityFailureError) as failure:
+            await asyncio.wait_for(failed.result(), 10)
+        assert isinstance(failure.value.cause, ApplicationError)
+        assert failure.value.cause.type == "InvalidParameters" and failure.value.cause.non_retryable
+        session = await service.get_session(session_id)
+        assert session.status == LifecycleStatus.READY and session.current_activity_id is None
+        assert not requests
+
+        first = await service.start_runner(session_id, activity_id=uuid4(), user_prompt="hello")
+        assert await asyncio.wait_for(first.result(), 10) == "done"
+        before = await service.read_history(session_id)
+        retained = await service.start_runner(session_id, activity_id=uuid4())
+        assert await asyncio.wait_for(retained.result(), 10) == "done"
+        assert await service.read_history(session_id) == before
+    assert len(requests) == 1
 
 
 @pytest.mark.integration
@@ -772,7 +881,7 @@ async def test_session_service_runs_successive_prompts_and_telegram_delivery(
         Worker(
             temporal,
             task_queue=queue,
-            activities=[runner.create, runner.run, runner.close],
+            activities=[runner.run],
         ),
     ):
         repository = TelegramRepository(async_sessionmaker(storage, expire_on_commit=False))
@@ -897,9 +1006,7 @@ async def test_activity_protocol_resources_and_history(
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-protocol-{uuid4()}"
     runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
-    async with Worker(
-        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
-    ):
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
         handle = await start(
             client,
             queue,
@@ -967,9 +1074,7 @@ async def test_model_failure_executes_once_closes_resources_and_keeps_previous_s
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-failure-{uuid4()}"
     runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
-    async with Worker(
-        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
-    ):
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
         handle = await start(
             client,
             queue,
@@ -1014,9 +1119,7 @@ async def test_cancellation_waits_for_model_cleanup_and_preserves_snapshot(
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-cancel-{uuid4()}"
     runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
-    async with Worker(
-        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
-    ):
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
         handle = await start(
             client,
             queue,
@@ -1061,9 +1164,7 @@ async def test_final_save_failure_does_not_retry_agent_or_undo_history(
     client = await connect_temporal(runner_database.settings)
     queue = f"runner-save-failure-{uuid4()}"
     runner = RunnerActivity(runner_database.sessions, runner_database.outputs, client)
-    async with Worker(
-        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
-    ):
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
         handle = await start(
             client,
             queue,

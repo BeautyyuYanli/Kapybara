@@ -1,11 +1,10 @@
-"""Typed static layer definitions and injected access to writable JSON dependencies.
+"""Typed static layer definitions and injected access to JSON data and local handles.
 
 Every layer reads its own ``config`` and ``state`` and explicitly dumps changes
 back to ``state``. Resources and SDK component instances never enter this JSON.
-Access functions return the actual entry in current deps, never a reconstructed
-copy. D is unbounded; layers treat deps as opaque and obtain all business data
-through injected access and their Config/State models. Layer definitions contain
-no session data; the SDK owns per-run binding.
+Data access returns the actual writable entry in current deps. D is unbounded;
+layers treat deps as opaque and use injected access for both data and handles.
+Layer definitions retain neither. The SDK owns per-run capability binding.
 """
 
 from collections.abc import Awaitable, Callable
@@ -25,21 +24,20 @@ class LayerData(TypedDict):
 
 
 @dataclass(frozen=True, kw_only=True)
-class Layer[D, C: BaseModel, S: BaseModel]:
-    """Installed models, capability and independent conversation hooks.
+class Layer[D, C: BaseModel, S: BaseModel, R]:
+    """Installed models, capability and optional local resource hooks.
 
     Capability/Toolset IDs stay fixed after construction. Stateful SDK components
-    use native ``for_run`` isolation. Exit must tolerate absent persisted State,
-    partial allocation and repeated cleanup using the host's conversation ID and Config.
-    SDK tools/hooks read that string from RunContext.conversation_id; the host
-    passes it directly to the independent enter/exit hooks outside Agent runs.
+    use native ``for_run`` isolation. Enter builds a local handle from Config and
+    releases anything it constructed if it fails before returning. Exit receives
+    only the returned handle and closes it without changing State or remote resources.
     """
 
     config_type: type[C]
     state_type: type[S]
     capability: AbstractCapability[D]
-    enter_conversation: Callable[[str, C], Awaitable[S]] | None = None
-    exit_conversation: Callable[[str, C, S | None], Awaitable[None]] | None = None
+    enter_conversation: Callable[[str, C], Awaitable[R]] | None = None
+    exit_conversation: Callable[[R], Awaitable[None]] | None = None
 
     @property
     def id(self) -> str:
@@ -49,12 +47,27 @@ class Layer[D, C: BaseModel, S: BaseModel]:
         return value
 
 
-type LayerAccess[D] = Callable[[D], LayerData]
-type LayerFactory[D] = Callable[[str, LayerAccess[D]], Layer[D, Any, Any]]
+@dataclass(frozen=True)
+class LayerAccess[D]:
+    """Read this layer's writable JSON entry and its open runtime handle."""
+
+    _data: Callable[[D], LayerData]
+    _resource: Callable[[D], Any]
+
+    def data(self, deps: D) -> LayerData:
+        return self._data(deps)
+
+    def resource(self, deps: D) -> Any:
+        """Raise UserError if the current deps have no handle for this layer."""
+        return self._resource(deps)
+
+
+type LayerFactory[D] = Callable[[str, LayerAccess[D]], Layer[D, Any, Any, Any]]
 
 
 class LayerDeps(BaseModel):
-    """Minimal serializable deps for standalone SDK consumers and examples."""
+    """Standalone SDK deps with serialized layer data and transient handles."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
     layers: dict[str, LayerData] = Field(default_factory=dict)
+    resources: dict[str, Any] = Field(default_factory=dict, exclude=True)

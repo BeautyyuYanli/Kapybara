@@ -138,14 +138,7 @@ export const updateSession = <ThrowOnError extends boolean = false>(options: Opt
 /**
  * Close Session
  */
-export const closeSession = <ThrowOnError extends boolean = false>(options: Options<CloseSessionData, ThrowOnError>): RequestResult<CloseSessionResponses, CloseSessionErrors, ThrowOnError> => (options.client ?? client).post<CloseSessionResponses, CloseSessionErrors, ThrowOnError>({
-    url: '/api/sessions/{session_id}/close',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
+export const closeSession = <ThrowOnError extends boolean = false>(options: Options<CloseSessionData, ThrowOnError>): RequestResult<CloseSessionResponses, CloseSessionErrors, ThrowOnError> => (options.client ?? client).post<CloseSessionResponses, CloseSessionErrors, ThrowOnError>({ url: '/api/sessions/{session_id}/close', ...options });
 
 /**
  * Start Runner

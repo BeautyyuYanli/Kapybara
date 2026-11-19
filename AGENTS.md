@@ -120,14 +120,14 @@ runner snapshot 与 layer State 原子保存，以及固定 history 和实时输
 - [控制面 FastAPI HTTP / WebSocket API](src/kapy/interfaces/http/README.md)
 
 调用方负责 engine、数据库 schema、Valkey / Temporal client 的生命周期。
-所有执行使用 `start_runner()`，模型与工具资源由独立 Worker 管理。
-创建、运行和关闭使用调用方提供的 Activity UUID，由 Temporal 在保留期内去重并保存执行记录。
-数据库生命周期只含 creating/ready/closing/closed；Worker 执行时通过成对的
-current_activity_id/current_activity_run_id 原子取得当前写入权，排队不占用 session。
-所有进度保存校验完整身份；只有显式 close 查询 Temporal 并 CAS 接管终态或不存在的旧执行。
-RPC 和 hooks 均不持有事务或显式锁。整轮最多一个 Temporal
-尝试，不恢复 Agent 内部步骤。迁移将旧 creating/starting/running/closing 转为 closing，
-保留 ready/closed、Config、State、快照和历史，清空旧占用并删除操作账本。
+独立 Worker 在一次 `kapy.run_agent` Activity 内管理模型、工具及 Layer 的本地句柄。
+调用方为 `start_runner()` 提供 Activity UUID，由 Temporal 在保留期内去重并保存执行记录。
+Session 在 PostgreSQL 创建为 ready，关闭后保留 closed 墓碑及历史。
+Worker 执行时通过成对的 current_activity_id/current_activity_run_id 原子取得写入权，
+排队期间 Session 仍可编辑或关闭。所有进度保存校验完整身份。
+run 准入和显式 close 都能在事务外查询旧写入者，确认终态或不存在后才通过 CAS 接管。
+RPC 和 Layer hooks 均在数据库事务外执行。整轮最多一个 Temporal 尝试。
+离线迁移将旧 creating/closing 归档为 closed 并清空这些行的写入者，保留 Config、State、快照和历史。
 
 `live(session_id, after_seq=-1)` 返回历史回放并继续监听的异步 generator，
 提前结束时使用 `aclosing`。消费者以最后完整应用消息的 `seq` 作为 `after_seq`，尚无该位置时使用 -1；
@@ -141,7 +141,8 @@ model→tool 在快照副本追加含 `RetryPromptPart` 的 request，内容为
 model→model 和 tool→model 则追加尚未进入 history 的下一条 request，保留工具回执或重试提示。
 所有中间快照的末条 request 标记为 SDK `interrupted`。恢复时总会请求模型；未获回执的调用
 由 SDK 补齐 `outcome="interrupted"` 的回执并跳过。tool→end 不更新中间快照。
-整轮成功后再保存最终快照并释放身份；失败保留最近保存的节点快照并进入 closing，不自动恢复执行。
+整轮成功后再保存最终快照并释放身份。失败保留最近提交的节点快照、释放身份，Session 仍为 ready。
+调用方可再次提交 `start_runner()` 并省略 `user_prompt` 以继续中断请求。
 
 业务 layers 在 [layer registry](src/kapy/layers/registry.py) 中统一组装，
 实现与审查必须遵守 [业务 layer 规则](agent_lint/layers.md)。

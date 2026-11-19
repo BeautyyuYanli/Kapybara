@@ -15,14 +15,12 @@ The import name is `pydantic_ai_layer_protocol`. The package requires no Tempora
 
 ## Definitions and registry
 
-A `Layer[D, Config, State]` is a static definition containing Pydantic model
-classes, one native `AbstractCapability[D]` instance and two independently
-optional conversation hooks. An installed factory has the signature
-`make(layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]`.
-The concrete return annotation links the hook parameters and asynchronous return
-values to the models; exit must accept `State | None`.
-D is unbounded and opaque to the layer. Only C/S are bounded by BaseModel;
-all layer business data comes from injected access and those models.
+A `Layer[D, Config, State, Resource]` is a static definition containing two
+Pydantic model classes, one native `AbstractCapability[D]` and optional hooks
+for a local runtime handle. A factory accepts `(layer_id: str, access: LayerAccess[D])`
+and returns that definition. Use `None` as the fourth type argument for a layer
+without a handle. D is opaque to layers. Config and State are bounded by
+`BaseModel`. The fourth argument ties the handle returned by enter to the exit hook.
 
 `LayerRegistry(factories, get_layers=get_layers)` assembles every installed factory once,
 without execution deps. It checks the returned Layer, model classes, native
@@ -35,14 +33,14 @@ fixed after construction. Native Combined containers do not need extra IDs.
 
 The caller supplies `get_layers(deps) -> dict[str, LayerData]`. Its mapping is the
 current enabled selection, separate from the installed factory allowlist. Each
-injected `access(deps)` returns the actual writable entry for its own ID, without
-copying it or creating missing entries. Each application owns its installed factory mapping and its deps layout.
+injected `access.data(deps)` returns the writable entry for its own ID.
+Applications provide the installed factory mapping and configure the deps layout.
 Changing the installation set requires reassembly.
 
 The registry preserves inferred deps type D across the access rule, factories,
 definitions and native capability. Install this object directly in an Agent.
-Its read-only `definitions` mapping exposes model types and business-scope hooks;
-the registry owns selection and JSON validation while the host drives those hooks.
+Its read-only `definitions` mapping exposes model types, capabilities and resource
+hooks. The host explicitly opens the selected handles around its Agent runs.
 
 Each entry is a JSON `config` object and `state` object. Config stays fixed for
 the session. Models read from current data are disposable copies; mutation requires
@@ -67,13 +65,13 @@ class State(BaseModel):
     calls: int = 0
 
 
-def make_counter(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State]:
+def make_counter(layer_id: str, access: LayerAccess[Deps]) -> Layer[Deps, Config, State, None]:
     def count(ctx: RunContext[Deps]) -> int:
-        entry = access(ctx.deps)
+        entry = access.data(ctx.deps)
         config = Config.model_validate(entry["config"])
         state = State.model_validate(entry["state"])
         state.calls += config.increment
-        access(ctx.deps)["state"] = dump_object(state)
+        entry["state"] = dump_object(state)
         return state.calls
 
     return Layer(
@@ -96,21 +94,19 @@ instructions stay stable for fixed Config. SDK callbacks may render those fixed
 declarations; dynamic business information belongs in State and tool results,
 so it does not change the model prefix.
 
-`layers.prepare_configs(configs)` validates all names and Config before
-conversation hooks, without constructing State. `layers.load(configs, states)`
-validates and copies existing JSON; omitted State validates from `{}` and fails
-when required fields are missing. It calls no conversation hooks. Unconfigured State and
-unknown names fail. `layers.snapshot(deps)` uses the saved access rule to validate and copy
-only the selected States. Both models must serialize to JSON objects; inputs are
-copied before validation so custom validators cannot mutate caller-owned data.
+`layers.load(configs, states)` validates and copies existing JSON. Every State
+model can initialize from `{}` when its entry is omitted. Unconfigured State and
+unknown names fail validation. `layers.snapshot(deps)` validates and copies selected
+States. Both models serialize to JSON objects. Validation receives detached inputs
+and runs without resource hooks.
 
 
 ## Native SDK composition
 
 The registry is a thin native `WrapperCapability` over a private selector. For
 each run it validates current Config/State and selects enabled definitions in the
-deps mapping's order; an empty selection enables zero layers. Unknown names or
-invalid data fail before capability execution. Factories are not rerun.
+deps mapping's order. Unknown names, invalid data and missing handles for selected
+layers fail before capability execution.
 
 The original static capabilities are selected directly through native
 `CombinedCapability.for_run`; native `for_agent` performs Agent binding. Missing
@@ -129,48 +125,44 @@ behavior when required by their business semantics. Hosts own final persistence.
 
 ## Conversations
 
-A Layer can explicitly supply either or both async hooks:
+A Layer can supply these async hooks:
 
 ```python
-async def enter_conversation(conversation_id: str, config: Config) -> State: ...
-async def exit_conversation(conversation_id: str, config: Config, state: State | None) -> None: ...
+async def enter_conversation(conversation_id: str, config: Config) -> Resource: ...
+async def exit_conversation(resource: Resource) -> None: ...
 ```
 
-The host chooses the string ID and owns initialization, cleanup, persistence and retry
-scheduling. Assembly, selection, load/snapshot and SDK component lifecycles do not
-invoke these hooks. Their validated model arguments remain separate from execution
-deps. Enter may return State with required fields that cannot initialize from `{}`.
-Without enter, the host initializes State from `{}`. Config validation, default
-State initialization and serialization perform no external I/O; enter may do business I/O.
-The protocol does not require UUIDs and provides no aliases for the old hook names.
+Enter turns a Config locator into a local runtime handle. It cleans up any
+partial initialization if it fails. Exit closes or detaches the returned handle.
+The external service or its orchestrator manages the lifetime of any referenced
+remote entity. An enter-only layer can return an in-memory handle that needs no
+cleanup. Exit requires enter, and installing layers with enter requires a
+`get_resources(deps)` adapter on the registry.
 
-Pass the same ID explicitly to `agent.run(..., conversation_id=conversation_id)`
-on every run and to these independent callbacks outside the run. SDK tools and
-hooks read `ctx.conversation_id`; they still use injected access for Config/State
-without depending on application-specific identity fields in deps. State stores
-business progress and necessary cleanup references, rather than conversation identity.
+`async with layers.open_conversation(conversation_id, configs) as resources`
+validates all Config and the nonempty string ID before entering selected layers in
+configuration order. Successful enters are unwound in reverse order, including
+after a failed enter. The hooks and the body share the caller's task and context,
+so exit hooks can unwind AnyIO cancel scopes and task groups opened by enter
+hooks. The registry shields cleanup from enclosing AnyIO cancel scopes and
+delivers their cancellation after cleanup. Direct `asyncio.Task.cancel()` calls
+can still interrupt a suspended exit hook.
 
-Resource-creating tools/hooks must mark upstream resources or their scope with
-conversation ownership when supported. Determine or derive the marker from the
-conversation ID, layer ID and fixed Config as needed, using only information
-necessary to locate that conversation's resources; the model must not choose or
-override it. Exit must reconstruct the marker and reclaim all owned resources,
-including resources missing from State. If upstream cannot query or clean by
-ownership, State-based cleanup is best effort and must document possible orphans.
+Use the yielded mapping in deps for each run inside that context.
+`access.resource(ctx.deps)` returns the local handle for the layer and raises
+`UserError` for a missing handle. For the provided `LayerDeps`, use
+`get_resources=lambda deps: deps.resources`. Its JSON serialization contains only
+layer data.
 
-Exit must be idempotent and clean partial or unacknowledged initialization using
-conversation ID and Config even when State is None. None does not mean there are no
-resources. Enter need not be generally idempotent; a top-level RetryableScopeError
-explicitly promises that repeating this call with the same identity and Config is
-safe. The host chooses retry limits. Nested causes, exception groups and cancellation
-do not imply retryability. The protocol provides no storage, leases or automatic
-resource recovery.
+Use the same ID in `agent.run(..., conversation_id=conversation_id)` for each
+run. Tools and SDK hooks can read it from `ctx.conversation_id`. The host may
+reuse open handles across runs and owns final State persistence.
 
 ## Examples and checks
 
 ```sh
 python -m pydantic_ai_layer_protocol.examples.in_process
-python -m pytest -q tests/test_registry.py tests/test_types.py
+python -m pytest -q tests
 ```
 
 Examples use deterministic SDK models. Tests cover native Agent lifecycle and

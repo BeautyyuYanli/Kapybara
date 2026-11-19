@@ -35,19 +35,14 @@ def application(database, sessions):
 
 
 async def test_creation_is_configuration_only_and_removed_contracts_are_rejected(
-    database, seed_session, monkeypatch, session_runtime
+    database, seed_session
 ):
-    sessions = session_runtime.service(database.sessions)
+    sessions = SessionService(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
     existing = await sessions.get_session(session_id)
 
-    async def unexpected_start(*args, **kwargs):
-        pytest.fail("configuration creation must not submit execution")
-
-    monkeypatch.setattr(sessions, "start_runner", unexpected_start)
     body = {
-        "activity_id": str(uuid4()),
         "provider_id": str(existing.provider_id),
         "model_name": existing.model_name,
     }
@@ -65,6 +60,7 @@ async def test_creation_is_configuration_only_and_removed_contracts_are_rejected
         assert created.json()["model_settings"] == {}
         for field, value in {
             "input": {"content": "obsolete"},
+            "activity_id": str(uuid4()),
             "plugins": [],
             "context_plugin": {},
             "compaction_threshold_tokens": 100,
@@ -78,6 +74,17 @@ async def test_creation_is_configuration_only_and_removed_contracts_are_rejected
                 await client.patch(f"/api/sessions/{session_id}", json={field: value})
             ).status_code == 422
         assert len((await sessions.list_sessions()).items) == 2
+        new_id = created.json()["id"]
+        closed = await client.post(f"/api/sessions/{new_id}/close")
+        assert closed.status_code == 200
+        assert closed.json()["id"] == new_id and closed.json()["status"] == "closed"
+        assert (await client.post(f"/api/sessions/{new_id}/close")).json() == closed.json()
+        assert (await client.get(f"/api/sessions/{new_id}")).json() == closed.json()
+        assert (await client.post("/api/sessions", json=body | {"id": new_id})).status_code == 409
+        assert (
+            await client.post(f"/api/sessions/{new_id}/runner", json={"activity_id": str(uuid4())})
+        ).status_code == 409
+        assert (await client.post(f"/api/sessions/{uuid4()}/close")).status_code == 404
         for path, methods in {
             "inputs": ("GET", "POST"),
             "inputs/1": ("DELETE",),
@@ -88,15 +95,14 @@ async def test_creation_is_configuration_only_and_removed_contracts_are_rejected
                 assert result.status_code == 404
 
 
-async def test_http_history_pages_and_canonical_model_paths(
-    database, seed_history, seed_session, session_runtime
-):
+async def test_http_history_pages_and_canonical_model_paths(database, seed_history, seed_session):
     session_id = await seed_history(
         [ModelRequest(parts=[UserPromptPart(str(i))]) for i in range(5)]
     )
     await seed_session(session_id)
-    sessions = session_runtime.service(database.sessions)
+    sessions = SessionService(database.sessions)
     existing = await sessions.get_session(session_id)
+    await sessions.close_session(session_id)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application(database, sessions)), base_url="http://test"
     ) as client:
@@ -147,10 +153,8 @@ async def test_http_history_pages_and_canonical_model_paths(
             assert (await client.get(path)).status_code == 422
 
 
-async def test_validation_omits_raw_credentials_and_internal_errors(
-    database, monkeypatch, session_runtime
-):
-    sessions = session_runtime.service(database.sessions)
+async def test_validation_omits_raw_credentials_and_internal_errors(database, monkeypatch):
+    sessions = SessionService(database.sessions)
     app = application(database, sessions)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -194,12 +198,10 @@ async def serve(app):
                 await task
 
 
-async def test_http_waits_for_durable_start_confirmation(
-    database, seed_session, monkeypatch, session_runtime
-):
+async def test_http_waits_for_durable_start_confirmation(database, seed_session, monkeypatch):
     from types import SimpleNamespace
 
-    sessions = session_runtime.service(database.sessions)
+    sessions = SessionService(database.sessions)
     session_id = uuid4()
     await seed_session(session_id)
     started, release = asyncio.Event(), asyncio.Event()
@@ -279,6 +281,7 @@ async def test_http_interface_websocket_without_credentials(
     monkeypatch.delenv("KAPY_CONTROL_TOKEN", raising=False)
     session_id = await seed_history([ModelRequest([UserPromptPart("history")])])
     await seed_session(session_id)
+    await SessionService(database.sessions).close_session(session_id)
     settings = CommonSettings.model_validate(
         {
             **os.environ,

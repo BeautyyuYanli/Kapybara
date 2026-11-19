@@ -5,14 +5,10 @@ runner owns the encoding. Fixed native layer Config and mutable internal State
 live in separate JSON columns. Tools mutate their run-local State; model→tool/model,
 tool→model and the Activity's final snapshot save all States and messages together.
 tool→end keeps the preceding snapshot until the final Activity save.
-CLOSING cleanup saves individual layer progress. CREATING stores fixed Config and
-empty States before enter;
-publication saves all initial States with READY, and abandoned creation keeps the
-States empty through cleanup. The session UUID's string form is the SDK
-conversation_id and independent enter_conversation/exit_conversation identity;
-layer State stores business progress and cleanup references rather than identity.
-Model references may dangle; no physical FKs tie
-history retention to configuration.
+Creation stores all initial States with READY. A CLOSED row retains its ID,
+configuration and history. The session UUID's string form is the SDK
+conversation_id. Layer State stores business progress. Model references may
+dangle; history retention is independent of model configuration.
 """
 
 from datetime import datetime

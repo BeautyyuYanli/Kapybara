@@ -26,8 +26,8 @@ The optional `KAPY_TELEGRAM_SESSION_TEMPLATE` supplies the initial fallback, for
 The template accepts CreateSession fields, including model settings, title and
 fixed native `layers` configuration. For example,
 add `"layers":{"shell":{"cwd":"/workspace","base_url":"http://shellctl:8765"}}`
-to enable the shell Toolset in newly created durable sessions. State is initialized
-and saved by SessionService/Worker.
+to enable the shell Toolset in newly created sessions. SessionService initializes
+default State in PostgreSQL. The Worker opens the shell client for each run.
 An omitted template or JSON `null` requires selecting a model before creating a
 session. A saved choice overrides only the template's provider/model pair, preserving
 layers and other session options. Without a template it uses normal CreateSession
@@ -61,8 +61,8 @@ storage identifiers; moving the Python package to `interfaces` does not change t
 | --- | --- |
 | /new [text] | Create/bind a session, optionally start a durable Activity |
 | Text | Start a durable Activity; create a session if unbound |
-| /status | Current UUID, lifecycle and active Activity |
-| /close [session UUID] | Close the current or specified session and registered resources; repeat to retry failures |
+| /status | Current UUID, lifecycle and retained run status |
+| /close [session UUID] | Close the current or specified session |
 | /model [provider UUID model name] | Show the bot default; with arguments, update the bound session and save the default |
 | /help | List these session commands |
 
@@ -70,8 +70,8 @@ Routes are keyed by bot/chat/topic (topic 0 when absent). Only allowed chats and
 non-bot senders are handled. Media receives an unsupported notice; unknown commands
 are never forwarded to the model. Status/no-argument close on an unbound route do
 not create a session. An explicit close UUID resolves independently of the binding;
-malformed UUIDs receive usage without falling back to it. Explicit cleanup never
-changes the route. A missing bound session clears its route; infrastructure errors do not.
+malformed UUIDs receive a usage reply. Explicit close leaves the route intact.
+A missing bound session clears its route.
 
 The default is shared by all allowed chats for that bot. A model command changes
 only the current chat/topic's bound session and the bot default; other existing
@@ -88,28 +88,23 @@ update whose progress is already saved. Confirmation-send retries do not reapply
 completed configuration. A crash before progress is saved can repeat the same
 session update, following the inbox's existing at-least-once contract.
 
-Polling persists every batch and offset atomically. The existing inbox saves fixed
-targets/templates, preallocated session IDs, create/run/close Activity UUIDs and
-received run_id references before progressing. No execution state/result ledger is
-added. Completed progress precedes confirmation delivery, so send retries do not
-repeat business calls. Core and private SQLite commits remain separate.
+Polling persists every batch and offset atomically. The inbox saves fixed targets
+and templates, preallocated session IDs, run Activity UUIDs and observed run IDs.
+Core and private SQLite commits are separate. If PostgreSQL creates the session
+before SQLite records the binding, replay retries the same ID and binds the
+existing session if it is ready. A closed candidate leaves the existing route
+intact and prompts the user to try `/new` again. Completed progress is saved
+before sending confirmation.
 
 Text and `/new <text>` return a submitted acknowledgment with execution identity;
 acceptance does not guarantee Worker admission. `/status` queries Temporal using
-the most recent inbox request and any current writer, showing native status,
-run_state and safe failure category. An unbound failed/queued creation can still
-be queried. No current writer does not imply that no tasks are queued. There is no
-background execution monitor or failure-push service.
+the most recent inbox run and any current writer, showing native status, run state
+and safe failure category. A queued run can appear before it has a writer.
 
-After restart an attempted UUID is queried, never automatically resubmitted or
-replaced. A found create/close is awaited through its fixed native run ID. Temporary
-RPC failures retry lookup; NOT_FOUND produces a safe reply with session/Activity
-identities and completes the inbox item, allowing later /new and /close commands.
-A crash between persisting the UUID and sending it can thus remain unconfirmed.
-No exact-once guarantee extends beyond Temporal retention. Failed creation retains
-the previous route; explicit `/close <UUID>` can clean its unbound resources.
-Caller cancellation does not cancel Worker execution. Obsolete commands return an
-unknown-command reply without allocating resources.
+After restart, an attempted run UUID is recovered by lookup. Temporary RPC
+failures retry lookup. A missing execution produces an unconfirmed reply with
+the session and Activity identities and completes the inbox item. A crash between
+saving a run UUID and submitting it can leave the outcome unconfirmed.
 
 Each delivery consumes SessionService.live batches in order with its persisted
 `after_seq`. Every fully applied complete message advances this cursor. Complete ModelResponse text becomes a fixed formal
@@ -156,17 +151,9 @@ separate sessions in one topic can interleave. Reconnection drops provisional
 preview state. Cancellation unwinds the current read or send and closes the live generator. SIGINT/SIGTERM stop all input and delivery tasks before closing
 Bot API, SQLite, Valkey and core PostgreSQL resources. Existing legacy Telegram state is not imported.
 
-`/close` sends its saved target and Activity key. `/close <UUID>` also works without
-a current binding and preserves any existing binding. The Worker claims unowned cleanup,
-or explicitly takes over a terminal/missing native writer by CAS, runs exits in reverse and saves progress
-after each attempt. Failure retains closing; a later explicit /close uses a new key
-and can repeat idempotent exits. Only outer RetryableScopeError gets three local
-attempts; Temporal itself has one attempt. Failed creation compensates all configured
-layers with None, including partial/uncalled enters, before recording its terminal
-native failure. /status reads lifecycle plus Temporal references from the inbox and
-current writer. Creation initializes each layer through `enter_conversation`;
-close/compensation use `exit_conversation`. Both receive `str(session_id)`, also
-passed explicitly to each Agent run as its SDK conversation ID.
-Forgotten execution results remain unconfirmed. Configuration/title
-updates require ready and no current writer. See the
+`/close` uses its saved target and waits for the PostgreSQL tombstone. A live
+writer produces a busy reply. An unavailable Temporal lookup backs off and
+retries the same target. Closed sessions remain readable and bound until
+`/new` chooses another session. Configuration and title updates require ready
+and an empty writer pair. See the
 [control state machine](../../control/README.md#session-state-machine).

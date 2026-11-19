@@ -4,8 +4,9 @@ The admission transaction copies current provider credentials and business data.
 `repr=False` prevents accidental disclosure of those process-local credentials.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Self
+from typing import Any, Self
 from uuid import UUID
 
 from pydantic import Field, SecretStr, model_validator
@@ -55,7 +56,7 @@ class RunnerInput(DTO):
 
     session_id: UUID
     runner_state: str | None
-    user_prompt: str
+    user_prompt: str | None = None
     config: ExecutionConfig
     layers: dict[str, LayerData] = Field(default_factory=dict)
 
@@ -70,4 +71,5 @@ class RunnerDeps:
     session_factory: async_sessionmaker[AsyncSession]
     output_service: AgentOutputService
     layers: dict[str, LayerData] = field(default_factory=dict)
+    layer_resources: Mapping[str, Any] = field(default_factory=dict, repr=False)
     response_seq: int | None = None

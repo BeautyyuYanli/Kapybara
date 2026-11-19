@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, sentinel
 from uuid import UUID, uuid4
 
 import httpx
@@ -22,14 +22,15 @@ from kapy.control.models import ModelService
 from kapy.control.sessions import (
     ActivityIdentityConflict,
     CreateSession,
+    SessionAlreadyExists,
     SessionBusy,
-    SessionExecutionError,
+    SessionRecord,
     SessionService,
     UpdateSession,
 )
 from kapy.control.sessions.models import SessionRow
 from kapy.control.sessions.repository import SessionRepository
-from kapy.lifecycle import LifecycleStatus
+from kapy.lifecycle import LifecycleError, LifecycleStatus
 from kapy.runner import RunnerActivity, RunnerDeps, activities
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -101,12 +102,12 @@ async def test_competing_workers_admit_one_idle_session_without_loser_side_effec
     contenders = []
     claim_run = SessionRepository.claim_run
 
-    async def claim(repo, target, activity_id, run_id):
+    async def claim(repo, target, activity_id, run_id, *, previous=None):
         contenders.append((activity_id, run_id))
         if len(contenders) == 2:
             arrived.set()
         await release_claims.wait()
-        return await claim_run(repo, target, activity_id, run_id)
+        return await claim_run(repo, target, activity_id, run_id, previous=previous)
 
     monkeypatch.setattr(SessionRepository, "claim_run", claim)
     started, release_model, calls, hooks = observed_run
@@ -166,12 +167,12 @@ async def test_configuration_edit_and_worker_admission_share_one_atomic_boundary
     contender_pid = asyncio.get_running_loop().create_future()
     claim_run, update_session = SessionRepository.claim_run, SessionRepository.update_session
 
-    async def claim(repo, *args):
+    async def claim(repo, *args, **kwargs):
         if first == "edit":
             contender_pid.set_result(
                 (await repo._db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
             )
-        row = await claim_run(repo, *args)
+        row = await claim_run(repo, *args, **kwargs)
         if first == "run":
             entered.set()
             await release_first.wait()
@@ -273,50 +274,48 @@ async def test_queue_has_no_database_owner_and_first_native_input_wins(
         with pytest.raises(ActivityIdentityConflict):
             await service.start_runner(uuid4(), activity_id=key, user_prompt="other session")
         # Reads and explicit close do not interpret a queued Activity as occupancy.
-        closed = await session_runtime.service(database.sessions).close_session(
-            session_id, activity_id=uuid4()
-        )
+        closed = await session_runtime.service(database.sessions).close_session(session_id)
         assert closed.status == LifecycleStatus.CLOSED
     finally:
         await first.terminate(reason="test cleanup")
         await another.terminate(reason="test cleanup")
     terminal = await service.get_activity(session_id, key, run_id=first.run_id)
     assert terminal.status == "TERMINATED" and terminal.error == "Terminated"
-    retained = await service.start_runner(session_id, activity_id=key, user_prompt="any prompt")
-    assert retained.run_id == first.run_id
+    with pytest.raises(LifecycleError):
+        await service.start_runner(session_id, activity_id=key, user_prompt="any prompt")
     assert (await service.get_session(session_id)).status == LifecycleStatus.CLOSED
 
 
-async def test_queued_create_is_queryable_without_a_business_row(database, session_runtime):
-    key = uuid4()
-    service = queued(database, session_runtime)
-    task = asyncio.create_task(
-        service.create_session(
-            CreateSession(provider_id=uuid4(), model_name="test"),
-            activity_id=key,
-        )
+async def test_create_and_close_are_local_and_keep_a_permanent_identity(database):
+    service = SessionService(database.sessions)
+    request = CreateSession(
+        id=uuid4(),
+        provider_id=uuid4(),
+        model_name="unconfigured",
+        layers={"shell": {"cwd": "/remote"}},
     )
-    try:
-        async with asyncio.timeout(5):
-            while True:
-                try:
-                    facts = await service.get_activity(key, key)
-                    break
-                except LookupError:
-                    await asyncio.sleep(0.01)
-        assert facts.status == "RUNNING" and facts.run_state == "SCHEDULED"
-        with pytest.raises(LookupError):
-            await service.get_session(key)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert (await service.get_activity(key, key)).status == "RUNNING"
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await session_runtime.client.get_activity_handle(str(key), run_id=facts.run_id).terminate(
-            reason="cleanup"
-        )
+    created, duplicate = await asyncio.gather(
+        service.create_session(request), service.create_session(request), return_exceptions=True
+    )
+    if isinstance(created, SessionAlreadyExists):
+        created, duplicate = duplicate, created
+    assert isinstance(created, SessionRecord)
+    assert isinstance(duplicate, SessionAlreadyExists)
+    assert duplicate.session_id == created.id == request.id
+    assert created.status == LifecycleStatus.READY
+    assert created.current_activity_id is created.current_activity_run_id is None
+    closed = await service.close_session(created.id)
+    assert closed.status == LifecycleStatus.CLOSED and closed.layers == created.layers
+    assert await service.close_session(created.id) == closed
+    assert (await service.list_sessions()).items == [closed]
+    with pytest.raises(SessionAlreadyExists):
+        await service.create_session(request)
+    with pytest.raises(LifecycleError):
+        await service.update_session(created.id, UpdateSession(title="closed session"))
+    with pytest.raises(LifecycleError):
+        await service.start_runner(created.id, activity_id=uuid4())
+    with pytest.raises(LookupError):
+        await service.close_session(uuid4())
 
 
 @pytest.mark.parametrize("same_key", [False, True])
@@ -347,43 +346,67 @@ async def test_http_returns_only_reference_and_native_queries_validate_session(
 ):
     from kapy.interfaces.http import create_router
 
-    session_id, key = uuid4(), uuid4()
+    session_id, key, prompt_key = uuid4(), uuid4(), uuid4()
     await seed_session(session_id)
     service = queued(database, session_runtime)
     app = FastAPI()
     app.include_router(create_router(ModelService(database.sessions), service))
+    handles: list[ActivityHandle[str]] = []
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://test"
         ) as http:
             path = f"/api/sessions/{session_id}/runner"
             assert (await http.post(path, json={"user_prompt": "hi"})).status_code == 422
-            body = {"activity_id": str(key), "user_prompt": "private prompt"}
+            body = {"activity_id": str(key)}
             response = await http.post(path, json=body)
             assert response.status_code == 202
             reference = response.json()
             assert set(reference) == {"activity_id", "run_id"}
-            assert (
-                await http.post(path, json=body | {"user_prompt": "changed"})
-            ).json() == reference
+            assert (await http.post(path, json=body | {"user_prompt": None})).json() == reference
+            handle = session_runtime.client.get_activity_handle(
+                str(key), run_id=reference["run_id"], result_type=str
+            )
+            handles.append(handle)
+            description = await handle.describe(include_input=True)
+            assert await description.input() == [
+                {"session_id": str(session_id), "user_prompt": None}
+            ]
+
+            prompt = "private prompt"
+            response = await http.post(
+                path, json={"activity_id": str(prompt_key), "user_prompt": prompt}
+            )
+            assert response.status_code == 202
+            supplied = response.json()
+            handle = session_runtime.client.get_activity_handle(
+                str(prompt_key), run_id=supplied["run_id"], result_type=str
+            )
+            handles.append(handle)
+            description = await handle.describe(include_input=True)
+            assert await description.input() == [
+                {"session_id": str(session_id), "user_prompt": prompt}
+            ]
             facts = await http.get(
-                f"/api/sessions/{session_id}/activities/{key}",
-                params={"run_id": reference["run_id"]},
+                f"/api/sessions/{session_id}/activities/{prompt_key}",
+                params={"run_id": supplied["run_id"]},
             )
             assert facts.json()["run_state"] == "SCHEDULED"
-            assert "private prompt" not in facts.text and "test-key" not in facts.text
+            assert prompt not in facts.text and "test-key" not in facts.text
             assert (await http.get(f"/api/sessions/{uuid4()}/activities/{key}")).status_code == 409
             assert (
                 await http.get(f"/api/sessions/{session_id}/operations/{key}")
             ).status_code == 404
             assert (await http.get(path)).status_code == 405
     finally:
-        await session_runtime.client.get_activity_handle(str(key)).terminate(reason="cleanup")
+        for handle in handles:
+            await handle.terminate(reason="cleanup")
 
 
 @pytest.mark.parametrize("status", [None, "TERMINATED"])
-async def test_only_explicit_close_can_recover_abandoned_ownership(
-    database, seed_session, session_runtime, status
+@pytest.mark.parametrize("operation", ["run", "close"])
+async def test_run_or_close_recovers_abandoned_ownership(
+    database, seed_session, session_runtime, status, operation, observed_run
 ):
     session_id = uuid4()
     await seed_session(session_id)
@@ -397,61 +420,146 @@ async def test_only_explicit_close_can_recover_abandoned_ownership(
     assert run_id is not None
     async with database.sessions.begin() as db:
         await SessionRepository(db).claim_run(session_id, owner, run_id)
-    # Queries leave the abandoned writer intact. A normal run fails admission.
+    # Queries leave the abandoned writer intact.
     if status:
         await service.get_activity(session_id, owner, run_id=run_id)
     live = session_runtime.service(database.sessions)
-    handle = await live.start_runner(
-        session_id, activity_id=uuid4(), user_prompt="must not execute"
-    )
-    from temporalio.client import ActivityFailureError
-
-    with pytest.raises(ActivityFailureError):
-        await handle.result()
-    assert (await live.get_activity(session_id, UUID(handle.id))).error == "SessionBusy"
     assert (await live.get_session(session_id)).current_activity_run_id == run_id
-    assert (
-        await live.close_session(session_id, activity_id=uuid4())
-    ).status == LifecycleStatus.CLOSED
-    assert (await live.get_session(session_id)).current_activity_id is None
+    _, release, calls, _ = observed_run
+    release.set()
+    if operation == "run":
+        handle = await live.start_runner(session_id, activity_id=uuid4(), user_prompt="take over")
+        assert await asyncio.wait_for(handle.result(), 10) == "done"
+        assert calls == [(UUID(handle.id), handle.run_id, {})]
+        expected = LifecycleStatus.READY
+    else:
+        await live.close_session(session_id)
+        assert not calls
+        expected = LifecycleStatus.CLOSED
+    record = await live.get_session(session_id)
+    assert record.status == expected
+    assert record.current_activity_id is record.current_activity_run_id is None
 
 
-async def test_close_does_not_take_over_running_or_unknown_execution(
+async def test_run_reclaims_an_abandoned_writer_when_the_same_activity_uuid_is_reused(
+    database, seed_session, session_runtime, observed_run
+):
+    from temporalio.api.workflowservice.v1 import DeleteActivityExecutionRequest
+
+    session_id, activity_id = uuid4(), uuid4()
+    await seed_session(session_id)
+    old = await queued(database, session_runtime).start_runner(
+        session_id, activity_id=activity_id, user_prompt="old run"
+    )
+    await old.terminate(reason="test abandoned writer")
+    assert old.run_id is not None
+    async with database.sessions.begin() as db:
+        assert await SessionRepository(db).claim_run(session_id, activity_id, old.run_id)
+
+    client = session_runtime.client
+    await client.workflow_service.delete_activity_execution(
+        DeleteActivityExecutionRequest(
+            namespace=client.namespace, activity_id=old.id, run_id=old.run_id
+        )
+    )
+    service = session_runtime.service(database.sessions)
+    with pytest.raises(LookupError):
+        await service.get_activity(session_id, activity_id, run_id=old.run_id)
+
+    _, release, calls, _ = observed_run
+    release.set()
+    replacement = await service.start_runner(
+        session_id, activity_id=activity_id, user_prompt="new run"
+    )
+    assert replacement.id == old.id and replacement.run_id != old.run_id
+    assert await asyncio.wait_for(replacement.result(), 10) == "done"
+    assert calls == [(activity_id, replacement.run_id, {})]
+    record = await service.get_session(session_id)
+    assert record.status == LifecycleStatus.READY
+    assert record.current_activity_id is record.current_activity_run_id is None
+
+
+async def test_close_and_runner_cannot_take_over_running_or_unknown_execution(
     database, seed_session, session_runtime, monkeypatch
 ):
     session_id = uuid4()
     await seed_session(session_id)
     service = queued(database, session_runtime)
     handle = await service.start_runner(session_id, activity_id=uuid4(), user_prompt="unused")
-    from uuid import UUID
-
     owner = UUID(handle.id)
     assert handle.run_id is not None
     async with database.sessions.begin() as db:
         await SessionRepository(db).claim_run(session_id, owner, handle.run_id)
     live = session_runtime.service(database.sessions)
     try:
-        with pytest.raises(SessionExecutionError) as busy:
-            await live.close_session(session_id, activity_id=uuid4())
-        assert busy.value.category == "SessionBusy"
+        with pytest.raises(SessionBusy):
+            await live.close_session(session_id)
         original = session_runtime.client.get_activity_handle
         old = original(handle.id, run_id=handle.run_id)
-        monkeypatch.setattr(
-            old,
-            "describe",
-            AsyncMock(side_effect=RPCError("private", RPCStatusCode.UNAVAILABLE, b"")),
-        )
+        rpc_error = RPCError("private", RPCStatusCode.UNAVAILABLE, b"")
+        monkeypatch.setattr(old, "describe", AsyncMock(side_effect=rpc_error))
         monkeypatch.setattr(
             session_runtime.client,
             "get_activity_handle",
             lambda id, **kw: old if id == handle.id else original(id, **kw),
         )
-        with pytest.raises(SessionExecutionError) as unknown:
-            await live.close_session(session_id, activity_id=uuid4())
-        assert unknown.value.category == "UnableToConfirm"
+        with pytest.raises(RPCError) as unknown:
+            await live.close_session(session_id)
+        assert unknown.value is rpc_error
+        contender_id = uuid4()
+        contender = await live.start_runner(session_id, activity_id=contender_id, user_prompt="run")
+        with pytest.raises(ActivityFailureError) as failure:
+            await asyncio.wait_for(contender.result(), 10)
+        assert isinstance(failure.value.cause, ApplicationError)
+        assert failure.value.cause.type == "UnableToConfirm" and failure.value.cause.non_retryable
+        assert (await live.get_activity(session_id, contender_id)).error == "UnableToConfirm"
         assert (await live.get_session(session_id)).current_activity_run_id == handle.run_id
     finally:
         await handle.terminate(reason="cleanup")
+
+
+@pytest.mark.parametrize("changed_to", ["closed", "idle", "new_writer"])
+async def test_close_rechecks_a_writer_changed_during_the_temporal_probe(
+    database, seed_session, monkeypatch, changed_to
+):
+    from kapy.control.sessions import service as service_module
+
+    session_id, old_id, new_id = uuid4(), uuid4(), uuid4()
+    await seed_session(session_id)
+    previous = (old_id, str(uuid4()))
+    new_run_id = str(uuid4())
+    async with database.sessions.begin() as db:
+        assert await SessionRepository(db).claim_run(session_id, *previous) is not None
+
+    async def probe(client, activity_id, run_id):
+        assert client is sentinel.temporal_client
+        assert (activity_id, run_id) == previous
+        async with database.sessions.begin() as db:
+            repo = SessionRepository(db)
+            if changed_to == "closed":
+                assert await repo.close_session(session_id, previous=previous) is not None
+            elif changed_to == "idle":
+                await repo.complete(session_id, *previous)
+            else:
+                assert (
+                    await repo.claim_run(session_id, new_id, new_run_id, previous=previous)
+                    is not None
+                )
+
+    monkeypatch.setattr(service_module, "ensure_activity_terminal", probe)
+    service = SessionService(database.sessions, temporal_client=sentinel.temporal_client)
+    if changed_to == "new_writer":
+        with pytest.raises(SessionBusy):
+            await asyncio.wait_for(service.close_session(session_id), 5)
+        current = await service.get_session(session_id)
+        assert (current.current_activity_id, current.current_activity_run_id) == (
+            new_id,
+            new_run_id,
+        )
+    else:
+        closed = await asyncio.wait_for(service.close_session(session_id), 5)
+        assert closed.status == LifecycleStatus.CLOSED
+        assert closed.current_activity_id is closed.current_activity_run_id is None
 
 
 async def test_submission_failure_does_not_touch_business_state(
@@ -471,11 +579,12 @@ async def test_submission_failure_does_not_touch_business_state(
     assert row.status == LifecycleStatus.READY and row.current_activity_id is None
 
 
-async def test_lost_confirmation_keeps_known_native_run_identity(
-    database, session_runtime, monkeypatch
+async def test_lost_run_confirmation_propagates_rpc_error_and_preserves_submission(
+    database, seed_session, session_runtime, monkeypatch
 ):
     service = queued(database, session_runtime)
-    key = uuid4()
+    session_id, key = uuid4(), uuid4()
+    await seed_session(session_id)
     client = session_runtime.client
     original = client.get_activity_handle
     handles = []
@@ -493,32 +602,33 @@ async def test_lost_confirmation_keeps_known_native_run_identity(
         return handle
 
     monkeypatch.setattr(client, "get_activity_handle", unavailable)
-    with pytest.raises(SessionExecutionError) as failure:
-        await service.create_session(
-            CreateSession(provider_id=uuid4(), model_name="test"), activity_id=key
-        )
-    assert failure.value.run_id and failure.value.run_id == handles[0].run_id
-    assert failure.value.session_id == key and failure.value.activity_id == key
-    fixed = original(str(key), run_id=failure.value.run_id)
+    with pytest.raises(RPCError) as failure:
+        await service.start_runner(session_id, activity_id=key, user_prompt="kept")
+    assert failure.value.status == RPCStatusCode.UNAVAILABLE
+    assert handles[0].id == str(key) and handles[0].run_id
+    fixed = original(str(key), run_id=handles[0].run_id)
     assert (await fixed.describe()).run_state.name == "SCHEDULED"
     await fixed.terminate(reason="cleanup")
 
 
+@pytest.mark.parametrize("abandoned", [False, True])
 async def test_deleting_provider_while_queued_fails_without_business_admission(
     database,
     seed_session,
     session_runtime,
+    abandoned,
 ):
-    from temporalio.client import ActivityFailureError
-
     from kapy.control.models.models import ProviderRow
 
     session_id = uuid4()
     await seed_session(session_id)
     service = queued(database, session_runtime)
     handle = await service.start_runner(session_id, activity_id=uuid4(), user_prompt="unused")
+    previous = (uuid4(), str(uuid4())) if abandoned else (None, None)
     async with database.sessions.begin() as db:
         row = await db.get(SessionRow, session_id)
+        assert row is not None
+        row.current_activity_id, row.current_activity_run_id = previous
         await db.delete(await db.get(ProviderRow, row.provider_id))
     runner = RunnerActivity(database.sessions, session_runtime.outputs, session_runtime.client)
     async with Worker(
@@ -531,4 +641,5 @@ async def test_deleting_provider_while_queued_fails_without_business_admission(
     facts = await service.get_activity(session_id, UUID(handle.id), run_id=handle.run_id)
     assert facts.error == "NotFound"
     row = await service.get_session(session_id)
-    assert row.status == LifecycleStatus.READY and row.current_activity_id is None
+    assert row.status == LifecycleStatus.READY
+    assert (row.current_activity_id, row.current_activity_run_id) == previous

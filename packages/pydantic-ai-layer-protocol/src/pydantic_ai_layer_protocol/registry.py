@@ -10,24 +10,24 @@ stable for fixed Config: never generate them from mutable State through factorie
 This preserves model prefix caching. SDK callbacks may render fixed instructions;
 dynamic business information belongs in State and tool results.
 
-Optional async Layer hooks describe a longer conversation. The host supplies
-its string ID, drives enter/exit and owns persistence and retry scheduling; assembly,
-validation and snapshots never invoke those hooks. Exit must be idempotent and
-handle partial or unacknowledged initialization with None State. Constructors,
-validators and instructions must never allocate business-scope resources.
+The host explicitly opens local handles around one or more runs and passes them
+in deps. Assembly, JSON validation and snapshots perform no resource I/O.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from inspect import iscoroutinefunction
 from types import MappingProxyType
 from typing import Any
 
+import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
 from pydantic import BaseModel
 from pydantic_ai.capabilities import AbstractCapability, WrapperCapability
 from pydantic_ai.exceptions import UserError
 
-from .types import JsonObject, Layer, LayerData, LayerFactory
+from .types import JsonObject, Layer, LayerAccess, LayerData, LayerFactory
 
 
 class LayerRegistry[D](WrapperCapability[D]):
@@ -43,19 +43,51 @@ class LayerRegistry[D](WrapperCapability[D]):
         factories: Mapping[str, LayerFactory[D]],
         *,
         get_layers: Callable[[D], dict[str, LayerData]],
+        get_resources: Callable[[D], Mapping[str, Any]] | None = None,
     ) -> None:
-        self._definitions = MappingProxyType(_make_layers(dict(factories), get_layers))
+        self._definitions = MappingProxyType(
+            _make_layers(dict(factories), get_layers, get_resources)
+        )
         self._get_layers = get_layers
-        super().__init__(self._build_capability())
+        super().__init__(self._build_capability(get_resources))
 
     @property
-    def definitions(self) -> Mapping[str, Layer[D, Any, Any]]:
-        """Read-only definitions for host-owned Config/State and conversation hooks."""
+    def definitions(self) -> Mapping[str, Layer[D, Any, Any, Any]]:
+        """Read-only installed models, capabilities and resource hooks."""
         return self._definitions
 
-    def prepare_configs(self, configs: Mapping[str, JsonObject]) -> dict[str, BaseModel]:
-        """Validate all names and Config before hooks, without constructing State."""
-        return _prepare_configs(configs, self.definitions)
+    @asynccontextmanager
+    async def open_conversation(
+        self, conversation_id: str, configs: Mapping[str, JsonObject]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Open configured local handles and close successful enters in reverse order.
+
+        The host passes the yielded mapping to its runs. Each enter owns partial
+        initialization until it returns successfully. Enter, the body and exit
+        share the caller's task and context. Cancellation from enclosing AnyIO
+        scopes is deferred until the exit hooks finish.
+        """
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise UserError("Layer resources require a nonempty conversation_id")
+        prepared = _prepare_configs(configs, self.definitions)
+        resources: dict[str, Any] = {}
+        stack = AsyncExitStack()
+        with anyio.CancelScope() as scope:
+            try:
+                for name, config in prepared.items():
+                    layer = self.definitions[name]
+                    if layer.enter_conversation is not None:
+                        resource = await layer.enter_conversation(conversation_id, config)
+                        resources[name] = resource
+                        if layer.exit_conversation is not None:
+                            stack.push_async_callback(layer.exit_conversation, resource)
+                yield resources
+            finally:
+                # Shield outside any cancel scopes opened by the enter hooks.
+                scope.shield = True
+                await stack.aclose()
+        # Surface cancellation that arrived while cleanup was shielded.
+        await checkpoint_if_cancelled()
 
     def load(
         self, configs: Mapping[str, JsonObject], states: Mapping[str, JsonObject]
@@ -67,16 +99,21 @@ class LayerRegistry[D](WrapperCapability[D]):
         """Validate and copy selected State through this registry's saved access rule."""
         return _snapshot(deps, self.definitions, self._get_layers)
 
-    def _build_capability(self) -> AbstractCapability[D]:
+    def _build_capability(
+        self, get_resources: Callable[[D], Mapping[str, Any]] | None
+    ) -> AbstractCapability[D]:
         from .composition import _layers_capability
 
-        return _layers_capability(self.definitions, get_layers=self._get_layers)
+        return _layers_capability(
+            self.definitions, get_layers=self._get_layers, get_resources=get_resources
+        )
 
 
 def _make_layers[D](
     registry: Mapping[str, LayerFactory[D]],
     get_layers: Callable[[D], dict[str, LayerData]],
-) -> dict[str, Layer[D, Any, Any]]:
+    get_resources: Callable[[D], Mapping[str, Any]] | None,
+) -> dict[str, Layer[D, Any, Any, Any]]:
     """Assemble all installed factories and check definitions without model/hook I/O.
 
     Access closes over one ID per invocation and returns the current writable
@@ -84,14 +121,20 @@ def _make_layers[D](
     already acquired their IDs during construction.
     """
 
-    def build(layer_id: str, factory: LayerFactory[D]) -> Layer[D, Any, Any]:
+    def build(layer_id: str, factory: LayerFactory[D]) -> Layer[D, Any, Any, Any]:
         if not layer_id:
             raise UserError("Layer registry names must be nonempty")
 
-        def access(deps: D) -> LayerData:
+        def data(deps: D) -> LayerData:
             return get_layers(deps)[layer_id]
 
-        layer = factory(layer_id, access)
+        def resource(deps: D) -> Any:
+            resources = get_resources(deps) if get_resources is not None else {}
+            if layer_id not in resources:
+                raise UserError(f"Layer {layer_id!r} has no open resource")
+            return resources[layer_id]
+
+        layer = factory(layer_id, LayerAccess(data, resource))
         if not isinstance(layer, Layer):
             raise UserError(f"Layer {layer_id!r} factory must return a Layer")
         for label, model in (("Config", layer.config_type), ("State", layer.state_type)):
@@ -105,6 +148,10 @@ def _make_layers[D](
         ):
             if hook is not None and not iscoroutinefunction(hook):
                 raise UserError(f"Layer {layer_id!r} {label} must be an async function")
+        if layer.enter_conversation is None and layer.exit_conversation is not None:
+            raise UserError(f"Layer {layer_id!r} exit_conversation requires enter_conversation")
+        if layer.enter_conversation is not None and get_resources is None:
+            raise UserError(f"Layer {layer_id!r} enter_conversation requires get_resources")
         if layer.capability.id != layer_id:
             raise UserError(
                 f"Layer capability id must be {layer_id!r}, got {layer.capability.id!r}"
@@ -123,9 +170,9 @@ def dump_object(model: BaseModel) -> JsonObject:
 
 
 def _prepare_configs[D](
-    configs: Mapping[str, JsonObject], layers: Mapping[str, Layer[D, Any, Any]]
+    configs: Mapping[str, JsonObject], layers: Mapping[str, Layer[D, Any, Any, Any]]
 ) -> dict[str, BaseModel]:
-    """Validate all names/Config before conversation hooks; State may require enter."""
+    """Validate and copy all Config before constructing State or opening handles."""
     unknown = configs.keys() - layers.keys()
     if unknown:
         raise UserError(f"Unknown registered layer: {', '.join(sorted(unknown))}")
@@ -141,7 +188,7 @@ def _prepare_configs[D](
 def _load[D](
     configs: Mapping[str, JsonObject],
     states: Mapping[str, JsonObject],
-    layers: Mapping[str, Layer[D, Any, Any]],
+    layers: Mapping[str, Layer[D, Any, Any, Any]],
 ) -> dict[str, LayerData]:
     """Validate and copy existing data; omitted State validates from {}, without hooks."""
     unexpected = states.keys() - configs.keys()
@@ -160,7 +207,7 @@ def _load[D](
 
 def _snapshot[D](
     deps: D,
-    layers: Mapping[str, Layer[D, Any, Any]],
+    layers: Mapping[str, Layer[D, Any, Any, Any]],
     get_layers: Callable[[D], dict[str, LayerData]],
 ) -> dict[str, JsonObject]:
     """Revalidate and copy selected State; never persist definitions or Config."""

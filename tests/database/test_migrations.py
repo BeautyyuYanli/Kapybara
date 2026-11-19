@@ -253,7 +253,7 @@ async def test_temporal_ownership_upgrade_drops_ledger_preserves_business_and_pa
                 before = (
                     await db.execute(text("SELECT * FROM agent_history ORDER BY session_id"))
                 ).all()
-                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "978cc41afc77"))
                 rows = (await db.execute(text("SELECT * FROM sessions"))).all()
                 assert {row.title: row.status for row in rows} == {
                     status: status if status in {"ready", "closed"} else "closing"
@@ -275,12 +275,98 @@ async def test_temporal_ownership_upgrade_drops_ledger_preserves_business_and_pa
                     lambda conn: inspect(conn).get_check_constraints("sessions")
                 )
                 assert any(check["name"] == "ck_sessions_current_activity_pair" for check in checks)
-                await db.run_sync(lambda conn: command.check(config(conn)))
                 with pytest.raises(NotImplementedError, match="irreversible"):
                     await db.run_sync(lambda conn: command.downgrade(config(conn), "33472a5802a2"))
     finally:
         async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as db:
             await db.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+            )
+
+
+@pytest.mark.asyncio
+async def test_local_lifecycle_archives_transitions_and_preserves_other_rows(database):
+    schema = "local_lifecycle_migration_" + uuid4().hex
+    settings = CommonSettings(database_url=SecretStr(database.url), database_schema=schema)
+    statuses = ("creating", "closing", "ready", "closed")
+    session_ids = {status: uuid4() for status in statuses}
+    try:
+        async with open_core_database(settings) as engine:
+            async with engine.begin() as db:
+                await db.execute(CreateSchema(schema))
+
+                def config(connection):
+                    connection.dialect.default_schema_name = schema
+                    return migration_config(
+                        connection,
+                        directory=Path(__file__).parents[2] / "src/kapy/database/migrations",
+                        metadata=[ControlTable.metadata, history_metadata],
+                        version_table="core_schema_version",
+                        owns_table=OWNED_TABLES.__contains__,
+                    )
+
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "1b9d8771d8cb"))
+                for status, session_id in session_ids.items():
+                    await db.execute(
+                        text("""INSERT INTO sessions
+                        (id, status, title, provider_id, model_name, model_settings,
+                         layers, layer_states, runner_state, current_activity_id,
+                         current_activity_run_id, created_at, updated_at)
+                        VALUES (:id, :status, 'retained', :provider, 'model',
+                            '{"temperature": 0.5}', '{"shell":{"cwd":"/tmp"}}',
+                            CAST(:state AS JSON), '[]', :activity_id, :run_id,
+                            '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z')"""),
+                        {
+                            "id": session_id,
+                            "status": status,
+                            "provider": uuid4(),
+                            "state": json.dumps({"shell": {"jobs": {"job": 8}}}),
+                            "activity_id": uuid4() if status != "closed" else None,
+                            "run_id": str(uuid4()) if status != "closed" else None,
+                        },
+                    )
+                    await db.execute(
+                        text("""INSERT INTO agent_history
+                        (session_id, seq, kind, message, message_metadata, created_at)
+                        VALUES (:id, 4, 'request', '{"parts":[]}', '{}',
+                            '2026-09-01T00:00:00Z')"""),
+                        {"id": session_id},
+                    )
+
+                async def sessions():
+                    rows = (await db.execute(text("SELECT * FROM sessions"))).mappings()
+                    return {row["id"]: dict(row) for row in rows}
+
+                history_query = text("SELECT * FROM agent_history ORDER BY session_id, seq")
+                before = await sessions()
+                history = (await db.execute(history_query)).all()
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                after = await sessions()
+                for status, session_id in session_ids.items():
+                    expected = before[session_id]
+                    actual = after[session_id]
+                    if status in {"creating", "closing"}:
+                        assert actual["updated_at"] > expected["updated_at"]
+                        expected = expected | {
+                            "status": "closed",
+                            "current_activity_id": None,
+                            "current_activity_run_id": None,
+                            "updated_at": actual["updated_at"],
+                        }
+                    assert actual == expected
+                assert (await db.execute(history_query)).all() == history
+                columns = await db.run_sync(lambda conn: inspect(conn).get_columns("sessions"))
+                status_column = next(column for column in columns if column["name"] == "status")
+                assert str(status_column["type"]) == "VARCHAR(6)"
+                assert status_column["nullable"] is False
+                assert status_column["default"] == "'ready'::character varying"
+                await db.run_sync(lambda conn: command.check(config(conn)))
+                with pytest.raises(NotImplementedError, match="irreversible"):
+                    await db.run_sync(lambda conn: command.downgrade(config(conn), "1b9d8771d8cb"))
+    finally:
+        async with await psycopg.AsyncConnection.connect(database.url, autocommit=True) as cleanup:
+            await cleanup.execute(
                 sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
             )
 
@@ -616,8 +702,8 @@ async def test_shell_conversation_migration_removes_only_identity_and_restores_s
 
                 before = await snapshot()
                 history = (await db.execute(text("SELECT * FROM agent_history"))).all()
-                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
-                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "1b9d8771d8cb"))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "1b9d8771d8cb"))
                 upgraded = await snapshot()
                 for session_id, row in before.items():
                     expected = dict(row)
@@ -642,7 +728,7 @@ async def test_shell_conversation_migration_removes_only_identity_and_restores_s
                             "shell": {**shell, "scope_id": str(session_id)},
                         }
                     assert downgraded[session_id] == expected
-                await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
+                await db.run_sync(lambda conn: command.upgrade(config(conn), "1b9d8771d8cb"))
                 assert await snapshot() == upgraded
                 assert (await db.execute(text("SELECT * FROM agent_history"))).all() == history
     finally:
@@ -963,10 +1049,9 @@ async def test_operation_migration_fences_legacy_sessions_and_preserves_stored_d
                 ).all()
                 await db.run_sync(lambda conn: command.upgrade(config(conn), "head"))
                 rows = (await db.execute(text("SELECT * FROM sessions"))).all()
-                assert {row.id: row.status for row in rows} == {
-                    sid: "closed" if phase == "closed" else "closing"
-                    for phase, sid in identities.items()
-                }
+                assert {row.id: row.status for row in rows} == dict.fromkeys(
+                    identities.values(), "closed"
+                )
                 assert all(
                     row.runner_state == "opaque snapshot" and row.current_activity_id is None
                     for row in rows

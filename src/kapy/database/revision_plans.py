@@ -8,6 +8,36 @@ import sqlalchemy as sa
 from alembic.operations import ops
 
 
+def local_session_lifecycle(context, revision, directives) -> None:
+    """Archive legacy transitional sessions before narrowing the status column."""
+    script = directives[0]
+    changes = script.upgrade_ops.ops
+    if (
+        len(changes) != 1
+        or not isinstance(table := changes[0], ops.ModifyTableOps)
+        or table.table_name != "sessions"
+        or len(table.ops) != 1
+        or not isinstance(status := table.ops[0], ops.AlterColumnOp)
+        or status.column_name != "status"
+        or not isinstance(status.modify_type, sa.Enum)
+        or status.modify_type.enums != ["ready", "closed"]
+    ):
+        raise ValueError("local-session-lifecycle requires only the session status type change")
+    table.ops.insert(
+        0,
+        ops.ExecuteSQLOp("""UPDATE sessions
+SET status = 'closed',
+    current_activity_id = NULL,
+    current_activity_run_id = NULL,
+    updated_at = clock_timestamp()
+WHERE status IN ('creating', 'closing')"""),
+    )
+    script.downgrade_ops = ops.DowngradeOps([])
+    context.config.attributes["irreversible_reason"] = (
+        "Archiving transitional sessions as closed is irreversible"
+    )
+
+
 def shell_conversation_state(context, revision, directives) -> None:
     """Remove only shell's persisted identity; ownership comes from the SDK context.
 

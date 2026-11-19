@@ -31,7 +31,7 @@ class Capability[D](NativeCapability[D]):
         )
 
 
-def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State]:
+def make[D](layer_id: str, access: LayerAccess[D]) -> Layer[D, Config, State, None]:
     return Layer(config_type=Config, state_type=State, capability=Capability[D](layer_id))
 
 

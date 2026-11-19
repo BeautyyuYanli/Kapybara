@@ -186,7 +186,5 @@ async def session_runtime(database, valkey_client):
     queue = f"session-test-{uuid4()}"
     outputs = AgentOutputService(valkey_client, channel_prefix=f"session-test-{uuid4()}")
     runner = RunnerActivity(database.sessions, outputs, client)
-    async with Worker(
-        client, task_queue=queue, activities=[runner.create, runner.run, runner.close]
-    ):
+    async with Worker(client, task_queue=queue, activities=[runner.run]):
         yield SessionRuntime(client, queue, outputs)

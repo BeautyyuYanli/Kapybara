@@ -19,16 +19,16 @@ class State(BaseModel):
     calls: int = 0
 
 
-def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State]:
+def make[DepsT](layer_id: str, access: LayerAccess[DepsT]) -> Layer[DepsT, Config, State, None]:
     """Build once; injected access reads the actual entry in each current deps."""
 
     def echo(ctx: RunContext[DepsT], text: str) -> str:
         """Return text formatted with this run's config and retain a call count."""
-        entry = access(ctx.deps)
+        entry = access.data(ctx.deps)
         config, state = Config.model_validate(entry["config"]), State.model_validate(entry["state"])
         value = text.upper() if config.uppercase else text
         state.calls += 1
-        access(ctx.deps)["state"] = dump_object(state)
+        entry["state"] = dump_object(state)
         return f"{config.prefix}{value}"
 
     return Layer(
